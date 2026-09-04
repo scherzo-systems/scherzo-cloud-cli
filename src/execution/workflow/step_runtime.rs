@@ -234,6 +234,7 @@ impl AgentExecution<NoAgentDispatcher> {
 }
 
 impl<Dispatcher> AgentExecution<Dispatcher> {
+    #[cfg(test)]
     pub(crate) fn enabled(
         run: WorkflowRunId,
         staging: AgentInputStaging,
@@ -428,6 +429,7 @@ where
         )
     }
 
+    #[cfg(test)]
     fn with_diagnostics(
         admitted: AdmittedWorkflow,
         artifacts: ArtifactStaging,
@@ -549,6 +551,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_step(
         &self,
         step: String,
@@ -3068,6 +3071,7 @@ where
 {
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_workflow<Clock, Commits>(
     admitted: AdmittedWorkflow,
     artifacts: &ArtifactStaging,

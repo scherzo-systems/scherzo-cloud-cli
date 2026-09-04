@@ -174,7 +174,9 @@ fn thread_started_notification() -> Value {
             "ephemeral": true,
             "path": null,
             "cliVersion": "0.147.0",
+            "turns": [],
             "cwd": "/synthetic/project",
+            "modelProvider": "native-provider",
         }}
     })
 }
@@ -464,18 +466,20 @@ fn matching_thread_notification_and_response_may_arrive_in_either_order() {
 }
 
 #[test]
-fn thread_start_enforces_identity_and_ignores_noncorrelation_schema_drift() {
+fn thread_start_requires_a_fresh_unassigned_root_and_accepts_nullable_metadata() {
     for notification_first in [false, true] {
         let mut parser = parser(AgentValueKind::None, 1024, None);
         initialize(&mut parser);
         effective_config(&mut parser, "native-provider");
         let mut notification = thread_started_notification();
-        notification["params"]["thread"]["projectId"] = json!("project-1");
+        notification["params"]["thread"]["projectId"] = Value::Null;
+        notification["params"]["thread"]["model"] = Value::Null;
+        notification["params"]["thread"]["reasoningEffort"] = Value::Null;
         notification["params"]["thread"]["futureField"] = json!({"nested": true});
         let mut response = thread_start_response("native-provider");
-        response["result"]["thread"]["projectId"] = json!("project-1");
-        response["result"]["thread"]["forkedFromId"] = json!("parent-thread");
-        response["result"]["thread"]["turns"] = json!([{"future": true}]);
+        response["result"]["thread"]["projectId"] = Value::Null;
+        response["result"]["thread"]["model"] = Value::Null;
+        response["result"]["thread"]["reasoningEffort"] = Value::Null;
         response["result"]["futureField"] = json!(true);
         if notification_first {
             feed(&mut parser, notification).unwrap();
@@ -484,6 +488,28 @@ fn thread_start_enforces_identity_and_ignores_noncorrelation_schema_drift() {
             feed(&mut parser, response).unwrap();
             feed(&mut parser, notification).unwrap();
         }
+    }
+
+    for (field, value) in [
+        ("projectId", json!("project-1")),
+        ("forkedFromId", json!("parent-thread")),
+        ("parentThreadId", json!("parent-thread")),
+        ("path", json!("/ambient/rollout.jsonl")),
+        ("ephemeral", json!(false)),
+        ("turns", json!([{"id": "prior-turn"}])),
+    ] {
+        let mut parser = parser(AgentValueKind::None, 1024, None);
+        initialize(&mut parser);
+        effective_config(&mut parser, "native-provider");
+        let mut response = thread_start_response("native-provider");
+        response["result"]["thread"][field] = value;
+        assert_eq!(
+            feed(&mut parser, response).unwrap_err(),
+            AgentFailureCause::HarnessSetupFailed {
+                stage: AgentHarnessSetupStage::ThreadStart,
+            },
+            "{field}",
+        );
     }
 }
 
@@ -1120,11 +1146,6 @@ fn project_and_strict_review_notifications_are_bounded_nonsettling_metadata() {
             },
             "emittedAtMs": 20,
         }),
-        json!({
-            "method": "thread/project/updated",
-            "params": {"threadId": "thread-1", "projectId": "project-1"},
-            "emittedAtMs": 20,
-        }),
     ] {
         let mut parser = running_parser(AgentValueKind::None, 1024);
         let (_, observations) = feed(&mut parser, additive).unwrap();
@@ -1133,6 +1154,20 @@ fn project_and_strict_review_notifications_are_bounded_nonsettling_metadata() {
             [AgentObservation::UnrecognizedHarnessEvent { .. }]
         ));
     }
+
+    let mut assigned = running_parser(AgentValueKind::None, 1024);
+    assert_eq!(
+        feed(
+            &mut assigned,
+            json!({
+                "method": "thread/project/updated",
+                "params": {"threadId": "thread-1", "projectId": "project-1"},
+                "emittedAtMs": 20,
+            }),
+        )
+        .unwrap_err(),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
 
     for mismatch in [
         json!({
@@ -1150,6 +1185,278 @@ fn project_and_strict_review_notifications_are_bounded_nonsettling_metadata() {
             AgentFailureCause::HarnessProtocolFailed
         );
     }
+}
+
+#[test]
+fn candidate_additive_events_are_bounded_nonsettling_observations() {
+    let mut parser = running_parser(AgentValueKind::Response, 1024);
+    feed(&mut parser, item_started("mcp-item", "mcpToolCall")).unwrap();
+    let realtime_item = json!({
+        "id": "realtime-item",
+        "realtimeSessionId": "realtime-session",
+        "type": "transcriptSegment",
+        "role": "assistant",
+        "text": "must not become a response",
+    });
+    for event in [
+        json!({
+            "method": "item/mcpToolCall/progress",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "mcp-item",
+                "message": "native progress",
+            },
+        }),
+        json!({
+            "method": "mcpServer/event/stream/notification",
+            "params": {
+                "subscriptionId": "subscription-1",
+                "notification": {
+                    "method": "notifications/progress",
+                    "params": {"progress": 1},
+                },
+            },
+        }),
+        json!({
+            "method": "thread/realtime/item/started",
+            "params": {"threadId": "thread-1", "item": realtime_item.clone()},
+        }),
+        json!({
+            "method": "thread/realtime/item/transcript/delta",
+            "params": {
+                "threadId": "thread-1",
+                "itemId": "realtime-item",
+                "delta": "provisional",
+            },
+        }),
+        json!({
+            "method": "thread/realtime/item/completed",
+            "params": {"threadId": "thread-1", "item": realtime_item},
+        }),
+        json!({
+            "method": "modelProvider/authRecoveryStarted",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "provider": "native-provider",
+                "message": "recovering",
+            },
+        }),
+        json!({
+            "method": "modelProvider/authRecoveryCompleted",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "provider": "native-provider",
+                "message": "recovered",
+            },
+        }),
+    ] {
+        let (progress, observations) = feed(&mut parser, event).unwrap();
+        assert_eq!(progress, ParserProgress::default());
+        assert!(matches!(
+            observations.as_slice(),
+            [AgentObservation::UnrecognizedHarnessEvent { .. }]
+        ));
+        assert!(parser.take_outbound().is_none());
+    }
+    feed(
+        &mut parser,
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "mcp-item",
+                    "type": "mcpToolCall",
+                    "status": "completed",
+                },
+            },
+        }),
+    )
+    .unwrap();
+
+    feed(&mut parser, item_started("final", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("final", "ordinary", json!("final_answer")),
+    )
+    .unwrap();
+    feed(
+        &mut parser,
+        turn_completed(
+            vec![
+                json!({
+                    "id": "mcp-item",
+                    "type": "mcpToolCall",
+                    "status": "completed",
+                }),
+                json!({
+                    "id": "final",
+                    "type": "agentMessage",
+                    "text": "ordinary",
+                    "phase": "final_answer",
+                }),
+            ],
+            "completed",
+        ),
+    )
+    .unwrap();
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = parser.finish(true)
+    else {
+        panic!("candidate events must not settle or replace the ordinary response");
+    };
+    assert_eq!(response.as_str(), "ordinary");
+
+    let mut mismatched = running_parser(AgentValueKind::None, 1024);
+    assert_eq!(
+        feed(
+            &mut mismatched,
+            json!({
+                "method": "thread/realtime/item/transcript/delta",
+                "params": {
+                    "threadId": "other-thread",
+                    "itemId": "realtime-item",
+                    "delta": "provisional",
+                },
+            }),
+        )
+        .unwrap_err(),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+}
+
+#[test]
+fn realtime_item_completion_rejects_different_session_identity() {
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    let started_item = json!({
+        "id": "realtime-item",
+        "realtimeSessionId": "session-a",
+        "type": "transcriptSegment",
+        "role": "assistant",
+        "text": "provisional",
+    });
+    feed(
+        &mut parser,
+        json!({
+            "method": "thread/realtime/item/started",
+            "params": {"threadId": "thread-1", "item": started_item.clone()},
+        }),
+    )
+    .unwrap();
+    let mut completed_item = started_item;
+    completed_item["realtimeSessionId"] = json!("session-b");
+    assert_eq!(
+        feed(
+            &mut parser,
+            json!({
+                "method": "thread/realtime/item/completed",
+                "params": {"threadId": "thread-1", "item": completed_item},
+            }),
+        )
+        .expect_err("a different realtime session must not complete the active item"),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+}
+
+#[test]
+fn interrupted_turn_hooks_settle_before_terminal_and_commit_no_provisional_value() {
+    let started_hook = json!({
+        "id": "interrupt-hook",
+        "eventName": "interrupt",
+        "displayOrder": 0,
+        "entries": [],
+        "executionMode": "sync",
+        "handlerType": "command",
+        "scope": "turn",
+        "sourcePath": "/synthetic/interrupt-hook",
+        "startedAt": 1,
+        "status": "running",
+    });
+    let mut completed_hook = started_hook.clone();
+    completed_hook["completedAt"] = json!(2);
+    completed_hook["durationMs"] = json!(1);
+    completed_hook["status"] = json!("completed");
+
+    let mut parser = running_parser(AgentValueKind::Response, 1024);
+    feed(&mut parser, item_started("provisional", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("provisional", "must not commit", json!("final_answer")),
+    )
+    .unwrap();
+    assert!(parser.request_turn_interrupt().unwrap());
+    assert_eq!(take_json(&mut parser)["method"], "turn/interrupt");
+    feed(&mut parser, json!({"id": 5, "result": {}})).unwrap();
+    feed(
+        &mut parser,
+        json!({
+            "method": "hook/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "run": started_hook.clone(),
+            },
+        }),
+    )
+    .unwrap();
+    feed(
+        &mut parser,
+        json!({
+            "method": "hook/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "run": completed_hook,
+            },
+        }),
+    )
+    .unwrap();
+    feed(
+        &mut parser,
+        turn_completed(
+            vec![json!({
+                "id": "provisional",
+                "type": "agentMessage",
+                "text": "must not commit",
+                "phase": "final_answer",
+            })],
+            "interrupted",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        parser.finish(true),
+        AgentOutcome::Failed(
+            AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::ModelAborted,
+            }
+            .into(),
+        ),
+    );
+
+    let mut premature = running_parser(AgentValueKind::None, 1024);
+    assert!(premature.request_turn_interrupt().unwrap());
+    let _ = take_json(&mut premature);
+    feed(&mut premature, json!({"id": 5, "result": {}})).unwrap();
+    feed(
+        &mut premature,
+        json!({
+            "method": "hook/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "run": started_hook,
+            },
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        feed(&mut premature, turn_completed(Vec::new(), "interrupted"),).unwrap_err(),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
 }
 
 #[test]
@@ -1878,7 +2185,15 @@ fn declined_server_requests_enforce_only_correlation_identity() {
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "itemId": "interactive",
-                "questions": "future-question-shape",
+                "isBlocking": false,
+                "questions": [{
+                    "id": "structured-question",
+                    "header": "Choice",
+                    "question": "Select an option",
+                    "options": [{"label": "A", "description": "first"}],
+                    "isOther": true,
+                    "isSecret": false,
+                }],
             }),
             json!({"answers": {}}),
         ),
@@ -1888,8 +2203,16 @@ fn declined_server_requests_enforce_only_correlation_identity() {
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
-                "mode": "future-mode",
-                "futureField": true,
+                "serverName": "fixture-mcp",
+                "mode": "form",
+                "message": "Provide structured input",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "choice": {"type": "string", "enum": ["A", "B"]},
+                    },
+                    "required": ["choice"],
+                },
             }),
             json!({"action": "decline"}),
         ),
@@ -1918,6 +2241,41 @@ fn declined_server_requests_enforce_only_correlation_identity() {
             "{method}",
         );
     }
+}
+
+#[test]
+fn mcp_elicitation_with_explicit_null_turn_id_is_declined() {
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    let (_, observations) = feed(
+        &mut parser,
+        json!({
+            "id": "standalone-mcp-request",
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": null,
+                "serverName": "fixture-mcp",
+                "mode": "form",
+                "message": "Provide structured input",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"choice": {"type": "string"}},
+                },
+            },
+        }),
+    )
+    .expect("schema-valid standalone elicitation should be declined");
+    assert!(matches!(
+        observations.as_slice(),
+        [AgentObservation::UnrecognizedHarnessEvent { .. }]
+    ));
+    assert_eq!(
+        take_json(&mut parser),
+        json!({
+            "id": "standalone-mcp-request",
+            "result": {"action": "decline"},
+        }),
+    );
 }
 
 #[test]

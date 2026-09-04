@@ -12,10 +12,6 @@ mod api;
 mod build_info;
 mod cli;
 mod error;
-#[allow(
-    dead_code,
-    reason = "validation resolves execution fields that later runtime components will consume"
-)]
 mod execution;
 mod exit_code;
 mod human_auth;

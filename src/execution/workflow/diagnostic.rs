@@ -130,6 +130,7 @@ impl StepDiagnosticLog {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn invocation_ids(&self, step: &str) -> Vec<ActionId> {
         lock_entries(&self.entries)
             .keys()

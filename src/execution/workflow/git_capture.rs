@@ -187,6 +187,7 @@ impl fmt::Debug for GitCaptureContext {
 }
 
 impl GitCaptureContext {
+    #[cfg(test)]
     pub(crate) fn admit(
         execution: &AdmittedExecutionContext,
         cancellation: &CaptureCancellation,
@@ -372,24 +373,24 @@ impl GitCaptureContext {
         Ok(context)
     }
 
+    #[cfg(test)]
     pub(crate) fn baseline_oid(&self) -> &str {
         &self.baseline_oid
     }
 
-    pub(crate) fn object_format(&self) -> GitObjectFormat {
-        self.object_format
-    }
-
+    #[cfg(test)]
     pub(crate) fn workflow_digest(&self) -> Option<&str> {
         self.workflow_digest.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn carrier_limits(&self) -> (usize, u64, u64) {
         self.carrier_limits
     }
 
     /// Stages and verifies one branch candidate. The returned set remains provisional until its
     /// workflow reduction is accepted; dropping it rolls back the carrier and reservation.
+    #[cfg(test)]
     pub(crate) fn capture(
         &self,
         output_identity: &str,
@@ -1405,11 +1406,6 @@ struct BoundedOutput {
 struct ProcessOutput {
     status: ExitStatus,
     stdout: BoundedOutput,
-    #[allow(
-        dead_code,
-        reason = "stderr is drained and retained for future private diagnostics"
-    )]
-    stderr: BoundedOutput,
 }
 
 fn execute_process(
@@ -1478,10 +1474,10 @@ fn execute_process(
             .map_err(|_| ProcessFailure::Input);
         let status = status?;
         input_result?;
+        stderr.map_err(|_| ProcessFailure::Io)?;
         Ok(ProcessOutput {
             status,
             stdout: stdout.map_err(|_| ProcessFailure::Io)?,
-            stderr: stderr.map_err(|_| ProcessFailure::Io)?,
         })
     })
 }

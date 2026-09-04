@@ -11,6 +11,7 @@ const RESPONSE_SUCCESS: &[u8] = include_bytes!("fixtures/response-success.jsonl"
 const NATIVE_RECOVERY: &[u8] = include_bytes!("fixtures/native-recovery.jsonl");
 const SIBLING_RESULT_CORRECTION: &[u8] = include_bytes!("fixtures/sibling-result-correction.jsonl");
 const TERMINAL_TOOL_USE: &[u8] = include_bytes!("fixtures/terminal-tool-use.jsonl");
+const TOOLCALL_START_METADATA: &[u8] = include_bytes!("fixtures/toolcall-start-metadata.jsonl");
 
 fn parser(kind: AgentValueKind) -> PiJsonV1Parser {
     PiJsonV1Parser::profile(Arc::from(CWD), kind)
@@ -234,6 +235,60 @@ fn recorded_response_is_ordered_bounded_and_repeatable_across_chunking() {
         })
         .collect::<String>();
     assert_eq!(text, "hello world");
+}
+
+#[test]
+fn toolcall_start_metadata_is_optional_and_observation_only() {
+    let candidate = replay(TOOLCALL_START_METADATA, AgentValueKind::None);
+    let mut lower_bound_events = values(TOOLCALL_START_METADATA);
+    let mut removed_metadata = false;
+    for event in &mut lower_bound_events {
+        let Some(start) = event
+            .get_mut("assistantMessageEvent")
+            .and_then(Value::as_object_mut)
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("toolcall_start"))
+        else {
+            continue;
+        };
+        removed_metadata = start.remove("id").is_some() && start.remove("toolName").is_some();
+    }
+    assert!(removed_metadata);
+    let lower_bound = replay(&encoded(&lower_bound_events), AgentValueKind::None);
+
+    assert_eq!(candidate, lower_bound);
+    assert_eq!(
+        candidate.outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+
+    let pending = assistant(json!([]), "pending", 2);
+    let mut result = result_parser();
+    result
+        .push_ignoring(&encoded(&[
+            session(),
+            json!({"type": "agent_start"}),
+            json!({"type": "message_start", "message": pending}),
+            json!({
+                "type": "message_update",
+                "usage": usage(),
+                "assistantMessageEvent": {
+                    "type": "toolcall_start",
+                    "contentIndex": 0,
+                    "id": "call-early-result",
+                    "toolName": "scherzo_result_fixed"
+                }
+            }),
+        ]))
+        .unwrap();
+    assert_eq!(
+        result.try_correlate_result_request(
+            "scherzo_result_fixed",
+            "call-early-result",
+            &json!({"result": {"answer": 42}}),
+        ),
+        Ok(false)
+    );
+    assert!(!result.accepted_result_ready_for_settlement());
 }
 
 #[test]

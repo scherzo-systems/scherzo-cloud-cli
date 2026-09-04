@@ -161,8 +161,9 @@ Claude Code; or expose any of those values in doctor output.
 The operator-selected CodexAppServerV1 check applies the same first-executable,
 canonical-path, no-fallback rule to executable name `codex`. Its isolated version and
 generated-schema probes use fresh private native and XDG directories, accept only stable
-`>=0.147.0 <0.150.0`, and require the maintained App Server schema capability, including
-the ephemeral-thread contract. The validator does not read ambient `CODEX_HOME`, provider
+`>=0.147.0 <0.154.0`, and require the maintained App Server schema capability, including
+the ephemeral-thread contract. The exact repository qualification anchor is `0.153.0`;
+it does not substitute for the retained selected executable or prove an unexecuted host. The validator does not read ambient `CODEX_HOME`, provider
 credentials, or
 native configuration; start an App Server thread; query a provider; or expose any such
 value in doctor output.

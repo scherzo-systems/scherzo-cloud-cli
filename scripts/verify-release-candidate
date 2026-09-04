@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Verify one exact managed CLI release allocation without mutating GitHub."""
+"""Verify one exact fail-forward CLI release candidate without mutating GitHub."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -15,42 +16,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, NoReturn, Sequence
 
-ALLOCATION_FIELDS = (
+CANDIDATE_FIELDS = (
     "contract",
     "source_revision",
     "cli_tree",
-    "policy_sha256",
     "journal_sha256",
     "public_base_commit",
-    "public_base_source_revision",
     "stable_refs_sha256",
     "latest_stable_tag",
     "latest_stable_commit",
     "latest_stable_source_revision",
     "latest_release_sha256",
     "release",
-    "reason",
     "impact",
     "version",
     "tag",
-    "changelog_sha256",
-    "source_evidence_sha256",
-)
-RECOVERY_FIELDS = (
-    "contract",
-    "allocation_plan_digest",
-    "allocation_ref",
-    "allocation_commit",
-    "allocated_mirror_commit",
-    "allocated_source_revision",
-    "version",
-    "tag",
-    "public_base_commit",
-    "previous_recovery_digest",
-    "repair_source_revision",
-    "repair_cli_tree",
-    "repair_patch_sha256",
-    "repair_evidence_sha256",
+    "notes_sha256",
+    "notes_base64",
 )
 LATEST_RELEASE_FIELDS = (
     "contract",
@@ -65,38 +47,14 @@ LATEST_RELEASE_FIELDS = (
     "published_at_sha256",
     "assets_sha256",
 )
-POLICY = (
-    b'schema = 2\ninitial_version = "0.1.0"\n'
-    b'development_version = "0.0.0-dev"\n'
-    b'pre_1_0_breaking_impact = "minor"\n'
-)
-ALLOCATION_PREFIX = "refs/heads/release-allocations/"
-RECOVERY_PREFIX = "refs/heads/release-recoveries/"
-REPAIR_EXACT = frozenset(
-    {
-        ".github/workflows/check.yml",
-        "scripts/verify-release-allocation",
-        "scripts/reconcile-release",
-        "scripts/test-release-allocation",
-    }
-)
-REPAIR_EXECUTABLE = frozenset(
-    {
-        ".github/workflows/check.yml",
-        "scripts/verify-release-allocation",
-        "scripts/reconcile-release",
-    }
-)
-REPAIR_PREFIX = "tests/fixtures/release-notes/"
 OID_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
-ATOM_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-
+ATOM_RE = re.compile(r"^[A-Za-z0-9._/+=-]+$")
 
 class VerificationError(Exception):
-    """The public state does not represent the exact managed allocation."""
+    """The public state does not represent the exact managed candidate."""
 
 
 def fail(message: str) -> NoReturn:
@@ -285,12 +243,6 @@ class GitRepository:
             f"tree {revision}",
         )
 
-    def blob(self, revision: str, path: str) -> bytes:
-        result = self.run("cat-file", "blob", f"{revision}:{path}", check=False)
-        if result.returncode != 0:
-            fail(f"managed record is missing {path}")
-        return result.stdout
-
     def parent(self, revision: str, description: str) -> str:
         commit = self.rev(revision)
         values = self.run("rev-list", "--parents", "-n", "1", commit).stdout.decode("ascii").split()
@@ -322,41 +274,6 @@ class GitRepository:
                 fail("managed commit has malformed or duplicate trailers")
             trailers[key] = atom(field_value, f"managed trailer {key}")
         return CommitMetadata(lines[0], trailers, *identities)
-
-    def exact_files(self, revision: str) -> dict[str, tuple[str, str]]:
-        raw = self.run("ls-tree", "-r", "-z", revision).stdout
-        files: dict[str, tuple[str, str]] = {}
-        for entry in raw.rstrip(b"\0").split(b"\0"):
-            if not entry:
-                continue
-            metadata, raw_path = entry.split(b"\t", 1)
-            mode, kind, object_id = metadata.split(b" ", 2)
-            if kind != b"blob":
-                fail("managed record contains a non-blob entry")
-            path = os.fsdecode(raw_path)
-            files[path] = (mode.decode("ascii"), object_id.decode("ascii"))
-        return files
-
-    def canonical_diff(self, base: str, candidate: str) -> bytes:
-        return self.run(
-            "diff",
-            "--no-color",
-            "--full-index",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            base,
-            candidate,
-        ).stdout
-
-    def changed_paths(self, base: str, candidate: str) -> list[str]:
-        raw = self.run("diff", "--no-renames", "--name-only", "-z", base, candidate).stdout
-        if raw and not raw.endswith(b"\0"):
-            fail("Git returned an incomplete changed-path list")
-        return [os.fsdecode(path) for path in raw.rstrip(b"\0").split(b"\0") if path]
 
 
 @dataclass(frozen=True)
@@ -552,132 +469,54 @@ def normalize_latest_release(
     )
 
 
-def parse_allocation(value: bytes) -> dict[str, str]:
-    plan = parse_ordered(value, ALLOCATION_FIELDS, "allocation contract 2")
-    if plan["contract"] != "2":
-        fail("allocation contract differs from 2")
-    for field in ("source_revision", "cli_tree", "public_base_commit", "public_base_source_revision"):
-        oid(plan[field], f"allocation {field}")
+
+def parse_candidate(value: bytes) -> tuple[dict[str, str], bytes]:
+    plan = parse_ordered(value, CANDIDATE_FIELDS, "candidate contract 1")
+    if plan["contract"] != "1":
+        fail("candidate contract differs from 1")
+    for field in ("source_revision", "cli_tree", "public_base_commit"):
+        oid(plan[field], f"candidate {field}")
     for field in (
-        "policy_sha256",
         "journal_sha256",
         "stable_refs_sha256",
         "latest_release_sha256",
-        "changelog_sha256",
-        "source_evidence_sha256",
+        "notes_sha256",
     ):
-        digest(plan[field], f"allocation {field}")
+        digest(plan[field], f"candidate {field}")
     if plan["latest_stable_tag"] == "none":
-        if plan["latest_stable_commit"] != "none" or plan["latest_stable_source_revision"] != "none":
-            fail("initial allocation has inconsistent stable provenance")
+        if (
+            plan["latest_stable_commit"] != "none"
+            or plan["latest_stable_source_revision"] != "none"
+        ):
+            fail("initial candidate has inconsistent stable provenance")
     else:
-        tag_version(plan["latest_stable_tag"], "allocation latest stable tag")
-        oid(plan["latest_stable_commit"], "allocation latest stable commit")
-        oid(plan["latest_stable_source_revision"], "allocation latest stable source")
-    if plan["release"] != "true" or plan["reason"] not in {"initial-release", "releaseable-changes"}:
-        fail("allocation is not release-bearing")
+        tag_version(plan["latest_stable_tag"], "candidate latest stable tag")
+        oid(plan["latest_stable_commit"], "candidate latest stable commit")
+        oid(plan["latest_stable_source_revision"], "candidate latest stable source")
+    if plan["release"] == "false":
+        if any(
+            plan[field] != "none"
+            for field in ("impact", "version", "tag", "notes_base64")
+        ) or plan["notes_sha256"] != sha256(b""):
+            fail("non-release candidate contains release metadata")
+        return plan, b""
+    if plan["release"] != "true":
+        fail("candidate release flag is invalid")
     if plan["impact"] not in {"patch", "minor", "major"}:
-        fail("allocation impact is invalid")
-    semver(plan["version"], "allocation version")
+        fail("candidate impact is invalid")
+    semver(plan["version"], "candidate version")
     if plan["tag"] != f"v{plan['version']}":
-        fail("allocation tag does not match its version")
-    return plan
-
-
-def parse_recovery(value: bytes) -> dict[str, str]:
-    plan = parse_ordered(value, RECOVERY_FIELDS, "recovery contract 1")
-    if plan["contract"] != "1":
-        fail("recovery contract differs from 1")
-    for field in ("allocation_plan_digest", "repair_patch_sha256", "repair_evidence_sha256"):
-        digest(plan[field], f"recovery {field}")
-    if plan["previous_recovery_digest"] != "none":
-        digest(plan["previous_recovery_digest"], "recovery predecessor")
-    for field in (
-        "allocation_commit",
-        "allocated_mirror_commit",
-        "allocated_source_revision",
-        "public_base_commit",
-        "repair_source_revision",
-        "repair_cli_tree",
-    ):
-        oid(plan[field], f"recovery {field}")
-    if plan["allocation_ref"] != ALLOCATION_PREFIX + plan["allocation_plan_digest"]:
-        fail("recovery allocation ref differs from its allocation digest")
-    semver(plan["version"], "recovery version")
-    if plan["tag"] != f"v{plan['version']}":
-        fail("recovery tag differs from its version")
-    return plan
-
-
-def verify_record(
-    repository: GitRepository,
-    commit: str,
-    subject: str,
-    files: Mapping[str, bytes],
-) -> None:
-    values = repository.run("rev-list", "--parents", "-n", "1", commit).stdout.decode("ascii").split()
-    if values != [commit]:
-        fail("managed release record is not an orphan commit")
-    metadata = repository.metadata(commit)
-    if (
-        metadata.subject != subject
-        or metadata.trailers
-        or metadata.author != "Scherzo Release Record"
-        or metadata.author_email != "noreply@scherzo.dev"
-        or metadata.committer != "Scherzo Release Record"
-        or metadata.committer_email != "noreply@scherzo.dev"
-        or metadata.author_time != "0"
-        or metadata.committer_time != "0"
-    ):
-        fail("managed release record metadata differs")
-    actual = repository.exact_files(commit)
-    if actual != {path: ("100644", actual.get(path, ("", ""))[1]) for path in files}:
-        fail("managed release record layout or modes differ")
-    for path, value in files.items():
-        if repository.blob(commit, path) != value:
-            fail(f"managed release record differs: {path}")
-
-
-def read_allocation(
-    repository: GitRepository, plan_digest: str, expected_commit: str
-) -> tuple[dict[str, str], bytes]:
-    digest(plan_digest, "allocation plan digest")
-    expected_commit = oid(expected_commit, "allocation record commit")
-    actual_commit = repository.rev(ALLOCATION_PREFIX + plan_digest)
-    if actual_commit != expected_commit:
-        fail("allocation ref does not target its bound record")
-    plan_bytes = repository.blob(actual_commit, "release-plan.txt")
-    if sha256(plan_bytes) != plan_digest:
-        fail("allocation ref name differs from release-plan bytes")
-    plan = parse_allocation(plan_bytes)
-    notes = repository.blob(actual_commit, "rendered-notes.md")
-    if sha256(notes) != plan["changelog_sha256"]:
-        fail("allocation rendered notes differ from the plan")
-    bound = {"release-plan.txt": plan_bytes, "rendered-notes.md": notes}
-    files = {**bound, "files.sha256": digest_manifest(bound)}
-    verify_record(repository, actual_commit, f"Reserve CLI release {plan['tag']}", files)
+        fail("candidate tag differs from its version")
+    encoded = "" if plan["notes_base64"] == "none" else plan["notes_base64"]
+    try:
+        notes = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error):
+        fail("candidate release notes are not canonical base64")
+    if base64.b64encode(notes).decode("ascii") != encoded:
+        fail("candidate release notes use noncanonical base64")
+    if sha256(notes) != plan["notes_sha256"]:
+        fail("candidate release notes differ from their digest")
     return plan, notes
-
-
-def read_recovery(
-    repository: GitRepository, recovery_digest: str, expected_commit: str
-) -> tuple[dict[str, str], bytes]:
-    digest(recovery_digest, "recovery digest")
-    expected_commit = oid(expected_commit, "recovery record commit")
-    actual_commit = repository.rev(RECOVERY_PREFIX + recovery_digest)
-    if actual_commit != expected_commit:
-        fail("recovery ref does not target its bound record")
-    plan_bytes = repository.blob(actual_commit, "release-recovery-plan.txt")
-    if sha256(plan_bytes) != recovery_digest:
-        fail("recovery ref name differs from recovery-plan bytes")
-    plan = parse_recovery(plan_bytes)
-    patch = repository.blob(actual_commit, "repair.patch")
-    if sha256(patch) != plan["repair_patch_sha256"]:
-        fail("recovery patch differs from the plan")
-    bound = {"release-recovery-plan.txt": plan_bytes, "repair.patch": patch}
-    files = {**bound, "files.sha256": digest_manifest(bound)}
-    verify_record(repository, actual_commit, f"Reserve CLI recovery {recovery_digest}", files)
-    return plan, patch
 
 
 def mirror_metadata(repository: GitRepository, commit: str) -> CommitMetadata:
@@ -688,120 +527,39 @@ def mirror_metadata(repository: GitRepository, commit: str) -> CommitMetadata:
         or metadata.committer != "Scherzo Cloud Mirror"
         or metadata.committer_email != "mirror@scherzo.dev"
     ):
-        fail("public main does not use the synthetic mirror identity")
+        fail("public commit does not use the synthetic mirror identity")
     return metadata
 
 
-def verify_allocation_mirror(
-    repository: GitRepository,
-    allocated_mirror: str,
-    plan_digest: str,
-    allocation_commit: str,
-    plan: Mapping[str, str],
-) -> None:
-    metadata = mirror_metadata(repository, allocated_mirror)
-    expected = {
-        "Source-Revision": plan["source_revision"],
-        "Release-Plan-Digest": plan_digest,
-        "Release-Allocation-Ref": ALLOCATION_PREFIX + plan_digest,
-        "Release-Allocation-Commit": allocation_commit,
+def candidate_from_commit(
+    repository: GitRepository, commit: str
+) -> tuple[dict[str, str], bytes, str]:
+    commit = repository.rev(commit)
+    metadata = mirror_metadata(repository, commit)
+    expected_fields = {
+        "Source-Revision",
+        "Candidate-Plan-SHA256",
+        "Candidate-Plan-Base64",
     }
-    if metadata.subject != "Mirror CLI source" or metadata.trailers != expected:
-        fail("allocated mirror metadata differs from its allocation")
-    if repository.parent(allocated_mirror, "allocated mirror") != plan["public_base_commit"]:
-        fail("allocated mirror parent differs from the approved public base")
-    if repository.tree(allocated_mirror) != plan["cli_tree"]:
-        fail("allocated mirror tree differs from the allocation")
-    if repository.blob(allocated_mirror, "release.toml") != POLICY:
-        fail("allocated mirror policy differs from schema 2")
-    if sha256(POLICY) != plan["policy_sha256"]:
-        fail("allocation policy digest differs from allocated source")
-    cargo = repository.blob(allocated_mirror, "Cargo.toml")
-    if re.search(rb'(?m)^version = "0\.0\.0-dev"$', cargo) is None:
-        fail("allocated Cargo fallback differs from 0.0.0-dev")
-
-
-def verify_repair_tree(repository: GitRepository, allocated: str, repair: str) -> bytes:
-    changed = repository.changed_paths(allocated, repair)
-    if not changed:
-        fail("recovery mirror does not change the allocated executor")
-    files = repository.exact_files(repair)
-    for path in changed:
-        if path not in REPAIR_EXACT and not path.startswith(REPAIR_PREFIX):
-            fail(f"recovery mirror changes a non-allowlisted path: {path}")
-        if path not in files:
-            continue
-        mode = files[path][0]
-        if mode not in {"100644", "100755"}:
-            fail(f"recovery mirror has an invalid mode: {path}")
-        if mode == "100755" and path not in REPAIR_EXECUTABLE:
-            fail(f"recovery mirror makes a forbidden path executable: {path}")
-    return repository.canonical_diff(allocated, repair)
-
-
-def verify_recovery_chain(
-    repository: GitRepository,
-    current: str,
-    allocated: str,
-    plan_digest: str,
-    allocation_commit: str,
-    allocation_plan: Mapping[str, str],
-) -> str:
-    current_digest = "none"
-    cursor = current
-    while cursor != allocated:
-        metadata = mirror_metadata(repository, cursor)
-        recovery_digest = digest(
-            metadata.trailers.get("Release-Recovery-Digest", ""), "recovery mirror digest"
-        )
-        recovery_commit = oid(
-            metadata.trailers.get("Release-Recovery-Commit", ""), "recovery mirror record"
-        )
-        recovery_plan, patch = read_recovery(repository, recovery_digest, recovery_commit)
-        expected = {
-            "Source-Revision": recovery_plan["repair_source_revision"],
-            "Release-Plan-Digest": plan_digest,
-            "Release-Allocation-Ref": ALLOCATION_PREFIX + plan_digest,
-            "Release-Allocation-Commit": allocation_commit,
-            "Allocated-Mirror-Commit": allocated,
-            "Release-Recovery-Digest": recovery_digest,
-            "Release-Recovery-Ref": RECOVERY_PREFIX + recovery_digest,
-            "Release-Recovery-Commit": recovery_commit,
-        }
-        if metadata.subject != "Mirror CLI recovery" or metadata.trailers != expected:
-            fail("recovery mirror metadata differs from its record")
-        parent = repository.parent(cursor, "recovery mirror")
-        if (
-            recovery_plan["allocation_plan_digest"] != plan_digest
-            or recovery_plan["allocation_commit"] != allocation_commit
-            or recovery_plan["allocated_mirror_commit"] != allocated
-            or recovery_plan["allocated_source_revision"] != allocation_plan["source_revision"]
-            or recovery_plan["version"] != allocation_plan["version"]
-            or recovery_plan["tag"] != allocation_plan["tag"]
-            or recovery_plan["public_base_commit"] != parent
-            or recovery_plan["repair_source_revision"] != metadata.trailers["Source-Revision"]
-            or recovery_plan["repair_cli_tree"] != repository.tree(cursor)
-        ):
-            fail("recovery record changes the original allocation identity")
-        if patch != verify_repair_tree(repository, allocated, cursor):
-            fail("recovery patch is not the canonical allocated-mirror diff")
-        previous = recovery_plan["previous_recovery_digest"]
-        if parent == allocated:
-            if previous != "none":
-                fail("first recovery record has an unexpected predecessor")
-        else:
-            parent_metadata = mirror_metadata(repository, parent)
-            if (
-                parent_metadata.subject != "Mirror CLI recovery"
-                or previous != parent_metadata.trailers.get("Release-Recovery-Digest")
-            ):
-                fail("recovery record does not name its immediate predecessor")
-        if current_digest == "none":
-            current_digest = recovery_digest
-        cursor = parent
-    if current_digest == "none":
-        fail("workflow_dispatch recovery requires a current recovery chain")
-    return current_digest
+    if metadata.subject != "Mirror CLI candidate" or set(metadata.trailers) != expected_fields:
+        fail("public commit is not an exact CLI candidate")
+    encoded = metadata.trailers["Candidate-Plan-Base64"]
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error):
+        fail("candidate plan is not canonical base64")
+    if base64.b64encode(raw).decode("ascii") != encoded:
+        fail("candidate plan uses noncanonical base64")
+    if sha256(raw) != metadata.trailers["Candidate-Plan-SHA256"]:
+        fail("candidate plan differs from its digest")
+    plan, notes = parse_candidate(raw)
+    if metadata.trailers["Source-Revision"] != plan["source_revision"]:
+        fail("candidate source trailer differs from its plan")
+    if repository.tree(commit) != plan["cli_tree"]:
+        fail("candidate tree differs from its plan")
+    if repository.parent(commit, "candidate mirror") != plan["public_base_commit"]:
+        fail("candidate parent differs from its public base")
+    return plan, notes, sha256(raw)
 
 
 def stable_refs(repository: GitRepository) -> dict[str, str]:
@@ -821,65 +579,45 @@ def stable_refs(repository: GitRepository) -> dict[str, str]:
 def stable_manifest(refs: Mapping[str, str]) -> bytes:
     return b"".join(
         sorted(
-            (
-                f"refs/tags/{tag}={commit}\n".encode("ascii")
-                for tag, commit in refs.items()
-            )
+            f"refs/tags/{tag}={commit}\n".encode("ascii")
+            for tag, commit in refs.items()
         )
     )
-
-
-def expected_version(impact: str, latest_tag: str) -> str:
-    if latest_tag == "none":
-        return "0.1.0"
-    major, minor, patch = tag_version(latest_tag, "allocation latest stable tag")
-    if impact == "patch":
-        patch += 1
-    elif impact == "minor":
-        minor += 1
-        patch = 0
-    elif impact == "major":
-        major += 1
-        minor = patch = 0
-    else:
-        fail("allocation impact is invalid")
-    if max(major, minor, patch) > 999_999:
-        fail("allocated version arithmetic overflowed")
-    return f"{major}.{minor}.{patch}"
 
 
 def verify_snapshot(
     repository: GitRepository,
     github: GitHub,
     plan: Mapping[str, str],
-    allocated_mirror: str,
+    candidate: str,
 ) -> bool:
     refs = stable_refs(repository)
-    target = refs.pop(plan["tag"], None)
-    if target is not None and target != allocated_mirror:
-        fail("allocated stable tag targets another commit")
+    target = None if plan["tag"] == "none" else refs.pop(plan["tag"], None)
+    if target is not None and target != candidate:
+        fail("candidate stable tag targets another commit")
     if sha256(stable_manifest(refs)) != plan["stable_refs_sha256"]:
-        fail("stable refs moved outside the exact allocation")
+        fail("stable refs moved outside the candidate snapshot")
     if refs:
         latest_tag = max(refs, key=lambda tag: tag_version(tag, "public stable tag"))
         latest_commit = refs[latest_tag]
         latest_metadata = mirror_metadata(repository, latest_commit)
         latest_source = latest_metadata.trailers.get("Source-Revision", "")
         if (
-            latest_metadata.subject != "Mirror CLI source"
+            latest_metadata.subject not in {"Mirror CLI source", "Mirror CLI candidate"}
             or latest_tag != plan["latest_stable_tag"]
             or latest_commit != plan["latest_stable_commit"]
             or latest_source != plan["latest_stable_source_revision"]
         ):
-            fail("latest stable provenance differs from the allocation")
+            fail("latest stable provenance differs from the candidate")
     elif any(
         plan[field] != "none"
-        for field in ("latest_stable_tag", "latest_stable_commit", "latest_stable_source_revision")
+        for field in (
+            "latest_stable_tag",
+            "latest_stable_commit",
+            "latest_stable_source_revision",
+        )
     ):
-        fail("initial allocation has an unexpected prior stable release")
-    base_metadata = mirror_metadata(repository, plan["public_base_commit"])
-    if base_metadata.trailers.get("Source-Revision") != plan["public_base_source_revision"]:
-        fail("allocation public-base source identity differs")
+        fail("initial candidate has unexpected prior stable provenance")
     latest_document = (
         None
         if plan["latest_stable_tag"] == "none"
@@ -889,12 +627,7 @@ def verify_snapshot(
         plan["latest_stable_tag"], plan["latest_stable_commit"], latest_document
     )
     if sha256(latest_manifest) != plan["latest_release_sha256"]:
-        fail("approved latest GitHub Release snapshot changed")
-    if plan["version"] != expected_version(plan["impact"], plan["latest_stable_tag"]):
-        fail("allocated version does not follow static policy arithmetic")
-    expected_reason = "initial-release" if plan["latest_stable_tag"] == "none" else "releaseable-changes"
-    if plan["reason"] != expected_reason:
-        fail("allocation reason differs from stable provenance")
+        fail("latest GitHub Release moved after candidate planning")
     return target is not None
 
 
@@ -917,15 +650,11 @@ def verify_checksums(github: GitHub, assets: Sequence[Asset], version: str) -> N
             downloaded[asset.name] = value
             path = root / asset.name
             path.write_bytes(value)
-            github.run(
-                "attestation",
-                "verify",
-                os.fspath(path),
-                "--repo",
-                github.repository,
-            )
+            github.run("attestation", "verify", os.fspath(path), "--repo", github.repository)
     checksum_bytes = downloaded["SHA256SUMS"]
-    archive_names = [name for name in expected_asset_names(version) if name != "SHA256SUMS"]
+    archive_names = [
+        name for name in expected_asset_names(version) if name != "SHA256SUMS"
+    ]
     expected = b"".join(
         f"{by_name[name].digest}  {name}\n".encode("ascii")
         for name in sorted(archive_names, key=os.fsencode)
@@ -940,6 +669,8 @@ def verify_target_release(
     notes: bytes,
     tag_exists: bool,
 ) -> TargetRelease:
+    if plan["release"] == "false":
+        return TargetRelease("none", None, ())
     document = github.target_release(plan["tag"])
     if document is None:
         return TargetRelease("tag-only" if tag_exists else "absent", None, ())
@@ -958,12 +689,12 @@ def verify_target_release(
         or prerelease_value is not False
         or not tag_exists
     ):
-        fail("allocated GitHub Release metadata conflicts with the exact allocation")
-    assets = parse_assets(document, "allocated GitHub Release")
+        fail("candidate GitHub Release metadata conflicts with the exact plan")
+    assets = parse_assets(document, "candidate GitHub Release")
     expected_names = set(expected_asset_names(plan["version"]))
     actual_names = {asset.name for asset in assets}
     if not actual_names <= expected_names:
-        fail("allocated GitHub Release contains an unexpected asset")
+        fail("candidate GitHub Release contains an unexpected asset")
     if draft_value:
         return TargetRelease("draft", document, tuple(assets))
     if [asset.name for asset in assets] != expected_asset_names(plan["version"]):
@@ -978,13 +709,13 @@ def verify_target_release(
 @dataclass(frozen=True)
 class Verification:
     plan_digest: str
-    allocation_commit: str
-    allocated_mirror: str
+    candidate_mirror: str
     source_revision: str
+    release: bool
+    impact: str
     version: str
     tag: str
     current_main: str
-    recovery_digest: str
     release_state: str
     complete: bool
     execute: bool
@@ -996,13 +727,13 @@ class Verification:
         return (
             ("contract", "1"),
             ("plan_digest", self.plan_digest),
-            ("allocation_commit", self.allocation_commit),
-            ("allocated_mirror", self.allocated_mirror),
+            ("candidate_mirror", self.candidate_mirror),
             ("source_revision", self.source_revision),
+            ("release", str(self.release).lower()),
+            ("impact", self.impact),
             ("version", self.version),
             ("tag", self.tag),
             ("current_main", self.current_main),
-            ("recovery_digest", self.recovery_digest),
             ("release_state", self.release_state),
             ("complete", str(self.complete).lower()),
             ("execute", str(self.execute).lower()),
@@ -1010,84 +741,41 @@ class Verification:
 
 
 def current_main(repository: GitRepository) -> str:
-    remote = repository.run("rev-parse", "--verify", "refs/remotes/origin/main^{commit}", check=False)
+    remote = repository.run(
+        "rev-parse", "--verify", "refs/remotes/origin/main^{commit}", check=False
+    )
     if remote.returncode == 0:
         return oid(remote.stdout.decode("ascii").strip(), "public origin/main")
     return repository.rev("refs/heads/main")
 
 
-def verify_release(
+def verify_candidate(
     *,
     repository_path: Path,
-    allocated_input: str,
     workflow_commit: str,
-    event: str,
     github_repository: str,
 ) -> Verification:
     repository = GitRepository(repository_path)
     github = GitHub(github_repository)
-    workflow_commit = repository.rev(oid(workflow_commit, "workflow commit"))
+    candidate = repository.rev(oid(workflow_commit, "workflow commit"))
+    plan, notes, plan_digest = candidate_from_commit(repository, candidate)
     main = current_main(repository)
-    if workflow_commit != main:
-        fail("workflow code is not the current public main commit")
-    main_metadata = mirror_metadata(repository, main)
-    if event == "recovery" and OID_RE.fullmatch(allocated_input) is None:
-        fail("workflow_dispatch recovery input must be an exact lowercase mirror commit")
-    if event not in {"push", "recovery"}:
-        fail("release verification event is not allowlisted")
-    if main_metadata.subject == "Mirror CLI source":
-        allocated_mirror = main
-        if event == "recovery":
-            fail("workflow_dispatch recovery requires current repaired workflow code")
-        if allocated_input not in {"auto", allocated_mirror}:
-            fail("normal allocation push named another allocated mirror")
-        recovery_digest = "none"
-        execute = True
-    elif main_metadata.subject == "Mirror CLI recovery":
-        allocated_mirror = oid(
-            main_metadata.trailers.get("Allocated-Mirror-Commit", ""), "allocated mirror commit"
-        )
-        if event == "recovery" and allocated_input != allocated_mirror:
-            fail("workflow_dispatch recovery input differs from the current recovery chain")
-        if event == "push" and allocated_input not in {"auto", main}:
-            fail("recovery-mirror push named another commit")
-        recovery_digest = "pending"
-        execute = event == "recovery"
-    else:
-        fail("public main is not an allocation or recovery mirror")
-    allocated_metadata = mirror_metadata(repository, allocated_mirror)
-    plan_digest = digest(
-        allocated_metadata.trailers.get("Release-Plan-Digest", ""), "allocated plan digest"
-    )
-    allocation_commit = oid(
-        allocated_metadata.trailers.get("Release-Allocation-Commit", ""),
-        "allocated record commit",
-    )
-    plan, notes = read_allocation(repository, plan_digest, allocation_commit)
-    verify_allocation_mirror(
-        repository, allocated_mirror, plan_digest, allocation_commit, plan
-    )
-    if main != allocated_mirror:
-        recovery_digest = verify_recovery_chain(
-            repository,
-            main,
-            allocated_mirror,
-            plan_digest,
-            allocation_commit,
-            plan,
-        )
-    tag_exists = verify_snapshot(repository, github, plan, allocated_mirror)
+    tag_exists = verify_snapshot(repository, github, plan, candidate)
+    if not tag_exists and candidate != main:
+        fail("untagged workflow candidate is no longer current public main")
     target_release = verify_target_release(github, plan, notes, tag_exists)
+    release = plan["release"] == "true"
     complete = target_release.state == "published"
+    execute = release and not complete
     return Verification(
         plan_digest,
-        allocation_commit,
-        allocated_mirror,
+        candidate,
         plan["source_revision"],
+        release,
+        plan["impact"],
         plan["version"],
         plan["tag"],
         main,
-        recovery_digest,
         target_release.state,
         complete,
         execute,
@@ -1097,13 +785,17 @@ def verify_release(
     )
 
 
-def write_verification(result: Verification, output: Path, github_output: Path | None) -> None:
+def write_verification(
+    result: Verification, output: Path, github_output: Path | None
+) -> None:
     if output.exists():
         fail("verification output path already exists")
     output.mkdir(parents=True)
     verification = serialize(result.fields())
     files = {
-        "release-plan.txt": serialize(tuple((field, result.plan[field]) for field in ALLOCATION_FIELDS)),
+        "candidate-plan.txt": serialize(
+            tuple((field, result.plan[field]) for field in CANDIDATE_FIELDS)
+        ),
         "rendered-notes.md": result.notes,
         "verification.txt": verification,
     }
@@ -1119,9 +811,7 @@ def write_verification(result: Verification, output: Path, github_output: Path |
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--repository", type=Path, required=True)
-    result.add_argument("--allocated-mirror", required=True)
     result.add_argument("--workflow-commit", required=True)
-    result.add_argument("--event", choices=("push", "recovery"), required=True)
     result.add_argument("--github-repository", required=True)
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--github-output", type=Path)
@@ -1130,18 +820,19 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     arguments = parser().parse_args()
-    result = verify_release(
+    result = verify_candidate(
         repository_path=arguments.repository,
-        allocated_input=arguments.allocated_mirror,
         workflow_commit=arguments.workflow_commit,
-        event=arguments.event,
         github_repository=arguments.github_repository,
     )
     write_verification(result, arguments.output, arguments.github_output)
-    print(
-        f"Verified managed allocation {result.plan_digest} for {result.tag} "
-        f"({result.release_state})."
-    )
+    if result.release:
+        print(
+            f"Verified CLI candidate {result.plan_digest} for {result.tag} "
+            f"({result.release_state})."
+        )
+    else:
+        print(f"Verified non-release CLI candidate {result.plan_digest}.")
     return 0
 
 
@@ -1149,5 +840,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except VerificationError as error:
-        print(f"CLI release allocation verification failed: {error}", file=sys.stderr)
+        print(f"CLI release candidate verification failed: {error}", file=sys.stderr)
         raise SystemExit(1)

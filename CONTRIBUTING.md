@@ -46,7 +46,7 @@ old baseline rather than retaining parallel support.
 Treat a higher source-build requirement as breaking release intent in the canonical
 private journal. Validate a bump with `./scripts/check`, the monorepo dependency-state
 check, and `nix flake check`; release CI builds every supported native target with the
-allocated version.
+candidate version.
 
 ## Release policy and archived notes
 
@@ -65,16 +65,17 @@ customer or incident details, premature vulnerability details, or an `internal` 
 that conceals a user-visible security fix. Run `./scripts/check-change-fragments` to
 validate the complete frozen archive offline.
 
-Managed Buildkite allocates one exact version and publishes an allocation record with the
-mirror. Public Actions ignores allocation- and recovery-metadata branch creation and never
-plans a version: `scripts/verify-release-allocation` checks the exact allocation,
-stable-state snapshot, release body, and any current recovery chain after the accompanying
-`main` push, then the three native builds check out the original allocated commit. The write-scoped
-`scripts/reconcile-release` accepts only matching absent, partial-tag, or draft state and
-leaves an exact published release unchanged. Run
-`python3 scripts/test-release-allocation` for the local Git and mocked GitHub fixture. Do
-not add another allocation path, move a stable tag, edit a published release, broaden the
-recovery allowlist, or make recovery build the repaired mirror.
+Managed Buildkite advances public `main` to an untagged candidate after validating the
+canonical source-evidence artifact. Public Actions verifies the candidate contract with
+`scripts/verify-release-candidate`, checks Linux and macOS, and builds all three native
+archives before the protected `cli-release` environment asks a human to approve the
+proposed version and notes. The write-scoped `scripts/reconcile-release` publishes only a
+candidate that is still public `main`, accepts matching absent, direct-tag, or draft state,
+and leaves an exact published release unchanged. Run
+`python3 scripts/test-release-candidate` for the local Git and mocked GitHub fixture. A
+pre-tag failure is repaired by advancing `main` with a corrected candidate; do not reset
+the branch, move a stable tag, edit a published release, or restore allocation and recovery
+state.
 
 ## Security reports
 

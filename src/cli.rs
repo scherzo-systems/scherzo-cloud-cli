@@ -3,6 +3,7 @@ mod artifact;
 mod auth;
 mod organization;
 mod principal;
+mod run;
 mod runner;
 mod version;
 mod workflow;
@@ -116,6 +117,8 @@ enum Command {
     Auth(auth::Command),
     #[command(about = organization::ABOUT)]
     Organization(organization::Command),
+    #[command(about = run::ABOUT)]
+    Run(run::Command),
     #[command(about = version::ABOUT)]
     Version(version::Command),
     #[command(about = runner::ABOUT)]
@@ -140,6 +143,7 @@ impl Cli {
             Some(Command::Artifact(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
+            Some(Command::Run(command)) => command.execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
             Some(Command::Workflow(command)) => command.execute(),
@@ -202,6 +206,22 @@ fn execute_read_only_with_signals(
     context: &'static str,
     operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
 ) -> CommandResult {
+    execute_blocking_with_signals(context, operation, Ok)
+}
+
+fn execute_mutation_with_signals(
+    context: &'static str,
+    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
+    incomplete_signal: impl FnOnce(ExitCode) -> CommandResult + 'static,
+) -> CommandResult {
+    execute_blocking_with_signals(context, operation, incomplete_signal)
+}
+
+fn execute_blocking_with_signals(
+    context: &'static str,
+    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
+    incomplete_signal: impl FnOnce(ExitCode) -> CommandResult + 'static,
+) -> CommandResult {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -222,7 +242,7 @@ fn execute_read_only_with_signals(
                 if completed.load(Ordering::Acquire) {
                     finish_read_only_operation(context, running.await)
                 } else {
-                    Ok(signal)
+                    incomplete_signal(signal)
                 }
             }
             result = &mut running => finish_read_only_operation(context, result),
@@ -392,6 +412,9 @@ mod tests {
             "organization members list",
             "organization show",
             "organization update",
+            "run",
+            "run create",
+            "run show",
             "runner",
             "runner activation",
             "runner activation create",
@@ -402,6 +425,7 @@ mod tests {
             "runner credential list",
             "runner credential retire",
             "runner credential revoke",
+            "runner delete",
             "runner disable",
             "runner doctor",
             "runner drain",
@@ -411,6 +435,7 @@ mod tests {
             "runner move",
             "runner pool",
             "runner pool create",
+            "runner pool delete",
             "runner pool list",
             "runner pool rename",
             "runner pool show",

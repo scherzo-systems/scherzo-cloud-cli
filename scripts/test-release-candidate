@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""Exercise candidate verification and mocked GitHub release reconciliation."""
+
+from __future__ import annotations
+
+import base64
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import Mapping, Sequence
+
+ROOT = Path(__file__).resolve().parents[1]
+VERIFIER = ROOT / "scripts/verify-release-candidate"
+RECONCILER = ROOT / "scripts/reconcile-release"
+WORKFLOW = ROOT / ".github/workflows/check.yml"
+REPOSITORY_NAME = "fixture/scherzo-cloud-cli"
+
+
+def fail(message: str) -> None:
+    print(f"CLI release-candidate fixture failed: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run(
+    arguments: Sequence[str | Path],
+    *,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    input_bytes: bytes | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    result = subprocess.run(
+        [os.fspath(argument) for argument in arguments],
+        cwd=cwd,
+        env=dict(environment or os.environ),
+        input=input_bytes,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and result.returncode != 0:
+        fail(
+            f"command failed ({' '.join(map(os.fspath, arguments))}): "
+            + result.stderr.decode("utf-8", "replace").strip()
+        )
+    return result
+
+
+def load_verifier() -> ModuleType:
+    loader = importlib.machinery.SourceFileLoader(
+        "fixture_release_candidate_verifier", os.fspath(VERIFIER)
+    )
+    specification = importlib.util.spec_from_loader(loader.name, loader)
+    if specification is None:
+        fail("cannot load candidate verifier")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def git(repository: Path, *arguments: str, input_bytes: bytes | None = None) -> bytes:
+    return run(
+        ["git", "-C", repository, *arguments],
+        environment={
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "LC_ALL": "C",
+        },
+        input_bytes=input_bytes,
+    ).stdout
+
+
+def commit_tree(
+    repository: Path,
+    tree: str,
+    message: bytes,
+    *,
+    parent: str | None,
+    identity: str,
+    email: str,
+) -> str:
+    arguments = ["git", "-C", repository, "commit-tree", tree]
+    if parent is not None:
+        arguments.extend(("-p", parent))
+    return run(
+        arguments,
+        environment={
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": identity,
+            "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": identity,
+            "GIT_COMMITTER_EMAIL": email,
+            "GIT_AUTHOR_DATE": "@1 +0000",
+            "GIT_COMMITTER_DATE": "@1 +0000",
+            "LC_ALL": "C",
+        },
+        input_bytes=message,
+    ).stdout.decode("ascii").strip()
+
+
+def legacy_asset_names(version: str) -> list[str]:
+    return sorted(
+        [
+            "SHA256SUMS",
+            f"scherzo-cloud-{version}-aarch64-apple-darwin.tar.gz",
+            f"scherzo-cloud-{version}-aarch64-unknown-linux-gnu.tar.gz",
+            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
+            f"scherzo-cloud-{version}-x86_64-unknown-linux-gnu.tar.gz",
+        ],
+        key=os.fsencode,
+    )
+
+
+def release_document(tag: str, commit: str, body: str, identifier: int) -> dict[str, object]:
+    assets = []
+    for index, name in enumerate(legacy_asset_names(tag.removeprefix("v")), start=1):
+        value = f"prior-{name}".encode("ascii")
+        assets.append(
+            {
+                "id": identifier * 100 + index,
+                "name": name,
+                "size": len(value),
+                "digest": f"sha256:{hashlib.sha256(value).hexdigest()}",
+                "bytes": base64.b64encode(value).decode("ascii"),
+            }
+        )
+    return {
+        "id": identifier,
+        "tag_name": tag,
+        "target_commitish": commit,
+        "name": f"Scherzo Cloud CLI {tag}",
+        "body": body,
+        "published_at": "2026-09-01T00:00:00Z",
+        "draft": False,
+        "prerelease": False,
+        "assets": assets,
+    }
+
+
+def write_public_tree(source: Path) -> None:
+    (source / "scripts").mkdir()
+    (source / "src").mkdir()
+    (source / ".github/workflows").mkdir(parents=True)
+    (source / "release.toml").write_bytes(ROOT.joinpath("release.toml").read_bytes())
+    (source / "Cargo.toml").write_text(
+        '[package]\nname = "fixture"\nversion = "0.0.0-dev"\n'
+    )
+    (source / "README.md").write_text("Fixture README.\n")
+    (source / "LICENSE").write_text("Fixture license.\n")
+    (source / "src/main.rs").write_text("fn main() {}\n")
+    (source / ".github/workflows/check.yml").write_text("name: Fixture\n")
+    for path in (VERIFIER, RECONCILER):
+        destination = source / "scripts" / path.name
+        destination.write_bytes(path.read_bytes())
+        destination.chmod(0o755)
+
+
+def candidate_message(module: ModuleType, plan: bytes, source_revision: str) -> bytes:
+    return (
+        "Mirror CLI candidate\n\n"
+        f"Source-Revision: {source_revision}\n"
+        f"Candidate-Plan-SHA256: {module.sha256(plan)}\n"
+        f"Candidate-Plan-Base64: {base64.b64encode(plan).decode('ascii')}\n"
+    ).encode("ascii")
+
+
+@dataclass
+class Fixture:
+    module: ModuleType
+    root: Path
+    source: Path
+    remote: Path
+    checkout: Path
+    fake_bin: Path
+    state_path: Path
+    base: str
+    candidate: str
+    plan: bytes
+    notes: bytes
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
+            "GH_TOKEN": "fixture-token",
+            "SCHERZO_MOCK_GH_STATE": os.fspath(self.state_path),
+        }
+
+    def state(self) -> dict[str, object]:
+        return json.loads(self.state_path.read_text())
+
+    def write_state(self, value: Mapping[str, object]) -> None:
+        self.state_path.write_text(json.dumps(value, sort_keys=True))
+
+    def reset_provider(self) -> None:
+        prior = release_document("v0.24.0", self.base, "Prior fixture release.\n", 10)
+        self.write_state(
+            {
+                "git_remote": os.fspath(self.remote),
+                "branches": {"main": self.candidate},
+                "tags": {"v0.24.0": self.base},
+                "releases": [prior],
+                "next_release_id": 20,
+                "next_asset_id": 2000,
+                "writes": [],
+            }
+        )
+        git(self.remote, "update-ref", "refs/heads/main", self.candidate)
+        git(self.remote, "update-ref", "refs/tags/v0.24.0", self.base)
+        git(self.remote, "update-ref", "-d", "refs/tags/v0.25.0")
+        git(self.checkout, "fetch", "--force", "--no-tags", "origin", "main:refs/remotes/origin/main")
+        git(self.checkout, "fetch", "--force", "--tags", "origin")
+        git(self.checkout, "update-ref", "-d", "refs/tags/v0.25.0")
+
+
+def build_fixture(module: ModuleType, root: Path) -> Fixture:
+    source = root / "source"
+    source.mkdir()
+    git(source, "init", "--quiet", "--initial-branch=main")
+    git(source, "config", "user.name", "Fixture")
+    git(source, "config", "user.email", "fixture@scherzo.invalid")
+    write_public_tree(source)
+    git(source, "add", "--all")
+    base_tree = git(source, "write-tree").decode("ascii").strip()
+    base_source = "b" * 40
+    base = commit_tree(
+        source,
+        base_tree,
+        (
+            "Mirror CLI source\n\n"
+            f"Source-Revision: {base_source}\n"
+            f"Release-Plan-Digest: {'c' * 64}\n"
+        ).encode("ascii"),
+        parent=None,
+        identity="Scherzo Cloud Mirror",
+        email="mirror@scherzo.dev",
+    )
+    git(source, "update-ref", "refs/tags/v0.24.0", base)
+
+    (source / "src/main.rs").write_text('fn main() { println!("candidate"); }\n')
+    git(source, "add", "--all")
+    candidate_tree = git(source, "write-tree").decode("ascii").strip()
+    prior = release_document("v0.24.0", base, "Prior fixture release.\n", 10)
+    latest = module.normalize_latest_release("v0.24.0", base, prior)
+    notes = b"## Fixed\n\n- Fix candidate publication.\n"
+    source_revision = "a" * 40
+    stable = f"refs/tags/v0.24.0={base}\n".encode("ascii")
+    plan = module.serialize(
+        (
+            ("contract", "1"),
+            ("source_revision", source_revision),
+            ("cli_tree", candidate_tree),
+            ("journal_sha256", "1" * 64),
+            ("public_base_commit", base),
+            ("stable_refs_sha256", module.sha256(stable)),
+            ("latest_stable_tag", "v0.24.0"),
+            ("latest_stable_commit", base),
+            ("latest_stable_source_revision", base_source),
+            ("latest_release_sha256", module.sha256(latest)),
+            ("release", "true"),
+            ("impact", "patch"),
+            ("version", "0.25.0"),
+            ("tag", "v0.25.0"),
+            ("notes_sha256", module.sha256(notes)),
+            ("notes_base64", base64.b64encode(notes).decode("ascii")),
+        )
+    )
+    candidate = commit_tree(
+        source,
+        candidate_tree,
+        candidate_message(module, plan, source_revision),
+        parent=base,
+        identity="Scherzo Cloud Mirror",
+        email="mirror@scherzo.dev",
+    )
+    git(source, "update-ref", "refs/heads/main", candidate)
+
+    remote = root / "remote.git"
+    git(root, "clone", "--quiet", "--bare", source, remote)
+    checkout = root / "checkout"
+    git(root, "clone", "--quiet", "--no-local", "--branch=main", remote, checkout)
+    git(checkout, "fetch", "--force", "--tags", "origin")
+    fake_bin = root / "bin"
+    fake_bin.mkdir()
+    write_fake_gh(fake_bin / "gh")
+    fixture = Fixture(
+        module,
+        root,
+        source,
+        remote,
+        checkout,
+        fake_bin,
+        root / "github.json",
+        base,
+        candidate,
+        plan,
+        notes,
+    )
+    fixture.reset_provider()
+    return fixture
+
+
+def write_fake_gh(path: Path) -> None:
+    path.write_text(
+        f"#!{sys.executable}\n"
+        + r'''import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+state_path = Path(os.environ["SCHERZO_MOCK_GH_STATE"])
+state = json.loads(state_path.read_text())
+args = sys.argv[1:]
+
+def save():
+    state_path.write_text(json.dumps(state, sort_keys=True))
+
+def public_release(release):
+    return {key: value for key, value in release.items() if key != "_private"}
+
+def die404():
+    print("gh: HTTP 404 Not Found", file=sys.stderr)
+    raise SystemExit(1)
+
+def option(name):
+    return args[args.index(name) + 1]
+
+def fields():
+    result = {}
+    for index, argument in enumerate(args):
+        if argument == "-f":
+            name, value = args[index + 1].split("=", 1)
+            result[name] = value
+    return result
+
+if args[:2] == ["attestation", "verify"]:
+    raise SystemExit(0)
+
+if args[0] == "api":
+    endpoint = args[-1]
+    if "/releases/assets/" in endpoint:
+        identifier = int(endpoint.rsplit("/", 1)[1])
+        for release in state["releases"]:
+            for asset in release["assets"]:
+                if asset["id"] == identifier:
+                    sys.stdout.buffer.write(base64.b64decode(asset["bytes"]))
+                    raise SystemExit(0)
+        die404()
+    if endpoint.endswith("/git/refs") and option("--method") == "POST":
+        values = fields()
+        ref = values.get("ref", "")
+        target = values.get("sha", "")
+        if not ref.startswith("refs/tags/") or not target:
+            raise SystemExit("malformed tag creation")
+        tag = ref.removeprefix("refs/tags/")
+        if tag in state["tags"]:
+            raise SystemExit("tag already exists")
+        state["tags"][tag] = target
+        subprocess.run(
+            ["git", f"--git-dir={state['git_remote']}", "update-ref", ref, target],
+            check=True,
+        )
+        state["writes"].append("create-tag")
+        save()
+        print(json.dumps({"ref": ref, "object": {"type": "commit", "sha": target}}))
+        raise SystemExit(0)
+    if "/git/ref/" in endpoint:
+        ref = endpoint.split("/git/ref/", 1)[1]
+        if ref.startswith("tags/"):
+            target = state["tags"].get(ref.removeprefix("tags/"))
+        elif ref.startswith("heads/"):
+            target = state["branches"].get(ref.removeprefix("heads/"))
+        else:
+            target = None
+        if target is None:
+            die404()
+        print(json.dumps({"ref": f"refs/{ref}", "object": {"type": "commit", "sha": target}}))
+        raise SystemExit(0)
+    if "/releases/tags/" in endpoint:
+        tag = endpoint.rsplit("/", 1)[1]
+        matches = [
+            release for release in state["releases"]
+            if release["tag_name"] == tag and not release["draft"]
+        ]
+        if not matches:
+            die404()
+        print(json.dumps(public_release(matches[0])))
+        raise SystemExit(0)
+    if "/releases?per_page=100&page=" in endpoint:
+        page = int(endpoint.rsplit("=", 1)[1])
+        start = (page - 1) * 100
+        print(json.dumps([public_release(value) for value in state["releases"][start:start + 100]]))
+        raise SystemExit(0)
+    raise SystemExit("unsupported mock gh api: " + endpoint)
+
+if args[:2] == ["release", "create"]:
+    tag = args[2]
+    if any(release["tag_name"] == tag for release in state["releases"]):
+        raise SystemExit("release already exists")
+    if "--target" in args or "--verify-tag" not in args:
+        raise SystemExit("release creation must verify the existing tag")
+    target = state["tags"].get(tag)
+    if target is None:
+        raise SystemExit("tag does not exist")
+    state["releases"].append({
+        "id": state["next_release_id"],
+        "tag_name": tag,
+        "target_commitish": target,
+        "name": option("--title"),
+        "body": Path(option("--notes-file")).read_text(),
+        "published_at": "",
+        "draft": True,
+        "prerelease": False,
+        "assets": [],
+    })
+    state["next_release_id"] += 1
+    state["writes"].append("create-draft")
+    save()
+    raise SystemExit(0)
+
+if args[:2] == ["release", "upload"]:
+    tag = args[2]
+    release = next(value for value in state["releases"] if value["tag_name"] == tag)
+    paths = args[args.index("--repo") + 2:]
+    for raw_path in paths:
+        path = Path(raw_path)
+        value = path.read_bytes()
+        release["assets"].append({
+            "id": state["next_asset_id"],
+            "name": path.name,
+            "size": len(value),
+            "digest": "sha256:" + hashlib.sha256(value).hexdigest(),
+            "bytes": base64.b64encode(value).decode("ascii"),
+        })
+        state["next_asset_id"] += 1
+        state["writes"].append("upload:" + path.name)
+    save()
+    raise SystemExit(0)
+
+if args[:2] == ["release", "edit"]:
+    tag = args[2]
+    release = next(value for value in state["releases"] if value["tag_name"] == tag)
+    release["draft"] = False
+    release["published_at"] = "2026-09-03T00:00:00Z"
+    state["writes"].append("publish")
+    save()
+    raise SystemExit(0)
+
+raise SystemExit("unsupported mock gh invocation: " + " ".join(args))
+'''
+    )
+    path.chmod(0o755)
+
+
+def run_verifier(fixture: Fixture, *, commit: str | None = None, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    output = fixture.root / f"verification-{len(list(fixture.root.glob('verification-*')))}"
+    return run(
+        [
+            VERIFIER,
+            "--repository",
+            fixture.checkout,
+            "--workflow-commit",
+            commit or fixture.candidate,
+            "--github-repository",
+            REPOSITORY_NAME,
+            "--output",
+            output,
+        ],
+        environment=fixture.environment,
+        check=check,
+    )
+
+
+def reconciliation_command(
+    fixture: Fixture, dist: Path, operation: str, *, check: bool = True
+) -> subprocess.CompletedProcess[bytes]:
+    return run(
+        [
+            RECONCILER,
+            operation,
+            "--repository",
+            fixture.checkout,
+            "--workflow-commit",
+            fixture.candidate,
+            "--github-repository",
+            REPOSITORY_NAME,
+            "--dist",
+            dist,
+        ],
+        environment=fixture.environment,
+        check=check,
+    )
+
+
+def make_dist(root: Path, version: str = "0.25.0") -> Path:
+    dist = root / "dist"
+    dist.mkdir()
+    archives = []
+    for target in (
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ):
+        package = f"scherzo-cloud-{version}-{target}"
+        path = dist / f"{package}.tar.gz"
+        with path.open("wb") as output:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+                    directory = tarfile.TarInfo(f"{package}/")
+                    directory.type = tarfile.DIRTYPE
+                    directory.mode = 0o755
+                    directory.mtime = directory.uid = directory.gid = 0
+                    directory.uname = directory.gname = ""
+                    archive.addfile(directory)
+                    for name, value, mode in (
+                        ("LICENSE", b"fixture license\n", 0o644),
+                        ("README.md", b"fixture readme\n", 0o644),
+                        ("scherzo-cloud", f"binary-{target}\n".encode("ascii"), 0o755),
+                    ):
+                        member = tarfile.TarInfo(f"{package}/{name}")
+                        member.size = len(value)
+                        member.mode = mode
+                        member.mtime = member.uid = member.gid = 0
+                        member.uname = member.gname = ""
+                        archive.addfile(member, io.BytesIO(value))
+        archives.append(path)
+    (dist / "SHA256SUMS").write_bytes(
+        b"".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n".encode("ascii")
+            for path in sorted(archives, key=lambda value: os.fsencode(value.name))
+        )
+    )
+    return dist
+
+
+def prove_workflow_contract() -> None:
+    workflow = WORKFLOW.read_text()
+    required = (
+        "cargo check --locked --workspace --all-targets --all-features",
+        "./scripts/verify-release-candidate",
+        "environment: cli-release",
+        "ref: ${{ needs.verify_release.outputs.candidate_mirror }}",
+    )
+    for text in required:
+        if text not in workflow:
+            fail(f"public workflow is missing candidate contract: {text}")
+    for forbidden in (
+        "release-allocations/",
+        "release-recoveries/",
+        "workflow_dispatch",
+        "allocated_mirror",
+        "verify-release-allocation",
+    ):
+        if forbidden in workflow:
+            fail(f"public workflow retains allocation state: {forbidden}")
+    prefix, _, publish = workflow.partition("  reconcile_release:\n")
+    if "contents: write" in prefix or "environment: cli-release" not in publish:
+        fail("public workflow exposes write authority before protected publication")
+
+
+def main() -> int:
+    module = load_verifier()
+    prove_workflow_contract()
+    with tempfile.TemporaryDirectory(prefix="cli-release-candidate-fixture.") as temporary:
+        fixture = build_fixture(module, Path(temporary))
+        run_verifier(fixture)
+        dist = make_dist(fixture.root)
+
+        before = list(fixture.state()["writes"])
+        reconciliation_command(fixture, dist, "inspect")
+        if fixture.state()["writes"] != before:
+            fail("candidate inspection changed GitHub state")
+
+        reconciliation_command(fixture, dist, "apply")
+        expected_writes = [
+            "create-tag",
+            "create-draft",
+            *[f"upload:{name}" for name in module.expected_asset_names("0.25.0")],
+            "publish",
+        ]
+        if fixture.state()["writes"] != expected_writes:
+            fail("candidate reconciliation did not create the exact release")
+        run_verifier(fixture)
+        before = list(fixture.state()["writes"])
+        reconciliation_command(fixture, dist, "apply")
+        if fixture.state()["writes"] != before:
+            fail("exact published release was not an idempotent no-op")
+
+        fixture.reset_provider()
+        state = fixture.state()
+        state["tags"]["v0.25.0"] = fixture.base
+        fixture.write_state(state)
+        git(fixture.remote, "update-ref", "refs/tags/v0.25.0", fixture.base)
+        git(fixture.checkout, "fetch", "--force", "--tags", "origin")
+        if run_verifier(fixture, check=False).returncode == 0:
+            fail("conflicting tag target passed candidate verification")
+
+        fixture.reset_provider()
+        tree = git(fixture.source, "rev-parse", f"{fixture.candidate}^{{tree}}").decode("ascii").strip()
+        stale_plan = module.serialize(
+            tuple(
+                (field, fixture.candidate if field == "public_base_commit" else value)
+                for field, value in module.parse_candidate(fixture.plan)[0].items()
+            )
+        )
+        successor = commit_tree(
+            fixture.source,
+            tree,
+            candidate_message(module, stale_plan, "a" * 40),
+            parent=fixture.candidate,
+            identity="Scherzo Cloud Mirror",
+            email="mirror@scherzo.dev",
+        )
+        git(
+            fixture.source,
+            "push",
+            "--force",
+            os.fspath(fixture.remote),
+            f"{successor}:refs/heads/main",
+        )
+        git(fixture.checkout, "fetch", "--force", "--no-tags", "origin", "main:refs/remotes/origin/main")
+        state = fixture.state()
+        state["branches"]["main"] = successor
+        fixture.write_state(state)
+        if run_verifier(fixture, check=False).returncode == 0:
+            fail("stale untagged candidate passed verification")
+        before = list(fixture.state()["writes"])
+        if reconciliation_command(fixture, dist, "apply", check=False).returncode == 0:
+            fail("stale untagged candidate reconciled a release")
+        if fixture.state()["writes"] != before:
+            fail("stale candidate failure changed GitHub state")
+
+        plan, _ = module.parse_candidate(fixture.plan)
+        for field, replacement in {
+            "contract": "2",
+            "source_revision": "bad",
+            "cli_tree": "bad",
+            "journal_sha256": "bad",
+            "public_base_commit": "bad",
+            "stable_refs_sha256": "bad",
+            "latest_stable_tag": "0.24.0",
+            "latest_stable_commit": "bad",
+            "latest_stable_source_revision": "bad",
+            "latest_release_sha256": "bad",
+            "release": "maybe",
+            "impact": "breaking",
+            "version": "01.2.3",
+            "tag": "v9.9.9",
+            "notes_sha256": "bad",
+            "notes_base64": "!",
+        }.items():
+            changed = dict(plan)
+            changed[field] = replacement
+            try:
+                tampered = module.serialize(
+                    tuple((name, changed[name]) for name in module.CANDIDATE_FIELDS)
+                )
+                module.parse_candidate(tampered)
+            except module.VerificationError:
+                continue
+            fail(f"candidate field tampering passed: {field}")
+
+    print("CLI release-candidate fixture passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

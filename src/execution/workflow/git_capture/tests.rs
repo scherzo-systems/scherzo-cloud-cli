@@ -9,8 +9,8 @@ use rustix::process::Pid;
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationSource, ExecutionContext, ExecutionRootLifecycle,
-    ResolvedImports, admit_workflow, default_execution_policy_limits,
+    CancellationPolicy, CancellationSource, ExecutionContext, ResolvedImports, admit_workflow,
+    default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::{
     CaptureBoundary, CaptureBoundaryObserver, CarrierBudgetClass,
@@ -23,7 +23,6 @@ const WORKFLOW: &str =
 struct GitFixture {
     _temporary: tempfile::TempDir,
     repository: PathBuf,
-    admitted: crate::execution::workflow::admission::AdmittedWorkflow,
     artifacts: ArtifactStaging,
     capture: GitCaptureContext,
 }
@@ -56,7 +55,6 @@ impl GitFixture {
         Self {
             _temporary: temporary,
             repository,
-            admitted,
             artifacts,
             capture,
         }
@@ -96,7 +94,6 @@ fn admitted_capture<const N: usize>(
         ResolvedImports::default(),
         ExecutionContext::new(
             repository.to_owned(),
-            ExecutionRootLifecycle::CallerOwnedRetained,
             default_execution_policy_limits(1),
             EnvironmentSnapshot::new(environment),
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),

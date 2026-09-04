@@ -85,6 +85,7 @@ pub(crate) fn discover_and_validate_installation<Profile: HarnessInstallationPro
     validate_installation_with::<Profile>(&executable, &search_path, runner)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_selected_installation<Profile: HarnessInstallationProfile>(
     selected_executable: &Path,
     runner: &dyn CommandRunner,

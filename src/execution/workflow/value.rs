@@ -110,6 +110,7 @@ pub(crate) struct CapturedJson {
 struct CapturedJsonInner {
     value: Arc<Value>,
     carrier: Arc<[u8]>,
+    #[cfg(test)]
     schema: RetainedJsonSchema,
     capture_lease: Option<CaptureLease>,
 }
@@ -120,10 +121,13 @@ impl CapturedJson {
         carrier: Arc<[u8]>,
         schema: RetainedJsonSchema,
     ) -> Self {
+        #[cfg(not(test))]
+        drop(schema);
         Self {
             inner: Arc::new(CapturedJsonInner {
                 value,
                 carrier,
+                #[cfg(test)]
                 schema,
                 capture_lease: None,
             }),
@@ -139,10 +143,13 @@ impl CapturedJson {
         if !canonical_carrier_matches(&value, &carrier) {
             return Err(SemanticCarrierError::InvalidCanonicalJson);
         }
+        #[cfg(not(test))]
+        drop(schema);
         Ok(Self {
             inner: Arc::new(CapturedJsonInner {
                 value,
                 carrier,
+                #[cfg(test)]
                 schema,
                 capture_lease: Some(capture_lease),
             }),
@@ -161,6 +168,7 @@ impl CapturedJson {
         self.carrier()
     }
 
+    #[cfg(test)]
     pub(crate) fn schema(&self) -> &RetainedJsonSchema {
         &self.inner.schema
     }
@@ -271,6 +279,7 @@ impl CapturedValue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn as_file(&self) -> Option<&CapturedArtifact> {
         match self {
             Self::File(file) => Some(file),
@@ -278,6 +287,7 @@ impl CapturedValue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_file(self) -> Option<CapturedArtifact> {
         match self {
             Self::File(file) => Some(file),

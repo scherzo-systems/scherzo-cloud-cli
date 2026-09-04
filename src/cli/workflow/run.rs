@@ -26,8 +26,8 @@ use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::admit_workflow;
 use crate::execution::workflow::admission::{
     AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
-    EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle, MAXIMUM_AGENT_PROMPT_BYTES,
-    ResolvedAttachment, ResolvedImports, admit_local_workflow, default_execution_policy_limits,
+    EnvironmentSnapshot, ExecutionContext, MAXIMUM_AGENT_PROMPT_BYTES, ResolvedAttachment,
+    ResolvedImports, admit_local_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::agent::WorkflowRunId;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
@@ -763,7 +763,6 @@ pub(super) fn execution_context_for_workflow(
     let environment = EnvironmentSnapshot::new(env::vars_os());
     let mut context = ExecutionContext::new(
         root,
-        ExecutionRootLifecycle::CallerOwnedRetained,
         default_execution_policy_limits(maximum_parallel_steps),
         environment.clone(),
         CancellationPolicy::new(cancellation, CANCELLATION_GRACE),

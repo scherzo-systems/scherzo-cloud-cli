@@ -503,13 +503,8 @@ impl MaterializationRequest {
 pub(super) struct MaterializedCheckout {
     request: MaterializationRequest,
     source_root: PathBuf,
-    ordinary_execution_root: PathBuf,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "source checkout binds explicit assignment authority and three confined roots"
-)]
 pub(super) fn checkout(
     broker: Arc<dyn SourceCredentialBroker>,
     environment: &EnvironmentSnapshot,
@@ -517,52 +512,37 @@ pub(super) fn checkout(
     request: &MaterializationRequest,
     cancellation: &CaptureCancellation,
     source_root: &Path,
-    ordinary_execution_root: &Path,
     private_root: &Path,
 ) -> Result<MaterializedCheckout, MaterializationFailure> {
     if request.object_format != "sha1" {
         return Err(MaterializationFailure::UnsupportedObjectFormat);
     }
     ensure_current(cancellation)?;
-    let source_metadata = fs::symlink_metadata(source_root)
-        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-    if !source_metadata.file_type().is_dir()
-        || fs::read_dir(source_root)
-            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?
-            .next()
-            .is_some()
-    {
-        return Err(MaterializationFailure::EnvironmentUnavailable);
-    }
+    verify_empty_clone_destination(source_root)?;
     let credential = broker
         .issue(assignment_id, cancellation)
         .map_err(map_broker_failure)?;
     ensure_current(cancellation)?;
     let repository_url = Arc::clone(&credential.repository_url);
 
-    run_git_status(
-        source_root,
-        environment,
-        &["init", "--quiet", "--object-format=sha1"],
-        None,
-        cancellation,
-    )?;
-    run_git_status(
-        source_root,
-        environment,
-        &["remote", "add", "origin", repository_url.as_ref()],
-        None,
-        cancellation,
-    )?;
     {
         let askpass = EphemeralAskpass::create(private_root, &credential.token.0)?;
         verify_remote_object_format(
             source_root,
             environment,
             private_root,
+            repository_url.as_ref(),
             &askpass,
             cancellation,
         )?;
+        clone_repository(
+            source_root,
+            environment,
+            repository_url.as_ref(),
+            &askpass,
+            cancellation,
+        )?;
+        verify_connectivity(source_root, environment, None, cancellation)?;
         fetch_pinned_commit(
             source_root,
             environment,
@@ -575,14 +555,19 @@ pub(super) fn checkout(
     }
     drop(credential);
     ensure_current(cancellation)?;
-    verify_fetched_commit(source_root, environment, request, cancellation)?;
+    verify_clone(
+        source_root,
+        environment,
+        request,
+        repository_url.as_ref(),
+        cancellation,
+    )?;
     checkout_pinned_commit(source_root, environment, &request.commit_oid, cancellation)?;
     verify_checkout(source_root, environment, request, cancellation)?;
     ensure_current(cancellation)?;
     Ok(MaterializedCheckout {
         request: request.clone(),
         source_root: source_root.to_owned(),
-        ordinary_execution_root: ordinary_execution_root.to_owned(),
     })
 }
 
@@ -607,10 +592,8 @@ pub(super) fn resolve_checkout(
         return Err(MaterializationFailure::WorkflowDigestMismatch);
     }
 
-    if workflow.requires_git_capture() {
-        fs::remove_dir(&checkout.ordinary_execution_root)
-            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-        let git_capture = CloudGitCaptureProjection::new(
+    let git_capture = workflow.requires_git_capture().then(|| {
+        CloudGitCaptureProjection::new(
             Arc::from(checkout.request.commit_oid.as_str()),
             Arc::from(
                 checkout
@@ -620,19 +603,13 @@ pub(super) fn resolve_checkout(
                     .as_str(),
             ),
             cancellation.clone(),
-        );
-        Ok(MaterializedSource {
-            workflow,
-            execution_root: checkout.source_root,
-            git_capture: Some(git_capture),
-        })
-    } else {
-        Ok(MaterializedSource {
-            workflow,
-            execution_root: checkout.ordinary_execution_root,
-            git_capture: None,
-        })
-    }
+        )
+    });
+    Ok(MaterializedSource {
+        workflow,
+        execution_root: checkout.source_root,
+        git_capture,
+    })
 }
 
 fn ensure_current(cancellation: &CaptureCancellation) -> Result<(), MaterializationFailure> {
@@ -641,6 +618,23 @@ fn ensure_current(cancellation: &CaptureCancellation) -> Result<(), Materializat
     } else {
         Ok(())
     }
+}
+
+fn verify_empty_clone_destination(root: &Path) -> Result<(), MaterializationFailure> {
+    let metadata =
+        fs::symlink_metadata(root).map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    if !metadata.file_type().is_dir()
+        || metadata.permissions().mode() & 0o222 == 0
+        || fs::read_dir(root)
+            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?
+            .next()
+            .is_some()
+    {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
+    tempfile::NamedTempFile::new_in(root)
+        .and_then(tempfile::NamedTempFile::close)
+        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)
 }
 
 fn map_broker_failure(failure: CredentialBrokerFailure) -> MaterializationFailure {
@@ -659,6 +653,7 @@ fn verify_remote_object_format(
     root: &Path,
     environment: &EnvironmentSnapshot,
     private_root: &Path,
+    repository_url: &str,
     askpass: &EphemeralAskpass,
     cancellation: &CaptureCancellation,
 ) -> Result<(), MaterializationFailure> {
@@ -671,7 +666,7 @@ fn verify_remote_object_format(
     let mut command = git_command(
         root,
         environment,
-        &["ls-remote", "origin", "HEAD"],
+        &["ls-remote", repository_url, "HEAD"],
         Some(askpass),
     );
     command
@@ -703,6 +698,33 @@ fn verify_remote_object_format(
     }
 }
 
+fn clone_repository(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    repository_url: &str,
+    askpass: &EphemeralAskpass,
+    cancellation: &CaptureCancellation,
+) -> Result<(), MaterializationFailure> {
+    run_git_status_with_failure(
+        root,
+        environment,
+        &[
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--no-local",
+            "--no-recurse-submodules",
+            "--no-single-branch",
+            "--template=",
+            repository_url,
+            ".",
+        ],
+        Some(askpass),
+        cancellation,
+        MaterializationFailure::ProviderUnavailable,
+    )
+}
+
 fn fetch_pinned_commit(
     root: &Path,
     environment: &EnvironmentSnapshot,
@@ -712,27 +734,11 @@ fn fetch_pinned_commit(
     commit_oid: &str,
     cancellation: &CaptureCancellation,
 ) -> Result<(), MaterializationFailure> {
-    run_git_status_with_failure(
-        root,
-        environment,
-        &[
-            "fetch",
-            "--quiet",
-            "--force",
-            "--no-write-fetch-head",
-            "origin",
-            "+refs/heads/*:refs/remotes/origin/*",
-            "+refs/tags/*:refs/tags/*",
-        ],
-        Some(askpass),
-        cancellation,
-        MaterializationFailure::ProviderUnavailable,
-    )?;
     if commit_is_available(root, environment, commit_oid, cancellation)? {
         return Ok(());
     }
 
-    let mut command = git_command(
+    let status = run_git_status_code(
         root,
         environment,
         &[
@@ -744,13 +750,6 @@ fn fetch_pinned_commit(
             commit_oid,
         ],
         Some(askpass),
-    );
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let status = run_managed_source_git(
-        &mut command,
         cancellation,
         MaterializationFailure::ProviderUnavailable,
     )?;
@@ -787,6 +786,132 @@ fn commit_is_available(
         MaterializationFailure::EnvironmentUnavailable,
     )
     .map(|status| status.success())
+}
+
+fn verify_clone(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    request: &MaterializationRequest,
+    repository_url: &str,
+    cancellation: &CaptureCancellation,
+) -> Result<(), MaterializationFailure> {
+    verify_fetched_commit(root, environment, request, cancellation)?;
+    let git_metadata = fs::symlink_metadata(root.join(".git"))
+        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    if !git_metadata.file_type().is_dir() || git_metadata.file_type().is_symlink() {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
+    for unsupported_path in [
+        ".git/shallow",
+        ".git/objects/info/alternates",
+        ".git/info/sparse-checkout",
+        ".git/commondir",
+        ".git/modules",
+    ] {
+        match fs::symlink_metadata(root.join(unsupported_path)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) | Ok(_) => return Err(MaterializationFailure::EnvironmentUnavailable),
+        }
+    }
+    let hooks = root.join(".git/hooks");
+    match fs::read_dir(&hooks) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(MaterializationFailure::EnvironmentUnavailable);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(MaterializationFailure::EnvironmentUnavailable),
+    }
+    let packs = fs::read_dir(root.join(".git/objects/pack"))
+        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+    for entry in packs {
+        let entry = entry.map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "promisor")
+        {
+            return Err(MaterializationFailure::EnvironmentUnavailable);
+        }
+    }
+    let shallow = run_git_output(
+        root,
+        environment,
+        &["rev-parse", "--is-shallow-repository"],
+        cancellation,
+    )?;
+    if shallow != b"false\n" {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
+    ensure_git_result_absent(
+        root,
+        environment,
+        &[
+            "config",
+            "--local",
+            "--get-regexp",
+            "^(credential\\.|http\\..*\\.extraheader$|remote\\..*\\.(promisor|partialclonefilter)$|remote\\.origin\\.tagopt$|extensions\\.partialclone$|core\\.sparsecheckout(cone)?$|filter\\.lfs\\.)",
+        ],
+        cancellation,
+    )?;
+    let remotes = run_git_output(root, environment, &["remote"], cancellation)?;
+    if remotes != b"origin\n" {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
+    let origin = run_git_output(
+        root,
+        environment,
+        &["remote", "get-url", "--all", "origin"],
+        cancellation,
+    )?;
+    if origin != format!("{repository_url}\n").as_bytes() {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
+    let fetch = run_git_output(
+        root,
+        environment,
+        &["config", "--local", "--get-all", "remote.origin.fetch"],
+        cancellation,
+    )?;
+    if fetch != b"+refs/heads/*:refs/remotes/origin/*\n" {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
+    verify_connectivity(root, environment, Some(&request.commit_oid), cancellation)
+}
+
+fn verify_connectivity(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    object: Option<&str>,
+    cancellation: &CaptureCancellation,
+) -> Result<(), MaterializationFailure> {
+    let mut arguments = vec!["fsck", "--connectivity-only", "--no-dangling"];
+    if let Some(object) = object {
+        arguments.push(object);
+    }
+    run_git_status(root, environment, &arguments, None, cancellation)
+}
+
+fn ensure_git_result_absent(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    arguments: &[&str],
+    cancellation: &CaptureCancellation,
+) -> Result<(), MaterializationFailure> {
+    let status = run_git_status_code(
+        root,
+        environment,
+        arguments,
+        None,
+        cancellation,
+        MaterializationFailure::EnvironmentUnavailable,
+    )?;
+    if status.code() == Some(1) {
+        Ok(())
+    } else {
+        Err(MaterializationFailure::EnvironmentUnavailable)
+    }
 }
 
 fn verify_fetched_commit(
@@ -877,6 +1002,18 @@ fn verify_checkout(
     if !status.is_empty() {
         return Err(MaterializationFailure::DirtyCheckout);
     }
+    let submodules = run_git_output(
+        root,
+        environment,
+        &["submodule", "status", "--recursive"],
+        cancellation,
+    )?;
+    if submodules
+        .split(|byte| *byte == b'\n')
+        .any(|line| !line.is_empty() && line[0] != b'-')
+    {
+        return Err(MaterializationFailure::EnvironmentUnavailable);
+    }
     Ok(())
 }
 
@@ -905,12 +1042,28 @@ fn run_git_status_with_failure(
     cancellation: &CaptureCancellation,
     failure: MaterializationFailure,
 ) -> Result<(), MaterializationFailure> {
+    let status = run_git_status_code(root, environment, arguments, askpass, cancellation, failure)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(failure)
+    }
+}
+
+fn run_git_status_code(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    arguments: &[&str],
+    askpass: Option<&EphemeralAskpass>,
+    cancellation: &CaptureCancellation,
+    failure: MaterializationFailure,
+) -> Result<ExitStatus, MaterializationFailure> {
     let mut command = git_command(root, environment, arguments, askpass);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    ensure_git_success(&mut command, cancellation, failure)
+    run_managed_source_git(&mut command, cancellation, failure)
 }
 
 fn ensure_git_success(
@@ -989,10 +1142,19 @@ fn git_command(
             "maintenance.auto=false",
             "-c",
             "fetch.writeCommitGraph=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.required=false",
         ])
         .args(arguments)
         .env_clear()
         .env("LC_ALL", "C")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1204,12 +1366,6 @@ pub(super) mod test_support {
         })
     }
 
-    // The test-only composed seam intentionally repeats checkout's explicit confinement inputs.
-    // jscpd:ignore-start
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the source unit seam composes checkout and workflow resolution"
-    )]
     pub(in crate::runner::service) fn materialize(
         broker: Arc<dyn SourceCredentialBroker>,
         environment: &EnvironmentSnapshot,
@@ -1217,7 +1373,6 @@ pub(super) mod test_support {
         request: &MaterializationRequest,
         cancellation: &CaptureCancellation,
         source_root: &Path,
-        ordinary_execution_root: &Path,
         private_root: &Path,
     ) -> Result<MaterializedSource, MaterializationFailure> {
         let checkout = checkout(
@@ -1227,12 +1382,10 @@ pub(super) mod test_support {
             request,
             cancellation,
             source_root,
-            ordinary_execution_root,
             private_root,
         )?;
         resolve_checkout(checkout, cancellation)
     }
-    // jscpd:ignore-end
 }
 
 #[cfg(test)]
@@ -1251,8 +1404,8 @@ mod tests {
 
     use super::*;
     use crate::execution::workflow::admission::{
-        CancellationPolicy, CancellationSource, ExecutionContext, ExecutionRootLifecycle,
-        ResolvedImports, admit_runner_workflow, default_execution_policy_limits,
+        CancellationPolicy, CancellationSource, ExecutionContext, ResolvedImports,
+        admit_runner_workflow, default_execution_policy_limits,
     };
     use crate::execution::workflow::artifact::ArtifactStaging;
     use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
@@ -1761,9 +1914,50 @@ mod tests {
         run_fixture_git(repository, &["commit", "--quiet", "-m", "fixture"]);
     }
 
+    const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 123\n";
+    const OUTPUTLESS_WORKFLOW: &str =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+
+    fn add_clone_semantics_fixture(fixture: &mut RepositoryFixture) {
+        fs::write(
+            fixture.repository.join(".gitattributes"),
+            b"large.bin filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.repository.join(".gitmodules"),
+            b"[submodule \"vendor/dependency\"]\n\tpath = vendor/dependency\n\turl = https://example.invalid/dependency.git\n",
+        )
+        .unwrap();
+        fs::write(fixture.repository.join("large.bin"), LFS_POINTER).unwrap();
+        run_fixture_git(
+            &fixture.repository,
+            &["add", ".gitattributes", ".gitmodules", "large.bin"],
+        );
+        let gitlink = format!("160000,{},vendor/dependency", fixture.parent_commit);
+        run_fixture_git(
+            &fixture.repository,
+            &["update-index", "--add", "--cacheinfo", &gitlink],
+        );
+        run_fixture_git(
+            &fixture.repository,
+            &["commit", "--quiet", "-m", "clone semantics fixture"],
+        );
+        fixture.commit = String::from_utf8(
+            fixture_git_command()
+                .current_dir(&fixture.repository)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+    }
+
     fn empty_assignment() -> tempfile::TempDir {
         let assignment = tempfile::tempdir().unwrap();
-        fs::create_dir(assignment.path().join("execution")).unwrap();
         fs::create_dir(assignment.path().join("private")).unwrap();
         fs::create_dir(assignment.path().join("source")).unwrap();
         assignment
@@ -1852,7 +2046,6 @@ mod tests {
             projection,
             cancellation,
             &assignment.path().join("source"),
-            &assignment.path().join("execution"),
             &assignment.path().join("private"),
         )
     }
@@ -1917,6 +2110,17 @@ mod tests {
         let (assignment, broker) = assignment_fixture(&fixture.repository);
         let materialized = materialization_result(&assignment, broker.clone(), projection).unwrap();
         (assignment, materialized, broker)
+    }
+
+    fn assert_outputless_repository_root(
+        assignment: &tempfile::TempDir,
+        materialized: &MaterializedSource,
+    ) {
+        assert_eq!(
+            materialized.execution_root,
+            assignment.path().join("source")
+        );
+        assert!(materialized.git_capture.is_none());
     }
 
     #[test]
@@ -2015,6 +2219,39 @@ mod tests {
                 .windows(TOKEN.len())
                 .any(|bytes| bytes == TOKEN.as_bytes())
         );
+        for pattern in [
+            "^credential\\.",
+            "^http\\..*\\.extraheader$",
+            "^remote\\..*\\.promisor$",
+            "^remote\\..*\\.partialclonefilter$",
+            "^extensions\\.partialclone$",
+            "^core\\.sparsecheckout",
+            "^filter\\.lfs\\.",
+        ] {
+            let status = fixture_git_command()
+                .current_dir(&materialized.execution_root)
+                .args(["config", "--local", "--get-regexp", pattern])
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(1));
+        }
+        let origin = fixture_git_command()
+            .current_dir(&materialized.execution_root)
+            .args(["remote", "get-url", "--all", "origin"])
+            .output()
+            .unwrap();
+        assert!(origin.status.success());
+        assert_eq!(
+            String::from_utf8(origin.stdout).unwrap().trim(),
+            server.repository_url
+        );
+        let fetch = fixture_git_command()
+            .current_dir(&materialized.execution_root)
+            .args(["config", "--local", "--get-all", "remote.origin.fetch"])
+            .output()
+            .unwrap();
+        assert!(fetch.status.success());
+        assert_eq!(fetch.stdout, b"+refs/heads/*:refs/remotes/origin/*\n");
         let head = fixture_git_command()
             .current_dir(&materialized.execution_root)
             .args(["rev-parse", "HEAD"])
@@ -2031,6 +2268,17 @@ mod tests {
             .unwrap();
         assert!(shallow.status.success());
         assert_eq!(shallow.stdout, b"false\n");
+        let connectivity = fixture_git_command()
+            .current_dir(&materialized.execution_root)
+            .args([
+                "fsck",
+                "--connectivity-only",
+                "--no-dangling",
+                &fixture.commit,
+            ])
+            .status()
+            .unwrap();
+        assert!(connectivity.success());
         for reference in [
             "HEAD^",
             "refs/remotes/origin/fixture-history",
@@ -2047,11 +2295,28 @@ mod tests {
                 fixture.parent_commit
             );
         }
+        for unsupported_path in [
+            ".git/shallow",
+            ".git/objects/info/alternates",
+            ".git/info/sparse-checkout",
+            ".git/commondir",
+        ] {
+            assert!(!materialized.execution_root.join(unsupported_path).exists());
+        }
+        assert_eq!(
+            fs::read_dir(materialized.execution_root.join(".git/hooks"))
+                .map(|entries| entries.count())
+                .unwrap_or_default(),
+            0
+        );
         assert!(
-            !materialized
-                .execution_root
-                .join(".git/objects/info/alternates")
-                .exists()
+            fs::read_dir(materialized.execution_root.join(".git/objects/pack"))
+                .unwrap()
+                .all(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "promisor"))
         );
         assert!(
             !fixture_git_command()
@@ -2091,7 +2356,6 @@ mod tests {
         );
         let context = ExecutionContext::new(
             materialized.execution_root.clone(),
-            ExecutionRootLifecycle::CallerOwnedRetained,
             default_execution_policy_limits(1),
             workflow_environment,
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
@@ -2102,10 +2366,6 @@ mod tests {
                 .unwrap();
         let git = admitted.git_capture().unwrap();
         assert_eq!(admitted.execution().root(), expected_root);
-        assert_eq!(
-            admitted.execution().root_lifecycle(),
-            ExecutionRootLifecycle::CallerOwnedRetained
-        );
         assert_eq!(git.baseline_oid(), fixture.commit);
         assert_eq!(git.workflow_digest(), Some(fixture.digest.as_str()));
         assert_eq!(
@@ -2285,6 +2545,34 @@ mod tests {
     }
 
     #[test]
+    fn leaves_lfs_pointers_and_submodules_unhydrated() {
+        let mut fixture = repository_fixture(OUTPUTLESS_WORKFLOW);
+        add_clone_semantics_fixture(&mut fixture);
+        let projection = projection(&fixture);
+        let (assignment, materialized, _) = materialize_fixture(&fixture, &projection);
+
+        assert_outputless_repository_root(&assignment, &materialized);
+        assert_eq!(
+            fs::read(materialized.execution_root.join("large.bin")).unwrap(),
+            LFS_POINTER
+        );
+        let submodules = fixture_git_command()
+            .current_dir(&materialized.execution_root)
+            .args(["submodule", "status", "--recursive"])
+            .output()
+            .unwrap();
+        assert!(submodules.status.success());
+        assert!(submodules.stdout.starts_with(b"-"));
+        assert!(!materialized.execution_root.join(".git/modules").exists());
+        assert!(
+            !materialized
+                .execution_root
+                .join("vendor/dependency/.git")
+                .exists()
+        );
+    }
+
+    #[test]
     fn credential_rejection_fails_closed_and_removes_the_askpass_helper() {
         const REJECTED_TOKEN: &str = "rejected-provider-token";
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
@@ -2358,25 +2646,53 @@ mod tests {
     }
 
     #[test]
-    fn outputless_workflow_retains_the_checkout_for_workspace_lease_release() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let fixture = repository_fixture(workflow);
+    fn outputless_workflow_executes_from_the_verified_repository() {
+        let fixture = repository_fixture(OUTPUTLESS_WORKFLOW);
         let projection = projection(&fixture);
         let (assignment, materialized, _) = materialize_fixture(&fixture, &projection);
 
-        assert_eq!(
-            materialized.execution_root,
-            assignment.path().join("execution")
-        );
-        assert!(materialized.git_capture.is_none());
-        assert!(assignment.path().join("source").exists());
+        assert_outputless_repository_root(&assignment, &materialized);
         assert_eq!(
             materialized
                 .workflow
                 .source_bytes("workflows/workflow.yaml")
                 .unwrap(),
-            workflow.as_bytes(),
+            OUTPUTLESS_WORKFLOW.as_bytes(),
         );
+    }
+
+    #[test]
+    fn every_attempt_requires_a_new_empty_destination_and_credential_issue() {
+        let fixture = repository_fixture(OUTPUTLESS_WORKFLOW);
+        let projection = projection(&fixture);
+        let broker = fixture_broker(
+            Url::from_file_path(&fixture.repository)
+                .unwrap()
+                .to_string(),
+            "per-attempt-provider-token",
+        );
+        let first = empty_assignment();
+        let first_source = materialization_result(&first, Arc::clone(&broker), &projection)
+            .unwrap()
+            .execution_root;
+        let second = empty_assignment();
+        let second_source = materialization_result(&second, Arc::clone(&broker), &projection)
+            .unwrap()
+            .execution_root;
+
+        assert_ne!(first_source, second_source);
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            [FixtureBrokerCall::Checkout, FixtureBrokerCall::Checkout]
+        );
+
+        let reused = empty_assignment();
+        fs::write(reused.path().join("source/prior-attempt"), b"stale").unwrap();
+        assert_eq!(
+            materialization_result(&reused, Arc::clone(&broker), &projection).map(|_| ()),
+            Err(MaterializationFailure::EnvironmentUnavailable)
+        );
+        assert_eq!(broker.calls.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -2478,6 +2794,20 @@ mod tests {
             materialization_result(&assignment, broker, &projection).map(|_| ()),
             Err(MaterializationFailure::RepositoryUnavailable)
         );
+    }
+
+    #[test]
+    fn local_clone_destination_failure_is_a_runner_environment_failure() {
+        let fixture = repository_fixture(OUTPUTLESS_WORKFLOW);
+        let projection = projection(&fixture);
+        let (assignment, broker) = assignment_fixture(&fixture.repository);
+        let source = assignment.path().join("source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = materialization_result(&assignment, broker, &projection).map(|_| ());
+
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result, Err(MaterializationFailure::EnvironmentUnavailable));
     }
 
     #[test]

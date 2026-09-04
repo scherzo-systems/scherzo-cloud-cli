@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect or reconcile one verified managed CLI GitHub Release."""
+"""Inspect or reconcile one verified fail-forward CLI GitHub Release."""
 
 from __future__ import annotations
 
@@ -40,11 +40,11 @@ def sha256(path: Path) -> str:
 
 
 def load_verifier() -> ModuleType:
-    path = Path(__file__).resolve().with_name("verify-release-allocation")
+    path = Path(__file__).resolve().with_name("verify-release-candidate")
     loader = importlib.machinery.SourceFileLoader("scherzo_release_verifier", os.fspath(path))
     specification = importlib.util.spec_from_loader(loader.name, loader)
     if specification is None:
-        fail("cannot load the allocation verifier")
+        fail("cannot load the candidate verifier")
     module = importlib.util.module_from_spec(specification)
     sys.modules[loader.name] = module
     loader.exec_module(module)
@@ -153,11 +153,9 @@ class Inspection:
 def inspect(arguments: argparse.Namespace) -> Inspection:
     verifier = load_verifier()
     try:
-        verification = verifier.verify_release(
+        verification = verifier.verify_candidate(
             repository_path=arguments.repository,
-            allocated_input=arguments.allocated_mirror,
             workflow_commit=arguments.workflow_commit,
-            event=arguments.event,
             github_repository=arguments.github_repository,
         )
     except verifier.VerificationError as error:
@@ -165,7 +163,7 @@ def inspect(arguments: argparse.Namespace) -> Inspection:
     github = verifier.GitHub(arguments.github_repository)
     live_target = tag_target(github, github.repository, verification.tag)
     expected_target = (
-        None if verification.release_state == "absent" else verification.allocated_mirror
+        None if verification.release_state == "absent" else verification.candidate_mirror
     )
     if live_target != expected_target:
         fail("live stable-tag state differs from the verified Git checkout")
@@ -185,22 +183,25 @@ def inspect(arguments: argparse.Namespace) -> Inspection:
 
 
 def tag_target(github: object, repository: str, tag: str) -> str | None:
-    value = github.api_json(f"repos/{repository}/git/ref/tags/{tag}", missing=True)
+    ref = f"refs/{tag}" if tag.startswith("heads/") else f"refs/tags/{tag}"
+    value = github.api_json(
+        f"repos/{repository}/git/ref/{ref.removeprefix('refs/')}", missing=True
+    )
     if value is None:
         return None
-    if not isinstance(value, dict) or value.get("ref") != f"refs/tags/{tag}":
-        fail("GitHub returned malformed stable-tag state")
+    if not isinstance(value, dict) or value.get("ref") != ref:
+        fail("GitHub returned malformed Git ref state")
     target = value.get("object")
     if (
         not isinstance(target, dict)
         or target.get("type") != "commit"
         or not isinstance(target.get("sha"), str)
     ):
-        fail("allocated stable tag is not a direct commit ref")
+        fail("candidate Git ref is not a direct commit ref")
     return target["sha"]
 
 
-def fetch_allocated_tag(inspection: Inspection) -> None:
+def fetch_candidate_tag(inspection: Inspection) -> None:
     verification = inspection.verification
     repository = inspection.verifier.GitRepository(inspection.repository)
     repository.run(
@@ -217,8 +218,8 @@ def refreshed_release(inspection: Inspection) -> object:
     target = tag_target(
         inspection.github, inspection.github.repository, verification.tag
     )
-    if target != verification.allocated_mirror:
-        fail("allocated stable tag was not created at the allocated mirror")
+    if target != verification.candidate_mirror:
+        fail("candidate stable tag was not created at the candidate mirror")
     return inspection.verifier.verify_target_release(
         inspection.github,
         verification.plan,
@@ -250,6 +251,9 @@ def wait_for_created_tag(inspection: Inspection) -> str | None:
 
 def create_tag(inspection: Inspection) -> None:
     verification = inspection.verification
+    main = tag_target(inspection.github, inspection.github.repository, "heads/main")
+    if main != verification.candidate_mirror:
+        fail("untagged candidate is no longer current public main")
     inspection.github.run(
         "api",
         "--method",
@@ -257,11 +261,11 @@ def create_tag(inspection: Inspection) -> None:
         "-f",
         f"ref=refs/tags/{verification.tag}",
         "-f",
-        f"sha={verification.allocated_mirror}",
+        f"sha={verification.candidate_mirror}",
         f"repos/{inspection.github.repository}/git/refs",
     )
-    if wait_for_created_tag(inspection) != verification.allocated_mirror:
-        fail("GitHub did not create the stable tag at the allocated mirror")
+    if wait_for_created_tag(inspection) != verification.candidate_mirror:
+        fail("GitHub did not create the stable tag at the candidate mirror")
 
 
 def create_draft(inspection: Inspection) -> None:
@@ -284,7 +288,7 @@ def create_draft(inspection: Inspection) -> None:
             os.fspath(notes),
             "--draft",
         )
-    fetch_allocated_tag(inspection)
+    fetch_candidate_tag(inspection)
     state = wait_for_created_draft(inspection)
     if state.state != "draft" or state.assets:
         fail("GitHub did not create the exact empty draft release")
@@ -344,7 +348,7 @@ def apply(arguments: argparse.Namespace) -> None:
     publish(inspection)
     print(
         f"Published {inspection.verification.tag} at "
-        f"{inspection.verification.allocated_mirror}."
+        f"{inspection.verification.candidate_mirror}."
     )
 
 
@@ -352,9 +356,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("operation", choices=("inspect", "apply"))
     result.add_argument("--repository", type=Path, required=True)
-    result.add_argument("--allocated-mirror", required=True)
     result.add_argument("--workflow-commit", required=True)
-    result.add_argument("--event", choices=("push", "recovery"), required=True)
     result.add_argument("--github-repository", required=True)
     result.add_argument("--dist", type=Path, required=True)
     return result

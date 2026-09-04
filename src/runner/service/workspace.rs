@@ -532,11 +532,9 @@ impl WorkRootLease {
             Some(assignment_marker.clone()),
         )
         .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
-        let execution = assignment_path.join("execution");
         let private_path = assignment_path.join("private");
         let workspace_path = assignment_path.join("workspace");
-        if create_private_directory(&execution).is_err()
-            || create_private_directory(&private_path).is_err()
+        if create_private_directory(&private_path).is_err()
             || create_private_directory(&workspace_path).is_err()
         {
             return Err(match self.engine.remove(&assignment_tree) {
@@ -560,7 +558,7 @@ impl WorkRootLease {
             };
         Ok(AssignmentRoot {
             assignment_tree,
-            execution,
+            execution: workspace_tree.path.clone(),
             private: PrivateStaging { path: private_path },
             workspace: WorkspaceLease::new(workspace_tree, self.engine.clone()),
             engine: self.engine.clone(),

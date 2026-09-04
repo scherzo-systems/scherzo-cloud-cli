@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 /// `ARCHITECTURE.md` in the same change when the prose no longer matches.
 fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     let entries: &[(&str, &[&str])] = &[
-        ("api", &["tls", "timing"]),
+        ("api", &["public_id", "tls", "timing"]),
         (
             "cli",
             &[

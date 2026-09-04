@@ -11,8 +11,7 @@ use std::time::Duration;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedAttachment,
-    ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
@@ -56,7 +55,6 @@ impl AdmittedFixture {
             ),
             ExecutionContext::new(
                 execution_root.clone(),
-                ExecutionRootLifecycle::CallerOwnedRetained,
                 ExecutionPolicyLimits::new(
                     2,
                     CaptureLimits::new(16, 1024, 4096),

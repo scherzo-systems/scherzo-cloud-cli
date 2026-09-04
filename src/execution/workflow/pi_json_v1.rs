@@ -290,6 +290,7 @@ impl PiJsonV1Parser {
 
     /// Records the one result already bounded and validated by the authoritative result bridge.
     /// Native completion remains provisional until the matching transcript, EOF, and exit validate.
+    #[cfg(test)]
     pub(crate) fn correlate_result_request(
         &mut self,
         tool_name: &str,
@@ -2498,7 +2499,11 @@ fn parse_assistant_event(
                 .ok_or(ParseAssistantEventError::Shape)?
                 .to_owned(),
         ),
-        "toolcall_start" => AssistantUpdateKind::ToolCallStart,
+        "toolcall_start" => {
+            optional_string(object, "id").ok_or(ParseAssistantEventError::Shape)?;
+            optional_string(object, "toolName").ok_or(ParseAssistantEventError::Shape)?;
+            AssistantUpdateKind::ToolCallStart
+        }
         "toolcall_delta" => AssistantUpdateKind::ToolCallDelta(
             required_string(object, "delta")
                 .ok_or(ParseAssistantEventError::Shape)?

@@ -580,9 +580,12 @@ fn update_identity_component(
 
 #[derive(Debug)]
 struct TransportSchema {
+    #[cfg(test)]
     complete_wrapper: Value,
     native_parameters: Value,
+    #[cfg(test)]
     resource_id: String,
+    #[cfg(test)]
     used_regex_fallback: bool,
 }
 
@@ -627,9 +630,12 @@ fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchem
         complete_wrapper.clone()
     };
     Ok(TransportSchema {
+        #[cfg(test)]
         complete_wrapper,
         native_parameters,
+        #[cfg(test)]
         resource_id,
+        #[cfg(test)]
         used_regex_fallback,
     })
 }

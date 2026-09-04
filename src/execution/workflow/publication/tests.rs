@@ -13,7 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::agent::{AgentOutcome, AgentValueKind};
 use crate::execution::workflow::artifact::{
@@ -66,7 +66,6 @@ impl PublicationFixture {
             ResolvedImports::default(),
             ExecutionContext::new(
                 execution_root.clone(),
-                ExecutionRootLifecycle::CallerOwnedRetained,
                 ExecutionPolicyLimits::new(
                     2,
                     CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),

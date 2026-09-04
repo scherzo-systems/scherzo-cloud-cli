@@ -49,10 +49,6 @@ pub(crate) fn to_writer(writer: impl Write, value: &Value) -> Result<(), serde_j
     serde_json::to_writer(writer, &CanonicalJson(value))
 }
 
-pub(crate) fn encoded_size(value: &Value, maximum_bytes: u64) -> Result<u64, CanonicalJsonError> {
-    serialize_bounded(value, io::sink(), maximum_bytes).map(|writer| writer.bytes)
-}
-
 pub(crate) fn to_bounded_bytes(
     value: &Value,
     maximum_bytes: u64,

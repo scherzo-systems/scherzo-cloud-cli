@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde_json::{Number, Value};
 
 use super::validated::WorkflowNode;
+#[cfg(test)]
 use super::value::{CapturedJson, CapturedText};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,10 +43,12 @@ impl JsonPointer {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn authored(&self) -> &str {
         &self.authored
     }
 
+    #[cfg(test)]
     pub(crate) fn tokens(&self) -> impl ExactSizeIterator<Item = &str> {
         self.tokens.iter().map(AsRef::as_ref)
     }
@@ -171,10 +174,6 @@ impl ResolvedOperand {
             value: ResolvedOperandValue::JsonLiteral(value),
         }
     }
-
-    pub(crate) const fn kind(&self) -> ConditionValueKind {
-        self.kind
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,6 +273,7 @@ pub(crate) struct ConditionValues<'a> {
 }
 
 impl<'a> ConditionValues<'a> {
+    #[cfg(test)]
     pub(crate) fn insert_text(
         &mut self,
         canonical_ref: impl Into<Arc<str>>,
@@ -287,6 +287,7 @@ impl<'a> ConditionValues<'a> {
             .insert(canonical_ref.into(), CapturedConditionValue::Text(value));
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_json(
         &mut self,
         canonical_ref: impl Into<Arc<str>>,

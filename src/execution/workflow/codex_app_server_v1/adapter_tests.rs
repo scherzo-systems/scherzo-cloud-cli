@@ -467,6 +467,7 @@ impl ProcessFixture {
                     | "async-before-final"
                     | "failure-after-output"
                     | "interruption-after-output"
+                    | "interruption-with-hook"
                     | "nonzero-after-output" => "12345",
                     "oversized" => "123456",
                     _ => RESPONSE,
@@ -1394,7 +1395,7 @@ fn codex_process_fixture() {
             Some("commandExecution"),
             json!({"permissions": {}}),
         )),
-        "request-user-input" => Some((
+        "request-user-input" | "request-user-input-async" => Some((
             "item/tool/requestUserInput",
             Some("commandExecution"),
             json!({"answers": {}}),
@@ -1428,6 +1429,20 @@ fn codex_process_fixture() {
                 "startedAtMs": 1,
                 "cwd": cwd,
                 "permissions": {},
+            }),
+            "item/tool/requestUserInput" if scenario == "request-user-input-async" => json!({
+                "threadId": THREAD_ID,
+                "turnId": TURN_ID,
+                "itemId": "interactive-1",
+                "isBlocking": false,
+                "questions": [{
+                    "id": "structured-question",
+                    "header": "Choice",
+                    "question": "Select an option",
+                    "options": [{"label": "A", "description": "first"}],
+                    "isOther": true,
+                    "isSecret": false,
+                }],
             }),
             "item/tool/requestUserInput" => json!({
                 "threadId": THREAD_ID,
@@ -1809,6 +1824,47 @@ fn codex_process_fixture() {
             }),
         );
     }
+    if scenario == "interruption-with-hook" {
+        let started_hook = json!({
+            "id": "interrupt-hook",
+            "eventName": "interrupt",
+            "displayOrder": 0,
+            "entries": [],
+            "executionMode": "sync",
+            "handlerType": "command",
+            "scope": "turn",
+            "sourcePath": "/synthetic/interrupt-hook",
+            "startedAt": 1,
+            "status": "running",
+        });
+        write_server_frame(
+            &mut output,
+            json!({"method": "hook/started", "params": {
+                "threadId": THREAD_ID, "turnId": TURN_ID, "run": started_hook
+            }}),
+        );
+        write_server_frame(
+            &mut output,
+            json!({"method": "hook/completed", "params": {
+                "threadId": THREAD_ID,
+                "turnId": TURN_ID,
+                "run": {
+                    "id": "interrupt-hook",
+                    "eventName": "interrupt",
+                    "displayOrder": 0,
+                    "entries": [],
+                    "executionMode": "sync",
+                    "handlerType": "command",
+                    "scope": "turn",
+                    "sourcePath": "/synthetic/interrupt-hook",
+                    "startedAt": 1,
+                    "completedAt": 2,
+                    "durationMs": 1,
+                    "status": "completed",
+                }
+            }}),
+        );
+    }
     let mut prefixed_items = Vec::new();
     if scenario == "async-before-final" || scenario == "async-only" {
         prefixed_items.push(completed_async_response(
@@ -1878,7 +1934,7 @@ fn codex_process_fixture() {
 
     let status = match scenario.as_str() {
         "failure-after-output" => "failed",
-        "interruption-after-output" => "interrupted",
+        "interruption-after-output" | "interruption-with-hook" => "interrupted",
         _ => "completed",
     };
     let mut items = prefixed_items;
@@ -1929,16 +1985,6 @@ struct LoopbackResponsesProvider {
 }
 
 impl LoopbackResponsesProvider {
-    async fn start(response: &str) -> Self {
-        Self::start_with_response_release(
-            LoopbackProviderResponse::Turns(VecDeque::from([LoopbackProviderTurn::Completed(
-                response.to_owned(),
-            )])),
-            None,
-        )
-        .await
-    }
-
     async fn start_sequence(responses: &[&str]) -> Self {
         assert!(!responses.is_empty());
         Self::start_with_response_release(
@@ -3271,6 +3317,7 @@ pub(super) mod unattended_requests {
                 "request-file-approval",
                 "request-permissions",
                 "request-user-input",
+                "request-user-input-async",
                 "request-mcp-elicitation",
             ] {
                 let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
@@ -3616,6 +3663,67 @@ pub(super) mod cancellation {
                 assert_eq!(requests.len(), 6, "{requests:?}");
             }
             assert_cancelled_without_native_rollout(&fixture, outcome);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_hooks_complete_before_terminal_quiescence() {
+        with_watchdog(async {
+            let fixture = ProcessFixture::new("interruption-with-hook", response_mode(), 1024);
+            let observations = fixture.observations.clone();
+            let (fixture, outcome, started) = run_fixture(fixture).await;
+            assert_started_failure(
+                "interruption-with-hook",
+                outcome,
+                started,
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelAborted,
+                },
+            );
+            assert_fixture_quiescent(&fixture);
+            assert_no_native_rollout(&fixture);
+
+            let observations = observations.snapshot();
+            let position = |predicate: &dyn Fn(&AgentObservation) -> bool| {
+                observations
+                    .iter()
+                    .position(|observation| predicate(observation.observation()))
+                    .unwrap()
+            };
+            let hook_started = position(&|observation| {
+                matches!(
+                    observation,
+                    AgentObservation::ToolCall { name, phase: AgentToolCallPhase::Started, .. }
+                        if name.as_ref() == "hook:interrupt"
+                )
+            });
+            let hook_completed = position(&|observation| {
+                matches!(
+                    observation,
+                    AgentObservation::ToolCall { name, phase: AgentToolCallPhase::Completed, .. }
+                        if name.as_ref() == "hook:interrupt"
+                )
+            });
+            let turn_completed = position(&|observation| {
+                matches!(
+                    observation,
+                    AgentObservation::Lifecycle {
+                        milestone: AgentLifecycleMilestone::TurnCompleted,
+                    }
+                )
+            });
+            let quiescent = position(&|observation| {
+                matches!(
+                    observation,
+                    AgentObservation::Lifecycle {
+                        milestone: AgentLifecycleMilestone::HarnessQuiescent,
+                    }
+                )
+            });
+            assert!(hook_started < hook_completed);
+            assert!(hook_completed < turn_completed);
+            assert!(turn_completed < quiescent);
         })
         .await;
     }

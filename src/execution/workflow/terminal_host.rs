@@ -1852,6 +1852,7 @@ fn render_split_steps<Step: StepProjection>(
     );
 }
 
+#[cfg(test)]
 fn render_steps(
     frame: &mut Frame<'_>,
     area: Rect,

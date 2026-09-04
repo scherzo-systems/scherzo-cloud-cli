@@ -11,7 +11,8 @@ use super::{
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
 const CAPABILITY_PROBE: &str = "--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help";
 const CLOSED_PROBES: &[u8] = b"--version\n--no-approve --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --help\n";
-pub(super) const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
+pub(super) const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [--] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
+const LOWER_BOUND_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
 const REQUIRED_CAPABILITIES: &str = "json_event_stream,custom_session_directory,extension_loading,system_prompt_append,invocation_scoped_project_trust";
 
 pub(super) struct PiFixture {
@@ -173,7 +174,7 @@ fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
 fn conformance_executable() -> Option<PathBuf> {
     std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
-        .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.2/bin/pi"))
+        .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.4/bin/pi"))
 }
 
 fn report_code(output: &std::process::Output) -> String {
@@ -189,7 +190,7 @@ fn assert_invalid_runner_gateway(output: &std::process::Output) {
 
 #[test]
 fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
-    let fixture = PiFixture::new("0.84.7", COMPLETE_HELP, true);
+    let fixture = PiFixture::new("0.84.4", COMPLETE_HELP, true);
     let first_agent_directory = tempfile::tempdir().expect("first Pi agent directory");
     let second_agent_directory = tempfile::tempdir().expect("second Pi agent directory");
     let first_settings = br#"{"defaultProjectTrust":"never"}"#;
@@ -231,7 +232,7 @@ fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
     assert_eq!(reports[0], reports[1]);
     assert_eq!(reports[0]["checks"][0]["id"], PI_CHECK_ID);
     assert_eq!(reports[0]["checks"][0]["status"], "pass");
-    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.84.7");
+    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.84.4");
     assert_eq!(reports[0]["checks"][0]["details"]["profile"], "PiJsonV1");
     assert_eq!(
         reports[0]["checks"][0]["details"]["supportedRange"],
@@ -353,7 +354,7 @@ fn human_doctor_reports_pi_qualification_anchor_when_missing() {
 fn doctor_path_lookup_skips_candidates_not_executable_by_current_user() {
     let inaccessible = PiFixture::new("0.84.2", COMPLETE_HELP, true);
     fs::set_permissions(inaccessible.executable(), fs::Permissions::from_mode(0o001)).unwrap();
-    let compatible = PiFixture::new("0.84.2", COMPLETE_HELP, true);
+    let compatible = PiFixture::new("0.84.2", LOWER_BOUND_HELP, true);
     let ordered_path =
         std::env::join_paths([inaccessible.path_directory(), compatible.path_directory()]).unwrap();
 
@@ -622,7 +623,7 @@ fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
 
     assert_eq!(reports[0], reports[1]);
     let details = &reports[0]["checks"][0]["details"];
-    assert_eq!(details["version"], "0.84.2");
+    assert_eq!(details["version"], "0.84.4");
     assert_eq!(details["profile"], "PiJsonV1");
     assert_eq!(details["supportedRange"], ">=0.84.2 <0.85.0");
     assert_eq!(details["capabilities"], REQUIRED_CAPABILITIES);

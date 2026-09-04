@@ -5,8 +5,8 @@ use std::time::Duration;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports,
-    admit_runner_workflow, admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedImports, admit_runner_workflow,
+    admit_workflow,
 };
 use crate::execution::workflow::resolution;
 
@@ -568,7 +568,6 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
         ResolvedImports::default(),
         ExecutionContext::new(
             execution_root,
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
@@ -628,7 +627,6 @@ steps:
         ResolvedImports::new(Some(Arc::from("skip")), Arc::from([])),
         ExecutionContext::new(
             execution_root,
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
@@ -688,7 +686,6 @@ steps:
         ResolvedImports::default(),
         ExecutionContext::new(
             execution_root,
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
             ExecutionPolicyLimits::new(
                 2,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
@@ -4485,7 +4482,6 @@ steps:
         ResolvedImports::default(),
         ExecutionContext::new(
             execution_root,
-            ExecutionRootLifecycle::CallerOwnedRetained,
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),

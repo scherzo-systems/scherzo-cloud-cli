@@ -82,6 +82,23 @@ fn credential_body(state: &str) -> serde_json::Value {
     credential
 }
 
+fn pool_list_body() -> serde_json::Value {
+    serde_json::json!({"items": [pool_body()]})
+}
+
+fn registration_list_body() -> serde_json::Value {
+    serde_json::json!({"items": [registration_body()]})
+}
+
+fn deletion_success_response() -> Vec<u8> {
+    http_response_with_headers(
+        "204 No Content",
+        None,
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &[],
+    )
+}
+
 fn registration_body() -> serde_json::Value {
     serde_json::json!({
         "id": RUNNER_ID,
@@ -120,6 +137,46 @@ fn rate_limit_response() -> Vec<u8> {
             "status": 429
         }),
     )
+}
+
+#[test]
+fn runner_deletion_requires_literal_confirmation_before_local_or_network_access() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let missing_credentials = tempfile::tempdir().unwrap().path().join("missing.json");
+    let credential_path = missing_credentials.to_str().unwrap();
+    let environment = deployment_environment(&api_url, credential_path);
+
+    for args in [
+        vec![
+            "runner",
+            "delete",
+            ORGANIZATION,
+            RUNNER_ID,
+            "--allow-insecure-http",
+        ],
+        vec![
+            "runner",
+            "pool",
+            "delete",
+            ORGANIZATION,
+            POOL_ID,
+            "--yes=false",
+            "--allow-insecure-http",
+        ],
+    ] {
+        let output = run_with_env(&args, &environment);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains('?'));
+        assert!(!stderr.to_ascii_lowercase().contains("prompt"));
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]
@@ -229,6 +286,364 @@ fn pool_create_sends_the_name_and_reports_the_created_pool() {
         serde_json::from_str::<serde_json::Value>(request_body(&request)).unwrap(),
         serde_json::json!({"name": "builders"})
     );
+}
+
+#[test]
+fn deletion_by_name_resolves_once_and_emits_exact_success_json() {
+    for (args, resolution, expected_path, expected_output) in [
+        (
+            vec![
+                "runner",
+                "delete",
+                ORGANIZATION,
+                "builder-one",
+                "--yes",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            json_http_response("200 OK", registration_list_body()),
+            format!(
+                "DELETE /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID} HTTP/1.1\r\n"
+            ),
+            ("runnerId", RUNNER_ID),
+        ),
+        (
+            vec![
+                "runner",
+                "pool",
+                "delete",
+                ORGANIZATION,
+                "builders",
+                "--yes",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            json_http_response("200 OK", pool_list_body()),
+            format!(
+                "DELETE /api/v1/organizations/{ORGANIZATION}/runner-pools/{POOL_ID} HTTP/1.1\r\n"
+            ),
+            ("runnerPoolId", POOL_ID),
+        ),
+    ] {
+        let (server, _directory, credential_path) =
+            prepared_runner(vec![resolution, deletion_success_response()]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(&args, &environment);
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"schemaVersion\": 1,\n",
+                    "  \"deployment\": \"{}\",\n",
+                    "  \"outcome\": \"deleted\",\n",
+                    "  \"{}\": \"{}\",\n",
+                    "  \"deleted\": true\n",
+                    "}}\n"
+                ),
+                server.api_url, expected_output.0, expected_output.1
+            )
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET "));
+        assert!(requests[1].starts_with(&expected_path));
+        assert_eq!(request_body(&requests[1]), "");
+        let key = header_value(&requests[1], "idempotency-key");
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+}
+
+#[test]
+fn deletion_refresh_reuses_the_resolved_id_and_invocation_key() {
+    let rejected = problem_http_response(
+        "401 Unauthorized",
+        serde_json::json!({
+            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "title": "Unauthorized",
+            "status": 401
+        }),
+    );
+    let server = ScriptedServer::respond(vec![
+        json_http_response("200 OK", registration_list_body()),
+        rejected,
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "access_token": "unique-refreshed-delete-access-token",
+                "refresh_token": "unique-refreshed-delete-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        ),
+        deletion_success_response(),
+    ]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &credential_path,
+        &server.api_url,
+        &server.issuer,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment_with_issuer(
+        &server.api_url,
+        &server.issuer,
+        credential_path.to_str().unwrap(),
+    );
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "delete",
+            ORGANIZATION,
+            "builder-one",
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("GET "))
+            .count(),
+        1
+    );
+    let deletes = [&requests[1], &requests[3]];
+    for request in deletes {
+        assert!(request.starts_with(&format!(
+            "DELETE /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID} HTTP/1.1\r\n"
+        )));
+    }
+    assert_eq!(
+        header_value(deletes[0], "idempotency-key"),
+        header_value(deletes[1], "idempotency-key")
+    );
+    assert!(deletes[1].contains("authorization: Bearer unique-refreshed-delete-access-token\r\n"));
+}
+
+#[test]
+fn deletion_blockers_remain_ordered_and_bound_to_the_resolved_id() {
+    let blocked = problem_http_response(
+        "409 Conflict",
+        serde_json::json!({
+            "type": "https://api.scherzo.dev/problems/runner-registration-delete-unavailable",
+            "title": "Runner registration deletion unavailable",
+            "status": 409,
+            "blockers": ["capacity_reserved", "nonterminal_assignment"]
+        }),
+    );
+    let (server, _directory, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", registration_body()),
+        blocked,
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "delete",
+            ORGANIZATION,
+            RUNNER_ID,
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "delete_unavailable");
+    assert_eq!(result["runnerId"], RUNNER_ID);
+    assert_eq!(
+        result["blockers"],
+        serde_json::json!(["capacity_reserved", "nonterminal_assignment"])
+    );
+    assert!(result.get("deleted").is_none());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn post_dispatch_transport_server_and_protocol_failures_report_unknown_commitment() {
+    let failures = [
+        Vec::new(),
+        http_response("204 No Content", None, &[]),
+        problem_http_response(
+            "500 Internal Server Error",
+            serde_json::json!({
+                "type": "https://api.scherzo.dev/problems/internal-server-error",
+                "title": "Internal server error",
+                "status": 500
+            }),
+        ),
+    ];
+    for failure in failures {
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", registration_body()),
+            failure,
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &[
+                "runner",
+                "delete",
+                ORGANIZATION,
+                RUNNER_ID,
+                "--yes",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(4));
+        assert!(output.stderr.is_empty());
+        let diagnostic: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            diagnostic,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "deployment": server.api_url,
+                "outcome": "unknown",
+                "runnerId": RUNNER_ID,
+                "commitment": "unknown"
+            })
+        );
+        assert!(diagnostic.get("deleted").is_none());
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET "));
+        assert!(requests[1].starts_with("DELETE "));
+    }
+}
+
+#[test]
+fn later_owner_directed_deletion_uses_a_new_key_after_unknown_commitment() {
+    let (first, _directory, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", registration_body()),
+        Vec::new(),
+    ]);
+    let environment = deployment_environment(&first.api_url, &credential_path);
+    let first_output = run_with_env(
+        &[
+            "runner",
+            "delete",
+            ORGANIZATION,
+            RUNNER_ID,
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(first_output.status.code(), Some(4));
+    let first_requests = first.finish();
+    let first_key = header_value(&first_requests[1], "idempotency-key").to_owned();
+
+    let (later, _directory, later_credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", registration_body()),
+        deletion_success_response(),
+    ]);
+    let later_environment = deployment_environment(&later.api_url, &later_credential_path);
+    let later_output = run_with_env(
+        &[
+            "runner",
+            "delete",
+            ORGANIZATION,
+            RUNNER_ID,
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &later_environment,
+    );
+    assert!(later_output.status.success());
+    let later_requests = later.finish();
+    let later_key = header_value(&later_requests[1], "idempotency-key");
+    assert_ne!(first_key, later_key);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn post_dispatch_interrupt_and_termination_report_unknown_without_retry() {
+    for (signal, expected_exit) in [
+        (rustix::process::Signal::INT, 130),
+        (rustix::process::Signal::TERM, 143),
+    ] {
+        let mut server = ScriptedServer::respond_with_paused_last_response(vec![
+            json_http_response("200 OK", registration_body()),
+            deletion_success_response(),
+        ]);
+        let credential_directory = private_credential_directory();
+        let credential_path = credential_directory.path().join("credentials.json");
+        write_credential_fixture(
+            &credential_path,
+            &server.api_url,
+            TOKEN,
+            "2999-01-01T00:00:00Z",
+        );
+        let environment =
+            deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        command
+            .args([
+                "runner",
+                "delete",
+                ORGANIZATION,
+                RUNNER_ID,
+                "--yes",
+                "--json",
+                "--allow-insecure-http",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in &environment {
+            command.env(name, value);
+        }
+        let child = command.spawn().unwrap();
+
+        let resolution = server.next_request();
+        let deletion = server.next_request();
+        assert!(resolution.starts_with("GET "));
+        assert!(deletion.starts_with("DELETE "));
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+            signal,
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        server.release_paused_response();
+        assert_eq!(output.status.code(), Some(expected_exit));
+        assert!(output.stderr.is_empty());
+        let diagnostic: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(diagnostic["runnerId"], RUNNER_ID);
+        assert_eq!(diagnostic["commitment"], "unknown");
+        assert!(diagnostic.get("deleted").is_none());
+        assert!(server.finish().is_empty());
+    }
 }
 
 #[test]

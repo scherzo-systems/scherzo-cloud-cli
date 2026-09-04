@@ -16,6 +16,19 @@ fn response(status: &str, body: &[u8]) -> Vec<u8> {
     response
 }
 
+fn deletion_response(status: &str, key: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let key = key
+        .map(|key| format!("Idempotency-Key: {key}\r\n"))
+        .unwrap_or_default();
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\n{key}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
 fn api(server: &ScriptedHttpServer) -> RunnerApi {
     RunnerApi::new(
         &server.api_url,
@@ -119,6 +132,73 @@ fn generated_runner_rename_uses_merge_patch_and_idempotency() {
             .lines()
             .any(|line| line == "idempotency-key: runner-rename-key")
     );
+}
+
+#[test]
+fn runner_deletion_requires_exact_bodyless_success_and_echoed_key() {
+    let server =
+        ScriptedHttpServer::respond(deletion_response("204 No Content", Some("delete-key"), &[]));
+
+    assert_eq!(
+        api(&server).delete_registration(ORGANIZATION, RUNNER_ID, "delete-key"),
+        Ok(())
+    );
+    let request = server.finish_one();
+    assert!(request.starts_with(&format!(
+        "DELETE /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID} HTTP/1.1\r\n"
+    )));
+    assert!(
+        request
+            .lines()
+            .any(|line| line == "idempotency-key: delete-key")
+    );
+    assert!(request.ends_with("\r\n\r\n"));
+
+    for malformed in [
+        deletion_response("204 No Content", None, &[]),
+        deletion_response("200 OK", Some("delete-key"), &[]),
+    ] {
+        let server = ScriptedHttpServer::respond(malformed);
+        assert_eq!(
+            api(&server).delete_pool(ORGANIZATION, POOL_ID, "delete-key"),
+            Err(RunnerFailure::Protocol)
+        );
+        server.finish_one();
+    }
+}
+
+#[test]
+fn runner_deletion_accepts_only_ordered_resource_specific_blockers() {
+    let blocked = serde_json::to_vec(&serde_json::json!({
+        "type": "https://api.scherzo.dev/problems/runner-pool-delete-unavailable",
+        "title": "Runner pool deletion unavailable",
+        "status": 409,
+        "blockers": ["runner_registrations_present", "nonterminal_runs_present"]
+    }))
+    .unwrap();
+    let server = ScriptedHttpServer::respond(response("409 Conflict", &blocked));
+    assert_eq!(
+        api(&server).delete_pool(ORGANIZATION, POOL_ID, "delete-key"),
+        Err(RunnerFailure::DeletionUnavailable(vec![
+            RunnerDeletionBlocker::RunnerRegistrationsPresent,
+            RunnerDeletionBlocker::NonterminalRunsPresent,
+        ]))
+    );
+    server.finish_one();
+
+    let malformed = serde_json::to_vec(&serde_json::json!({
+        "type": "https://api.scherzo.dev/problems/runner-registration-delete-unavailable",
+        "title": "Runner registration deletion unavailable",
+        "status": 409,
+        "blockers": ["nonterminal_assignment", "capacity_reserved"]
+    }))
+    .unwrap();
+    let server = ScriptedHttpServer::respond(response("409 Conflict", &malformed));
+    assert_eq!(
+        api(&server).delete_registration(ORGANIZATION, RUNNER_ID, "delete-key"),
+        Err(RunnerFailure::Protocol)
+    );
+    server.finish_one();
 }
 
 #[test]

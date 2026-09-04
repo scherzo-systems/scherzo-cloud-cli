@@ -273,26 +273,15 @@ pub(crate) struct WorkflowRunTerminalResultV1 {
 }
 
 impl WorkflowRunTerminalResultV1 {
-    pub(crate) fn outcome(&self) -> WorkflowOutcomeV1 {
-        self.outcome
-    }
-
     pub(crate) fn exit_status(&self) -> u16 {
         self.exit_status
-    }
-
-    pub(crate) fn run_directory(&self) -> &str {
-        &self.run_directory
-    }
-
-    pub(crate) fn attempt_number(&self) -> u64 {
-        self.attempt_number
     }
 
     pub(crate) fn result_directory(&self) -> &str {
         &self.result_directory
     }
 
+    #[cfg(test)]
     pub(crate) fn result(&self) -> &WorkflowResultV1 {
         &self.result
     }
@@ -823,20 +812,6 @@ pub(crate) struct FinalizationCancellationV1 {
     pub(crate) force_stop_deadline: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StepReasonV1 {
-    FailureStop,
-    UserRequest,
-    TerminationRequest,
-    CallerOutputFailure,
-    RunnerShutdown,
-    ExecutionLeaseExpired,
-    FinalizationForceAbort,
-    InputUnavailable,
-    FinalizerTriggerNotSelected,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FailureV1 {
@@ -1234,12 +1209,7 @@ pub(crate) struct PreparedResultDestination {
     target: PublicationTarget,
 }
 
-impl PreparedResultDestination {
-    pub(crate) fn result_directory(&self) -> &str {
-        &self.target.normalized
-    }
-}
-
+#[cfg(test)]
 pub(crate) fn prepare_result_destination(
     destination: &Path,
 ) -> Result<PreparedResultDestination, LocalPublicationError> {
@@ -1269,6 +1239,7 @@ pub(crate) fn publish_prepared_workflow_result(
     publish_prepared_with_observer(destination, artifacts, run, &mut NoopPublicationObserver)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_workflow_result(
     destination: &Path,
     artifacts: &ArtifactStaging,
@@ -2760,22 +2731,10 @@ pub(super) fn cancellation_reason(reason: CancellationReason) -> CancellationRea
     }
 }
 
-pub(super) fn cancellation_step_reason(reason: CancellationReason) -> StepReasonV1 {
-    match reason {
-        CancellationReason::UserRequest => StepReasonV1::UserRequest,
-        CancellationReason::TerminationRequest => StepReasonV1::TerminationRequest,
-        CancellationReason::CallerOutputFailure => StepReasonV1::CallerOutputFailure,
-        CancellationReason::RunnerShutdown => StepReasonV1::RunnerShutdown,
-        CancellationReason::ExecutionLeaseExpired => StepReasonV1::ExecutionLeaseExpired,
-        CancellationReason::FinalizationForceAbort => StepReasonV1::FinalizationForceAbort,
-    }
-}
-
 fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailableReasonV1 {
     match reason {
         ExportUnavailableReason::Failed => ExportUnavailableReasonV1::Failed,
         ExportUnavailableReason::Blocked => ExportUnavailableReasonV1::Blocked,
-        ExportUnavailableReason::InputUnavailable => ExportUnavailableReasonV1::InputUnavailable,
         ExportUnavailableReason::Skipped => ExportUnavailableReasonV1::Skipped,
         ExportUnavailableReason::NotRun => ExportUnavailableReasonV1::NotRun,
         ExportUnavailableReason::TriggerNotSelected => {

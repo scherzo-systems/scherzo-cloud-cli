@@ -9,6 +9,7 @@ Commands:
   list    List Scherzo Cloud runner pools
   show    Show a Scherzo Cloud runner pool
   rename  Rename a Scherzo Cloud runner pool
+  delete  Delete an unused Scherzo Cloud runner pool
   help    Print this message or the help of the given subcommand(s)
 
 Options:

@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, watch};
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
-    ResolvedAttachment, ResolvedImports, admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports,
+    admit_workflow,
 };
 use crate::execution::workflow::agent::{AgentProcessDirective, agent_process_control_channel};
 use crate::execution::workflow::artifact::{
@@ -4012,7 +4012,6 @@ fn admit_fixture_with_inputs(
         execution.imports,
         ExecutionContext::new(
             execution_root.to_owned(),
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
             execution.limits,
             environment,
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
@@ -4059,7 +4058,6 @@ steps:
         ResolvedImports::default(),
         ExecutionContext::new(
             execution_root,
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),

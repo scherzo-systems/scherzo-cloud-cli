@@ -8,6 +8,7 @@ mod human_principal;
 mod organizations;
 mod problem;
 mod runners;
+mod runs;
 mod signup;
 
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
@@ -44,9 +45,10 @@ pub(crate) use organizations::{
 };
 pub(crate) use runners::{
     RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,
-    RunnerCredentialStoredState, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
-    RunnerRegistrationList, RunnerRegistrationMode,
+    RunnerCredentialStoredState, RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList,
+    RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
+pub(crate) use runs::{Run, RunApi, RunCreationAcceptance, RunFailure};
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations
@@ -62,7 +64,7 @@ pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
     clippy::too_many_arguments,
     clippy::unimplemented,
     clippy::uninlined_format_args,
-    reason = "OpenAPI Generator emits a library-shaped client outside handwritten policy"
+    reason = "api::signup_human and runner enrollment call the generated client while OpenAPI Generator retains the full contract surface"
 )]
 mod generated;
 

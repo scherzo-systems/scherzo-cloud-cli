@@ -14,11 +14,8 @@ use tokio::sync::watch;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::admission::{AdmissionFailure, CancellationReason};
-use super::artifact::CaptureFailureKind;
 use super::document::FailurePolicy;
 use super::evidence::{BlockedDetail, FailureDetail, Prerequisite, PrimaryIssueDetail};
-use super::git_capture::GitCaptureFailure;
-use super::input::InputPreparationFailureKind;
 use super::local_run::{LocalRetryRejection, RetryIneligibilityReason};
 use super::observation::{ExecutionObservation, ExecutionObserver, ObservedStepTransition};
 use super::presentation_feed::{
@@ -32,14 +29,14 @@ use super::publication::{
 use super::rejection::{RejectionDiagnostic, human_resolution_remedy};
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolvedWorkflow};
 use super::run_timing::{ObservationClock, ObservationTime};
+#[cfg(test)]
+use super::runtime::FailurePhase;
 use super::runtime::{
-    ActiveStepInvocation, FailurePhase, RecoveryDecisionKind, RecoveryHandlerActivity,
-    RecoveryHandlerKind, RunOutcome, StepState, StepStateKind, TransitionEvent,
+    ActiveStepInvocation, RecoveryDecisionKind, RecoveryHandlerActivity, RecoveryHandlerKind,
+    RunOutcome, StepState, StepStateKind, TransitionEvent,
 };
-use super::step_runtime::{
-    CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
-    StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
-};
+#[cfg(test)]
+use super::step_runtime::{CommandExecutionFailure, StepExecutionFailure, StepFailureCause};
 use super::validated::ValidatedStep;
 use crate::execution::AgentHarnessInstallationFailure;
 
@@ -223,7 +220,6 @@ impl ObservationClock for SystemObservationClock {
 pub(crate) enum PresentationFailureOperation {
     HeaderWriter,
     LineWriter,
-    DiagnosticWriter,
     TerminalJsonWriter,
     TerminalSetup,
     TerminalInput,
@@ -717,6 +713,7 @@ where
         self.opened_at
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe_failures(&self) -> watch::Receiver<Option<PresentationFailure>> {
         lock_state(&self.state).failure_sender.subscribe()
     }
@@ -2049,128 +2046,6 @@ pub(crate) fn canonical_blocked_detail(detail: &BlockedDetail) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("prerequisites_unsatisfied · {prerequisites}")
-}
-
-pub(crate) fn failure_detail(phase: FailurePhase, cause: &StepFailureCause) -> String {
-    format!("{} · {}", phase.as_str(), failure_cause(cause))
-}
-
-fn failure_cause(cause: &StepFailureCause) -> String {
-    match cause {
-        StepFailureCause::Start(cause) => match cause {
-            StepStartFailure::StepUnavailable => "step unavailable".to_owned(),
-            StepStartFailure::PreparationTaskUnavailable => {
-                "preparation task unavailable".to_owned()
-            }
-            StepStartFailure::InputsUnavailable => "inputs unavailable".to_owned(),
-            StepStartFailure::InputPreparation(failure) => {
-                let code = match failure.kind() {
-                    InputPreparationFailureKind::InvalidInputName => "input invalid name",
-                    InputPreparationFailureKind::ValueCountLimitExceeded => {
-                        "input value count limit"
-                    }
-                    InputPreparationFailureKind::ValueSizeLimitExceeded => "input value size limit",
-                    InputPreparationFailureKind::TotalSizeLimitExceeded => "input total size limit",
-                    InputPreparationFailureKind::CollectionOrdinalLimitExceeded => {
-                        "input collection ordinal limit"
-                    }
-                    InputPreparationFailureKind::ValueTypeMismatch => "input type mismatch",
-                    InputPreparationFailureKind::SourceUnavailable => "input source unavailable",
-                    InputPreparationFailureKind::StagingUnavailable => "input staging unavailable",
-                    InputPreparationFailureKind::LiveLimitExceeded => "input live limit",
-                };
-                failure.input_identity().map_or_else(
-                    || code.to_owned(),
-                    |input| format!("{code} · input {input}"),
-                )
-            }
-            StepStartFailure::AgentInput(failure) => format!("agent input · {failure:?}"),
-            StepStartFailure::Agent(failure) => failure.code().replace('_', " "),
-            StepStartFailure::AgentRuntimeUnavailable => "agent runtime unavailable".to_owned(),
-            StepStartFailure::OutputsUnsupported => "outputs unsupported".to_owned(),
-            StepStartFailure::WorkingDirectory(failure) => match failure {
-                WorkingDirectoryFailure::ExecutionRootRebound => "execution root rebound",
-                WorkingDirectoryFailure::Unavailable => "working directory unavailable",
-                WorkingDirectoryFailure::EscapesExecutionRoot => "working directory escape",
-                WorkingDirectoryFailure::NotDirectory => "working directory not directory",
-            }
-            .to_owned(),
-            StepStartFailure::CommandPreparation(failure) => match failure {
-                CommandPreparationFailure::InvalidArgv => "invalid command argv",
-                CommandPreparationFailure::PathNotConfigured => "command PATH unconfigured",
-                CommandPreparationFailure::ExecutableNotFound => "executable not found",
-                CommandPreparationFailure::ExecutableUnavailable => "executable unavailable",
-            }
-            .to_owned(),
-            StepStartFailure::CommandLaunch(failure) => match failure {
-                CommandLaunchFailure::NotFound => "command launch not found",
-                CommandLaunchFailure::PermissionDenied => "command launch permission denied",
-                CommandLaunchFailure::InvalidInput => "command launch invalid input",
-                CommandLaunchFailure::Other => "command launch failed",
-            }
-            .to_owned(),
-        },
-        StepFailureCause::Execution(StepExecutionFailure::Command(failure)) => match failure {
-            CommandExecutionFailure::UnsuccessfulExit { code: Some(code) } => {
-                format!("exit {code}")
-            }
-            CommandExecutionFailure::UnsuccessfulExit { code: None } => {
-                "unsuccessful exit without status".to_owned()
-            }
-            CommandExecutionFailure::Wait => "command wait failed".to_owned(),
-        },
-        StepFailureCause::Execution(StepExecutionFailure::Agent(failure)) => {
-            failure.code().replace('_', " ")
-        }
-        StepFailureCause::Execution(StepExecutionFailure::TaskUnavailable) => {
-            "execution task unavailable".to_owned()
-        }
-        StepFailureCause::RecoveryHandler(_) => "recovery handler failed".to_owned(),
-        StepFailureCause::OutputCapture(failure) => match failure {
-            OutputCaptureFailure::StepUnavailable => "step unavailable".to_owned(),
-            OutputCaptureFailure::UnsupportedOutput => "output unsupported".to_owned(),
-            OutputCaptureFailure::TaskUnavailable => "capture task unavailable".to_owned(),
-            OutputCaptureFailure::Capture(failure) => {
-                let code = match failure.kind() {
-                    CaptureFailureKind::AbsolutePath => "output path absolute",
-                    CaptureFailureKind::LexicalEscape => "output path escape",
-                    CaptureFailureKind::EmptyPath => "output path empty",
-                    CaptureFailureKind::Missing => "output missing",
-                    CaptureFailureKind::SymbolicLink => "output symbolic link",
-                    CaptureFailureKind::NotDirectory => "output parent not directory",
-                    CaptureFailureKind::NotRegularFile => "output not regular file",
-                    CaptureFailureKind::SourceUnavailable => "output source unavailable",
-                    CaptureFailureKind::InvalidTextEncoding => "output invalid UTF-8",
-                    CaptureFailureKind::InvalidJson => "output invalid JSON",
-                    CaptureFailureKind::DuplicateJsonMember => "output duplicate JSON member",
-                    CaptureFailureKind::JsonSchemaMismatch => "output JSON schema mismatch",
-                    CaptureFailureKind::FileCountLimitExceeded => "captured file count limit",
-                    CaptureFailureKind::FileSizeLimitExceeded => "captured file size limit",
-                    CaptureFailureKind::TotalSizeLimitExceeded => "captured total size limit",
-                    CaptureFailureKind::GitCarrierCountLimitExceeded => {
-                        "captured Git carrier count limit"
-                    }
-                    CaptureFailureKind::GitCarrierSizeLimitExceeded => {
-                        "captured Git carrier size limit"
-                    }
-                    CaptureFailureKind::TotalGitCarrierSizeLimitExceeded => {
-                        "captured total Git carrier size limit"
-                    }
-                    CaptureFailureKind::CarrierProducerUnavailable => {
-                        "Git carrier producer unavailable"
-                    }
-                    CaptureFailureKind::StagingUnavailable => "output staging unavailable",
-                };
-                format!("{code} · output {}", failure.output_identity())
-            }
-            OutputCaptureFailure::Git { output, failure } => match failure {
-                GitCaptureFailure::CommandTimedOut(_) => {
-                    format!("{failure} · output {output}")
-                }
-                _ => format!("Git branch capture {failure:?} · output {output}"),
-            },
-        },
-    }
 }
 
 fn completion_detail(detail: String, duration: Option<Duration>) -> String {

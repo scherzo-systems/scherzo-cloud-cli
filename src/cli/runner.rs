@@ -9,6 +9,8 @@ mod status;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use clap::{Args, Subcommand};
 
@@ -53,6 +55,8 @@ enum RunnerCommand {
     Move(MoveCommand),
     #[command(about = "Rename a Scherzo Cloud runner registration")]
     Rename(RenameCommand),
+    #[command(about = "Delete a quiescent Scherzo Cloud runner registration")]
+    Delete(DeleteCommand),
     #[command(about = doctor::ABOUT)]
     Doctor(doctor::Command),
     #[command(about = serve::ABOUT)]
@@ -163,6 +167,23 @@ struct RenameCommand {
     options: CloudOptions,
 }
 
+#[derive(Debug, Args)]
+struct DeleteCommand {
+    #[command(flatten)]
+    target: RegistrationTarget,
+
+    #[arg(
+        long,
+        required = true,
+        action = clap::ArgAction::SetTrue,
+        help = "Confirm permanent runner deletion"
+    )]
+    yes: bool,
+
+    #[command(flatten)]
+    options: CloudOptions,
+}
+
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
@@ -204,6 +225,7 @@ impl Command {
             }
             Some(RunnerCommand::Move(command)) => execute_cloud(command, MoveCommand::execute),
             Some(RunnerCommand::Rename(command)) => execute_cloud(command, RenameCommand::execute),
+            Some(RunnerCommand::Delete(command)) => command.execute(),
             Some(RunnerCommand::Doctor(command)) => command.execute(),
             Some(RunnerCommand::Serve(command)) => command.execute(),
             Some(RunnerCommand::Status(command)) => command.execute(),
@@ -482,6 +504,204 @@ impl RenameCommand {
             api.rename_registration(&organization, &runner, &key, &name)
         })?;
         cloud::write_runner_rename(deployment.fingerprint().api_url(), &result, options.json)
+    }
+}
+
+impl DeleteCommand {
+    fn execute(self) -> super::CommandResult {
+        execute_deletion_command(DeletionInvocation {
+            organization: self.target.organization,
+            resource_ref: self.target.runner,
+            options: self.options,
+            kind: DeletionKind::Runner,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeletionKind {
+    Runner,
+    Pool,
+}
+
+struct DeletionInvocation {
+    organization: String,
+    resource_ref: String,
+    options: CloudOptions,
+    kind: DeletionKind,
+}
+
+struct DeletionDispatchState {
+    resolved_id: Mutex<Option<String>>,
+    dispatched: AtomicBool,
+}
+
+impl DeletionDispatchState {
+    fn new() -> Self {
+        Self {
+            resolved_id: Mutex::new(None),
+            dispatched: AtomicBool::new(false),
+        }
+    }
+
+    fn set_resolved_id(&self, resource_id: String) {
+        *self
+            .resolved_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resource_id);
+    }
+
+    fn resolved_id(&self) -> Option<String> {
+        self.resolved_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+fn execute_pool_deletion(
+    organization: String,
+    pool: String,
+    options: CloudOptions,
+) -> super::CommandResult {
+    execute_deletion_command(DeletionInvocation {
+        organization,
+        resource_ref: pool,
+        options,
+        kind: DeletionKind::Pool,
+    })
+}
+
+fn execute_deletion_command(invocation: DeletionInvocation) -> super::CommandResult {
+    super::execute_deployment_command(
+        Some(invocation),
+        &[NAME],
+        "configure Scherzo Cloud runner deletion",
+        |invocation, deployment| execute_deletion_with_signals(invocation, deployment.clone()),
+    )
+}
+
+fn execute_deletion_with_signals(
+    invocation: DeletionInvocation,
+    deployment: Deployment,
+) -> super::CommandResult {
+    let state = Arc::new(DeletionDispatchState::new());
+    let operation_state = Arc::clone(&state);
+    let signal_state = Arc::clone(&state);
+    let signal_kind = invocation.kind;
+    let signal_json = invocation.options.json;
+    let signal_deployment = deployment.clone();
+    super::execute_mutation_with_signals(
+        "runner deletion",
+        move |cancelled, completed| {
+            execute_deletion_blocking(
+                invocation,
+                &deployment,
+                &operation_state,
+                cancelled,
+                completed,
+            )
+        },
+        move |signal| {
+            if !signal_state.dispatched.load(Ordering::Acquire) {
+                return Ok(signal);
+            }
+            let Some(resource_id) = signal_state.resolved_id() else {
+                return Ok(signal);
+            };
+            cloud::write_deletion_unknown(
+                signal_deployment.fingerprint().api_url(),
+                deletion_target(signal_kind, &resource_id),
+                signal_json,
+                signal,
+            )
+            .map_err(Into::into)
+        },
+    )
+}
+
+fn execute_deletion_blocking(
+    invocation: DeletionInvocation,
+    deployment: &Deployment,
+    state: &DeletionDispatchState,
+    cancelled: &AtomicBool,
+    completed: &AtomicBool,
+) -> super::CommandResult {
+    let transport = invocation.options.http.transport_policy();
+    let resolved = cloud::with_api(deployment, transport, |api| match invocation.kind {
+        DeletionKind::Runner => api
+            .get_registration(&invocation.organization, &invocation.resource_ref)
+            .map(|runner| runner.id),
+        DeletionKind::Pool => api
+            .get_pool(&invocation.organization, &invocation.resource_ref)
+            .map(|pool| pool.id),
+    })?;
+    let resource_id = match resolved {
+        Ok(resource_id) => resource_id,
+        Err(failure) => {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(ExitCode::GeneralFailure);
+            }
+            completed.store(true, Ordering::Release);
+            return cloud::write_failure(
+                deployment.fingerprint().api_url(),
+                &failure,
+                invocation.options.json,
+            )
+            .map_err(Into::into);
+        }
+    };
+    state.set_resolved_id(resource_id.clone());
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(ExitCode::GeneralFailure);
+    }
+    let key = generate_idempotency_key().context("generate runner deletion request identity")?;
+    let result = cloud::with_api(deployment, transport, |api| {
+        state.dispatched.store(true, Ordering::Release);
+        match invocation.kind {
+            DeletionKind::Runner => {
+                api.delete_registration(&invocation.organization, &resource_id, &key)
+            }
+            DeletionKind::Pool => api.delete_pool(&invocation.organization, &resource_id, &key),
+        }
+    })?;
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(ExitCode::GeneralFailure);
+    }
+    completed.store(true, Ordering::Release);
+    let target = deletion_target(invocation.kind, &resource_id);
+    match result {
+        Ok(()) => cloud::write_deletion_success(
+            deployment.fingerprint().api_url(),
+            target,
+            invocation.options.json,
+        ),
+        Err(
+            failure @ (crate::api::RunnerFailure::Unreachable(_)
+            | crate::api::RunnerFailure::Protocol),
+        ) => {
+            let _ = failure;
+            cloud::write_deletion_unknown(
+                deployment.fingerprint().api_url(),
+                target,
+                invocation.options.json,
+                ExitCode::Unavailable,
+            )
+        }
+        Err(failure) => cloud::write_deletion_failure(
+            deployment.fingerprint().api_url(),
+            target,
+            &failure,
+            invocation.options.json,
+        ),
+    }
+    .map_err(Into::into)
+}
+
+fn deletion_target<'a>(kind: DeletionKind, resource_id: &'a str) -> cloud::DeletionTarget<'a> {
+    match kind {
+        DeletionKind::Runner => cloud::DeletionTarget::Runner(resource_id),
+        DeletionKind::Pool => cloud::DeletionTarget::Pool(resource_id),
     }
 }
 

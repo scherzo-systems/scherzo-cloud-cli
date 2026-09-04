@@ -1,3 +1,6 @@
+use std::io;
+
+use reqwest::blocking::Response as BlockingResponse;
 use reqwest::header::HeaderValue;
 use reqwest::{Response, Url};
 use url::Position;
@@ -11,19 +14,8 @@ pub(crate) enum BoundedBodyError {
 }
 
 pub(crate) async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, BoundedBodyError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES_U64)
-    {
-        return Err(BoundedBodyError::TooLarge);
-    }
-
-    let initial_capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or_default()
-        .min(MAX_RESPONSE_BODY_BYTES);
-    let mut body = Vec::with_capacity(initial_capacity);
+    let mut body =
+        bounded_body_buffer(response.content_length()).ok_or(BoundedBodyError::TooLarge)?;
     while let Some(chunk) = response
         .chunk()
         .await
@@ -35,6 +27,55 @@ pub(crate) async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>,
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+pub(crate) fn read_bounded_blocking_body(
+    mut response: BlockingResponse,
+) -> Result<Vec<u8>, BoundedBodyError> {
+    let body = bounded_body_buffer(response.content_length()).ok_or(BoundedBodyError::TooLarge)?;
+    let mut writer = BoundedBodyWriter {
+        body,
+        limit_exceeded: false,
+    };
+    if let Err(error) = response.copy_to(&mut writer) {
+        return Err(if writer.limit_exceeded {
+            BoundedBodyError::TooLarge
+        } else {
+            BoundedBodyError::Transport(error)
+        });
+    }
+    Ok(writer.body)
+}
+
+struct BoundedBodyWriter {
+    body: Vec<u8>,
+    limit_exceeded: bool,
+}
+
+impl io::Write for BoundedBodyWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > MAX_RESPONSE_BODY_BYTES.saturating_sub(self.body.len()) {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("response body exceeds limit"));
+        }
+        self.body.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_body_buffer(content_length: Option<u64>) -> Option<Vec<u8>> {
+    if content_length.is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES_U64) {
+        return None;
+    }
+    let initial_capacity = content_length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(MAX_RESPONSE_BODY_BYTES);
+    Some(Vec::with_capacity(initial_capacity))
 }
 
 pub(crate) fn endpoint(base_url: &str, path: &[&str]) -> Result<Url, ()> {

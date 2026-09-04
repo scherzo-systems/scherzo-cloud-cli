@@ -196,6 +196,7 @@ pub(crate) struct RecoveryDecision {
 }
 
 impl RecoveryDecision {
+    #[cfg(test)]
     pub(crate) fn recheck(summary: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
             kind: RecoveryDecisionKind::Recheck,
@@ -204,6 +205,7 @@ impl RecoveryDecision {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn gave_up(summary: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
             kind: RecoveryDecisionKind::GaveUp,
@@ -362,8 +364,6 @@ impl<Deadline> WorkflowState<Deadline> {
         }
     }
 }
-
-pub(crate) type NotRunReason = NonExecutionCode;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StepState<Output> {
@@ -644,7 +644,6 @@ fn common_step(step: &ValidatedStep) -> &ValidatedCommonStep {
 pub(crate) enum ExportUnavailableReason {
     Failed,
     Blocked,
-    InputUnavailable,
     Skipped,
     NotRun,
     TriggerNotSelected,
@@ -689,29 +688,6 @@ pub(crate) struct FinalizationSummary<Deadline = ()> {
     pub(crate) cancellation: Option<FinalizationCancellation<Deadline>>,
     pub(crate) force_abort: bool,
 }
-
-// Mapping deadlines mirrors WorkflowState because summaries outlive transitions and are
-// projected independently; a shared trait would obscure these two closed contracts.
-// jscpd:ignore-start
-impl<Deadline> FinalizationSummary<Deadline> {
-    pub(crate) fn map_deadline<Mapped>(
-        self,
-        map: impl FnOnce(Deadline) -> Mapped,
-    ) -> FinalizationSummary<Mapped> {
-        FinalizationSummary {
-            trigger: self.trigger,
-            finalizers: self.finalizers,
-            cancellation: self
-                .cancellation
-                .map(|cancellation| FinalizationCancellation {
-                    reason: cancellation.reason,
-                    deadline: cancellation.deadline.map(map),
-                }),
-            force_abort: self.force_abort,
-        }
-    }
-}
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FinalizationRuntime<Deadline> {
@@ -809,6 +785,7 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
         action: ActionId,
         cause: Cause,
     },
+    #[cfg(test)]
     CancellationRequested {
         reason: CancellationReason,
         deadline: Deadline,
@@ -932,6 +909,7 @@ pub(crate) struct Reduction<Provisional, Cause, Output, Deadline> {
     pub(crate) occurrence_accepted: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn initialize<Provisional, Cause, Output, Deadline>(
     admitted: &AdmittedWorkflow,
     initial_cancellation: Option<CancellationRequest<Deadline>>,
@@ -1230,6 +1208,7 @@ where
                 cause,
             );
         }
+        #[cfg(test)]
         Occurrence::CancellationRequested { reason, deadline } => {
             if reason == CancellationReason::FinalizationForceAbort {
                 return false;

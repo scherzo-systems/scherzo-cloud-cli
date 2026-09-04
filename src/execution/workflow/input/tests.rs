@@ -10,7 +10,7 @@ use serde_json::json;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureDeclaration};
 use crate::execution::workflow::resolution;
@@ -68,7 +68,6 @@ impl Fixture {
             ResolvedImports::default(),
             ExecutionContext::new(
                 execution_root.clone(),
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
                 ExecutionPolicyLimits::new(
                     maximum_parallel_steps,
                     CaptureLimits::new(64, 1024 * 1024, 8 * 1024 * 1024),

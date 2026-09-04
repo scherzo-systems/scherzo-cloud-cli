@@ -526,7 +526,7 @@ impl RealPiFixture {
                 "stepId": "agent-step",
                 "invocationId": 0,
                 "profile": "PiJsonV1",
-                "piVersion": "0.84.2",
+                "piVersion": PI_JSON_V1_QUALIFICATION_VERSION,
                 "nativeSession": {
                     "relativeDirectory": "session",
                     "formatVersion": 3

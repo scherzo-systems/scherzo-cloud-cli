@@ -157,10 +157,6 @@ impl LeaseTimerRelease {
 }
 
 #[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "focused lease failure tests select the required controlled fault"
-)]
 impl ControlledLeaseClock {
     pub(super) fn advance(&self, duration: Duration) {
         let nanoseconds = duration_nanoseconds(duration).expect("controlled lease clock duration");
@@ -179,36 +175,12 @@ impl ControlledLeaseClock {
         self.advance(duration);
     }
 
-    pub(super) fn make_clock_unavailable(&self) {
-        self.source
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clock_available = false;
-    }
-
     pub(super) fn make_timer_unavailable(&self) {
         self.source
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .timer_available = false;
-    }
-
-    pub(super) fn make_wait_fail(&self) {
-        self.source
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .wait_available = false;
-    }
-
-    pub(super) fn active_timers(&self) -> usize {
-        self.source
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_timers
     }
 }
 

@@ -4,13 +4,16 @@ use std::path::{Path, PathBuf};
 
 // This harness consumes the shared installation lifecycle but owns all profile policy below.
 // jscpd:ignore-start
+#[cfg(test)]
+use super::harness_installation::validate_installation_with as validate_shared_installation;
 use super::harness_installation::{
     ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
     ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
-    parse_probe_text, validate_installation_with as validate_shared_installation,
-    validate_selected_installation,
+    parse_probe_text,
 };
-use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
+#[cfg(test)]
+use crate::process::CommandRunner;
+use crate::process::{CommandOutput, SystemCommandRunner};
 // jscpd:ignore-end
 
 pub(crate) const CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE: &str = ">=2.1.234 <2.2.0";
@@ -345,15 +348,7 @@ pub(crate) fn discover_and_validate_claude_code_installation()
     discover_and_validate_installation::<ClaudeCodeInstallationProfile>(&SystemCommandRunner)
 }
 
-pub(crate) fn validate_claude_code_installation(
-    selected_executable: &Path,
-) -> Result<ValidatedClaudeCodeInstallation, ClaudeCodeInstallationFailure> {
-    validate_selected_installation::<ClaudeCodeInstallationProfile>(
-        selected_executable,
-        &SystemCommandRunner,
-    )
-}
-
+#[cfg(test)]
 fn validate_claude_code_installation_with(
     selected_executable: &Path,
     search_path: &OsStr,

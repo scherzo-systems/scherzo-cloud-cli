@@ -15,10 +15,6 @@ mod claude_code;
 pub(crate) mod claude_code_stream_json_v1;
 pub(crate) mod codex;
 pub(crate) mod codex_app_server_v1;
-#[allow(
-    dead_code,
-    reason = "conditional syntax remains inert until the coordinated activation"
-)]
 pub(crate) mod condition;
 pub(crate) mod coordinator;
 pub(crate) mod diagnostic;
@@ -108,10 +104,6 @@ pub(crate) struct DecodeFailure {
 impl DecodeFailure {
     pub(crate) fn kind(self) -> DecodeFailureKind {
         self.kind
-    }
-
-    pub(crate) fn diagnostic(self) -> &'static str {
-        self.diagnostic
     }
 
     fn malformed_yaml() -> Self {

@@ -10,7 +10,6 @@
 )]
 
 use std::fs::{self, OpenOptions, Permissions};
-#[cfg(target_os = "linux")]
 use std::io;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -45,6 +44,8 @@ mod organization;
 mod pi_installation;
 #[path = "cli/recovery.rs"]
 mod recovery;
+#[path = "cli/run.rs"]
+mod run_command;
 #[path = "cli/runner_administration.rs"]
 mod runner_administration;
 #[path = "cli/runner_enrollment.rs"]
@@ -75,21 +76,31 @@ const BUILD_IDENTITY: &str = match option_env!("SCHERZO_CLOUD_BUILD_IDENTITY") {
     None => "unknown",
 };
 
-#[cfg(target_os = "linux")]
 struct TestPty {
     master: std::os::fd::OwnedFd,
     slave: std::os::fd::OwnedFd,
 }
 
-#[cfg(target_os = "linux")]
+/// Opens a pseudoterminal pair for terminal-boundary tests.
+///
+/// The peer is opened by name instead of through Linux's `TIOCGPTPEER` ioctl, and close-on-exec
+/// is applied to the controlling end after `posix_openpt`, so the helper builds on every target
+/// the CLI supports rather than only on Linux.
 fn open_test_pty(size: Option<&rustix::termios::Winsize>) -> io::Result<TestPty> {
-    use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
+    use rustix::fs::{Mode, OFlags, open};
+    use rustix::io::{FdFlags, fcntl_setfd};
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
-    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-    let master = openpt(flags)?;
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    fcntl_setfd(&master, FdFlags::CLOEXEC)?;
     grantpt(&master)?;
     unlockpt(&master)?;
-    let slave = ioctl_tiocgptpeer(&master, flags)?;
+    let peer = ptsname(&master, Vec::new())?;
+    let slave = open(
+        peer,
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
     if let Some(size) = size {
         rustix::termios::tcsetwinsize(&slave, *size)?;
     }

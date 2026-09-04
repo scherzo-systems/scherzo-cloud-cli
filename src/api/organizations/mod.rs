@@ -10,7 +10,10 @@ use super::bearer_authorization;
 use super::generated::models as generated_models;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
-use super::problem;
+use super::problem::{
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
+    PROBLEM_MEDIA_TYPE, UNAUTHORIZED,
+};
 use super::{UnreachableCategory, classify_reqwest_error};
 
 pub(crate) use models::{
@@ -21,15 +24,7 @@ pub(crate) use models::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MUTATION_ATTEMPTS: usize = 2;
 const READ_ATTEMPTS: usize = 1;
-const JSON_MEDIA_TYPE: &str = "application/json";
 const MERGE_PATCH_MEDIA_TYPE: &str = "application/merge-patch+json";
-const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
-const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";
-
-const BAD_REQUEST: &str = "https://api.scherzo.dev/problems/bad-request";
-const UNAUTHORIZED: &str = "https://api.scherzo.dev/problems/unauthorized";
-const FORBIDDEN: &str = "https://api.scherzo.dev/problems/forbidden";
-const NOT_FOUND: &str = "https://api.scherzo.dev/problems/not-found";
 const CREATION_NOT_PERMITTED: &str =
     "https://api.scherzo.dev/problems/organization-creation-not-permitted";
 const SLUG_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/slug-unavailable";

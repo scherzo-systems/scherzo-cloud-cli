@@ -12,7 +12,7 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
     clippy::unwrap_used,
     clippy::large_enum_variant,
     clippy::enum_variant_names,
-    reason = "cargo-typify emits reusable schema definitions, public types, enum names, variant sizes, and infallible static regex initialization"
+    reason = "decode_cloud_frame and encode_runner_frame call generated protocol codecs while cargo-typify retains the full schema surface"
 )]
 pub(crate) mod generated;
 
@@ -155,10 +155,6 @@ pub(crate) enum RunnerFrame {
 pub(crate) enum RunnerUnableReason {
     ExecutionEnvironmentUnavailable,
     SourceServiceUnavailable,
-    #[allow(
-        dead_code,
-        reason = "reserved for the Run Inputs materializer that consumes this protocol taxonomy"
-    )]
     InputServiceUnavailable,
     WorkflowEnvironmentUnsupported,
 }
@@ -181,10 +177,6 @@ pub(crate) enum ExecutionSpecInvalidReason {
     InvalidSourceProjection,
     UnsupportedSourceObjectFormat,
     SourceCommitMismatch,
-    #[allow(
-        dead_code,
-        reason = "reserved for provider-confirmed absence; current materialization never infers it from Git diagnostics"
-    )]
     SourceCommitUnavailable,
     SourceCheckoutDirty,
     WorkflowSourceDigestMismatch,
@@ -195,18 +187,10 @@ pub(crate) enum ExecutionSpecInvalidReason {
     )]
     WorkflowContractInvalid,
     WorkflowAdmissionInvalid,
-    #[allow(
-        dead_code,
-        reason = "reserved for the Run Inputs materializer that consumes this protocol taxonomy"
-    )]
     InvalidInputProjection,
-    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
     InputManifestMismatch,
-    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
     InputContentUnavailable,
-    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
     InputContentMismatch,
-    #[allow(dead_code, reason = "reserved for Run Inputs materialization")]
     InputPromptInvalid,
 }
 

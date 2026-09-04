@@ -154,6 +154,7 @@ impl InvocationAccountingLog {
         lock(&self.inner).native_sessions.get(&invocation).cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn recorded_invocations(&self) -> Vec<ActionId> {
         let accounting = lock(&self.inner);
         accounting

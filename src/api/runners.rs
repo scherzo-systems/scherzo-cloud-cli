@@ -1,12 +1,13 @@
 use std::fmt;
 use std::time::Duration;
 
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, TRANSFER_ENCODING};
 use reqwest::{StatusCode, Url};
 use zeroize::Zeroize as _;
 
 use super::generated::apis::{self, runners_api};
 use super::generated::models;
-use super::http_client::categorized_dns_resolver;
+use super::http_client::generated_configuration;
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -37,6 +38,7 @@ pub(crate) type RunnerCredential = models::RunnerCredential;
 pub(crate) type RunnerCredentialList = models::RunnerCredentialList;
 pub(crate) type RunnerCredentialStoredState = models::runner_credential::StoredState;
 pub(crate) type RunnerCredentialEffectiveState = models::runner_credential::EffectiveState;
+pub(crate) type RunnerDeletionBlocker = models::ProblemBlocker;
 
 #[derive(Clone, Copy)]
 pub(crate) enum RunnerRegistrationMode {
@@ -66,18 +68,9 @@ impl RunnerApi {
         if parsed.cannot_be_a_base() || parsed.query().is_some() || parsed.fragment().is_some() {
             return Err(RunnerApiError::InvalidEndpoint);
         }
-        crate::tls::install_provider();
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .dns_resolver(categorized_dns_resolver())
-            .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
-            .build()
-            .map_err(RunnerApiError::BuildClient)?;
-        let mut configuration = apis::configuration::Configuration::new();
-        configuration.base_path = api_url.trim_end_matches('/').to_owned();
-        configuration.bearer_access_token = Some(access_token.to_owned());
-        configuration.client = client;
+        let configuration =
+            generated_configuration(api_url, access_token, transport_policy, REQUEST_TIMEOUT)
+                .map_err(RunnerApiError::BuildClient)?;
         Ok(Self { configuration })
     }
 
@@ -147,6 +140,20 @@ impl RunnerApi {
             models::RenameRunnerPoolPatch::new(name.to_owned()),
         )
         .map_err(classify_runner_error)
+    }
+
+    pub(crate) fn delete_pool(
+        &self,
+        organization: &str,
+        pool_id: &str,
+        idempotency_key: &str,
+    ) -> Result<(), RunnerFailure> {
+        self.delete_resource(
+            organization,
+            pool_id,
+            idempotency_key,
+            RunnerDeletionKind::Pool,
+        )
     }
 
     pub(crate) fn create_registration(
@@ -324,6 +331,20 @@ impl RunnerApi {
         .map_err(classify_runner_error)
     }
 
+    pub(crate) fn delete_registration(
+        &self,
+        organization: &str,
+        runner_id: &str,
+        idempotency_key: &str,
+    ) -> Result<(), RunnerFailure> {
+        self.delete_resource(
+            organization,
+            runner_id,
+            idempotency_key,
+            RunnerDeletionKind::Registration,
+        )
+    }
+
     pub(crate) fn update_registration_mode(
         &self,
         organization: &str,
@@ -371,6 +392,141 @@ impl RunnerApi {
         )
         .map_err(classify_runner_error)
     }
+
+    fn delete_resource(
+        &self,
+        organization: &str,
+        resource_id: &str,
+        idempotency_key: &str,
+        kind: RunnerDeletionKind,
+    ) -> Result<(), RunnerFailure> {
+        let resource_segment = match kind {
+            RunnerDeletionKind::Pool => "runner-pools",
+            RunnerDeletionKind::Registration => "runner-registrations",
+        };
+        let endpoint = format!(
+            "{}/v1/organizations/{}/{}/{}",
+            self.configuration.base_path,
+            apis::urlencode(organization),
+            resource_segment,
+            apis::urlencode(resource_id),
+        );
+        let mut request = self
+            .configuration
+            .client
+            .delete(endpoint)
+            .header("Idempotency-Key", idempotency_key);
+        if let Some(user_agent) = &self.configuration.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, user_agent);
+        }
+        let token = self
+            .configuration
+            .bearer_access_token
+            .as_ref()
+            .ok_or(RunnerFailure::Protocol)?;
+        let response = request
+            .bearer_auth(token)
+            .send()
+            .map_err(|error| RunnerFailure::Unreachable(classify_reqwest_error(&error)))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .bytes()
+            .map_err(|error| RunnerFailure::Unreachable(classify_reqwest_error(&error)))?;
+        if status == StatusCode::NO_CONTENT {
+            return strict_deletion_success(&headers, &body, idempotency_key);
+        }
+        if status.is_success() {
+            return Err(RunnerFailure::Protocol);
+        }
+        Err(classify_deletion_response(status, &body, kind))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RunnerDeletionKind {
+    Pool,
+    Registration,
+}
+
+fn strict_deletion_success(
+    headers: &HeaderMap,
+    body: &[u8],
+    idempotency_key: &str,
+) -> Result<(), RunnerFailure> {
+    let echoed_keys = headers
+        .get_all("Idempotency-Key")
+        .iter()
+        .collect::<Vec<_>>();
+    let content_lengths = headers.get_all(CONTENT_LENGTH).iter().collect::<Vec<_>>();
+    let content_length_valid = content_lengths.is_empty()
+        || (content_lengths.len() == 1 && content_lengths[0].as_bytes() == b"0");
+    if !body.is_empty()
+        || echoed_keys.len() != 1
+        || echoed_keys[0].as_bytes() != idempotency_key.as_bytes()
+        || !content_length_valid
+        || headers.contains_key(CONTENT_TYPE)
+        || headers.contains_key(TRANSFER_ENCODING)
+    {
+        return Err(RunnerFailure::Protocol);
+    }
+    Ok(())
+}
+
+fn classify_deletion_response(
+    status: StatusCode,
+    body: &[u8],
+    kind: RunnerDeletionKind,
+) -> RunnerFailure {
+    if status == StatusCode::CONFLICT
+        && let Ok(decoded) = problem::decode(body, status)
+    {
+        let expected_type = match kind {
+            RunnerDeletionKind::Pool => {
+                "https://api.scherzo.dev/problems/runner-pool-delete-unavailable"
+            }
+            RunnerDeletionKind::Registration => {
+                "https://api.scherzo.dev/problems/runner-registration-delete-unavailable"
+            }
+        };
+        if decoded.r#type == expected_type {
+            let blockers = decoded.blockers.unwrap_or_default();
+            return if valid_deletion_blockers(kind, &blockers) {
+                RunnerFailure::DeletionUnavailable(blockers)
+            } else {
+                RunnerFailure::Protocol
+            };
+        }
+    }
+    classify_runner_response(status, body)
+}
+
+fn valid_deletion_blockers(kind: RunnerDeletionKind, blockers: &[RunnerDeletionBlocker]) -> bool {
+    let allowed: &[RunnerDeletionBlocker] = match kind {
+        RunnerDeletionKind::Pool => &[
+            RunnerDeletionBlocker::RunnerRegistrationsPresent,
+            RunnerDeletionBlocker::ProjectAssignmentsPresent,
+            RunnerDeletionBlocker::NonterminalRunsPresent,
+        ],
+        RunnerDeletionKind::Registration => &[
+            RunnerDeletionBlocker::CapacityReserved,
+            RunnerDeletionBlocker::NonterminalAssignment,
+        ],
+    };
+    if blockers.is_empty() {
+        return false;
+    }
+    let mut next = 0;
+    for blocker in blockers {
+        let Some(offset) = allowed[next..]
+            .iter()
+            .position(|allowed| allowed == blocker)
+        else {
+            return false;
+        };
+        next += offset + 1;
+    }
+    true
 }
 
 fn find_named_resource<T>(
@@ -416,6 +572,7 @@ pub(crate) enum RunnerFailure {
     ActivationUnavailable,
     CredentialTransitionUnavailable,
     PoolMoveUnavailable,
+    DeletionUnavailable(Vec<RunnerDeletionBlocker>),
     Unreachable(UnreachableCategory),
     Protocol,
 }

@@ -2887,9 +2887,9 @@ export default function fixtureWrite(pi: ExtensionAPI): void {
 fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     let pinned_pi = std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
-        .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.2/bin/pi"))
+        .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.4/bin/pi"))
         .unwrap_or_else(|| {
-            panic!("SCHERZO_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.84.2 executable")
+            panic!("SCHERZO_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.84.4 executable")
         });
     let bundle = RunBundle::new(mixed_agent_source());
     for (path, text) in [

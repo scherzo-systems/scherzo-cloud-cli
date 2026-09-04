@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud runner pool delete --help
+Delete an unused Scherzo Cloud runner pool
+
+Usage: scherzo-cloud runner pool delete [OPTIONS] --yes <ORGANIZATION> <POOL>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <POOL>          Runner pool ID or exact name
+
+Options:
+      --yes                  Confirm permanent runner pool deletion
+      --json                 Print the runner result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

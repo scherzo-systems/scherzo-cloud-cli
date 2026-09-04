@@ -1,4 +1,6 @@
-use std::future::{Future, ready};
+use std::future::Future;
+#[cfg(test)]
+use std::future::ready;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -120,6 +122,7 @@ impl AgentProcessContext {
         Self { cwd, environment }
     }
 
+    #[cfg(test)]
     pub(crate) fn cwd(&self) -> &Path {
         self.cwd.provenance_path()
     }
@@ -128,6 +131,7 @@ impl AgentProcessContext {
         self.cwd.protocol_path()
     }
 
+    #[cfg(test)]
     pub(super) fn execution_root_is_bound(&self) -> bool {
         self.cwd.validate_execution_root()
     }
@@ -225,6 +229,7 @@ impl StagedAgentAttachment {
         &self.media_type
     }
 
+    #[cfg(test)]
     pub(crate) fn diagnostic_source_name(&self) -> Option<&str> {
         self.diagnostic_source_name.as_deref()
     }
@@ -477,6 +482,7 @@ impl AgentObservationEnvelope {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn run(&self) -> &WorkflowRunId {
         self.identity.run()
     }
@@ -514,9 +520,11 @@ pub(crate) trait AgentObservationSink: Clone + Send + Sync + 'static {
     fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send;
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NoopAgentObservationSink;
 
+#[cfg(test)]
 impl AgentObservationSink for NoopAgentObservationSink {
     fn observe(&self, _observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
         ready(())
@@ -752,6 +760,7 @@ impl BoundedAgentResponse {
         Self(value)
     }
 
+    #[cfg(test)]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -908,10 +917,6 @@ impl AgentFailure {
     pub(crate) fn protocol_rejection(&self) -> Option<&AgentProtocolRejectionDiagnostic> {
         self.protocol_rejection.as_deref()
     }
-
-    pub(crate) fn code(&self) -> &'static str {
-        self.cause.code()
-    }
 }
 
 impl From<AgentFailureCause> for AgentFailure {
@@ -954,22 +959,6 @@ pub(crate) fn check_agent_input_bound(
         });
     }
     Ok(())
-}
-
-impl AgentFailureCause {
-    pub(crate) fn code(&self) -> &'static str {
-        match self {
-            Self::HarnessStartFailed | Self::HarnessSetupFailed { .. } => "harness_start_failed",
-            Self::HarnessInputTooLarge { .. } => "harness_input_too_large",
-            Self::HarnessFailed { .. } => "harness_failed",
-            Self::HarnessProtocolFailed => "harness_protocol_failed",
-            Self::MissingResponse => "missing_response",
-            Self::MissingResult => "missing_result",
-            Self::ResultValidationLimitExceeded { .. } => "result_validation_limit_exceeded",
-            Self::CapturedValueTooLarge => "captured_value_too_large",
-            Self::ResultSettlementFailed => "result_settlement_failed",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

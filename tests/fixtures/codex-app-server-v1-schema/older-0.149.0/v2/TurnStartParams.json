@@ -1,0 +1,37 @@
+{
+  "properties": {
+    "approvalPolicy": {},
+    "cwd": {},
+    "effort": {},
+    "input": {},
+    "model": {},
+    "outputSchema": {},
+    "sandboxPolicy": {},
+    "threadId": {}
+  },
+  "definitions": {
+    "ReasoningEffort": {
+      "type": "string",
+      "minLength": 1
+    },
+    "SandboxPolicy": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": { "enum": ["externalSandbox"] },
+            "networkAccess": {}
+          }
+        }
+      ]
+    },
+    "TextInput": {
+      "properties": { "type": { "enum": ["text"] } }
+    },
+    "LocalImageInput": {
+      "properties": { "type": { "enum": ["localImage"] } }
+    },
+    "MentionInput": {
+      "properties": { "type": { "enum": ["mention"] } }
+    }
+  }
+}

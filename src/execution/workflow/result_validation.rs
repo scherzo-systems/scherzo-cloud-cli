@@ -198,6 +198,7 @@ where
         let deadline = clock.now().add(self.deadline.get());
         let request = ValidationWorkerRequest {
             schema: self.schema.clone(),
+            #[cfg(test)]
             candidate: Arc::clone(&candidate),
             canonical_json: Arc::clone(&canonical_json),
             maximum_feedback_bytes: self.maximum_feedback_bytes,
@@ -307,6 +308,7 @@ pub(crate) trait RunningResultValidation: Send + 'static {
 #[derive(Clone)]
 pub(crate) struct ValidationWorkerRequest {
     schema: RetainedJsonSchema,
+    #[cfg(test)]
     candidate: Arc<Value>,
     canonical_json: Arc<[u8]>,
     maximum_feedback_bytes: NonZeroU64,

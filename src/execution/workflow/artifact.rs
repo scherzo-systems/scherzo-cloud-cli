@@ -28,6 +28,7 @@ use super::private_staging::{
 use super::result_validation::RetainedJsonSchema;
 use super::schema_common::lowercase_hex;
 use super::strict_json;
+#[cfg(test)]
 use super::validated::WorkflowValueType;
 use super::value::{CapturedJson, CapturedText, CapturedValue};
 
@@ -269,6 +270,7 @@ impl Drop for ArtifactLease {
 }
 
 impl ArtifactHandle {
+    #[cfg(test)]
     pub(crate) fn opaque_id(&self) -> &str {
         &self.artifact_identity
     }
@@ -302,6 +304,7 @@ impl StagedCarrier {
         &self.handle
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &str {
         self.handle.opaque_id()
     }
@@ -447,6 +450,7 @@ impl GitBranchCarrier {
         self.staged.handle()
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &str {
         self.staged.identity()
     }
@@ -459,6 +463,7 @@ impl GitBranchCarrier {
         self.staged.media_type()
     }
 
+    #[cfg(test)]
     pub(crate) fn budget_class(&self) -> CarrierBudgetClass {
         self.staged.budget_class()
     }
@@ -666,6 +671,7 @@ pub(crate) enum PathCaptureProfile<'a> {
 }
 
 impl<'a> PathCaptureProfile<'a> {
+    #[cfg(test)]
     pub(crate) const fn value_type(self) -> WorkflowValueType {
         match self {
             Self::Text => WorkflowValueType::Text,
@@ -682,6 +688,7 @@ impl<'a> PathCaptureProfile<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn json_schema(self) -> Option<&'a RetainedJsonSchema> {
         match self {
             Self::Json { schema } => Some(schema),
@@ -1017,6 +1024,7 @@ impl ArtifactStaging {
         self.inner.execution_root.is_same_directory(root)
     }
 
+    #[cfg(test)]
     pub(crate) fn capture_files(
         &self,
         declarations: &[CaptureDeclaration<'_>],
@@ -1982,10 +1990,12 @@ impl ArtifactStaging {
         Ok(File::from(opened))
     }
 
+    #[cfg(test)]
     pub(super) fn discard(&self, artifact: &CapturedArtifact) {
         self.discard_carrier(artifact.carrier());
     }
 
+    #[cfg(test)]
     fn discard_carrier(&self, carrier: &StagedCarrier) {
         if carrier.handle.store_identity == self.inner.store_identity
             && self

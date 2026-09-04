@@ -9,6 +9,7 @@ Commands:
   artifact      Work with portable workflow artifacts
   auth          Manage your Scherzo Cloud sign-in
   organization  Manage Scherzo Cloud organizations
+  run           Work with Scherzo Cloud runs
   version       Print version information
   runner        Work with the Scherzo Cloud runner
   workflow      Work with local workflow definitions and runs

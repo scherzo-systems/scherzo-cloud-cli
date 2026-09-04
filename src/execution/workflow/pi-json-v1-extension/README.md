@@ -21,15 +21,17 @@ From the exported CLI root, run the canonical package check:
 ./scripts/check-pi-json-v1-extension
 ```
 
-The script installs exactly `package-lock.json` with lifecycle scripts disabled, then
-runs formatting, linting, TypeScript checking against Pi 0.84.2, generated-fixture
-checking, and Node's built-in test runner.
+The script copies the package into an invocation-local temporary tree, installs exactly
+`package-lock.json` with lifecycle scripts disabled, then runs formatting, linting,
+TypeScript checking against Pi 0.84.4, generated-fixture checking, and Node's built-in
+test runner. Formatting installs its tools in a separate temporary tree, so concurrent
+repository checks never share or mutate a source-tree `node_modules` directory.
 
 The pinned Devenv environment supplies Node 24. After the locked install, the script
 sets npm's offline mode for all package checks so lint, formatting, type-checking,
 generation checking, and tests cannot resolve a missing package from a registry.
 The source tree also type-checks the qualification-only fake provider against the
-exact Pi 0.84.2 extension and provider APIs. That provider communicates only through
+exact Pi 0.84.4 extension and provider APIs. That provider communicates only through
 framed local Unix sockets and is copied into isolated test projects by the Rust
 conformance suite; it is never available to workflow configuration.
 

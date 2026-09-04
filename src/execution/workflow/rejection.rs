@@ -243,7 +243,6 @@ impl<'a> RejectionLocation<'a> {
 
     fn from_admission(location: &'a AdmissionLocation) -> Option<Self> {
         match location {
-            AdmissionLocation::Workflow => Some(Self::simple("workflow")),
             AdmissionLocation::PromptImport => Some(Self::simple("prompt_import")),
             AdmissionLocation::AttachmentImport { index } => Some(Self {
                 index: Some(*index),
@@ -771,7 +770,7 @@ mod tests {
     fn codex_installation_rejection_uses_the_closed_profile_identity() {
         let failure =
             AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {
-                incompatibility: CodexIncompatibility::Version("0.150.0".to_owned()),
+                incompatibility: CodexIncompatibility::Version("0.154.0".to_owned()),
                 identity: None,
             });
 

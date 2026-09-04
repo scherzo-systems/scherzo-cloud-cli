@@ -6,8 +6,9 @@ This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, OAuth Device Authorization, server-confirmed
 authentication status, explicit human-principal signup, revoking logout, organization
-profile management, one-page active member-directory reads, local Workflow V1
-definition validation, and an outbound, enrolled runner transport.
+profile management, one-page active member-directory reads, inputless Cloud run creation
+and current projection reads, local Workflow V1 definition validation, and an outbound,
+enrolled runner transport.
 `scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
 acknowledges received assignment effects, and uses the shared workflow resolver,
 admission boundary, and execution engine for one configured inputless command, Pi,
@@ -86,11 +87,13 @@ only so an environment-based launcher can resolve its interpreter; they never us
 select another harness candidate.
 
 Pi maps canonical stable versions in `>=0.84.2 <0.85.0` into
-`ValidatedPiInstallation`. Claude Code maps canonical stable versions in
+`ValidatedPiInstallation`; the repository separately qualifies exact release `0.84.4`.
+Claude Code maps canonical stable versions in
 `>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
-qualifies exact release `2.1.259`. Codex maps stable `>=0.147.0 <0.150.0`
+qualifies exact release `2.1.259`. Codex maps stable `>=0.147.0 <0.154.0`
 installations with the maintained App Server schema capabilities into
-`ValidatedCodexInstallation`. Each immutable value carries the absolute path, exact
+`ValidatedCodexInstallation`; the repository separately qualifies exact release
+`0.153.0`. Each immutable value carries the absolute path, exact
 observed version, closed profile, and closed capability set. Local and runner admission
 inspect resolved workflows and require only each selected installation. Admission and
 later execution use those values without another `PATH` lookup or native probe, so later
@@ -310,7 +313,10 @@ decode successful API representations, then converts successes into validated
 handwritten organization and membership models. It owns route-specific outcomes,
 problem classification, opaque path and query construction, bounded responses, and the
 mutation retry contract. Generated blocking organization transport is not called by the
-command layer.
+command layer. The Run API adapter similarly owns status, receipt-header, response-size,
+and projection validation around generated request and response DTOs. API contract
+validation reuses the crate's shared public-ID syntax validator rather than defining a
+second ID policy inside the API boundary.
 
 ## Rust source shape
 
@@ -351,41 +357,33 @@ compile time, and both `scherzo-cloud version` and `scherzo-cloud --version` rea
 version. Structured version output also reports the resolved executable path and
 separately injected build identity. Packaging must verify the installed executable
 reports these exact values. `scripts/check-release` validates static policy and fallback
-consistency. Release-only planning may observe stable state after source validation, but
-a stale observation requires fresh approval rather than a source edit.
+consistency. Release-only planning observes stable state after source validation and binds that
+snapshot into an untagged candidate commit. Public `main` is a rolling candidate rather
+than a release reservation. Managed Buildkite reads canonical source and private journal
+objects as data, verifies the canonical source-evidence artifact, renders notes, and
+advances only public `main` with a force-with-lease. Its ordered candidate contract binds
+the exact source revision and CLI tree, journal selection, public parent, stable refs,
+latest complete release, proposed version, and release notes. It creates no tag, release,
+or metadata ref.
 
-Managed Buildkite is the sole allocator. An allocation mirror names an append-only
-`refs/heads/release-allocations/<plan-digest>` orphan record whose ordered contract 2 and
-`rendered-notes.md` bind the approved source revision and tree, parent public state,
-stable-ref and prior-release snapshots, policy, exact version and tag, and release body.
-Public GitHub Actions verifies those bytes and arithmetic without selecting a version.
-Push triggers ignore the `release-allocations/**` and `release-recoveries/**` metadata
-branches; only the accompanying public `main` push can start normal release execution.
-Pull requests, ordinary checks, metadata-ref creation, and a recovery-mirror push remain
-read-only. Provider rules permit each content-addressed metadata ref to be created once
-but forbid updates and deletion. Only the final reconcile job receives `contents: write`
-after exact verification and native builds pass.
-
-The three release builds check out the original allocated mirror, including during
-recovery, and build x86-64 and ARM64 Linux plus Apple Silicon macOS archives. Archives
+Public GitHub Actions verifies the candidate contract and compiles every target, including
+macOS, before any release approval or write. The three release builds check out that exact
+candidate and build x86-64 and ARM64 Linux plus Apple Silicon macOS archives. Archives
 have a canonical inventory and metadata so a transient retry reproduces the same asset
-bytes. The reconcile job accepts only an absent release, an exact tag-only partial state,
-or a matching draft containing an unchanged subset of the four expected assets. It
-creates or completes the draft, verifies archive digests and `SHA256SUMS`, attests the
-four assets, and publishes. A tag at another commit, unrelated stable-tag
-movement, changed notes or identity, unexpected or changed assets, a conflicting draft,
-or a mismatched published release fails before a contents write. An exact published
-release is a successful no-op; stable tags and published releases are never moved or
-edited.
+bytes. Only the final job names the protected `cli-release` environment and receives
+`contents: write` after a human approves its rendered notes.
 
-A permanent verifier or reconciler defect is repaired without reallocating. Managed
-Buildkite may mirror only the workflow, verifier, reconciler, focused allocation test,
-and data fixtures named by recovery contract 1, after a separate approval. Each
-content-addressed recovery record names its exact predecessor and the original allocation.
-Exact `workflow_dispatch` recovery must run from current public `main`, verify the whole
-chain, accept the original allocated mirror as a lowercase commit input, and build and tag
-that original mirror rather than the repaired commit. Signing, notarization, installers,
-package-manager metadata, and update channels remain separate decisions.
+Before creating an absent tag, reconciliation requires the candidate to remain current
+public `main`. A pre-tag failure is repaired by advancing `main` to a corrected candidate;
+no version or recovery state blocks it. Once an exact direct tag exists, reconciliation
+accepts only tag-only state or a matching draft containing an unchanged subset of the four
+expected assets. It creates or completes the draft, verifies archive digests and
+`SHA256SUMS`, attests the four assets, and publishes. A tag at another commit, unrelated
+stable-tag movement, changed notes or identity, unexpected or changed assets, a
+conflicting draft, or a mismatched published release fails before a contents write. An
+exact published release is a successful no-op; stable tags and published releases are
+never moved or edited. Signing, notarization, installers, package-manager metadata, and
+update channels remain separate decisions.
 
 The runner and execution components should use owned state and explicit message passing
 rather than shared mutable global state. Protocol DTOs must be translated into domain

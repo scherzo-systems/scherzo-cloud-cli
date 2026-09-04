@@ -22,8 +22,8 @@ use crate::execution::codex::ValidatedCodexInstallation;
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits,
-    ResolvedAttachment, ResolvedImports, admit_local_workflow, admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports,
+    admit_local_workflow, admit_workflow,
 };
 use crate::execution::workflow::agent::scripted::{
     ScriptedAgentDispatcher, ScriptedAgentValue, scripted_agent_dispatcher,
@@ -307,7 +307,6 @@ fn execution_fixture_with_source_files(
         imports,
         ExecutionContext::new(
             execution_root.clone(),
-            ExecutionRootLifecycle::CallerOwnedRetained,
             ExecutionPolicyLimits::new(
                 parallelism,
                 CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
@@ -695,7 +694,6 @@ async fn configured_inactive_local_recovery_preserves_target_execution() {
         ResolvedImports::default(),
         ExecutionContext::new(
             fixture.execution_root.clone(),
-            ExecutionRootLifecycle::CallerOwnedRetained,
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),

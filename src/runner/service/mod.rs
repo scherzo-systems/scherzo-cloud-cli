@@ -92,10 +92,6 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 );
 
 pub(crate) trait Sleeper: Send + Sync {
-    #[allow(
-        dead_code,
-        reason = "deterministic transport tests inspect their logical sleep clock"
-    )]
     fn now(&self) -> std::time::Instant;
     fn utc_now(&self) -> time::OffsetDateTime;
     fn sleep(&self, duration: std::time::Duration) -> SleepFuture<'_>;

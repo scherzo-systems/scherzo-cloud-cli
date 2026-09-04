@@ -13,7 +13,9 @@ use crate::execution::codex::{
     CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CodexCompatibilityProfile,
     ValidatedCodexInstallation,
 };
-use crate::execution::pi::{PiCapability, PiCompatibilityProfile, ValidatedPiInstallation};
+use crate::execution::pi::{
+    PI_JSON_V1_QUALIFICATION_VERSION, PiCapability, PiCompatibilityProfile, ValidatedPiInstallation,
+};
 use crate::execution::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use crate::execution::workflow::codex::CodexConfig;
 use crate::execution::workflow::pi::Thinking;
@@ -136,18 +138,8 @@ impl WorkflowFixture {
         resolution::resolve(&self.source_root, Path::new("workflow.yaml")).unwrap()
     }
 
-    fn context(
-        &self,
-        lifecycle: ExecutionRootLifecycle,
-        maximum_parallel_steps: usize,
-        grace: Duration,
-    ) -> ExecutionContext {
-        execution_context(
-            self.execution_root.clone(),
-            lifecycle,
-            maximum_parallel_steps,
-            grace,
-        )
+    fn context(&self, maximum_parallel_steps: usize, grace: Duration) -> ExecutionContext {
+        execution_context(self.execution_root.clone(), maximum_parallel_steps, grace)
     }
 }
 
@@ -310,11 +302,7 @@ fn admission_partitions_durable_stream_bytes_before_capture() {
     let admitted = admit_workflow(
         resolved,
         ResolvedImports::default(),
-        fixture.context(
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
-            1,
-            Duration::from_secs(1),
-        ),
+        fixture.context(1, Duration::from_secs(1)),
     )
     .unwrap();
 
@@ -339,11 +327,7 @@ fn admission_requires_pi_only_for_graphs_containing_agent_steps() {
             } else {
                 ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([]))
             };
-            let mut context = fixture.context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            );
+            let mut context = fixture.context(1, Duration::from_secs(1));
             if supply_installation {
                 // A validated value is sufficient even when its pinned path no longer exists.
                 context = context.with_pi_installation(ValidatedPiInstallation::fixture(
@@ -386,11 +370,7 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
         resolved.clone(),
         ResolvedImports::default(),
         fixture
-            .context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            )
+            .context(1, Duration::from_secs(1))
             .with_capacity_budget(exact)
             .with_pi_installation(installation.clone()),
     )
@@ -406,11 +386,7 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
         resolved.clone(),
         ResolvedImports::default(),
         fixture
-            .context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            )
+            .context(1, Duration::from_secs(1))
             .with_capacity_budget(exact)
             .with_pi_installation(installation),
     )
@@ -424,7 +400,6 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
         runner.capacity().execution_contract.as_str(),
         "workflow_v1_cloud_inputs_artifacts@1"
     );
-    assert!(runner.has_recovery());
 }
 
 #[test]
@@ -465,11 +440,7 @@ fn maximal_handler_workflow_admits_exact_cloud_capacity() {
         resolved,
         ResolvedImports::default(),
         fixture
-            .context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            )
+            .context(1, Duration::from_secs(1))
             .with_capacity_budget(exact)
             .with_pi_installation(ValidatedPiInstallation::fixture(
                 fixture.execution_root.join("pi"),
@@ -492,13 +463,7 @@ fn admission_rejects_capacity_reused_after_source_closure_changes() {
         "injected-after-resolution.txt".to_owned(),
         Arc::from(b"changed closure bytes".as_slice()),
     );
-    let context = || {
-        fixture.context(
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
-            1,
-            Duration::from_secs(1),
-        )
-    };
+    let context = || fixture.context(1, Duration::from_secs(1));
 
     let local = admit_local_workflow(resolved.clone(), ResolvedImports::default(), context());
     let runner = admit_runner_workflow(resolved, ResolvedImports::default(), context());
@@ -524,13 +489,7 @@ fn admission_rejects_recovery_placement_capacity_and_binding_before_execution() 
     .unwrap();
     let resolved = fixture.resolve();
     let exact = WorkflowCapacityBudget::exact(&resolved.capacity);
-    let context = || {
-        fixture.context(
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
-            1,
-            Duration::from_secs(1),
-        )
-    };
+    let context = || fixture.context(1, Duration::from_secs(1));
 
     assert_failure(
         admit_local_workflow(
@@ -632,7 +591,6 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
         ResolvedImports::default(),
         ExecutionContext::new(
             fixture.execution_root.clone(),
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
             ExecutionPolicyLimits::new(
                 2,
                 CaptureLimits::new(11, 3 * 1024 * 1024, 9 * 1024 * 1024).with_git_carrier_limits(
@@ -661,7 +619,10 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
             step.installation().executable(),
             recorder.path().join("validated-pi")
         );
-        assert_eq!(step.installation().version().as_str(), "0.84.2");
+        assert_eq!(
+            step.installation().version().as_str(),
+            PI_JSON_V1_QUALIFICATION_VERSION
+        );
         assert_eq!(
             step.installation().profile(),
             PiCompatibilityProfile::PiJsonV1
@@ -677,10 +638,6 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
             format!("future-provider/unknown-model-{index}")
         );
         assert_eq!(step.configuration().thinking, *thinking);
-        assert_eq!(
-            step.project_trust(),
-            ProjectTrustPolicy::InvocationScopedEnabled
-        );
         assert_eq!(
             step.limits().maximum_system_prompt_bytes().get(),
             MAXIMUM_AGENT_PROMPT_BYTES
@@ -769,11 +726,7 @@ fn internal_claude_admission_retains_native_effort_and_profile_limits() {
         resolved,
         ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([])),
         fixture
-            .context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            )
+            .context(1, Duration::from_secs(1))
             .with_claude_code_installation(installation.clone()),
     )
     .unwrap();
@@ -816,11 +769,7 @@ fn codex_admission_preserves_the_exact_installation_configuration_and_limits() {
         resolved,
         ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([])),
         fixture
-            .context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            )
+            .context(1, Duration::from_secs(1))
             .with_codex_installation(installation.clone()),
     )
     .unwrap();
@@ -889,7 +838,6 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
         imports,
         ExecutionContext::new(
             fixture.execution_root.join("."),
-            ExecutionRootLifecycle::CallerOwnedRetained,
             ExecutionPolicyLimits::new(
                 3,
                 CaptureLimits::new(17, 2 * 1024 * 1024, 8 * 1024 * 1024),
@@ -908,10 +856,6 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
     assert_eq!(
         admitted.execution().root(),
         fs::canonicalize(&fixture.execution_root).unwrap()
-    );
-    assert_eq!(
-        admitted.execution().root_lifecycle(),
-        ExecutionRootLifecycle::CallerOwnedRetained
     );
     assert_eq!(
         admitted.execution().limits().maximum_parallel_steps().get(),
@@ -1033,12 +977,7 @@ fn admission_rejects_each_invalid_execution_root_kind() {
         admit_workflow(
             missing.resolve(),
             ResolvedImports::default(),
-            execution_context(
-                missing_root,
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            ),
+            execution_context(missing_root, 1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::ExecutionRootUnavailable,
         AdmissionLocation::ExecutionRoot,
@@ -1051,12 +990,7 @@ fn admission_rejects_each_invalid_execution_root_kind() {
         admit_workflow(
             file.resolve(),
             ResolvedImports::default(),
-            execution_context(
-                file_root,
-                ExecutionRootLifecycle::EngineOwnedRetained,
-                1,
-                Duration::from_secs(1),
-            ),
+            execution_context(file_root, 1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::ExecutionRootNotDirectory,
         AdmissionLocation::ExecutionRoot,
@@ -1070,11 +1004,7 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
         admit_workflow(
             zero_parallelism.resolve(),
             ResolvedImports::default(),
-            zero_parallelism.context(
-                ExecutionRootLifecycle::EngineOwnedRetained,
-                0,
-                Duration::from_secs(1),
-            ),
+            zero_parallelism.context(0, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::NonPositiveParallelism,
         AdmissionLocation::MaximumParallelSteps,
@@ -1110,7 +1040,6 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
                 ResolvedImports::default(),
                 ExecutionContext::new(
                     fixture.execution_root.clone(),
-                    ExecutionRootLifecycle::EngineOwnedRetained,
                     ExecutionPolicyLimits::new(
                         1,
                         CaptureLimits::new(captured_files, file_bytes, total_bytes),
@@ -1156,7 +1085,6 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
                 ResolvedImports::default(),
                 ExecutionContext::new(
                     fixture.execution_root.clone(),
-                    ExecutionRootLifecycle::EngineOwnedRetained,
                     ExecutionPolicyLimits::new(
                         1,
                         CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024)
@@ -1214,7 +1142,6 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
                 ResolvedImports::default(),
                 ExecutionContext::new(
                     fixture.execution_root.clone(),
-                    ExecutionRootLifecycle::EngineOwnedRetained,
                     ExecutionPolicyLimits::new(
                         1,
                         CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
@@ -1237,7 +1164,6 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
             ResolvedImports::default(),
             ExecutionContext::new(
                 zero_log_limit.execution_root.clone(),
-                ExecutionRootLifecycle::EngineOwnedRetained,
                 ExecutionPolicyLimits::new(
                     1,
                     CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
@@ -1257,11 +1183,7 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
         admit_workflow(
             short_grace.resolve(),
             ResolvedImports::default(),
-            short_grace.context(
-                ExecutionRootLifecycle::EngineOwnedRetained,
-                1,
-                MINIMUM_CANCELLATION_GRACE - Duration::from_nanos(1),
-            ),
+            short_grace.context(1, MINIMUM_CANCELLATION_GRACE - Duration::from_nanos(1)),
         ),
         AdmissionFailureKind::CancellationGraceTooShort,
         AdmissionLocation::CancellationPolicy,
@@ -1272,11 +1194,7 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
         admit_workflow(
             excessive_grace.resolve(),
             ResolvedImports::default(),
-            excessive_grace.context(
-                ExecutionRootLifecycle::EngineOwnedRetained,
-                1,
-                MAXIMUM_CANCELLATION_GRACE + Duration::from_nanos(1),
-            ),
+            excessive_grace.context(1, MAXIMUM_CANCELLATION_GRACE + Duration::from_nanos(1)),
         ),
         AdmissionFailureKind::CancellationGraceTooLong,
         AdmissionLocation::CancellationPolicy,
@@ -1290,11 +1208,7 @@ fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations(
         admit_workflow(
             missing_prompt.resolve(),
             ResolvedImports::default(),
-            missing_prompt.context(
-                ExecutionRootLifecycle::CallerOwnedRetained,
-                1,
-                Duration::from_secs(1),
-            ),
+            missing_prompt.context(1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::MissingRequiredPrompt,
         AdmissionLocation::PromptImport,
@@ -1305,11 +1219,7 @@ fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations(
         admit_workflow(
             agent.resolve(),
             ResolvedImports::default(),
-            agent.context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            ),
+            agent.context(1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::MissingRequiredPrompt,
         AdmissionLocation::PromptImport,
@@ -1318,11 +1228,7 @@ fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations(
         admit_workflow(
             agent.resolve(),
             ResolvedImports::new(Some(Arc::<str>::from("Prompt.")), Arc::from([])),
-            agent.context(
-                ExecutionRootLifecycle::EngineOwnedEphemeral,
-                1,
-                Duration::from_secs(1),
-            ),
+            agent.context(1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::AgentStepRuntimeUnsupported,
         AdmissionLocation::Step {
@@ -1349,33 +1255,11 @@ fn admission_rejects_invalid_attachment_media_type() {
         admit_workflow(
             fixture.resolve(),
             imports,
-            fixture.context(
-                ExecutionRootLifecycle::CallerOwnedRetained,
-                1,
-                Duration::from_secs(1),
-            ),
+            fixture.context(1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::InvalidAttachmentMediaType,
         AdmissionLocation::AttachmentImport { index: 1 },
     );
-}
-
-#[test]
-fn admitted_root_lifecycle_preserves_each_closed_ownership_variant() {
-    for lifecycle in [
-        ExecutionRootLifecycle::CallerOwnedRetained,
-        ExecutionRootLifecycle::EngineOwnedRetained,
-        ExecutionRootLifecycle::EngineOwnedEphemeral,
-    ] {
-        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
-        let admitted = admit_workflow(
-            fixture.resolve(),
-            ResolvedImports::default(),
-            fixture.context(lifecycle, 1, MAXIMUM_CANCELLATION_GRACE),
-        )
-        .unwrap();
-        assert_eq!(admitted.execution().root_lifecycle(), lifecycle);
-    }
 }
 
 #[test]
@@ -1419,13 +1303,11 @@ fn workflow_admission_reserves_only_engine_environment_variables() {
 
 fn execution_context(
     root: PathBuf,
-    lifecycle: ExecutionRootLifecycle,
     maximum_parallel_steps: usize,
     grace: Duration,
 ) -> ExecutionContext {
     ExecutionContext::new(
         root,
-        lifecycle,
         ExecutionPolicyLimits::new(
             maximum_parallel_steps,
             CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),

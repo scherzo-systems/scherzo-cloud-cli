@@ -236,6 +236,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 cause,
             },
             Occurrence::StepQuiesced { step, action } => Occurrence::StepQuiesced { step, action },
+            #[cfg(test)]
             Occurrence::CancellationRequested { deadline, .. } => match deadline {},
             Occurrence::CancellationOperationRequested {
                 operation: _,
@@ -316,8 +317,9 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
             Occurrence::StepQuiesced { action, .. } => {
                 (*action, DriverOccurrenceKind::StepQuiesced, None)
             }
-            Occurrence::CancellationRequested { deadline, .. }
-            | Occurrence::CancellationOperationRequested { deadline, .. }
+            #[cfg(test)]
+            Occurrence::CancellationRequested { deadline, .. } => match *deadline {},
+            Occurrence::CancellationOperationRequested { deadline, .. }
             | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
         };
         DriverOccurrenceIdentity {
@@ -445,6 +447,7 @@ impl<Provisional, Cause, Output> DriverOccurrenceDelivery<Provisional, Cause, Ou
         }
     }
 
+    #[cfg(test)]
     async fn resolve(self) -> Option<ResolvedDriverOccurrence<Provisional, Cause, Output>> {
         self.select()?.resolve().await
     }
@@ -552,6 +555,7 @@ impl DriverOccurrenceTestAcknowledgement {
 }
 
 impl<Provisional, Cause, Output> OccurrenceReceiver<Provisional, Cause, Output> {
+    #[cfg(test)]
     pub(crate) async fn recv(&mut self) -> Option<DriverOccurrence<Provisional, Cause, Output>> {
         loop {
             let delivery = self.recv_delivery().await?;

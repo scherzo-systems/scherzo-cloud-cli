@@ -902,7 +902,6 @@ pub(crate) trait DurableDeadline {
 
 pub(crate) struct LocalAttemptOwner {
     normalized: PathBuf,
-    root: Arc<OwnedFd>,
     lock: Option<File>,
     private_directory: PathBuf,
     attempt_directory: OwnedFd,
@@ -1098,8 +1097,9 @@ impl LocalAttemptOwner {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn root_handle(&self) -> &OwnedFd {
-        &self.root
+        &self.state.root
     }
 
     fn release_lock(&mut self) {
@@ -1545,7 +1545,6 @@ fn create_with_observer(
         .join("result");
     Ok(LocalAttemptOwner {
         normalized: target.normalized,
-        root,
         lock: Some(lock),
         private_directory,
         attempt_directory,
@@ -3548,7 +3547,6 @@ fn begin_local_retry(
         .join("result");
     Ok(LocalAttemptOwner {
         normalized: pending.normalized,
-        root: pending.root,
         lock: Some(pending.lock),
         private_directory,
         attempt_directory,

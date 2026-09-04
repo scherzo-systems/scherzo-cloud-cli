@@ -4,8 +4,8 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::api::{
-    HttpTransportPolicy, RunnerApi, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
-    RunnerRegistrationList,
+    HttpTransportPolicy, RunnerApi, RunnerDeletionBlocker, RunnerFailure, RunnerPool,
+    RunnerPoolList, RunnerRegistration, RunnerRegistrationList,
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
@@ -366,12 +366,98 @@ fn enum_text(value: &impl Serialize) -> anyhow::Result<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DeletionTarget<'a> {
+    Runner(&'a str),
+    Pool(&'a str),
+}
+
+pub(super) fn write_deletion_success(
+    deployment: &str,
+    target: DeletionTarget<'_>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        match target {
+            DeletionTarget::Runner(runner_id) => write_json(&RunnerDeletionSuccess {
+                schema_version: 1,
+                deployment,
+                outcome: "deleted",
+                runner_id,
+                deleted: true,
+            })?,
+            DeletionTarget::Pool(runner_pool_id) => write_json(&PoolDeletionSuccess {
+                schema_version: 1,
+                deployment,
+                outcome: "deleted",
+                runner_pool_id,
+                deleted: true,
+            })?,
+        }
+    } else {
+        let (heading, label, id) = match target {
+            DeletionTarget::Runner(id) => ("✓ Runner deleted.", "Runner", id),
+            DeletionTarget::Pool(id) => ("✓ Runner pool deleted.", "Pool", id),
+        };
+        writeln!(
+            io::stdout().lock(),
+            "{heading}\n\n  {label}:       {id}\n  Deployment: {deployment}"
+        )?;
+    }
+    Ok(ExitCode::Success)
+}
+
+pub(super) fn write_deletion_unknown(
+    deployment: &str,
+    target: DeletionTarget<'_>,
+    json: bool,
+    exit_code: ExitCode,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        match target {
+            DeletionTarget::Runner(runner_id) => write_json(&RunnerDeletionUnknown {
+                schema_version: 1,
+                deployment,
+                outcome: "unknown",
+                runner_id,
+                commitment: "unknown",
+            })?,
+            DeletionTarget::Pool(runner_pool_id) => write_json(&PoolDeletionUnknown {
+                schema_version: 1,
+                deployment,
+                outcome: "unknown",
+                runner_pool_id,
+                commitment: "unknown",
+            })?,
+        }
+    } else {
+        let (noun, field, id) = match target {
+            DeletionTarget::Runner(id) => ("runner", "runner", id),
+            DeletionTarget::Pool(id) => ("runner pool", "runner pool", id),
+        };
+        writeln!(
+            io::stderr().lock(),
+            "error: {noun} deletion commitment is unknown\n\n{field}: {id}\ncommitment: unknown\n\nRun a later owner-directed deletion for this ID. The new invocation uses a new request identity and may observe deletion completion or a privacy-safe not-found result."
+        )?;
+    }
+    Ok(exit_code)
+}
+
+pub(super) fn write_deletion_failure(
+    deployment: &str,
+    target: DeletionTarget<'_>,
+    failure: &RunnerFailure,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    write_failure_with_context(deployment, failure, json, Some(target), None)
+}
+
 pub(super) fn write_failure(
     deployment: &str,
     failure: &RunnerFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_failure_with_context(deployment, failure, json, None)
+    write_failure_with_context(deployment, failure, json, None, None)
 }
 
 pub(super) fn write_activation_failure(
@@ -385,6 +471,7 @@ pub(super) fn write_activation_failure(
         deployment,
         failure,
         json,
+        None,
         Some(CreatedRegistration {
             organization,
             runner_id,
@@ -402,6 +489,7 @@ fn write_failure_with_context(
     deployment: &str,
     failure: &RunnerFailure,
     json: bool,
+    target: Option<DeletionTarget<'_>>,
     created: Option<CreatedRegistration<'_>>,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, outcome_class) = match failure {
@@ -477,6 +565,12 @@ fn write_failure_with_context(
             "error: runner cannot move while it has active work\n\nDrain or disable the runner, then wait for its reservation and assignments to finish.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
+        RunnerFailure::DeletionUnavailable(_) => (
+            "delete_unavailable",
+            None,
+            "error: runner resource deletion has active blockers\n\nWait for every reported blocker to clear, then run the deletion again.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
         RunnerFailure::Unreachable(category) => (
             "unreachable",
             Some(category.as_str()),
@@ -496,14 +590,38 @@ fn write_failure_with_context(
     // Runner failures own a closed machine vocabulary distinct from organization
     // failures, so the small stream-selection adapter remains domain-local.
     // jscpd:ignore-start
+    let (runner_id, runner_pool_id) = match target {
+        Some(DeletionTarget::Runner(id)) => (Some(id), None),
+        Some(DeletionTarget::Pool(id)) => (None, Some(id)),
+        None => (created.map(|registration| registration.runner_id), None),
+    };
+    let blockers = match failure {
+        RunnerFailure::DeletionUnavailable(blockers) => Some(blockers.as_slice()),
+        _ => None,
+    };
     if json {
         write_json(&FailureResult {
             schema_version: 1,
             deployment,
             outcome,
+            runner_id,
+            runner_pool_id,
             category,
-            runner_id: created.map(|registration| registration.runner_id),
+            blockers,
         })?;
+    } else if let Some(target) = target {
+        let (diagnostic, remedy) = human.split_once("\n\n").unwrap_or((
+            human.as_str(),
+            "Run the deletion again after correcting the reported condition.",
+        ));
+        let (field, id) = match target {
+            DeletionTarget::Runner(id) => ("runner", id),
+            DeletionTarget::Pool(id) => ("runner pool", id),
+        };
+        writeln!(
+            io::stderr().lock(),
+            "{diagnostic}\n\n{field}: {id}\n\n{remedy}"
+        )?;
     } else {
         let stderr = io::stderr();
         let mut stderr = stderr.lock();
@@ -577,9 +695,53 @@ struct FailureResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    runner_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_pool_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    runner_id: Option<&'a str>,
+    blockers: Option<&'a [RunnerDeletionBlocker]>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunnerDeletionSuccess<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    runner_id: &'a str,
+    deleted: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PoolDeletionSuccess<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    runner_pool_id: &'a str,
+    deleted: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunnerDeletionUnknown<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    runner_id: &'a str,
+    commitment: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PoolDeletionUnknown<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    runner_pool_id: &'a str,
+    commitment: &'static str,
 }
 // jscpd:ignore-end
 

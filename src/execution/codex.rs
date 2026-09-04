@@ -5,17 +5,20 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+#[cfg(test)]
+use super::harness_installation::validate_installation_with as validate_shared_installation;
 use super::harness_installation::{
     ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
     ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
-    validate_installation_with as validate_shared_installation, validate_selected_installation,
 };
-use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
+#[cfg(test)]
+use crate::process::CommandRunner;
+use crate::process::{CommandOutput, SystemCommandRunner};
 
-pub(crate) const CODEX_APP_SERVER_V1_SUPPORTED_RANGE: &str = ">=0.147.0 <0.150.0";
-pub(crate) const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.149.0";
+pub(crate) const CODEX_APP_SERVER_V1_SUPPORTED_RANGE: &str = ">=0.147.0 <0.154.0";
+pub(crate) const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.153.0";
 const CODEX_APP_SERVER_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 147, 0);
-const CODEX_APP_SERVER_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 150, 0);
+const CODEX_APP_SERVER_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 154, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 4] =
     ["app-server", "generate-json-schema", "--out", "../schemas"];
 const MAXIMUM_SCHEMA_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -415,15 +418,7 @@ pub(crate) fn discover_and_validate_codex_installation()
     discover_and_validate_installation::<CodexInstallationProfile>(&SystemCommandRunner)
 }
 
-pub(crate) fn validate_codex_installation(
-    selected_executable: &Path,
-) -> Result<ValidatedCodexInstallation, CodexInstallationFailure> {
-    validate_selected_installation::<CodexInstallationProfile>(
-        selected_executable,
-        &SystemCommandRunner,
-    )
-}
-
+#[cfg(test)]
 fn validate_codex_installation_with(
     selected_executable: &Path,
     search_path: &OsStr,
@@ -689,8 +684,13 @@ mod tests {
     }
 
     fn copy_schema_fixture(destination: &Path) {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-app-server-v1-schema");
+        copy_named_schema_fixture(destination, Path::new(""));
+    }
+
+    fn copy_named_schema_fixture(destination: &Path, name: &Path) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-app-server-v1-schema")
+            .join(name);
         for relative in REQUIRED_SCHEMA_FILES {
             fs::copy(fixture.join(relative), destination.join(relative)).unwrap();
         }
@@ -737,8 +737,15 @@ mod tests {
             "0.148.1",
             "0.148.999",
             "0.149.0",
-            "0.149.1",
             "0.149.999",
+            "0.150.0",
+            "0.150.999",
+            "0.151.0",
+            "0.151.999",
+            "0.152.0",
+            "0.152.999",
+            "0.153.0",
+            "0.153.999",
         ] {
             let runner = compatible_runner(version);
             let installation = validate_codex_installation_with(
@@ -774,7 +781,7 @@ mod tests {
     #[test]
     fn admission_rejects_versions_outside_the_undecorated_stable_release_line() {
         let executable = std::env::current_exe().unwrap();
-        for unsupported in ["0.146.999", "0.150.0", "1.147.0"] {
+        for unsupported in ["0.146.999", "0.154.0", "1.147.0"] {
             let runner = compatible_runner(unsupported);
             assert_eq!(
                 validate_codex_installation_with(
@@ -814,6 +821,19 @@ mod tests {
                 }),
                 "{malformed}"
             );
+        }
+    }
+
+    #[test]
+    fn candidate_and_representative_older_schemas_satisfy_the_common_profile() {
+        for fixture in [Path::new(""), Path::new("older-0.149.0")] {
+            let root = tempfile::tempdir().unwrap();
+            for relative in ["schemas", "schemas/v1", "schemas/v2"] {
+                fs::create_dir(root.path().join(relative)).unwrap();
+            }
+            let schemas = root.path().join("schemas");
+            copy_named_schema_fixture(&schemas, fixture);
+            validate_schema_directory(&schemas).unwrap();
         }
     }
 

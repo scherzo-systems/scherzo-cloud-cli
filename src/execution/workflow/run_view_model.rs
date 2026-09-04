@@ -311,6 +311,7 @@ where
         self.timing.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> WorkflowRunViewSnapshot {
         self.snapshot_with_logs(None)
     }

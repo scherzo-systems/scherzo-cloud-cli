@@ -5,9 +5,11 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::blocking::Client as BlockingClient;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Url};
 
+use super::generated::apis;
 use super::http_util;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +107,27 @@ impl Drop for HttpClient {
             runtime.shutdown_timeout(Duration::ZERO);
         }
     }
+}
+
+pub(super) fn generated_configuration(
+    api_url: &str,
+    access_token: &str,
+    transport_policy: HttpTransportPolicy,
+    timeout: Duration,
+) -> Result<apis::configuration::Configuration, reqwest::Error> {
+    crate::tls::install_provider();
+    let client = BlockingClient::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(timeout)
+        .dns_resolver(categorized_dns_resolver())
+        .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
+        .build()?;
+    let mut configuration = apis::configuration::Configuration::new();
+    configuration.base_path = api_url.trim_end_matches('/').to_owned();
+    configuration.bearer_access_token = Some(access_token.to_owned());
+    configuration.client = client;
+    Ok(configuration)
 }
 
 pub(super) fn categorized_dns_resolver() -> Arc<impl Resolve> {

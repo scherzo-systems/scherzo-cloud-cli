@@ -13,8 +13,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPendingPollBarrier, CancellationPolicy, CancellationReason, CancellationSource,
-    CaptureLimits, EnvironmentSnapshot, ExecutionContext, ExecutionPolicyLimits,
-    ExecutionRootLifecycle, InputLimits, ResolvedImports, admit_workflow,
+    CaptureLimits, EnvironmentSnapshot, ExecutionContext, ExecutionPolicyLimits, InputLimits,
+    ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
@@ -162,7 +162,6 @@ fn admitted_fixture_for_workflow(
         ResolvedImports::default(),
         ExecutionContext::new(
             execution_root,
-            ExecutionRootLifecycle::EngineOwnedEphemeral,
             ExecutionPolicyLimits::new(
                 1,
                 CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),

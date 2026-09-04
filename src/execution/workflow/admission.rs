@@ -102,14 +102,6 @@ pub(crate) enum CancellationOperation {
     },
 }
 
-impl CancellationOperation {
-    pub(crate) const fn id(self) -> CancellationOperationId {
-        match self {
-            Self::Graceful { id, .. } | Self::ForceAbort { id } => id,
-        }
-    }
-}
-
 #[derive(Debug)]
 struct CancellationOperationState {
     operations: Vec<CancellationOperation>,
@@ -534,13 +526,6 @@ impl ResolvedImports {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExecutionRootLifecycle {
-    CallerOwnedRetained,
-    EngineOwnedRetained,
-    EngineOwnedEphemeral,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct CancellationPolicy {
     source: CancellationSource,
@@ -678,6 +663,7 @@ impl CaptureLimits {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_git_carrier_limits(
         mut self,
         maximum_git_carriers: usize,
@@ -786,6 +772,7 @@ impl WorkflowCapacityBudget {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn exact(capacity: &WorkflowCapacity) -> Self {
         let requirements = capacity.requirements;
         Self {
@@ -823,7 +810,6 @@ pub(crate) struct AdmittedWorkflowCapacity {
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
-    root_lifecycle: ExecutionRootLifecycle,
     limits: ExecutionPolicyLimits,
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
@@ -837,14 +823,12 @@ pub(crate) struct ExecutionContext {
 impl ExecutionContext {
     pub(crate) fn new(
         root: PathBuf,
-        root_lifecycle: ExecutionRootLifecycle,
         limits: ExecutionPolicyLimits,
         environment: EnvironmentSnapshot,
         cancellation: CancellationPolicy,
     ) -> Self {
         Self {
             root,
-            root_lifecycle,
             limits,
             environment,
             cancellation,
@@ -962,7 +946,6 @@ impl ExecutionLimits {
 #[derive(Clone, Debug)]
 pub(crate) struct AdmittedExecutionContext {
     root: AdmittedExecutionRoot,
-    root_lifecycle: ExecutionRootLifecycle,
     limits: ExecutionLimits,
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
@@ -975,10 +958,6 @@ impl AdmittedExecutionContext {
 
     pub(super) fn root_identity(&self) -> &AdmittedExecutionRoot {
         &self.root
-    }
-
-    pub(crate) fn root_lifecycle(&self) -> ExecutionRootLifecycle {
-        self.root_lifecycle
     }
 
     pub(crate) fn limits(&self) -> ExecutionLimits {
@@ -994,16 +973,10 @@ impl AdmittedExecutionContext {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProjectTrustPolicy {
-    InvocationScopedEnabled,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PiJsonV1Admission {
     installation: Arc<ValidatedPiInstallation>,
     configuration: PiConfig,
-    project_trust: ProjectTrustPolicy,
     limits: AgentInvocationLimits<PiJsonV1ProtocolLimits>,
 }
 
@@ -1014,10 +987,6 @@ impl PiJsonV1Admission {
 
     pub(crate) fn configuration(&self) -> &PiConfig {
         &self.configuration
-    }
-
-    pub(crate) fn project_trust(&self) -> ProjectTrustPolicy {
-        self.project_trust
     }
 
     pub(crate) fn limits(&self) -> &AgentInvocationLimits<PiJsonV1ProtocolLimits> {
@@ -1149,14 +1118,6 @@ impl AdmittedWorkflow {
         self.capacity.maximum_transitions = maximum_transitions;
     }
 
-    pub(crate) fn has_recovery(&self) -> bool {
-        self.workflow
-            .definition
-            .recoveries
-            .values()
-            .any(Option::is_some)
-    }
-
     pub(crate) fn git_capture(&self) -> Option<&GitCaptureContext> {
         self.git_capture.as_deref()
     }
@@ -1201,7 +1162,6 @@ pub(crate) enum AdmissionFailureKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionLocation {
-    Workflow,
     PromptImport,
     AttachmentImport { index: usize },
     Step { step: String },
@@ -1463,7 +1423,6 @@ fn admit_workflow_for(
     let root = canonical_execution_root(&context.root)?;
     let execution = AdmittedExecutionContext {
         root,
-        root_lifecycle: context.root_lifecycle,
         limits: ExecutionLimits {
             maximum_parallel_steps,
             maximum_captured_files,
@@ -1716,7 +1675,6 @@ fn admit_harness(
             Ok(AdmittedHarness::Pi(PiJsonV1Admission {
                 installation: Arc::clone(installation),
                 configuration: configuration.clone(),
-                project_trust: ProjectTrustPolicy::InvocationScopedEnabled,
                 limits: pi_json_v1_limits(),
             }))
         }

@@ -5,22 +5,15 @@ env:
 
 on:
   push:
-    branches-ignore:
-      - "release-allocations/**"
-      - "release-recoveries/**"
+    branches:
+      - main
   pull_request:
-  workflow_dispatch:
-    inputs:
-      allocated_mirror:
-        description: Exact lowercase allocated mirror commit to recover
-        required: true
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -74,10 +67,8 @@ jobs:
             --target aarch64-apple-darwin
 
   verify_release:
-    name: Verify managed allocation
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    name: Verify release candidate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs:
       - check
       - check_macos
@@ -86,9 +77,11 @@ jobs:
     permissions:
       contents: read
     outputs:
-      allocated_mirror: ${{ steps.verify.outputs.allocated_mirror }}
+      candidate_mirror: ${{ steps.verify.outputs.candidate_mirror }}
       complete: ${{ steps.verify.outputs.complete }}
       execute: ${{ steps.verify.outputs.execute }}
+      impact: ${{ steps.verify.outputs.impact }}
+      release: ${{ steps.verify.outputs.release }}
       source_revision: ${{ steps.verify.outputs.source_revision }}
       tag: ${{ steps.verify.outputs.tag }}
       version: ${{ steps.verify.outputs.version }}
@@ -99,37 +92,39 @@ jobs:
           fetch-depth: 0
           fetch-tags: false
           persist-credentials: false
-      - name: Fetch managed release records
+      - name: Fetch current main and stable tags
         shell: bash
         run: |
           set -euo pipefail
           git fetch --force --no-tags origin \
-            main:refs/remotes/origin/main \
-            '+refs/heads/release-allocations/*:refs/heads/release-allocations/*' \
-            '+refs/heads/release-recoveries/*:refs/heads/release-recoveries/*'
+            main:refs/remotes/origin/main
           git fetch --force --tags origin
-      - name: Verify exact allocation and recovery chain
+      - name: Verify exact candidate
         id: verify
         shell: bash
         env:
-          DISPATCHED_ALLOCATION: ${{ inputs.allocated_mirror }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          allocated=auto
-          event=push
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            allocated=$DISPATCHED_ALLOCATION
-            event=recovery
-          fi
-          ./scripts/verify-release-allocation \
+          ./scripts/verify-release-candidate \
             --repository . \
-            --allocated-mirror "$allocated" \
             --workflow-commit "$GITHUB_SHA" \
-            --event "$event" \
             --github-repository "$GITHUB_REPOSITORY" \
-            --output "$RUNNER_TEMP/verified-allocation" \
+            --output "$RUNNER_TEMP/verified-candidate" \
             --github-output "$GITHUB_OUTPUT"
+      - name: Summarize proposed release
+        if: steps.verify.outputs.release == 'true'
+        shell: bash
+        env:
+          IMPACT: ${{ steps.verify.outputs.impact }}
+          TAG: ${{ steps.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          {
+            printf "## Proposed CLI release \`%s\`\n\n" "$TAG"
+            printf "Impact: \`%s\`\n\n" "$IMPACT"
+            cat "$RUNNER_TEMP/verified-candidate/rendered-notes.md"
+          } >>"$GITHUB_STEP_SUMMARY"
 
   build_release:
     name: Build ${{ matrix.target }}
@@ -155,17 +150,17 @@ jobs:
       - name: Check out allocated source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.verify_release.outputs.allocated_mirror }}
+          ref: ${{ needs.verify_release.outputs.candidate_mirror }}
           fetch-depth: 1
           fetch-tags: false
           persist-credentials: false
-      - name: Verify allocated checkout
+      - name: Verify candidate checkout
         shell: bash
         env:
-          ALLOCATED_MIRROR: ${{ needs.verify_release.outputs.allocated_mirror }}
+          CANDIDATE_MIRROR: ${{ needs.verify_release.outputs.candidate_mirror }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$ALLOCATED_MIRROR"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_MIRROR"
       - name: Install pinned Rust toolchain
         shell: bash
         run: |
@@ -257,7 +252,7 @@ jobs:
           retention-days: 7
 
   reconcile_release:
-    name: Reconcile ${{ needs.verify_release.outputs.tag }}
+    name: Publish ${{ needs.verify_release.outputs.tag }}
     if: >-
       needs.verify_release.outputs.execute == 'true' &&
       needs.verify_release.outputs.complete == 'false'
@@ -266,6 +261,7 @@ jobs:
       - build_release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment: cli-release
     permissions:
       contents: write
       id-token: write
@@ -277,14 +273,12 @@ jobs:
           fetch-depth: 0
           fetch-tags: false
           persist-credentials: false
-      - name: Fetch managed release records
+      - name: Fetch current main and stable tags
         shell: bash
         run: |
           set -euo pipefail
           git fetch --force --no-tags origin \
-            main:refs/remotes/origin/main \
-            '+refs/heads/release-allocations/*:refs/heads/release-allocations/*' \
-            '+refs/heads/release-recoveries/*:refs/heads/release-recoveries/*'
+            main:refs/remotes/origin/main
           git fetch --force --tags origin
       - name: Download release archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -311,24 +305,15 @@ jobs:
               lines.append(f"{digest}  {archive.name}\n")
           (root / "SHA256SUMS").write_text("".join(lines), encoding="ascii")
           PY
-      - name: Inspect exact reconciliation
+      - name: Inspect exact candidate release
         shell: bash
         env:
-          ALLOCATED_MIRROR: ${{ needs.verify_release.outputs.allocated_mirror }}
-          DISPATCHED_ALLOCATION: ${{ inputs.allocated_mirror }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          event=push
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            event=recovery
-            test "$DISPATCHED_ALLOCATION" = "$ALLOCATED_MIRROR"
-          fi
           ./scripts/reconcile-release inspect \
             --repository . \
-            --allocated-mirror "$ALLOCATED_MIRROR" \
             --workflow-commit "$GITHUB_SHA" \
-            --event "$event" \
             --github-repository "$GITHUB_REPOSITORY" \
             --dist dist
       - name: Attest exact release assets
@@ -340,20 +325,11 @@ jobs:
       - name: Reconcile exact GitHub Release
         shell: bash
         env:
-          ALLOCATED_MIRROR: ${{ needs.verify_release.outputs.allocated_mirror }}
-          DISPATCHED_ALLOCATION: ${{ inputs.allocated_mirror }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          event=push
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            event=recovery
-            test "$DISPATCHED_ALLOCATION" = "$ALLOCATED_MIRROR"
-          fi
           ./scripts/reconcile-release apply \
             --repository . \
-            --allocated-mirror "$ALLOCATED_MIRROR" \
             --workflow-commit "$GITHUB_SHA" \
-            --event "$event" \
             --github-repository "$GITHUB_REPOSITORY" \
             --dist dist

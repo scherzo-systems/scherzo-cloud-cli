@@ -1,0 +1,15 @@
+{
+  "oneOf": [
+    { "properties": { "method": { "const": "error" } } },
+    { "properties": { "method": { "const": "hook/completed" } } },
+    { "properties": { "method": { "const": "hook/started" } } },
+    { "properties": { "method": { "const": "item/agentMessage/delta" } } },
+    { "properties": { "method": { "const": "item/completed" } } },
+    { "properties": { "method": { "const": "item/started" } } },
+    { "properties": { "method": { "const": "mcpServer/startupStatus/updated" } } },
+    { "properties": { "method": { "const": "thread/started" } } },
+    { "properties": { "method": { "const": "turn/completed" } } },
+    { "properties": { "method": { "const": "turn/started" } } },
+    { "properties": { "method": { "const": "warning" } } }
+  ]
+}

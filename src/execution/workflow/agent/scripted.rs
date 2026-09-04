@@ -240,10 +240,6 @@ impl ScriptedAgentControl {
             .ok_or(ScriptedAgentError::AdapterStopped)
     }
 
-    pub(crate) async fn start(&self) -> Result<(), ScriptedAgentError> {
-        self.current()?.start().await
-    }
-
     pub(crate) fn block(&self) -> Result<ScriptedBarrier, ScriptedAgentError> {
         self.current()?.block()
     }

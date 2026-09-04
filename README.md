@@ -166,15 +166,16 @@ The current release supports:
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, logout, account signup, organization
-  profile management, and one-page member-directory reads;
+  profile management, one-page member-directory reads, and inputless Cloud run creation
+  and inspection;
 - runner prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
 
 The Cloud management surface is not complete. The CLI can create an organization, read
-or update its initial profile, and list one page of active members. It cannot yet
-configure repositories, invite or change members, submit workflows, or guide the rest
-of Cloud onboarding.
+or update its initial profile, list one page of active members, and create or inspect an
+inputless run for a configured project. It cannot yet configure repositories, invite or
+change members, stage run inputs, or guide the rest of Cloud onboarding.
 
 ## Local workflow validation
 
@@ -557,9 +558,8 @@ The human store remains separate from workflow-run state and all runner credenti
 
 Development deployments that use HTTP require `--allow-insecure-http` on the networked
 leaf command: `auth login`, `auth status`, `auth logout`, `account signup`,
-`organization create`, `organization show`, `organization update`, or
-`organization members list`. The option
-is not global.
+`organization create`, `organization show`, `organization update`,
+`organization members list`, `run create`, or `run show`. The option is not global.
 
 ## Account signup
 
@@ -610,6 +610,37 @@ response. Do not issue a new mutation merely because an earlier result was uncon
 These commands are a direct human management surface. Authentication status may carry a
 server-advertised `organization.create` action, but the CLI only transports that value;
 a trusted external guide owns action selection, explanation, and approval.
+
+## Cloud runs
+
+Run commands use the selected human OAuth credential and the configured Scherzo Cloud
+deployment. They are separate from `scherzo-cloud workflow`, which runs and inspects
+local workflow definitions and run directories.
+
+```sh
+# Admit an inputless run without waiting for execution.
+scherzo-cloud run create acme-labs \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --workflow-path workflows/build.yaml \
+  --source-branch main \
+  --display-name "Release checks"
+
+# Read the latest public projection.
+scherzo-cloud run show \
+  acme-labs \
+  run_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+`run create` never selects or stages a Run Input Set. Its receipt reports the accepted
+Run ID and whether the deployment replayed the request. One invocation keeps the same
+idempotency key through an ambiguous transport retry and an access-token refresh; the
+key is not persisted for a later invocation. An interrupt after dispatch reports an
+unknown acceptance commitment rather than claiming that no run was created.
+
+Add `--json` for schema-version-1 output. A create receipt preserves `replayed` as a
+boolean and identifies the submitted `organizationRef`. A show result contains the
+complete public Run projection, including the current attempt, pinned workflow and
+workspace source, input summary, and timestamps.
 
 ## Runner doctor
 
@@ -669,10 +700,14 @@ probe and one capability-help probe. The probes clear the child environment exce
 the captured inherited `PATH`, fresh temporary Pi state and working-directory paths, and
 the required isolation controls. Retaining `PATH` lets an environment-based launcher
 resolve its interpreter without allowing another `pi` selection. It admits
-canonical stable versions in the range `>=0.84.2 <0.85.0` with the JSON event,
-custom-session-directory, extension, system-prompt append, and invocation-scoped
-`--approve` capabilities required by `PiJsonV1`. It retains the exact observed release, never falls
-through to another candidate after selection, and does not inspect model metadata or
+canonical stable versions in the range `>=0.84.2 <0.85.0`; the repository qualifies
+exact Pi 0.84.4. The capability probe accepts both the 0.84.2
+`pi [options] [@files...] [messages...]` usage line and the 0.84.3+
+`pi [options] [--] [@files...] [messages...]` line, while still requiring the JSON
+event, custom-session-directory, extension, system-prompt append, and
+invocation-scoped `--approve` capabilities required by `PiJsonV1`. It retains the exact
+observed release, never falls through to another candidate after selection, and does not
+inspect model metadata or
 credentials, execute the caller's project, or read or write saved Pi project-trust
 decisions. Missing, unexecutable, malformed, unsupported-version, and missing-capability
 outcomes have distinct report codes.
@@ -689,14 +724,15 @@ and does not claim that every admitted release or unexecuted host received exact
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.
 
-The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.150.0`, and
+The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.154.0`, and
 requires the generated App Server schema capability used by CodexAppServerV1. Its
 isolated version and schema probes do not read ambient `CODEX_HOME`, provider
 credentials, or native configuration. The report contains the exact observed version,
-supported range, exact repository qualification version, closed capabilities, and
-canonical executable without starting a thread. At execution, async-delivery messages
-and bounded project or strict-review metadata remain observable but cannot settle,
-approve, persist, or commit a workflow value.
+supported range, exact repository qualification version `0.153.0`, closed capabilities,
+and canonical executable without starting a thread. At execution, async-delivery
+messages, structured asynchronous questions, form elicitation, and bounded additive
+events remain unattended and cannot settle, approve, assign a project, persist, or
+commit a workflow value.
 
 ## Runner serve
 
@@ -761,7 +797,7 @@ operator-controlled `PATH`. Scherzo installs none of them. Each successful insta
 is validated once and retained as an immutable executable, exact-version, profile, and
 capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.85.0`, Claude Code
 requires `>=2.1.234 <2.2.0`, and Codex requires capability-compatible stable
-`>=0.147.0 <0.150.0`. Admission and invocation never repeat a lookup or probe. A missing
+`>=0.147.0 <0.154.0` with exact repository qualification anchor `0.153.0`. Admission and invocation never repeat a lookup or probe. A missing
 or incompatible installation leaves only that harness unavailable, so Runner Serve
 continues to accept command-only and other available-harness assignments. An assignment
 requiring the unavailable harness is rejected before launch, and selection never falls

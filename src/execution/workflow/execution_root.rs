@@ -209,6 +209,7 @@ impl fmt::Debug for AdmittedWorkingDirectory {
 }
 
 impl AdmittedWorkingDirectory {
+    #[cfg(test)]
     pub(super) fn provenance_path(&self) -> &Path {
         &self.provenance_path
     }

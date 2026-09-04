@@ -16,8 +16,7 @@ use crate::execution::codex::{
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, ExecutionRootLifecycle, InputLimits, ResolvedAttachment,
-    ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports, admit_workflow,
 };
 use crate::execution::workflow::agent::{AgentValueKind, NoopAgentObservationSink, WorkflowRunId};
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
@@ -334,7 +333,6 @@ steps:
 fn execution_context(execution_root: &Path) -> ExecutionContext {
     ExecutionContext::new(
         execution_root.to_owned(),
-        ExecutionRootLifecycle::CallerOwnedRetained,
         ExecutionPolicyLimits::new(
             4,
             CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),

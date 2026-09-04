@@ -22,6 +22,8 @@ enum PoolCommand {
     Show(ShowCommand),
     #[command(about = "Rename a Scherzo Cloud runner pool")]
     Rename(RenameCommand),
+    #[command(about = "Delete an unused Scherzo Cloud runner pool")]
+    Delete(DeleteCommand),
 }
 
 #[derive(Debug, Args)]
@@ -79,22 +81,37 @@ struct RenameCommand {
 }
 // jscpd:ignore-end
 
+#[derive(Debug, Args)]
+struct DeleteCommand {
+    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
+    organization: String,
+
+    #[arg(value_name = "POOL", help = "Runner pool ID or exact name")]
+    pool: String,
+
+    #[arg(
+        long,
+        required = true,
+        action = clap::ArgAction::SetTrue,
+        help = "Confirm permanent runner pool deletion"
+    )]
+    yes: bool,
+
+    #[command(flatten)]
+    options: CloudOptions,
+}
+
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         let Some(command) = self.command else {
             return super::super::print_help(COMMAND_PATH);
         };
-        super::execute_cloud(command, |command, deployment| command.execute(deployment))
-    }
-}
-
-impl PoolCommand {
-    fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        match self {
-            Self::Create(command) => command.execute(deployment),
-            Self::List(command) => command.execute(deployment),
-            Self::Show(command) => command.execute(deployment),
-            Self::Rename(command) => command.execute(deployment),
+        match command {
+            PoolCommand::Create(command) => super::execute_cloud(command, CreateCommand::execute),
+            PoolCommand::List(command) => super::execute_cloud(command, ListCommand::execute),
+            PoolCommand::Show(command) => super::execute_cloud(command, ShowCommand::execute),
+            PoolCommand::Rename(command) => super::execute_cloud(command, RenameCommand::execute),
+            PoolCommand::Delete(command) => command.execute(),
         }
     }
 }
@@ -156,5 +173,11 @@ impl RenameCommand {
             &result,
             self.options.json,
         )
+    }
+}
+
+impl DeleteCommand {
+    fn execute(self) -> super::super::CommandResult {
+        super::execute_pool_deletion(self.organization, self.pool, self.options)
     }
 }

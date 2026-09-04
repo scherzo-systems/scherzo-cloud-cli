@@ -100,14 +100,6 @@ impl ArchivedWorkflowTerminalHost {
         archived_join_result(self.take_task()?.await)
     }
 
-    pub(crate) async fn stop(
-        mut self,
-        exit: ArchivedTerminalHostExit,
-    ) -> Result<ArchivedTerminalHostExit, PresentationFailure> {
-        let _ = self.exit.send(exit);
-        archived_join_result(self.take_task()?.await)
-    }
-
     fn take_task(
         &mut self,
     ) -> Result<

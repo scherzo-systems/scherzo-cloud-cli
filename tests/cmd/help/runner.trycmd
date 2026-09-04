@@ -17,6 +17,7 @@ Commands:
   disable     Disable a Scherzo Cloud runner registration
   move        Move a quiescent Scherzo Cloud runner registration
   rename      Rename a Scherzo Cloud runner registration
+  delete      Delete a quiescent Scherzo Cloud runner registration
   doctor      Check local runner prerequisites
   serve       Connect to Scherzo Cloud and serve run assignments
   status      Show live Runner Serve status

@@ -255,6 +255,7 @@ fn presentation_outputs(
 pub(crate) struct AcceptedRecordOrder(u64);
 
 impl AcceptedRecordOrder {
+    #[cfg(test)]
     pub(crate) const fn get(self) -> u64 {
         self.0
     }

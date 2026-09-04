@@ -15,7 +15,9 @@ use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
     StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
-use super::validated::{WorkflowNode, WorkflowNodeRole};
+use super::validated::WorkflowNode;
+#[cfg(test)]
+use super::validated::WorkflowNodeRole;
 
 pub(crate) const MAXIMUM_PREREQUISITES: usize = 1_024;
 
@@ -293,7 +295,7 @@ impl FailureDetail {
             _ => self.phase == Phase::Start,
         };
         if !phase_valid {
-            return Err(EvidenceError::InvalidFailureDetail);
+            return Err(EvidenceError::FailureDetail);
         }
 
         let input_invalid_name = self.code == Code::InputInvalidName;
@@ -338,7 +340,7 @@ impl FailureDetail {
             || (self.phase == Phase::Condition && !condition_failure)
             || (self.phase != Phase::Condition && (self.r#ref.is_some() || self.pointer.is_some()))
         {
-            return Err(EvidenceError::InvalidFailureDetail);
+            return Err(EvidenceError::FailureDetail);
         }
         Ok(())
     }
@@ -376,21 +378,21 @@ impl Prerequisite {
         let node = node.into();
         (!node.is_empty())
             .then_some(Self::Control { node })
-            .ok_or(EvidenceError::InvalidPrerequisite)
+            .ok_or(EvidenceError::Prerequisite)
     }
 
     pub(crate) fn condition(reference: impl Into<String>) -> Result<Self, EvidenceError> {
         let r#ref = reference.into();
         is_output_reference(&r#ref)
             .then_some(Self::Condition { r#ref })
-            .ok_or(EvidenceError::InvalidPrerequisite)
+            .ok_or(EvidenceError::Prerequisite)
     }
 
     pub(crate) fn body(reference: impl Into<String>) -> Result<Self, EvidenceError> {
         let r#ref = reference.into();
         is_output_reference(&r#ref)
             .then_some(Self::Body { r#ref })
-            .ok_or(EvidenceError::InvalidPrerequisite)
+            .ok_or(EvidenceError::Prerequisite)
     }
 
     pub(crate) fn kind(&self) -> PrerequisiteKind {
@@ -451,8 +453,8 @@ impl<'de> Deserialize<'de> for BlockedDetail {
         let wire = BlockedDetailWire::deserialize(deserializer)?;
         let original = wire.prerequisites;
         let detail = Self::new(original.clone()).map_err(D::Error::custom)?;
-        if detail.prerequisites != original {
-            return Err(D::Error::custom(EvidenceError::InvalidPrerequisite));
+        if detail.code != wire.code || detail.prerequisites != original {
+            return Err(D::Error::custom(EvidenceError::Prerequisite));
         }
         Ok(detail)
     }
@@ -466,14 +468,14 @@ impl BlockedDetail {
         prerequisites.sort();
         prerequisites.dedup();
         if prerequisites.is_empty() || prerequisites.len() > MAXIMUM_PREREQUISITES {
-            return Err(EvidenceError::InvalidPrerequisiteCount);
+            return Err(EvidenceError::PrerequisiteCount);
         }
         if prerequisites.iter().any(|prerequisite| {
             prerequisite.target().is_empty()
                 || (prerequisite.kind() != PrerequisiteKind::Control
                     && !is_output_reference(prerequisite.target()))
         }) {
-            return Err(EvidenceError::InvalidPrerequisite);
+            return Err(EvidenceError::Prerequisite);
         }
         Ok(Self {
             code: BlockedCode::PrerequisitesUnsatisfied,
@@ -508,6 +510,7 @@ impl NonExecutionDetail {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_role(
         role: WorkflowNodeRole,
         code: NonExecutionCode,
@@ -684,11 +687,12 @@ impl PrimaryIssue {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EvidenceError {
-    InvalidFailureCause,
-    InvalidFailureDetail,
-    InvalidPrerequisite,
-    InvalidPrerequisiteCount,
+    FailureCause,
+    FailureDetail,
+    Prerequisite,
+    PrerequisiteCount,
     InvalidConditionFalseDetail,
+    #[cfg(test)]
     NodeRoleMismatch,
 }
 
@@ -734,7 +738,7 @@ pub(crate) fn failure_detail(
         (FailurePhase::OutputCapture, StepFailureCause::OutputCapture(source)) => {
             output_capture_failure_detail(source)
         }
-        _ => return Err(EvidenceError::InvalidFailureCause),
+        _ => return Err(EvidenceError::FailureCause),
     };
     detail.validate()?;
     Ok(detail)

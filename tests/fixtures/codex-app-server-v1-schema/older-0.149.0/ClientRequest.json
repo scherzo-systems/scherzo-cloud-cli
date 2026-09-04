@@ -1,0 +1,9 @@
+{
+  "oneOf": [
+    { "properties": { "method": { "const": "initialize" } } },
+    { "properties": { "method": { "const": "config/read" } } },
+    { "properties": { "method": { "const": "thread/start" } } },
+    { "properties": { "method": { "const": "turn/start" } } },
+    { "properties": { "method": { "const": "turn/interrupt" } } }
+  ]
+}

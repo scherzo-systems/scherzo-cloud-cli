@@ -4,7 +4,8 @@ use std::fs;
 use std::sync::Mutex;
 use std::time::Duration;
 
-const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
+const COMPLETE_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [--] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
+const LOWER_BOUND_HELP: &str = "pi - fixture\nUsage:\n  pi [options] [@files...] [messages...]\n  --mode <mode> Output mode: text, json, or rpc\n  --session-dir <dir> Directory for session storage and lookup\n  --extension, -e <path> Load extension\n  --append-system-prompt <text> Append prompt\n  --approve, -a Trust project files for this run\n";
 
 struct FakeRunner {
     invocations: Mutex<Vec<Vec<String>>>,
@@ -97,7 +98,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
     let executable = std::env::current_exe().unwrap();
     let runner = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"0.84.7\n"),
+        version: output(b"0.84.4\n"),
         capabilities: output(COMPLETE_HELP.as_bytes()),
     };
 
@@ -108,7 +109,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
         installation.executable(),
         fs::canonicalize(executable).unwrap()
     );
-    assert_eq!(installation.version().as_str(), "0.84.7");
+    assert_eq!(installation.version().as_str(), "0.84.4");
     assert_eq!(installation.profile().as_str(), "PiJsonV1");
     assert_eq!(
         installation.capabilities().required(),
@@ -121,6 +122,22 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
             CAPABILITY_PROBE_ARGUMENTS.map(str::to_owned).to_vec(),
         ]
     );
+}
+
+#[test]
+fn lower_bound_help_banner_remains_compatible() {
+    let executable = std::env::current_exe().unwrap();
+    let runner = FakeRunner {
+        invocations: Mutex::new(Vec::new()),
+        version: output(b"0.84.2\n"),
+        capabilities: output(LOWER_BOUND_HELP.as_bytes()),
+    };
+
+    let installation =
+        validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &runner).unwrap();
+
+    assert_eq!(installation.version().as_str(), "0.84.2");
+    assert_eq!(installation.profile(), PiCompatibilityProfile::PiJsonV1);
 }
 
 #[test]
@@ -159,45 +176,46 @@ fn version_range_and_capabilities_are_both_required() {
         );
     }
 
-    let missing_session_directory = FakeRunner {
-        invocations: Mutex::new(Vec::new()),
-        version: output(b"0.84.2\n"),
-        capabilities: output(
-            COMPLETE_HELP
-                .replace("--session-dir <dir>", "--session-root <dir>")
-                .as_bytes(),
+    for (advertisement, replacement, capability) in [
+        (
+            "--mode <mode>",
+            "--output <mode>",
+            PiCapability::JsonEventStream,
         ),
-    };
-    assert_eq!(
-        validate_pi_installation_with(
-            &executable,
-            OsStr::new("/controlled/bin"),
-            &missing_session_directory,
+        (
+            "--session-dir <dir>",
+            "--session-root <dir>",
+            PiCapability::CustomSessionDirectory,
         ),
-        Err(PiInstallationFailure::Unsupported(
-            PiIncompatibility::Capability {
-                capability: PiCapability::CustomSessionDirectory,
-                version: "0.84.2".to_owned(),
-            }
-        ))
-    );
-
-    let missing_trust = FakeRunner {
-        invocations: Mutex::new(Vec::new()),
-        version: output(b"0.84.2\n"),
-        capabilities: output(
-            COMPLETE_HELP
-                .replace("--approve, -a", "--permit, -p")
-                .as_bytes(),
+        (
+            "--extension, -e <path>",
+            "--plugin, -e <path>",
+            PiCapability::ExtensionLoading,
         ),
-    };
-    assert_eq!(
-        validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &missing_trust,),
-        Err(PiInstallationFailure::Unsupported(
-            PiIncompatibility::Capability {
-                capability: PiCapability::InvocationScopedProjectTrust,
-                version: "0.84.2".to_owned(),
-            }
-        ))
-    );
+        (
+            "--append-system-prompt <text>",
+            "--system-prompt <text>",
+            PiCapability::SystemPromptAppend,
+        ),
+        (
+            "--approve, -a",
+            "--permit, -p",
+            PiCapability::InvocationScopedProjectTrust,
+        ),
+    ] {
+        let runner = FakeRunner {
+            invocations: Mutex::new(Vec::new()),
+            version: output(b"0.84.4\n"),
+            capabilities: output(COMPLETE_HELP.replace(advertisement, replacement).as_bytes()),
+        };
+        assert_eq!(
+            validate_pi_installation_with(&executable, OsStr::new("/controlled/bin"), &runner),
+            Err(PiInstallationFailure::Unsupported(
+                PiIncompatibility::Capability {
+                    capability,
+                    version: "0.84.4".to_owned(),
+                }
+            ))
+        );
+    }
 }

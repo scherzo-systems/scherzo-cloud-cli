@@ -7,13 +7,20 @@ fi
 
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 package_root=$public_root/src/execution/workflow/pi-json-v1-extension
+install_root=$(mktemp -d "${TMPDIR:-/tmp}/scherzo-pi-json-v1-format.XXXXXX")
 
 cleanup() {
-  rm -rf -- "$package_root/node_modules"
+  rm -rf -- "$install_root"
 }
 trap cleanup EXIT
-cleanup
 
-npm --prefix "$package_root" ci --ignore-scripts --no-audit --no-fund
+cp \
+  "$package_root/package.json" \
+  "$package_root/package-lock.json" \
+  "$install_root/"
+(
+  cd "$install_root"
+  npm ci --ignore-scripts --no-audit --no-fund
+)
 npm_config_offline=true \
-  "$package_root/node_modules/.bin/prettier" --write -- "$@"
+  "$install_root/node_modules/.bin/prettier" --write -- "$@"

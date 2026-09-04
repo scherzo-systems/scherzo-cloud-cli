@@ -21,9 +21,8 @@ use super::workspace::{
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
-    CancellationSource, EnvironmentSnapshot, ExecutionContext, ExecutionRootLifecycle,
-    ResolvedImports, WorkflowCapacityBudget, admit_runner_workflow,
-    default_execution_policy_limits,
+    CancellationSource, EnvironmentSnapshot, ExecutionContext, ResolvedImports,
+    WorkflowCapacityBudget, admit_runner_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::execution::workflow::cancellation::{
@@ -815,6 +814,34 @@ struct AssignmentIdentity {
     source_commit_oid: String,
 }
 
+impl AssignmentIdentity {
+    fn from_offer(offer: &AssignmentOffer) -> Self {
+        Self {
+            assignment_id: offer.assignment_id.clone(),
+            run_id: offer.run_id.clone(),
+            project_id: offer.project_id.clone(),
+            attempt_id: offer.attempt_id.clone(),
+            execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+            source_branch: offer.execution_spec.source_branch.clone(),
+            repository_connection_id: offer
+                .execution_spec
+                .primary_workspace_source
+                .repository_connection_id
+                .clone(),
+            source_object_format: offer
+                .execution_spec
+                .primary_workspace_source
+                .object_format
+                .clone(),
+            source_commit_oid: offer
+                .execution_spec
+                .primary_workspace_source
+                .commit_oid
+                .clone(),
+        }
+    }
+}
+
 pub(super) struct AcceptedAssignment {
     identity: AssignmentIdentity,
     pub(super) root: AssignmentRoot,
@@ -1139,29 +1166,7 @@ impl AdmissionRuntime {
             Err(decline) => return Err(Box::new((root, decline))),
         };
         Ok(AcceptedAssignment {
-            identity: AssignmentIdentity {
-                assignment_id: offer.assignment_id.clone(),
-                run_id: offer.run_id.clone(),
-                project_id: offer.project_id.clone(),
-                attempt_id: offer.attempt_id.clone(),
-                execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
-                source_branch: offer.execution_spec.source_branch.clone(),
-                repository_connection_id: offer
-                    .execution_spec
-                    .primary_workspace_source
-                    .repository_connection_id
-                    .clone(),
-                source_object_format: offer
-                    .execution_spec
-                    .primary_workspace_source
-                    .object_format
-                    .clone(),
-                source_commit_oid: offer
-                    .execution_spec
-                    .primary_workspace_source
-                    .commit_oid
-                    .clone(),
-            },
+            identity: AssignmentIdentity::from_offer(offer),
             root,
             admitted,
             transition_budget,
@@ -1651,7 +1656,6 @@ impl AssignmentManager {
                         &source,
                         &worker_cancellation,
                         &workspace_path,
-                        &root.execution,
                         &root.private,
                     )
                     .map_err(materialization_decline)?;
@@ -3058,15 +3062,9 @@ fn build_execution_context(
             .map_err(|_| invalid_execution_limits())?;
     let cancellation_grace =
         Duration::from_secs(execution_spec.execution_limits.cancellation_grace_seconds);
-    let lifecycle = if git_capture.is_some() {
-        ExecutionRootLifecycle::CallerOwnedRetained
-    } else {
-        ExecutionRootLifecycle::EngineOwnedEphemeral
-    };
     let capacity = &execution_spec.capacity;
     let context = ExecutionContext::new(
         root.to_owned(),
-        lifecycle,
         default_execution_policy_limits(maximum_parallel_steps),
         environment.without_managed_runner_credentials_and_helpers(),
         CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
@@ -5367,10 +5365,12 @@ steps:
 
         offer_then_prepare(&mut manager, &offered).await;
 
-        let environment = match &manager.slot {
-            Some(LocalSlot::Accepted(accepted)) => accepted.admitted.execution().environment(),
+        let execution = match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => accepted.admitted.execution(),
             _ => panic!("assignment should be accepted"),
         };
+        assert!(execution.root().join(".git").is_dir());
+        let environment = execution.environment();
         assert_eq!(
             environment.variable(OsStr::new("RUNNER_VISIBLE")),
             Some(OsStr::new("retained"))
@@ -6490,12 +6490,17 @@ steps:
     }
 
     #[tokio::test]
-    async fn executes_outputless_agent_and_command_dag() {
-        let fixture_argv = serde_json::to_string(&command_fixture_arguments()).unwrap();
+    async fn executes_outputless_agent_and_command_dag_in_the_prepared_repository() {
+        let repository_argv = serde_json::to_string(&[
+            "sh",
+            "-c",
+            "test -d .git && test \"$(git rev-parse --is-inside-work-tree)\" = true && test -z \"$(git rev-parse --show-prefix)\" && test -z \"$(git branch --show-current)\"",
+        ])
+        .unwrap();
         let workflow = format!(
-            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{{ file: system.md }}]\n  consume:\n    kind: cmd\n    dependsOn: [agent]\n    command:\n      argv: {fixture_argv}\n"
+            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{{ file: system.md }}]\n  consume:\n    kind: cmd\n    dependsOn: [agent]\n    command:\n      argv: {repository_argv}\n"
         );
-        let reports = execute_fixture_workflow(&workflow, Some(SUCCESSFUL_PI), 1).await;
+        let reports = execute_fixture_workflow(&workflow, Some(SUCCESSFUL_PI), 0).await;
         assert_succeeded(&reports);
     }
 
@@ -6745,8 +6750,8 @@ steps:
         assert_eq!(outbox.lock().entries.len(), 32);
     }
 
-    #[tokio::test]
-    async fn oversized_observation_is_rejected_before_queueing() {
+    #[test]
+    fn oversized_observation_is_rejected_before_queueing() {
         let outbox = ObservationOutbox::new();
         // This limit fixture deliberately keeps a complete schema-valid transition; sharing
         // the failure-mapper test's richer construction would obscure the size boundary.
@@ -6761,7 +6766,7 @@ steps:
                         "eventVersion": 1,
                         "eventType": "step_state_changed",
                         "transitionSequence": 1,
-                        "stepId": "x".repeat(MAXIMUM_TERMINAL_FRAME_BYTES),
+                        "stepId": "x".repeat(MAXIMUM_ORDINARY_FRAME_BYTES),
                         "failurePolicy": "required",
                         "from": "pending",
                         "to": "starting",
@@ -6888,36 +6893,47 @@ steps:
         });
     }
 
-    #[tokio::test]
-    async fn successor_fences_leave_room_for_more_than_256_completed_assignments() {
+    #[test]
+    fn successor_fences_leave_room_for_more_than_256_completed_assignments() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let alphabet = b"0123456789abcdefghjkmnpqrstvwxyz";
+        let mut predecessor: Option<AssignmentIdentity> = None;
 
+        // Build the completed-assignment retention state directly. Materializing the same
+        // repository 256 times does not exercise successor fencing and makes this bounded
+        // state-machine check depend on filesystem throughput.
         for index in 0..MAXIMUM_RETAINED_DECISIONS {
             let suffix = format!(
                 "{}{}",
                 char::from(alphabet[index / alphabet.len()]),
                 char::from(alphabet[index % alphabet.len()])
             );
+            if let Some(identity) = &predecessor {
+                manager.retire_assignment_observations(&identity.assignment_id);
+            }
             let offered = offer(&suffix);
-            offer_then_prepare(&mut manager, &offered).await;
-            let acceptance_id = manager.pending_observations(&BTreeSet::new(), 10)[0].id;
+            predecessor = Some(AssignmentIdentity::from_offer(&offered));
+            let response = AssignmentDecision::Accepted {
+                effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5acz".to_owned(),
+                assignment_id: offered.assignment_id.clone(),
+                offered_execution_spec_id: offered.execution_spec.execution_spec_id.clone(),
+            };
+            manager.retain_decision(offered, response).unwrap();
+            let acceptance_id = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
             manager.mark_observation_encoded(acceptance_id);
             manager.finish_transport();
-            let identity = match manager.slot.take().unwrap() {
-                LocalSlot::Accepted(accepted) => accepted.identity.clone(),
-                _ => panic!("offer must be accepted"),
-            };
-            let final_observation_id = enqueue_finished(&manager, &identity);
-            manager.mark_observation_encoded(final_observation_id);
-            manager.finish_transport();
-            manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-                identity,
-                final_observation_id,
-                root: None,
-            })));
         }
+
+        let predecessor = predecessor.unwrap();
+        let final_observation_id = enqueue_finished(&manager, &predecessor);
+        manager.mark_observation_encoded(final_observation_id);
+        manager.finish_transport();
+        manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
+            identity: predecessor,
+            final_observation_id,
+            root: None,
+        })));
 
         assert_eq!(manager.handle_offer(offer("80")), Ok(()));
     }

@@ -256,6 +256,11 @@ struct ActiveItem {
 }
 
 #[derive(Clone, Debug)]
+struct ActiveRealtimeItem {
+    session_id: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
 struct CompletedItem {
     kind: Arc<str>,
     agent_message: Option<CompletedAgentMessage>,
@@ -378,6 +383,7 @@ pub(super) struct CodexAppServerV1Parser {
     turn_started_seen: bool,
     active_items: BTreeMap<ItemId, ActiveItem>,
     completed_items: BTreeMap<ItemId, CompletedItem>,
+    active_realtime_items: BTreeMap<Arc<str>, ActiveRealtimeItem>,
     active_hooks: BTreeMap<Arc<str>, ActiveHook>,
     retained_correlation_bytes: u64,
     retained_agent_message_bytes: u64,
@@ -448,6 +454,7 @@ impl CodexAppServerV1Parser {
             turn_started_seen: false,
             active_items: BTreeMap::new(),
             completed_items: BTreeMap::new(),
+            active_realtime_items: BTreeMap::new(),
             active_hooks: BTreeMap::new(),
             retained_correlation_bytes: 0,
             retained_agent_message_bytes: 0,
@@ -954,7 +961,16 @@ impl CodexAppServerV1Parser {
             );
         }
         self.require_thread(params)?;
-        self.require_additive_correlation(params)
+        let turn_id = optional_string(params, "turnId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid)
+        })?;
+        if let Some(turn_id) = turn_id
+            && (turn_id.is_empty()
+                || self.turn_id.as_ref().map(|id| id.0.as_ref()) != Some(turn_id))
+        {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::TurnCorrelationInvalid));
+        }
+        self.require_additive_item_correlation(params)
     }
 
     fn require_additive_correlation(
@@ -981,6 +997,13 @@ impl CodexAppServerV1Parser {
                 );
             }
         }
+        self.require_additive_item_correlation(params)
+    }
+
+    fn require_additive_item_correlation(
+        &self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
         if let Some(item_id) = params.get("itemId") {
             let Some(item_id) = item_id.as_str().filter(|id| !id.is_empty()) else {
                 return Err(
@@ -1086,6 +1109,17 @@ impl CodexAppServerV1Parser {
             .is_some_and(|started| started.0.as_ref() != raw_thread_id)
         {
             return Err(self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid));
+        }
+        self.validate_thread_document(thread, raw_thread_id)?;
+        if required_string(result, "model") != Some(self.model.as_ref())
+            || required_string(result, "modelProvider") != self.effective_model_provider.as_deref()
+            || required_string(result, "cwd") != Some(self.expected_cwd.as_ref())
+            || required_string(result, "approvalPolicy") != Some("never")
+            || required_object(result, "sandbox")
+                .and_then(|sandbox| required_string(sandbox, "type"))
+                != Some("dangerFullAccess")
+        {
+            return Err(self.failure_for_current_phase());
         }
         if self.thread_id.is_none() {
             self.thread_id = Some(self.retain_thread_id(raw_thread_id)?);
@@ -1210,9 +1244,8 @@ impl CodexAppServerV1Parser {
             "thread/project/updated" => {
                 let params = self.required_notification_params(object)?;
                 self.require_thread(params)?;
-                self.require_additive_correlation(params)?;
-                self.observe_unrecognized(value);
-                Ok(ParserProgress::default())
+                Err(self
+                    .failure_for(CodexAppServerV1RejectionReason::NotificationTransitionInvalid))
             }
             "autoApprovalReview/strictReviewRequired" => {
                 let params = self.required_notification_params(object)?;
@@ -1251,6 +1284,24 @@ impl CodexAppServerV1Parser {
             "thread/status/changed" => {
                 let params = self.required_notification_params(object)?;
                 self.require_thread(params)?;
+                self.observe_unrecognized(value);
+                Ok(ParserProgress::default())
+            }
+            "thread/realtime/item/started" => {
+                let params = self.required_notification_params(object)?;
+                self.parse_realtime_item_started(params)?;
+                self.observe_unrecognized(value);
+                Ok(ParserProgress::default())
+            }
+            "thread/realtime/item/completed" => {
+                let params = self.required_notification_params(object)?;
+                self.parse_realtime_item_completed(params)?;
+                self.observe_unrecognized(value);
+                Ok(ParserProgress::default())
+            }
+            "thread/realtime/item/transcript/delta" => {
+                let params = self.required_notification_params(object)?;
+                self.parse_realtime_item_delta(params)?;
                 self.observe_unrecognized(value);
                 Ok(ParserProgress::default())
             }
@@ -1331,8 +1382,32 @@ impl CodexAppServerV1Parser {
             .ok_or_else(|| {
                 self.failure_for(CodexAppServerV1RejectionReason::ThreadCorrelationInvalid)
             })?;
+        self.validate_thread_document(thread, raw_thread_id)?;
         self.correlate_thread_value(raw_thread_id)?;
         self.thread_started_seen = true;
+        Ok(())
+    }
+
+    fn validate_thread_document(
+        &self,
+        thread: &Map<String, Value>,
+        thread_id: &str,
+    ) -> Result<(), AgentFailureCause> {
+        if required_string(thread, "sessionId") != Some(thread_id)
+            || required_bool(thread, "ephemeral") != Some(true)
+            || optional_string(thread, "path") != Some(None)
+            || optional_string(thread, "forkedFromId") != Some(None)
+            || optional_string(thread, "parentThreadId") != Some(None)
+            || optional_string(thread, "projectId") != Some(None)
+            || required_array(thread, "turns").is_none_or(|turns| !turns.is_empty())
+            || required_string(thread, "cliVersion") != Some(self.codex_version.as_ref())
+            || required_string(thread, "cwd") != Some(self.expected_cwd.as_ref())
+            || required_string(thread, "modelProvider") != self.effective_model_provider.as_deref()
+        {
+            return Err(
+                self.failure_for(CodexAppServerV1RejectionReason::ThreadStartResponseInvalid)
+            );
+        }
         Ok(())
     }
 
@@ -1748,6 +1823,78 @@ impl CodexAppServerV1Parser {
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
         self.require_additive_correlation(params)
+    }
+
+    fn parse_realtime_item_started(
+        &mut self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        let (raw_id, raw_session_id) = self.required_realtime_item_identity(params)?;
+        let id = self.retain_identity(raw_id)?;
+        let session_id = self.retain_identity(raw_session_id)?;
+        if self.active_realtime_items.contains_key(&id) {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ItemTransitionInvalid));
+        }
+        self.active_realtime_items
+            .insert(id, ActiveRealtimeItem { session_id });
+        Ok(())
+    }
+
+    fn parse_realtime_item_completed(
+        &mut self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        let (id, session_id) = self.required_realtime_item_identity(params)?;
+        let active = self.active_realtime_items.get(id).ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ItemTransitionInvalid)
+        })?;
+        if active.session_id.as_ref() != session_id {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid));
+        }
+        self.active_realtime_items.remove(id);
+        Ok(())
+    }
+
+    fn required_realtime_item_identity<'a>(
+        &self,
+        params: &'a Map<String, Value>,
+    ) -> Result<(&'a str, &'a str), AgentFailureCause> {
+        self.require_running_thread(params)?;
+        let item = required_object(params, "item").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+        })?;
+        let id = required_nonempty_string(item, "id").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+        })?;
+        let session_id = required_nonempty_string(item, "realtimeSessionId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+        })?;
+        Ok((id, session_id))
+    }
+
+    fn parse_realtime_item_delta(
+        &self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        self.require_running_thread(params)?;
+        let id = required_nonempty_string(params, "itemId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+        })?;
+        if !self.active_realtime_items.contains_key(id) {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid));
+        }
+        required_string(params, "delta")
+            .map(|_| ())
+            .ok_or_else(|| self.failure_for(CodexAppServerV1RejectionReason::MessageInvalid))
+    }
+
+    fn require_running_thread(&self, params: &Map<String, Value>) -> Result<(), AgentFailureCause> {
+        if self.state != SetupState::Running {
+            return Err(
+                self.failure_for(CodexAppServerV1RejectionReason::NotificationTransitionInvalid)
+            );
+        }
+        self.require_thread(params)
     }
 
     fn parse_strict_review_required(

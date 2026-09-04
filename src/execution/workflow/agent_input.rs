@@ -93,6 +93,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn process(&self) -> &AgentProcessContext {
         match self {
             Self::Pi(invocation) => invocation.process(),
@@ -101,6 +102,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn staging(&self) -> &AgentInvocationStaging {
         match self {
             Self::Pi(invocation) => invocation.staging(),
@@ -117,6 +119,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prompt(&self) -> &AgentPrompt {
         match self {
             Self::Pi(invocation) => invocation.prompt(),
@@ -125,6 +128,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn attachments(&self) -> &[StagedAgentAttachment] {
         match self {
             Self::Pi(invocation) => invocation.attachments(),
@@ -141,43 +145,11 @@ where
         }
     }
 
-    pub(crate) fn cancellation(&self) -> &CancellationSource {
-        match self {
-            Self::Pi(invocation) => invocation.cancellation(),
-            Self::ClaudeCode(invocation) => invocation.cancellation(),
-            Self::Codex(invocation) => invocation.cancellation(),
-        }
-    }
-
-    pub(crate) fn observations(&self) -> &super::agent::OrderedAgentObservationSink<Sink> {
-        match self {
-            Self::Pi(invocation) => invocation.observations(),
-            Self::ClaudeCode(invocation) => invocation.observations(),
-            Self::Codex(invocation) => invocation.observations(),
-        }
-    }
-
     pub(crate) fn process_control(&self) -> &super::agent::AgentProcessControl {
         match self {
             Self::Pi(invocation) => invocation.process_control(),
             Self::ClaudeCode(invocation) => invocation.process_control(),
             Self::Codex(invocation) => invocation.process_control(),
-        }
-    }
-
-    pub(crate) fn maximum_response_bytes(&self) -> std::num::NonZeroU64 {
-        match self {
-            Self::Pi(invocation) => invocation.limits().maximum_response_bytes(),
-            Self::ClaudeCode(invocation) => invocation.limits().maximum_response_bytes(),
-            Self::Codex(invocation) => invocation.limits().maximum_response_bytes(),
-        }
-    }
-
-    pub(crate) fn maximum_result_bytes(&self) -> std::num::NonZeroU64 {
-        match self {
-            Self::Pi(invocation) => invocation.limits().maximum_result_bytes(),
-            Self::ClaudeCode(invocation) => invocation.limits().maximum_result_bytes(),
-            Self::Codex(invocation) => invocation.limits().maximum_result_bytes(),
         }
     }
 }
@@ -342,6 +314,7 @@ where
         &self.invocation
     }
 
+    #[cfg(test)]
     pub(crate) fn staging_path(&self) -> &Path {
         self.staging.path()
     }
@@ -494,7 +467,12 @@ impl AgentInputStaging {
         cancellation: &CancellationSource,
     ) -> Result<(), AgentInputMaterializationError> {
         #[cfg(not(test))]
-        let _ = boundary;
+        match boundary {
+            AgentMaterializationBoundaryInternal::BeforeAttachment { index } => {
+                let _ = index;
+            }
+            AgentMaterializationBoundaryInternal::Ready => {}
+        }
         #[cfg(test)]
         if let Some(observer) = &self.inner.observer {
             observer.reached(match boundary {

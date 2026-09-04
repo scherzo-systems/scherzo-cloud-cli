@@ -19,14 +19,21 @@ if [[ $# -gt 1 ]]; then
   usage
 fi
 
+check_root=$(mktemp -d "${TMPDIR:-/tmp}/scherzo-pi-json-v1-check.XXXXXX")
 cleanup() {
-  rm -rf -- "$package_root/node_modules"
+  rm -rf -- "$check_root"
 }
 trap cleanup EXIT
-cleanup
+
+shopt -s dotglob nullglob
+for entry in "$package_root"/*; do
+  if [[ ${entry##*/} != node_modules ]]; then
+    cp -R -- "$entry" "$check_root/"
+  fi
+done
 
 (
-  cd "$package_root"
+  cd "$check_root"
   npm ci --ignore-scripts --no-audit --no-fund
   npm ls --all >/dev/null
   if [[ "$mode" == check ]]; then

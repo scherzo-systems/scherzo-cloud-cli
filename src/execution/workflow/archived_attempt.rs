@@ -118,14 +118,6 @@ pub(crate) enum ArchivedStepState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArchivedFailurePhase {
-    Start,
-    Condition,
-    Execution,
-    OutputCapture,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchivedCancellationReason {
     UserRequest,
     TerminationRequest,
@@ -1380,13 +1372,6 @@ fn project_primary_issue(
             Ok(Some(primary.clone()))
         }
         WorkflowOutcomeV1::Succeeded | WorkflowOutcomeV1::Cancelled => Ok(None),
-    }
-}
-
-fn workflow_node_role(role: WorkflowNodeRoleV1) -> WorkflowNodeRole {
-    match role {
-        WorkflowNodeRoleV1::Step => WorkflowNodeRole::Step,
-        WorkflowNodeRoleV1::Finalizer => WorkflowNodeRole::Finalizer,
     }
 }
 

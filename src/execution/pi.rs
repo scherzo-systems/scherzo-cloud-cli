@@ -1,16 +1,21 @@
 use super::harness_installation::{
     ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
     ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
-    parse_probe_text, validate_installation_with as validate_shared_installation,
-    validate_selected_installation,
+    parse_probe_text,
 };
-use crate::process::{CommandOutput, CommandRunner, SystemCommandRunner};
+#[cfg(test)]
+use super::harness_installation::{
+    validate_installation_with as validate_shared_installation, validate_selected_installation,
+};
+#[cfg(test)]
+use crate::process::CommandRunner;
+use crate::process::{CommandOutput, SystemCommandRunner};
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub(crate) const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.84.2 <0.85.0";
-pub(crate) const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.84.2";
+pub(crate) const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.84.4";
 const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 84, 2);
 const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 85, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 7] = [
@@ -290,6 +295,7 @@ pub(crate) fn discover_and_validate_pi_installation()
     discover_and_validate_installation::<PiInstallationProfile>(&SystemCommandRunner)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_pi_installation(
     selected_executable: &Path,
 ) -> Result<ValidatedPiInstallation, PiInstallationFailure> {
@@ -299,6 +305,7 @@ pub(crate) fn validate_pi_installation(
     )
 }
 
+#[cfg(test)]
 fn validate_pi_installation_with(
     selected_executable: &Path,
     search_path: &OsStr,
@@ -336,9 +343,13 @@ fn validate_capability_output(
     };
     let help = parse_probe_text(output).ok_or_else(malformed)?;
     if !help.starts_with("pi ")
-        || !help
-            .lines()
-            .any(|line| line.trim() == "pi [options] [@files...] [messages...]")
+        || !help.lines().any(|line| {
+            matches!(
+                line.trim(),
+                "pi [options] [@files...] [messages...]"
+                    | "pi [options] [--] [@files...] [messages...]"
+            )
+        })
     {
         return Err(malformed());
     }
