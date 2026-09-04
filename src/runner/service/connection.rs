@@ -3265,6 +3265,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_never_replays_an_unacknowledged_effect_receipt() {
+        let context = EstablishedTestContext::new();
+        let mut next_sequence = 2;
+
+        let (first_inbound, mut first_outbound, first_connection) =
+            established_fixture(&context, &mut next_sequence);
+        let first_peer = async {
+            with_watchdog(first_outbound.recv())
+                .await
+                .expect("first opening hello timed out")
+                .expect("first opening hello missing");
+            first_inbound.send(welcome());
+            first_inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            first_inbound.send(assignment_release());
+            let receipt = with_watchdog(first_outbound.recv())
+                .await
+                .expect("effect receipt timed out")
+                .expect("effect receipt missing");
+            let Message::Text(receipt) = receipt else {
+                panic!("effect receipt was not text");
+            };
+            let receipt: serde_json::Value =
+                serde_json::from_str(&receipt).expect("decode effect receipt");
+            assert_eq!(receipt["type"], "effect_acknowledged");
+            first_inbound.send(Message::Close(None));
+        };
+        let (first_result, ()) =
+            with_watchdog(async { tokio::join!(first_connection, first_peer) })
+                .await
+                .expect("first effect receipt connection timed out");
+        first_result.expect("first effect receipt connection failed");
+        assert_eq!(next_sequence, 3);
+
+        let (second_inbound, mut second_outbound, second_connection) =
+            established_fixture(&context, &mut next_sequence);
+        let second_peer = async {
+            with_watchdog(second_outbound.recv())
+                .await
+                .expect("replacement opening hello timed out")
+                .expect("replacement opening hello missing");
+            second_inbound.send(welcome());
+            second_inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            second_inbound.send(Message::Ping(b"no-effect-receipt-replay".to_vec().into()));
+            let barrier = with_watchdog(second_outbound.recv())
+                .await
+                .expect("replacement synchronization pong timed out")
+                .expect("replacement synchronization pong missing");
+            assert!(
+                matches!(&barrier, Message::Pong(payload) if payload.as_ref() == b"no-effect-receipt-replay"),
+                "replacement emitted an observation before its synchronization pong: {barrier:?}",
+            );
+            second_inbound.send(Message::Close(None));
+        };
+        let (second_result, ()) =
+            with_watchdog(async { tokio::join!(second_connection, second_peer) })
+                .await
+                .expect("replacement effect receipt connection timed out");
+        second_result.expect("replacement effect receipt connection failed");
+        assert_eq!(next_sequence, 3, "reconnect replayed the effect receipt");
+    }
+
+    #[tokio::test]
     async fn reconnect_replays_unacknowledged_terminal_with_same_identity() {
         let context = EstablishedTestContext::new();
         {
