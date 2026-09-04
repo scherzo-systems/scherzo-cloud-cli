@@ -10,6 +10,8 @@ use std::time::Duration;
 use fs4::{FileExt, TryLockError};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
+use super::workflow_git::WorkflowGitAuthority;
+
 const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
 const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
 const BOOT_MARKER: &[u8] = b"scherzo-runner-serve/boot-root/v1\n";
@@ -561,7 +563,12 @@ impl WorkRootLease {
             execution: workspace_tree.path.clone(),
             private: PrivateStaging { path: private_path },
             workspace: WorkspaceLease::new(workspace_tree, self.engine.clone()),
+            workflow_git: None,
             engine: self.engine.clone(),
+            workspace_release: Arc::new(AssignmentReleaseState {
+                started: AtomicBool::new(false),
+                completion: ReleaseCompletion::new(),
+            }),
             release: Arc::new(AssignmentReleaseState {
                 started: AtomicBool::new(false),
                 completion: ReleaseCompletion::new(),
@@ -804,11 +811,58 @@ pub(super) struct AssignmentRoot {
     pub(super) execution: PathBuf,
     pub(super) private: PrivateStaging,
     pub(super) workspace: WorkspaceLease,
+    workflow_git: Option<WorkflowGitAuthority>,
     engine: CleanupEngine,
+    workspace_release: Arc<AssignmentReleaseState>,
     release: Arc<AssignmentReleaseState>,
 }
 
 impl AssignmentRoot {
+    pub(super) fn install_workflow_git(&mut self, authority: WorkflowGitAuthority) {
+        self.workflow_git = Some(authority);
+    }
+
+    pub(super) fn workflow_git(&self) -> Option<WorkflowGitAuthority> {
+        self.workflow_git.clone()
+    }
+
+    pub(super) fn release_workspace_pending(
+        &self,
+        quiescence: ProcessQuiescence,
+    ) -> PendingRelease {
+        let pending = self.workspace_release.completion.pending();
+        if self
+            .workspace_release
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return pending;
+        }
+        let authority = self.workflow_git.clone();
+        let workspace = self.workspace.clone();
+        let completion = self.workspace_release.completion.clone();
+        let worker_completion = completion.clone();
+        if std::thread::Builder::new()
+            .name("runner-workspace-boundary-release".to_owned())
+            .spawn(move || {
+                if let Some(authority) = authority {
+                    let report = authority.teardown(quiescence);
+                    if !report.local_state_destroyed {
+                        worker_completion
+                            .complete(CleanupResult::Quarantined(CleanupFailure::Safety));
+                        return;
+                    }
+                }
+                worker_completion.complete(workspace.release_pending(quiescence).wait());
+            })
+            .is_err()
+        {
+            completion.complete(CleanupResult::Quarantined(CleanupFailure::Safety));
+        }
+        pending
+    }
+
     pub(super) fn release_pending(&self, quiescence: ProcessQuiescence) -> PendingRelease {
         let pending = self.release.completion.pending();
         if self
@@ -819,7 +873,7 @@ impl AssignmentRoot {
         {
             return pending;
         }
-        let workspace = self.workspace.release_pending(quiescence);
+        let workspace = self.release_workspace_pending(quiescence);
         let assignment_tree = self.assignment_tree.clone();
         let engine = self.engine.clone();
         let completion = self.release.completion.clone();

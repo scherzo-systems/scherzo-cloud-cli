@@ -36,6 +36,13 @@ fn main() -> ExitCode {
     if execution::workflow::result_validation::internal_worker_requested() {
         return execution::workflow::result_validation::run_internal_worker();
     }
+    if runner::service::workflow_git_helper_requested() {
+        return if runner::service::run_workflow_git_helper() {
+            ExitCode::Success
+        } else {
+            ExitCode::GeneralFailure
+        };
+    }
 
     match cli::parse(env::args_os()) {
         Ok(command) => match command.execute() {

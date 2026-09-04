@@ -11,10 +11,11 @@ use super::artifact_delivery::{
     ArtifactCloudResponse, ArtifactDeliveryBroker, ArtifactDeliveryProtocolFailure,
 };
 use super::config::Config;
-use super::execution::{AssignmentProcessGuards, ExecutionJob};
+use super::execution::{AssignmentProcessGuards, ExecutionAuthority, ExecutionJob};
 use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::run_inputs::{HttpRunInputBroker, PreparationDeadline, RunInputBroker, RunInputFailure};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
+use super::workflow_git::{WorkflowGitAuthority, WorkflowGitInstall};
 use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, WorkRootLease,
 };
@@ -22,7 +23,8 @@ use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationSource, EnvironmentSnapshot, ExecutionContext, ResolvedImports,
-    WorkflowCapacityBudget, admit_runner_workflow, default_execution_policy_limits,
+    SourceRevisionProvenance, WorkflowCapacityBudget, admit_runner_workflow,
+    default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::execution::workflow::cancellation::{
@@ -849,6 +851,7 @@ pub(super) struct AcceptedAssignment {
     pub(super) transition_budget: usize,
     pub(super) process_guards: AssignmentProcessGuards,
     pub(super) guard_processes: bool,
+    pub(super) workflow_git: WorkflowGitAuthority,
 }
 
 impl AcceptedAssignment {
@@ -947,6 +950,8 @@ struct RunningAssignment {
     current_grant: ExecutionLeaseGrant,
     causal_lease: CausalLease,
     authority_updates: tokio::sync::watch::Sender<LeaseAuthority>,
+    workflow_git: WorkflowGitAuthority,
+    workspace_release: Option<CleanupResult>,
 }
 
 struct PreparingAssignment {
@@ -1048,6 +1053,10 @@ pub(super) enum ManagerEvent {
         deadline: PreparationDeadline,
         admission: Box<Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>>>,
     },
+    WorkspaceReleased {
+        assignment_id: String,
+        result: CleanupResult,
+    },
     Finished {
         assignment_id: String,
         final_observation_id: Option<u64>,
@@ -1098,6 +1107,7 @@ struct AdmissionRuntime {
     environment: EnvironmentSnapshot,
     outbox: ObservationOutbox,
     guard_processes: bool,
+    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
     preparation_event: Option<TelemetryEvent>,
 }
 
@@ -1165,6 +1175,9 @@ impl AdmissionRuntime {
             Ok(prepared) => prepared,
             Err(decline) => return Err(Box::new((root, decline))),
         };
+        let Some(workflow_git) = root.workflow_git() else {
+            return Err(Box::new((root, environment_unavailable())));
+        };
         Ok(AcceptedAssignment {
             identity: AssignmentIdentity::from_offer(offer),
             root,
@@ -1172,6 +1185,7 @@ impl AdmissionRuntime {
             transition_budget,
             process_guards: AssignmentProcessGuards::new(),
             guard_processes: self.guard_processes,
+            workflow_git,
         })
     }
 }
@@ -1650,7 +1664,7 @@ impl AssignmentManager {
                 let workspace_path = root.workspace.path();
                 let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let checkout = super::source::checkout(
-                        broker,
+                        Arc::clone(&broker),
                         &environment,
                         &worker_offer.assignment_id,
                         &source,
@@ -1679,18 +1693,40 @@ impl AssignmentManager {
                 let admission = match preparation {
                     Ok(Ok((materialized, imports))) => {
                         root.execution = materialized.execution_root;
-                        runtime.finish(
-                            &worker_offer,
-                            root,
-                            materialized.workflow,
-                            imports,
-                            materialized.git_capture,
-                            PreparationAuthority {
-                                deadline,
-                                cancellation: &worker_cancellation,
-                                monotonic_now: sleeper.now(),
-                            },
-                        )
+                        let workflow_git = std::env::current_exe()
+                            .map_err(anyhow::Error::from)
+                            .and_then(|helper_executable| {
+                                WorkflowGitAuthority::install(WorkflowGitInstall {
+                                    broker: Arc::clone(&broker),
+                                    assignment_id: &worker_offer.assignment_id,
+                                    origin: materialized.origin,
+                                    workspace: &root.execution,
+                                    private_root: &root.private,
+                                    environment: &environment,
+                                    helper_executable: &helper_executable,
+                                    clock: Arc::clone(&sleeper),
+                                    recorder: runtime.recorder.clone(),
+                                    cancellation: &worker_cancellation,
+                                })
+                            });
+                        match workflow_git {
+                            Ok(workflow_git) => {
+                                root.install_workflow_git(workflow_git.clone());
+                                runtime.finish(
+                                    &worker_offer,
+                                    root,
+                                    materialized.workflow,
+                                    imports,
+                                    materialized.git_capture,
+                                    PreparationAuthority {
+                                        deadline,
+                                        cancellation: &worker_cancellation,
+                                        monotonic_now: sleeper.now(),
+                                    },
+                                )
+                            }
+                            Err(_) => Err(Box::new((root, environment_unavailable()))),
+                        }
                     }
                     Ok(Err(decline)) => Err(Box::new((root, decline))),
                     Err(_) => Err(Box::new((root, environment_unavailable()))),
@@ -1822,6 +1858,10 @@ impl AssignmentManager {
             .source()
             .clone();
         let (authority_updates, authority_receiver) = tokio::sync::watch::channel(authority);
+        let workflow_git = accepted.workflow_git.clone();
+        let workflow_git_activated = workflow_git
+            .activate(self.lease_clock.clone(), authority_receiver.clone())
+            .is_ok();
         self.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
             cancellation,
@@ -1829,15 +1869,20 @@ impl AssignmentManager {
             current_grant: start.lease,
             causal_lease: causal_lease.clone(),
             authority_updates,
+            workflow_git,
+            workspace_release: None,
         })));
         Ok(Some(ExecutionJob::new(
             *accepted,
             self.outbox.clone(),
             self.artifact_delivery.clone(),
             self.event_sender.clone(),
-            self.lease_clock.clone(),
-            causal_lease,
-            authority_receiver,
+            ExecutionAuthority {
+                lease_clock: self.lease_clock.clone(),
+                causal_lease,
+                updates: authority_receiver,
+                workflow_git_activated,
+            },
         )))
     }
 
@@ -2165,6 +2210,7 @@ impl AssignmentManager {
                 self.finish_before_execution(identity, root, "graceful_shutdown")?;
             }
             LocalSlot::Running(running) => {
+                running.workflow_git.disable();
                 running.cancellation.request_cancellation(
                     crate::execution::workflow::admission::CancellationReason::RunnerShutdown,
                 );
@@ -2433,6 +2479,16 @@ impl AssignmentManager {
                                 ReleaseAfter::Idle,
                             );
                         }
+                    }
+                }
+                ManagerEvent::WorkspaceReleased {
+                    assignment_id,
+                    result,
+                } => {
+                    if let Some(LocalSlot::Running(running)) = &mut self.slot
+                        && running.identity.assignment_id == assignment_id
+                    {
+                        running.workspace_release = Some(result);
                     }
                 }
                 ManagerEvent::Finished {
@@ -2758,6 +2814,7 @@ impl AssignmentManager {
             environment: self.environment.clone(),
             outbox: self.outbox.clone(),
             guard_processes: self.guard_processes,
+            recorder: self.recorder.clone(),
             preparation_event,
         }
     }
@@ -3069,6 +3126,10 @@ fn build_execution_context(
         environment.without_managed_runner_credentials_and_helpers(),
         CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
     )
+    .with_source_revision(SourceRevisionProvenance::new(
+        execution_spec.source_branch.as_str(),
+        execution_spec.primary_workspace_source.commit_oid.as_str(),
+    ))
     .with_capacity_budget(WorkflowCapacityBudget {
         maximum_invocations: capacity.maximum_invocations,
         diagnostic_retention_bytes: capacity.diagnostic_retention_bytes,
@@ -3095,6 +3156,7 @@ fn build_execution_context(
 }
 
 fn revoke_authority(running: &mut RunningAssignment) {
+    running.workflow_git.disable();
     running.authority_updates.send_modify(|authority| {
         authority.revoked = true;
     });
@@ -3446,7 +3508,7 @@ mod tests {
         ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
     };
     use crate::runner::service::source::{
-        CommitAvailability, CredentialBrokerFailure, ProviderCredential,
+        CommitAvailability, CredentialBrokerFailure, ProviderCredential, WorkflowGitRevocation,
         test_support::{fixture_source_broker, unavailable_source_broker},
     };
     use crate::runner::service::test_support::{
@@ -3651,6 +3713,25 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         ) -> Result<CommitAvailability, CredentialBrokerFailure> {
             Err(CredentialBrokerFailure::Fenced)
         }
+
+        // Preparation-cancellation tests never grant execution-time source authority.
+        // jscpd:ignore-start
+        fn issue_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Fenced)
+        }
+
+        fn revoke_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _token: &[u8],
+        ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Fenced)
+        }
+        // jscpd:ignore-end
     }
 
     struct BlockingSourceFixture {
@@ -4547,6 +4628,29 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         !registrations.is_empty()
     }
 
+    async fn wait_for_carrier_registration(
+        manager: &mut AssignmentManager,
+    ) -> Vec<PendingAssignmentObservation> {
+        let notification = manager.notification();
+        loop {
+            let notified = notification.notified();
+            tokio::pin!(notified);
+            let pending = manager.pending_observations(&BTreeSet::new(), 100);
+            if pending.iter().any(|entry| {
+                matches!(
+                    entry.observation,
+                    AssignmentObservation::Artifact {
+                        request: ArtifactRequest::RegisterCarrier { .. },
+                        ..
+                    }
+                )
+            }) {
+                return pending;
+            }
+            notified.await;
+        }
+    }
+
     async fn wait_for_terminal(manager: &mut AssignmentManager) -> Vec<ExecutionReport> {
         let notification = manager.notification();
         loop {
@@ -4840,38 +4944,20 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let mut offered = offer("bg");
         align_offer_with_source_fixture(&manager, &mut offered);
         manager.handle_offer(offered.clone()).unwrap();
-        let runtime = manager.admission_runtime();
-        let source_root = source_fixture_path(&manager);
-        let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
-        let mut preparing = match manager.slot.take() {
-            Some(LocalSlot::Preparing(preparing)) => preparing,
-            _ => panic!("offered assignment must be preparing"),
+        prepare_current(&mut manager, &offered).await;
+        let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
+        manager.acknowledge_observation(acceptance);
+        let accepted = match manager.slot.take() {
+            Some(LocalSlot::Accepted(accepted)) => *accepted,
+            _ => panic!("fixture assignment must be accepted"),
         };
-        let root = preparing.root.take().expect("preparing root");
-        let cancellation = CaptureCancellation::default();
-        let preparation = prepare_for(&manager, &offered);
-        let live_deadline = PreparationDeadline::from_wire(
-            &preparation.preparation_expires_at,
-            manager.sleeper.utc_now(),
-            manager.sleeper.now(),
-        )
-        .unwrap();
-        let accepted = match runtime.finish(
-            &offered,
-            root,
-            workflow,
-            ResolvedImports::default(),
-            None,
-            PreparationAuthority {
-                deadline: live_deadline,
-                cancellation: &cancellation,
-                monotonic_now: manager.sleeper.now(),
-            },
-        ) {
-            Ok(accepted) => accepted,
-            Err(_) => panic!("fixture admission must succeed before the deadline"),
-        };
-        manager.slot = Some(LocalSlot::Preparing(preparing));
+        manager.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
+            offer: offered.clone(),
+            cancellation: CaptureCancellation::default(),
+            root: None,
+            prepare_effect_id: Some("eff_01k0z6r1w8f4jy2m7q9v3x5acz".to_owned()),
+            preparation_event: None,
+        })));
         manager
             .event_sender
             .send(ManagerEvent::Prepared {
@@ -4903,6 +4989,70 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             pending[0].observation,
             AssignmentObservation::Decision(AssignmentDecision::Accepted { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn staged_carrier_delivery_begins_only_after_the_workspace_is_released() {
+        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf staged > value.txt\"]\n    outputs:\n      value:\n        kind: file\n        from: path\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let (workspace, private, helper) = match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => {
+                let private = accepted.root.private.path().to_owned();
+                (
+                    accepted.root.workspace.path(),
+                    private.clone(),
+                    private.join("workflow-git-credential"),
+                )
+            }
+            _ => panic!("fixture assignment must be accepted"),
+        };
+        spawn_execution(&mut manager, &offered);
+
+        let pending = with_watchdog(wait_for_carrier_registration(&mut manager))
+            .await
+            .expect("carrier registration was not reached");
+        assert!(!workspace.exists());
+        assert!(private.exists());
+        assert!(!helper.exists());
+        assert!(!pending.iter().any(|entry| entry.observation.is_terminal()));
+        assert!(fail_pending_artifact_registrations(&mut manager, &pending));
+
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("terminal report was not selected");
+        assert!(matches!(
+            reports.last(),
+            Some(ExecutionReport::Finished { .. })
+        ));
+        assert!(!workspace.exists());
+        assert!(private.exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_release_survives_a_stale_git_config_lock() {
+        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"touch .git/config.lock; printf staged > value.txt\"]\n    outputs:\n      value:\n        kind: file\n        from: path\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let workspace = match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => accepted.root.workspace.path(),
+            _ => panic!("fixture assignment must be accepted"),
+        };
+        spawn_execution(&mut manager, &offered);
+
+        let pending = with_watchdog(wait_for_carrier_registration(&mut manager))
+            .await
+            .expect("carrier registration was not reached");
+        assert!(
+            !workspace.exists(),
+            "a stale Git config lock must not retain the checkout through delivery"
+        );
+        assert!(fail_pending_artifact_registrations(&mut manager, &pending));
+        with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("terminal report was not selected");
     }
 
     #[tokio::test]
@@ -5375,6 +5525,15 @@ steps:
             environment.variable(OsStr::new("RUNNER_VISIBLE")),
             Some(OsStr::new("retained"))
         );
+        assert_eq!(
+            environment.variable(OsStr::new("SCHERZO_SOURCE_BRANCH")),
+            Some(OsStr::new("main"))
+        );
+        let commit = run_fixture_git(execution.root(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            environment.variable(OsStr::new("SCHERZO_SOURCE_COMMIT_OID")),
+            Some(OsStr::new(&commit))
+        );
         for name in [
             "GIT_ASKPASS",
             "GIT_ASKPASS_REQUIRE",
@@ -5547,6 +5706,19 @@ steps:
                 if running.cancellation.cancellation_reason()
                     == Some(crate::execution::workflow::admission::CancellationReason::RunnerShutdown)
         ));
+        let (authority_active, authority) = match &manager.slot {
+            Some(LocalSlot::Running(running)) => (
+                running.workflow_git.is_active(),
+                running.workflow_git.clone(),
+            ),
+            _ => panic!("assignment must remain running during graceful shutdown"),
+        };
+        let report = authority.teardown(ProcessQuiescence::Proven);
+        assert!(report.local_state_destroyed);
+        assert!(
+            !authority_active,
+            "runner shutdown must immediately fence workflow Git authority"
+        );
     }
 
     #[tokio::test]
@@ -6490,18 +6662,41 @@ steps:
     }
 
     #[tokio::test]
-    async fn executes_outputless_agent_and_command_dag_in_the_prepared_repository() {
+    async fn cloud_commands_agents_and_finalizers_receive_exact_source_revision() {
         let repository_argv = serde_json::to_string(&[
             "sh",
             "-c",
-            "test -d .git && test \"$(git rev-parse --is-inside-work-tree)\" = true && test -z \"$(git rev-parse --show-prefix)\" && test -z \"$(git branch --show-current)\"",
+            "test -d .git && test \"$(git rev-parse --is-inside-work-tree)\" = true && test -z \"$(git rev-parse --show-prefix)\" && test -z \"$(git branch --show-current)\" && test \"$SCHERZO_SOURCE_BRANCH\" = main && test \"$SCHERZO_SOURCE_COMMIT_OID\" = \"$(git rev-parse HEAD)\"",
         ])
         .unwrap();
         let workflow = format!(
-            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{{ file: system.md }}]\n  consume:\n    kind: cmd\n    dependsOn: [agent]\n    command:\n      argv: {repository_argv}\n"
+            "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: high\nsteps:\n  agent:\n    kind: agent\n    agent:\n      profile: coding\n      systemPrompt: system.md\n      message:\n        text: [{{ file: system.md }}]\n  consume:\n    kind: cmd\n    dependsOn: [agent]\n    command:\n      argv: {repository_argv}\nfinalizers:\n  verify:\n    kind: cmd\n    command:\n      argv: {repository_argv}\n"
         );
-        let reports = execute_fixture_workflow(&workflow, Some(SUCCESSFUL_PI), 0).await;
-        assert_succeeded(&reports);
+        let pi_source = SUCCESSFUL_PI.replacen(
+            "set -eu",
+            "set -eu\ntest \"$SCHERZO_SOURCE_BRANCH\" = main\ntest \"$SCHERZO_SOURCE_COMMIT_OID\" = \"$(git rev-parse HEAD)\"",
+            1,
+        );
+        let (_temporary, mut manager) = manager_fixture_with_pi(&workflow, Some(&pi_source));
+        let mut environment = manager.environment.variables().clone();
+        environment.insert(
+            OsString::from("SCHERZO_SOURCE_BRANCH"),
+            OsString::from("inherited-branch"),
+        );
+        environment.insert(
+            OsString::from("SCHERZO_SOURCE_COMMIT_OID"),
+            OsString::from("inherited-commit"),
+        );
+        manager.environment = EnvironmentSnapshot::new(environment);
+
+        let reports = offer_and_execute(&mut manager).await;
+
+        assert!(matches!(
+            reports.last(),
+            Some(ExecutionReport::Finished { outcome, .. })
+                if outcome["outcome"] == "succeeded"
+                    && outcome["finalization"]["finalizers"][0]["id"] == "verify"
+        ));
     }
 
     #[tokio::test]

@@ -850,9 +850,18 @@ Run Input manifest, downloads every member through fresh exact capabilities into
 0600 temporary files without redirects, and admits the complete prompt and ordered
 attachments before semantic acceptance. The fixed preparation deadline is not extended
 by progress. Verified staging remains under the assignment root through execution and is
-removed or quarantined by the existing release path. Transport receipt and semantic
-acceptance remain separate; execution requires a later start effect and remains bounded
-by the latest received execution lease across same-boot reconnects.
+removed or quarantined by the existing release path. Cloud commands, agents, and
+finalizers receive the exact recorded source branch and pinned commit as
+`SCHERZO_SOURCE_BRANCH` and `SCHERZO_SOURCE_COMMIT_OID`; local execution receives neither.
+After the later start effect, a token-free repository helper can obtain lease-bound read
+access only for the credential-free primary `origin`. Runner Serve disables the helper,
+revokes every known issuance after process quiescence, destroys local helper and token
+state, verifies all retained carriers in private staging, and releases the checkout
+before artifact upload or terminal acknowledgement. Author code can deliberately query
+that helper and copy its bearer into author-controlled output; the platform does not
+claim to prevent that behavior. Transport receipt and semantic
+acceptance remain separate, and execution remains bounded by the latest received lease
+across same-boot reconnects.
 
 While the service runs, standard error contains newline-delimited JSON. Each outbound
 attempt completes one `runner.gateway_connection` event with safe runner and boot IDs,

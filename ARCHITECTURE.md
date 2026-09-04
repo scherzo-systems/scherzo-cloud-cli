@@ -243,11 +243,10 @@ configuration, and runtime layout are not compatibility targets.
 
 A run invocation resolves one workflow and supplies its resolved imports. Every
 invocation produces the same internal resolved workflow, including its immutable static
-source closure and digest, before execution begins. A local invocation currently begins
-from an explicit file path. The Cloud source-selection and transfer contract remains
-undefined; the current Runner Serve development slice instead maps an opaque workflow
-selector to operator-configured local source. That selector is neither an architectural
-workflow identity nor authoritative source provenance.
+source closure and digest, before execution begins. A local invocation begins from an
+explicit file path and carries no Cloud source provenance. Runner Serve instead receives
+an immutable workflow-definition source, primary-workspace source, and recorded branch,
+then prepares one full detached clone at the pinned commit before shared admission.
 
 A workflow contains a schema version, one dependency graph of command and agent steps,
 explicit data references, and output declarations. It has no mandatory checkout,
@@ -255,16 +254,17 @@ preparation, or execution phases. Cloning a repository, using an existing workin
 creating a Git worktree or Jujutsu workspace, installing dependencies, and other setup
 are ordinary workflow-authorized steps.
 
-The caller supplies the execution root and its lifecycle. An on-demand runner normally
-uses an empty engine-owned ephemeral root, an active local invocation can explicitly
-lend its current directory, and a standalone local invocation can request a new retained
-root. Workflows select the applicable behavior through ordinary inputs, environment, and
-commands; the language may add engine-visible step conditions without introducing a
-separate phase model.
+The caller supplies the execution root and its lifecycle. A local invocation can lend
+its current directory or request a retained engine-owned root. Runner Serve always lends
+the verified checkout as a caller-owned retained root, supplies exact branch and commit
+provenance through engine-owned environment variables, and installs a token-free helper
+whose one-origin read authority exists only under the current execution lease. After
+finalizers and capture quiesce, Runner Serve destroys that authority, verifies staged
+carriers, and releases the checkout before artifact delivery or terminal acknowledgement.
 
 Local execution and Runner Serve call the same execution component. Runner Serve adds
-assignment, lease, durable observation, and cleanup behavior around it, but connectivity
-code does not acquire source, schedule steps, or interpret workflow outputs.
+source preparation, assignment, lease, durable observation, and cleanup behavior around
+it; the connection adapter still does not schedule steps or interpret workflow outputs.
 
 The private npm project under
 `src/execution/workflow/pi-json-v1-extension/` checks the single-file PiJsonV1 result

@@ -17,6 +17,7 @@ use super::connection::{
 };
 use super::source::{
     CommitAvailability, CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker,
+    WorkflowGitRevocation,
 };
 use super::test_support::{
     ConfigFixture, DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
@@ -31,6 +32,8 @@ const REPLAY_OVERRIDE: &str = "SCHERZO_RUNNER_CONVERSATION_FIXTURE";
 
 struct UnavailableSourceBroker;
 
+// Conversation replay intentionally models one broker with every source operation unavailable.
+// jscpd:ignore-start
 impl SourceCredentialBroker for UnavailableSourceBroker {
     fn issue(
         &self,
@@ -47,7 +50,24 @@ impl SourceCredentialBroker for UnavailableSourceBroker {
     ) -> Result<CommitAvailability, CredentialBrokerFailure> {
         Err(CredentialBrokerFailure::Unavailable)
     }
+
+    fn issue_workflow_git(
+        &self,
+        _assignment_id: &str,
+        _cancellation: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        Err(CredentialBrokerFailure::Unavailable)
+    }
+
+    fn revoke_workflow_git(
+        &self,
+        _assignment_id: &str,
+        _token: &[u8],
+    ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+        Err(CredentialBrokerFailure::Unavailable)
+    }
 }
+// jscpd:ignore-end
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

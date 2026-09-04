@@ -2677,7 +2677,7 @@ mod tests {
     use crate::runner::service::config::Config;
     use crate::runner::service::source::{
         CommitAvailability, CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker,
-        test_support::unavailable_source_broker,
+        WorkflowGitRevocation, test_support::unavailable_source_broker,
     };
     use crate::runner::service::test_support::{
         ConfigFixture, DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
@@ -2720,6 +2720,8 @@ mod tests {
             }
         }
 
+        // This transport gate models source unavailability; runtime Git is deliberately inert.
+        // jscpd:ignore-start
         fn commit_availability(
             &self,
             _assignment_id: &str,
@@ -2727,6 +2729,23 @@ mod tests {
         ) -> Result<CommitAvailability, CredentialBrokerFailure> {
             Err(CredentialBrokerFailure::Unavailable)
         }
+
+        fn issue_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+
+        fn revoke_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _token: &[u8],
+        ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+        // jscpd:ignore-end
     }
 
     struct EstablishedTestContext {

@@ -13,7 +13,7 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use opentelemetry::KeyValue;
 use reqwest::StatusCode;
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 use zeroize::Zeroize as _;
@@ -44,6 +44,18 @@ pub(super) trait SourceCredentialBroker: Send + Sync {
         assignment_id: &str,
         cancellation: &CaptureCancellation,
     ) -> Result<CommitAvailability, CredentialBrokerFailure>;
+
+    fn issue_workflow_git(
+        &self,
+        assignment_id: &str,
+        cancellation: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure>;
+
+    fn revoke_workflow_git(
+        &self,
+        assignment_id: &str,
+        token: &[u8],
+    ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -63,9 +75,9 @@ pub(super) enum CredentialBrokerFailure {
 }
 
 pub(super) struct ProviderCredential {
-    repository_url: Arc<str>,
-    token: ProviderSecret,
-    expires_at: OffsetDateTime,
+    pub(super) repository_url: Arc<str>,
+    pub(super) token: ProviderSecret,
+    pub(super) expires_at: OffsetDateTime,
 }
 
 impl std::fmt::Debug for ProviderCredential {
@@ -78,7 +90,7 @@ impl std::fmt::Debug for ProviderCredential {
     }
 }
 
-struct ProviderSecret(Vec<u8>);
+pub(super) struct ProviderSecret(pub(super) Vec<u8>);
 
 impl Drop for ProviderSecret {
     fn drop(&mut self) {
@@ -90,6 +102,8 @@ impl Drop for ProviderSecret {
 pub(super) struct HttpSourceCredentialBroker {
     credential_endpoint: Url,
     availability_endpoint: Url,
+    workflow_git_endpoint: Url,
+    workflow_git_revoke_endpoint: Url,
     runner_credential: Credential,
     boot_id: Arc<str>,
     repository_url_policy: RepositoryUrlPolicy,
@@ -120,9 +134,15 @@ impl HttpSourceCredentialBroker {
             private_runner_http_endpoint(endpoint, "/v1/runner/source-credentials")?;
         let availability_endpoint =
             private_runner_http_endpoint(endpoint, "/v1/runner/source-commit-availability")?;
+        let workflow_git_endpoint =
+            private_runner_http_endpoint(endpoint, "/v1/runner/workflow-git-credentials")?;
+        let workflow_git_revoke_endpoint =
+            private_runner_http_endpoint(endpoint, "/v1/runner/workflow-git-credentials/revoke")?;
         Ok(Self {
             credential_endpoint,
             availability_endpoint,
+            workflow_git_endpoint,
+            workflow_git_revoke_endpoint,
             runner_credential: runner_credential.clone(),
             boot_id: Arc::from(boot_id),
             repository_url_policy,
@@ -156,8 +176,18 @@ impl HttpSourceCredentialBroker {
 struct CredentialResponse {
     schema_version: u64,
     repository_url: String,
-    token: String,
+    token: SensitiveString,
     expires_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct SensitiveString(String);
+
+impl Drop for SensitiveString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 #[derive(Deserialize)]
@@ -180,6 +210,40 @@ struct CommitAvailabilityResponse {
     availability: CommitAvailability,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WorkflowGitRevocationOutcome {
+    Revoked,
+    AlreadyRevoked,
+    Expired,
+    ResidualUntilExpiry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct WorkflowGitRevocation {
+    pub(super) issuance_id: String,
+    pub(super) outcome: WorkflowGitRevocationOutcome,
+    pub(super) provider_expires_at: OffsetDateTime,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowGitRevocationResponse {
+    schema_version: u64,
+    issuance_id: String,
+    outcome: WorkflowGitRevocationOutcome,
+    provider_expires_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowGitRevocationRequest<'a> {
+    schema_version: u64,
+    boot_id: &'a str,
+    assignment_id: &'a str,
+    token: &'a str,
+}
+
 struct BrokerResponse {
     status: StatusCode,
     encoded: ProviderSecret,
@@ -193,6 +257,22 @@ impl HttpSourceCredentialBroker {
         cancellation: &CaptureCancellation,
     ) -> Result<BrokerResponse, CredentialBrokerFailure> {
         ensure_broker_current(cancellation)?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "bootId": self.boot_id.as_ref(),
+            "assignmentId": assignment_id,
+        }))
+        .map(ProviderSecret)
+        .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+        self.request_encoded(endpoint, body, Some(cancellation))
+    }
+
+    fn request_encoded(
+        &self,
+        endpoint: &Url,
+        mut body: ProviderSecret,
+        cancellation: Option<&CaptureCancellation>,
+    ) -> Result<BrokerResponse, CredentialBrokerFailure> {
         crate::tls::install_provider();
         let client = reqwest::Client::builder()
             .timeout(PROVIDER_OPERATION_TIMEOUT)
@@ -201,23 +281,27 @@ impl HttpSourceCredentialBroker {
         let request = client
             .post(endpoint.clone())
             .bearer_auth(self.runner_credential.bearer_value())
-            .json(&serde_json::json!({
-                "schemaVersion": 1,
-                "bootId": self.boot_id.as_ref(),
-                "assignmentId": assignment_id,
-            }));
+            .header(CONTENT_TYPE, "application/json")
+            .body(std::mem::take(&mut body.0));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| CredentialBrokerFailure::Unavailable)?;
         runtime.block_on(async {
-            let mut response = tokio::select! {
-                result = request.send() => {
-                    result.map_err(|_| CredentialBrokerFailure::Unavailable)?
+            let mut response = if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    result = request.send() => {
+                        result.map_err(|_| CredentialBrokerFailure::Unavailable)?
+                    }
+                    () = wait_for_cancellation(cancellation) => {
+                        return Err(CredentialBrokerFailure::Fenced);
+                    }
                 }
-                () = wait_for_cancellation(cancellation) => {
-                    return Err(CredentialBrokerFailure::Fenced);
-                }
+            } else {
+                request
+                    .send()
+                    .await
+                    .map_err(|_| CredentialBrokerFailure::Unavailable)?
             };
             let status = response.status();
             if response
@@ -241,13 +325,20 @@ impl HttpSourceCredentialBroker {
             let mut encoded = ProviderSecret(Vec::new());
             if has_json {
                 loop {
-                    let chunk = tokio::select! {
-                        result = response.chunk() => {
-                            result.map_err(|_| CredentialBrokerFailure::Unavailable)?
+                    let chunk = if let Some(cancellation) = cancellation {
+                        tokio::select! {
+                            result = response.chunk() => {
+                                result.map_err(|_| CredentialBrokerFailure::Unavailable)?
+                            }
+                            () = wait_for_cancellation(cancellation) => {
+                                return Err(CredentialBrokerFailure::Fenced);
+                            }
                         }
-                        () = wait_for_cancellation(cancellation) => {
-                            return Err(CredentialBrokerFailure::Fenced);
-                        }
+                    } else {
+                        response
+                            .chunk()
+                            .await
+                            .map_err(|_| CredentialBrokerFailure::Unavailable)?
                     };
                     let Some(chunk) = chunk else {
                         break;
@@ -264,11 +355,11 @@ impl HttpSourceCredentialBroker {
 
     fn issue_current(
         &self,
+        endpoint: &Url,
         assignment_id: &str,
         cancellation: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure> {
-        let response =
-            self.request_current(&self.credential_endpoint, assignment_id, cancellation)?;
+        let response = self.request_current(endpoint, assignment_id, cancellation)?;
         match response.status {
             StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
             StatusCode::FAILED_DEPENDENCY => {
@@ -294,7 +385,7 @@ impl HttpSourceCredentialBroker {
             token,
             expires_at,
         } = parsed;
-        let token = ProviderSecret(token.into_bytes());
+        let token = ProviderSecret(token.0.as_bytes().to_vec());
         if schema_version != 1
             || token.0.is_empty()
             || token.0.len() > 64 * 1024
@@ -316,6 +407,46 @@ impl HttpSourceCredentialBroker {
             repository_url: Arc::from(repository_url),
             token,
             expires_at,
+        })
+    }
+
+    fn revoke_workflow_git_current(
+        &self,
+        assignment_id: &str,
+        token: &[u8],
+    ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+        let token =
+            std::str::from_utf8(token).map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
+        let body = serde_json::to_vec(&WorkflowGitRevocationRequest {
+            schema_version: 1,
+            boot_id: self.boot_id.as_ref(),
+            assignment_id,
+            token,
+        })
+        .map(ProviderSecret)
+        .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+        let response = self.request_encoded(&self.workflow_git_revoke_endpoint, body, None)?;
+        match response.status {
+            StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
+            StatusCode::OK => {}
+            _ => return Err(CredentialBrokerFailure::Unavailable),
+        }
+        let parsed: WorkflowGitRevocationResponse = serde_json::from_slice(&response.encoded.0)
+            .map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
+        let utc_spelling = parsed.provider_expires_at.ends_with('Z');
+        let provider_expires_at = OffsetDateTime::parse(&parsed.provider_expires_at, &Rfc3339)
+            .ok()
+            .filter(|value| utc_spelling && value.offset() == UtcOffset::UTC)
+            .ok_or(CredentialBrokerFailure::InvalidResponse)?;
+        if parsed.schema_version != 1
+            || !crate::public_id::valid_typed_id(&parsed.issuance_id, "gti_")
+        {
+            return Err(CredentialBrokerFailure::InvalidResponse);
+        }
+        Ok(WorkflowGitRevocation {
+            issuance_id: parsed.issuance_id,
+            outcome: parsed.outcome,
+            provider_expires_at,
         })
     }
 
@@ -354,7 +485,11 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
         let assignment_id = assignment_id.to_owned();
         let worker_cancellation = cancellation.clone();
         run_broker_worker("runner-source-credential", cancellation, move || {
-            broker.issue_current(&assignment_id, &worker_cancellation)
+            broker.issue_current(
+                &broker.credential_endpoint.clone(),
+                &assignment_id,
+                &worker_cancellation,
+            )
         })
     }
 
@@ -369,6 +504,28 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
         run_broker_worker("runner-source-verification", cancellation, move || {
             broker.commit_availability_current(&assignment_id, &worker_cancellation)
         })
+    }
+
+    fn issue_workflow_git(
+        &self,
+        assignment_id: &str,
+        cancellation: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        ensure_broker_current(cancellation)?;
+        let request_lifetime = CaptureCancellation::default();
+        self.issue_current(
+            &self.workflow_git_endpoint,
+            assignment_id,
+            &request_lifetime,
+        )
+    }
+
+    fn revoke_workflow_git(
+        &self,
+        assignment_id: &str,
+        token: &[u8],
+    ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+        self.revoke_workflow_git_current(assignment_id, token)
     }
 }
 
@@ -402,7 +559,7 @@ fn run_broker_worker<T: Send + 'static>(
     }
 }
 
-fn ensure_broker_current(
+pub(super) fn ensure_broker_current(
     cancellation: &CaptureCancellation,
 ) -> Result<(), CredentialBrokerFailure> {
     if cancellation.is_cancelled() {
@@ -463,6 +620,7 @@ pub(super) enum MaterializationFailure {
 pub(super) struct MaterializedSource {
     pub(super) workflow: ResolvedWorkflow,
     pub(super) execution_root: PathBuf,
+    pub(super) origin: Arc<str>,
     pub(super) git_capture: Option<CloudGitCaptureProjection>,
 }
 
@@ -503,6 +661,7 @@ impl MaterializationRequest {
 pub(super) struct MaterializedCheckout {
     request: MaterializationRequest,
     source_root: PathBuf,
+    origin: Arc<str>,
 }
 
 pub(super) fn checkout(
@@ -568,6 +727,7 @@ pub(super) fn checkout(
     Ok(MaterializedCheckout {
         request: request.clone(),
         source_root: source_root.to_owned(),
+        origin: repository_url,
     })
 }
 
@@ -608,6 +768,7 @@ pub(super) fn resolve_checkout(
     Ok(MaterializedSource {
         workflow,
         execution_root: checkout.source_root,
+        origin: checkout.origin,
         git_capture,
     })
 }
@@ -1119,12 +1280,7 @@ fn run_git_output(
     Ok(output)
 }
 
-fn git_command(
-    root: &Path,
-    environment: &EnvironmentSnapshot,
-    arguments: &[&str],
-    askpass: Option<&EphemeralAskpass>,
-) -> Command {
+pub(super) fn isolated_git_command(root: &Path, environment: &EnvironmentSnapshot) -> Command {
     let mut command = Command::new("git");
     command
         .current_dir(root)
@@ -1140,18 +1296,7 @@ fn git_command(
             "gc.auto=0",
             "-c",
             "maintenance.auto=false",
-            "-c",
-            "fetch.writeCommitGraph=false",
-            "-c",
-            "credential.helper=",
-            "-c",
-            "filter.lfs.process=",
-            "-c",
-            "filter.lfs.smudge=",
-            "-c",
-            "filter.lfs.required=false",
         ])
-        .args(arguments)
         .env_clear()
         .env("LC_ALL", "C")
         .env("GIT_ATTR_NOSYSTEM", "1")
@@ -1163,6 +1308,30 @@ fn git_command(
     if let Some(path) = environment.variable(OsStr::new("PATH")) {
         command.env("PATH", path);
     }
+    command
+}
+
+fn git_command(
+    root: &Path,
+    environment: &EnvironmentSnapshot,
+    arguments: &[&str],
+    askpass: Option<&EphemeralAskpass>,
+) -> Command {
+    let mut command = isolated_git_command(root, environment);
+    command
+        .args([
+            "-c",
+            "fetch.writeCommitGraph=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.required=false",
+        ])
+        .args(arguments);
     if let Some(askpass) = askpass {
         askpass.bind(&mut command);
     }
@@ -1329,9 +1498,7 @@ pub(super) mod test_support {
             _assignment_id: &str,
             cancellation: &CaptureCancellation,
         ) -> Result<ProviderCredential, CredentialBrokerFailure> {
-            if cancellation.is_cancelled() {
-                return Err(CredentialBrokerFailure::Fenced);
-            }
+            ensure_broker_current(cancellation)?;
             let repository_url = self
                 .repository_url
                 .clone()
@@ -1349,6 +1516,25 @@ pub(super) mod test_support {
                 .map(|_| CommitAvailability::CommitAvailable)
                 .ok_or(CredentialBrokerFailure::Unavailable)
         }
+
+        // This preparation fixture never exercises the separately tested runtime broker.
+        // jscpd:ignore-start
+        fn issue_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+
+        fn revoke_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _token: &[u8],
+        ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+        // jscpd:ignore-end
     }
 
     pub(in crate::runner::service) fn fixture_source_broker(
@@ -1458,6 +1644,25 @@ mod tests {
                 .push(FixtureBrokerCall::CommitAvailability);
             Ok(self.availability)
         }
+
+        // Materialization call accounting is isolated from runtime-authority fixtures.
+        // jscpd:ignore-start
+        fn issue_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+
+        fn revoke_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _token: &[u8],
+        ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+        // jscpd:ignore-end
     }
 
     struct RepositoryFixture {
@@ -2941,6 +3146,16 @@ mod tests {
         )
     }
 
+    fn http_source_broker(endpoint: &Url) -> HttpSourceCredentialBroker {
+        HttpSourceCredentialBroker::new(
+            endpoint,
+            &test_credential(),
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            RepositoryUrlPolicy::production(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn repository_url_validation_uses_the_injected_policy() {
         let repository = tempfile::tempdir().unwrap();
@@ -3028,6 +3243,62 @@ mod tests {
         assert!(document.get("commitOid").is_none());
         assert!(document.get("repositoryConnectionId").is_none());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn workflow_git_broker_uses_assignment_only_issue_and_sensitive_revoke_requests() {
+        let expires = "2099-08-20T13:00:00Z";
+        let (endpoint, issue_request, issue_server) = source_broker_response_fixture(
+            "200 OK",
+            &format!(
+                r#"{{"schemaVersion":1,"repositoryUrl":"https://github.example/acme/private.git","token":"workflow-runtime-token","expiresAt":"{expires}"}}"#
+            ),
+        );
+        let broker = http_source_broker(&endpoint);
+        let credential = broker
+            .issue_workflow_git(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                &CaptureCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            credential.repository_url.as_ref(),
+            "https://github.example/acme/private.git"
+        );
+        assert_eq!(credential.token.0, b"workflow-runtime-token");
+        let issue: serde_json::Value =
+            serde_json::from_str(&issue_request.recv().unwrap()).unwrap();
+        assert_eq!(
+            issue,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            })
+        );
+        issue_server.join().unwrap();
+
+        let (endpoint, revoke_request, revoke_server) = source_broker_response_fixture(
+            "200 OK",
+            &format!(
+                r#"{{"schemaVersion":1,"issuanceId":"gti_01k0z6r1w8f4jy2m7q9v3x5abc","outcome":"residual_until_expiry","providerExpiresAt":"{expires}"}}"#
+            ),
+        );
+        let broker = http_source_broker(&endpoint);
+        let revocation = broker
+            .revoke_workflow_git("asn_01k0z6r1w8f4jy2m7q9v3x5abc", b"workflow-runtime-token")
+            .unwrap();
+        assert_eq!(
+            revocation.outcome,
+            WorkflowGitRevocationOutcome::ResidualUntilExpiry
+        );
+        let revoke: serde_json::Value =
+            serde_json::from_str(&revoke_request.recv().unwrap()).unwrap();
+        assert_eq!(revoke["schemaVersion"], 1);
+        assert_eq!(revoke["assignmentId"], "asn_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert_eq!(revoke["token"], "workflow-runtime-token");
+        assert!(revoke.get("repositoryConnectionId").is_none());
+        revoke_server.join().unwrap();
     }
 
     #[test]

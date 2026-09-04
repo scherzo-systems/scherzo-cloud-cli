@@ -1263,6 +1263,89 @@ fn admission_rejects_invalid_attachment_media_type() {
 }
 
 #[test]
+fn managed_runner_environment_removes_git_trace_redaction_overrides() {
+    let environment = EnvironmentSnapshot::new([
+        ("GIT_TRACE_CURL", "1"),
+        ("GIT_TRACE_REDACT", "0"),
+        ("GIT_CURL_VERBOSE", "1"),
+        ("VISIBLE", "retained"),
+    ])
+    .without_managed_runner_credentials_and_helpers();
+
+    for name in ["GIT_TRACE_CURL", "GIT_TRACE_REDACT", "GIT_CURL_VERBOSE"] {
+        assert!(environment.variable(OsStr::new(name)).is_none());
+    }
+    assert_eq!(
+        environment.variable(OsStr::new("VISIBLE")),
+        Some(OsStr::new("retained"))
+    );
+}
+
+#[test]
+fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none() {
+    let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
+    let environment = EnvironmentSnapshot::new([
+        ("PATH", "/bin"),
+        ("SCHERZO_SOURCE_BRANCH", "inherited-branch"),
+        ("SCHERZO_SOURCE_COMMIT_OID", "inherited-commit"),
+        ("SCHERZO_OTHER", "inherited-other"),
+    ]);
+    let context = ExecutionContext::new(
+        fixture.execution_root.clone(),
+        default_execution_policy_limits(1),
+        environment.clone(),
+        CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+    );
+    let local = admit_workflow(
+        fixture.resolve(),
+        ResolvedImports::new(Some(Arc::from("prompt")), Arc::from([])),
+        context.clone(),
+    )
+    .unwrap();
+    for name in ["SCHERZO_SOURCE_BRANCH", "SCHERZO_SOURCE_COMMIT_OID"] {
+        assert!(
+            local
+                .execution()
+                .environment()
+                .variable(OsStr::new(name))
+                .is_none(),
+            "local admission retained {name}"
+        );
+    }
+
+    let cloud = admit_runner_workflow(
+        fixture.resolve(),
+        ResolvedImports::new(Some(Arc::from("prompt")), Arc::from([])),
+        context.with_source_revision(SourceRevisionProvenance::new(
+            "refs/heads/exact-source",
+            "0123456789abcdef0123456789abcdef01234567",
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        cloud
+            .execution()
+            .environment()
+            .variable(OsStr::new("SCHERZO_SOURCE_BRANCH")),
+        Some(OsStr::new("refs/heads/exact-source"))
+    );
+    assert_eq!(
+        cloud
+            .execution()
+            .environment()
+            .variable(OsStr::new("SCHERZO_SOURCE_COMMIT_OID")),
+        Some(OsStr::new("0123456789abcdef0123456789abcdef01234567"))
+    );
+    assert!(
+        cloud
+            .execution()
+            .environment()
+            .variable(OsStr::new("SCHERZO_OTHER"))
+            .is_none()
+    );
+}
+
+#[test]
 fn workflow_admission_reserves_only_engine_environment_variables() {
     let environment = EnvironmentSnapshot::new([
         ("PATH", "/bin"),

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io::Read as _;
 use std::ops::Add;
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::FutureExt as _;
@@ -45,12 +47,13 @@ use crate::execution::workflow::process_group::{
     terminate_authenticated_process_group,
 };
 use crate::execution::workflow::publication::{
-    CloudExecutionCapacityV1, DigestV1, RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1,
-    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryInvocationUsageV1,
-    RecoveryInvocationV1, WorkflowRunCancellation, WorkflowRunFinalization,
-    WorkflowRunFinalizationCancellation, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
-    WorkflowRunTiming, WorkflowStepTiming, command_output_v1, prepare_cloud_workflow_result,
-    step_recovery_summary_v1, summary_disposition_matches,
+    CloudCarrierBody, CloudExecutionCapacityV1, DigestV1, PreparedCloudWorkflowResult,
+    RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1,
+    RecoveryInvocationStateV1, RecoveryInvocationUsageV1, RecoveryInvocationV1,
+    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
+    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
+    command_output_v1, prepare_cloud_workflow_result, step_recovery_summary_v1,
+    summary_disposition_matches,
 };
 use crate::execution::workflow::runtime::{
     ActionId, ActiveStepInvocation, FinalizationGate, FinalizationSummary, FinalizerResult,
@@ -207,16 +210,21 @@ impl DurableProcessGuardStore for AssignmentProcessGuards {
 #[derive(Clone)]
 struct PostStopFence {
     fenced: Arc<Mutex<bool>>,
+    workflow_git: Option<super::workflow_git::WorkflowGitAuthority>,
 }
 
 impl PostStopFence {
-    fn new() -> Self {
+    fn with_workflow_git(authority: Option<super::workflow_git::WorkflowGitAuthority>) -> Self {
         Self {
             fenced: Arc::new(Mutex::new(false)),
+            workflow_git: authority,
         }
     }
 
     fn fence(&self) {
+        if let Some(authority) = &self.workflow_git {
+            authority.disable();
+        }
         *self.lock() = true;
     }
 
@@ -271,6 +279,13 @@ impl ExecutionCompletion {
     }
 }
 
+pub(super) struct ExecutionAuthority {
+    pub(super) lease_clock: LeaseClock,
+    pub(super) causal_lease: CausalLease,
+    pub(super) updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+    pub(super) workflow_git_activated: bool,
+}
+
 pub(super) struct ExecutionJob {
     accepted: AcceptedAssignment,
     outbox: ObservationOutbox,
@@ -279,6 +294,8 @@ pub(super) struct ExecutionJob {
     lease_clock: LeaseClock,
     causal_lease: CausalLease,
     pub(super) authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+    workflow_git_activated: bool,
+    workspace_release_reported: AtomicBool,
 }
 
 impl ExecutionJob {
@@ -287,18 +304,18 @@ impl ExecutionJob {
         outbox: ObservationOutbox,
         artifact_delivery: ArtifactDeliveryBroker,
         manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
-        lease_clock: LeaseClock,
-        causal_lease: CausalLease,
-        authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+        authority: ExecutionAuthority,
     ) -> Self {
         Self {
             accepted,
             outbox,
             artifact_delivery,
             manager_events,
-            lease_clock,
-            causal_lease,
-            authority_updates,
+            lease_clock: authority.lease_clock,
+            causal_lease: authority.causal_lease,
+            authority_updates: authority.updates,
+            workflow_git_activated: authority.workflow_git_activated,
+            workspace_release_reported: AtomicBool::new(false),
         }
     }
 
@@ -306,6 +323,7 @@ impl ExecutionJob {
         let assignment_id = self.accepted.assignment_id().to_owned();
         let root = self.accepted.root.clone();
         let process_guards = self.accepted.process_guards.clone();
+        let workflow_git = self.accepted.workflow_git.clone();
         let manager_events = self.manager_events.clone();
         let outbox = self.outbox.clone();
         tokio::spawn(async move {
@@ -320,6 +338,15 @@ impl ExecutionJob {
                 } else {
                     super::workspace::ProcessQuiescence::Failed
                 };
+                workflow_git.disable();
+                let release = root
+                    .release_workspace_pending(quiescence)
+                    .wait_async()
+                    .await;
+                let _ = manager_events.send(ManagerEvent::WorkspaceReleased {
+                    assignment_id: assignment_id.clone(),
+                    result: release,
+                });
                 let _ = manager_events.send(ManagerEvent::Finished {
                     assignment_id,
                     final_observation_id: None,
@@ -351,6 +378,7 @@ impl ExecutionJob {
         } else {
             super::workspace::ProcessQuiescence::Failed
         };
+        let _ = self.release_workspace(quiescence).await;
         let retained_root = self.accepted.root;
         let _ = self.manager_events.send(ManagerEvent::Finished {
             assignment_id,
@@ -363,13 +391,60 @@ impl ExecutionJob {
         self.outbox.wake();
     }
 
+    async fn release_workspace(
+        &self,
+        quiescence: super::workspace::ProcessQuiescence,
+    ) -> super::workspace::CleanupResult {
+        self.accepted.workflow_git.disable();
+        let result = self
+            .accepted
+            .root
+            .release_workspace_pending(quiescence)
+            .wait_async()
+            .await;
+        if !self.workspace_release_reported.swap(true, Ordering::AcqRel) {
+            let _ = self.manager_events.send(ManagerEvent::WorkspaceReleased {
+                assignment_id: self.accepted.assignment_id().to_owned(),
+                result,
+            });
+            self.outbox.wake();
+        }
+        result
+    }
+
+    fn process_quiescence(&self) -> super::workspace::ProcessQuiescence {
+        if self.accepted.process_guards.is_quiescent() {
+            super::workspace::ProcessQuiescence::Proven
+        } else {
+            super::workspace::ProcessQuiescence::Failed
+        }
+    }
+
+    async fn abort_after_workspace_release(
+        &self,
+        assignment_id: &str,
+        attempt_id: &str,
+        last_execution_event_sequence: u64,
+        reason: &str,
+    ) -> ExecutionCompletion {
+        let quiescence = self.process_quiescence();
+        let _ = self.release_workspace(quiescence).await;
+        ExecutionCompletion::ordinary(self.abort(
+            assignment_id,
+            attempt_id,
+            last_execution_event_sequence,
+            reason,
+        ))
+    }
+
     async fn run_workflow(
         &self,
         assignment_id: &str,
         attempt_id: &str,
         run_id: &str,
     ) -> ExecutionCompletion {
-        let post_stop_fence = PostStopFence::new();
+        let post_stop_fence =
+            PostStopFence::with_workflow_git(Some(self.accepted.workflow_git.clone()));
         let cancellation = self
             .accepted
             .admitted
@@ -377,16 +452,33 @@ impl ExecutionJob {
             .cancellation()
             .source()
             .clone();
-        match self.has_execution_authority() {
-            Ok(true) => {}
-            Ok(false) => return ExecutionCompletion::without_report(),
-            Err(_) => {
-                return self.fail_before_execution(
-                    &cancellation,
-                    &post_stop_fence,
+        if !self.workflow_git_activated {
+            return self
+                .abort_after_workspace_release(
                     assignment_id,
                     attempt_id,
-                );
+                    0,
+                    "execution_environment_lost",
+                )
+                .await;
+        }
+        match self.has_execution_authority() {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = self
+                    .release_workspace(super::workspace::ProcessQuiescence::Proven)
+                    .await;
+                return ExecutionCompletion::without_report();
+            }
+            Err(_) => {
+                return self
+                    .fail_before_execution(
+                        &cancellation,
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                    )
+                    .await;
             }
         }
         let initial_authority = self.authority_updates.borrow().clone();
@@ -396,12 +488,14 @@ impl ExecutionJob {
         {
             Ok(wait) => wait,
             Err(_) => {
-                return self.fail_before_execution(
-                    &cancellation,
-                    &post_stop_fence,
-                    assignment_id,
-                    attempt_id,
-                );
+                return self
+                    .fail_before_execution(
+                        &cancellation,
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                    )
+                    .await;
             }
         };
         let artifacts = match ArtifactStaging::create(
@@ -410,12 +504,14 @@ impl ExecutionJob {
         ) {
             Ok(staging) => staging,
             Err(_) => {
-                return ExecutionCompletion::ordinary(self.abort(
-                    assignment_id,
-                    attempt_id,
-                    0,
-                    "execution_environment_lost",
-                ));
+                return self
+                    .abort_after_workspace_release(
+                        assignment_id,
+                        attempt_id,
+                        0,
+                        "execution_environment_lost",
+                    )
+                    .await;
             }
         };
         let inputs = match InputStaging::create(
@@ -425,12 +521,14 @@ impl ExecutionJob {
             Ok(staging) => staging,
             Err(_) => {
                 let _ = artifacts.release();
-                return ExecutionCompletion::ordinary(self.abort(
-                    assignment_id,
-                    attempt_id,
-                    0,
-                    "execution_environment_lost",
-                ));
+                return self
+                    .abort_after_workspace_release(
+                        assignment_id,
+                        attempt_id,
+                        0,
+                        "execution_environment_lost",
+                    )
+                    .await;
             }
         };
         let agent_staging = if self.accepted.admitted.agent_steps().is_empty() {
@@ -444,12 +542,14 @@ impl ExecutionJob {
                 Err(_) => {
                     let _ = inputs.release();
                     let _ = artifacts.release();
-                    return ExecutionCompletion::ordinary(self.abort(
-                        assignment_id,
-                        attempt_id,
-                        0,
-                        "execution_environment_lost",
-                    ));
+                    return self
+                        .abort_after_workspace_release(
+                            assignment_id,
+                            attempt_id,
+                            0,
+                            "execution_environment_lost",
+                        )
+                        .await;
                 }
             }
         };
@@ -468,12 +568,14 @@ impl ExecutionJob {
                 Some(sessions) => Some(sessions),
                 None => {
                     let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                    return ExecutionCompletion::ordinary(self.abort(
-                        assignment_id,
-                        attempt_id,
-                        0,
-                        "execution_environment_lost",
-                    ));
+                    return self
+                        .abort_after_workspace_release(
+                            assignment_id,
+                            attempt_id,
+                            0,
+                            "execution_environment_lost",
+                        )
+                        .await;
                 }
             }
         } else {
@@ -484,16 +586,21 @@ impl ExecutionJob {
             Ok(true) => {}
             Ok(false) => {
                 let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
+                let _ = self
+                    .release_workspace(super::workspace::ProcessQuiescence::Proven)
+                    .await;
                 return ExecutionCompletion::without_report();
             }
             Err(_) => {
                 let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                return self.fail_before_execution(
-                    &cancellation,
-                    &post_stop_fence,
-                    assignment_id,
-                    attempt_id,
-                );
+                return self
+                    .fail_before_execution(
+                        &cancellation,
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                    )
+                    .await;
             }
         }
 
@@ -502,12 +609,15 @@ impl ExecutionJob {
             .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
             .is_none()
         {
-            return ExecutionCompletion::ordinary(self.abort(
-                assignment_id,
-                attempt_id,
-                0,
-                "runner_internal_failure",
-            ));
+            let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            return self
+                .abort_after_workspace_release(
+                    assignment_id,
+                    attempt_id,
+                    0,
+                    "runner_internal_failure",
+                )
+                .await;
         }
 
         let diagnostics = StepDiagnosticLog::default();
@@ -544,12 +654,14 @@ impl ExecutionJob {
                 observer.clone(),
             ) else {
                 let _ = release_staging(&inputs, Some(agent_staging), &artifacts);
-                return ExecutionCompletion::ordinary(self.abort(
-                    assignment_id,
-                    attempt_id,
-                    observer.last_sequence(),
-                    "runner_internal_failure",
-                ));
+                return self
+                    .abort_after_workspace_release(
+                        assignment_id,
+                        attempt_id,
+                        observer.last_sequence(),
+                        "runner_internal_failure",
+                    )
+                    .await;
             };
             let agents = AgentExecution::enabled_with_accounting(
                 WorkflowRunId::from(Arc::from(run_id)),
@@ -617,6 +729,7 @@ impl ExecutionJob {
             // jscpd:ignore-end
             result
         };
+        self.accepted.workflow_git.disable();
         let support_cleanup_failed = release_support_staging(&inputs, agent_staging.as_ref());
 
         let (result, final_delivery_budget) = match execution {
@@ -629,21 +742,32 @@ impl ExecutionJob {
                 final_delivery_budget,
             } => {
                 let _ = artifacts.release();
-                return self.abort_unless_fenced(
-                    &post_stop_fence,
-                    assignment_id,
-                    attempt_id,
-                    observer.last_sequence(),
-                    "runner_internal_failure",
-                    final_delivery_budget,
-                );
+                return self
+                    .abort_unless_fenced(
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                        observer.last_sequence(),
+                        "runner_internal_failure",
+                        final_delivery_budget,
+                    )
+                    .await;
             }
             LeaseExecution::ContainmentDeadline => {
                 let _ = artifacts.release();
+                let _ = self
+                    .release_workspace(super::workspace::ProcessQuiescence::Failed)
+                    .await;
                 return ExecutionCompletion::fenced(None, None);
             }
             LeaseExecution::LeaseClockFailed { quiescent } => {
                 let _ = artifacts.release();
+                let quiescence = if quiescent {
+                    super::workspace::ProcessQuiescence::Proven
+                } else {
+                    super::workspace::ProcessQuiescence::Failed
+                };
+                let _ = self.release_workspace(quiescence).await;
                 let report = quiescent.then(|| {
                     self.abort(
                         assignment_id,
@@ -657,25 +781,29 @@ impl ExecutionJob {
         };
         if support_cleanup_failed {
             let _ = artifacts.release();
-            return self.abort_unless_fenced(
-                &post_stop_fence,
-                assignment_id,
-                attempt_id,
-                observer.last_sequence(),
-                "execution_environment_lost",
-                final_delivery_budget,
-            );
+            return self
+                .abort_unless_fenced(
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                    observer.last_sequence(),
+                    "execution_environment_lost",
+                    final_delivery_budget,
+                )
+                .await;
         }
         if observer.faulted() {
             let _ = artifacts.release();
-            return self.abort_unless_fenced(
-                &post_stop_fence,
-                assignment_id,
-                attempt_id,
-                observer.last_sequence(),
-                "runner_internal_failure",
-                final_delivery_budget,
-            );
+            return self
+                .abort_unless_fenced(
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                    observer.last_sequence(),
+                    "runner_internal_failure",
+                    final_delivery_budget,
+                )
+                .await;
         }
         let last_sequence = observer.last_sequence();
         let has_finalizers = !self
@@ -691,14 +819,16 @@ impl ExecutionJob {
             || has_finalizers != result.finalization_summary.is_some()
         {
             let _ = artifacts.release();
-            return self.abort_unless_fenced(
-                &post_stop_fence,
-                assignment_id,
-                attempt_id,
-                last_sequence,
-                "engine_result_inconsistent",
-                final_delivery_budget,
-            );
+            return self
+                .abort_unless_fenced(
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                    last_sequence,
+                    "engine_result_inconsistent",
+                    final_delivery_budget,
+                )
+                .await;
         }
 
         let finished_at = RunnerExecutionClock.now();
@@ -720,12 +850,27 @@ impl ExecutionJob {
                 )
                 .ok()
             });
-        let delivery = match prepared {
-            Some(prepared) => {
+        let carriers_ready = match &prepared {
+            Some(prepared) => verify_prepared_carriers(&artifacts, prepared).await,
+            None => false,
+        };
+        let quiescence = if self.accepted.process_guards.is_quiescent() {
+            super::workspace::ProcessQuiescence::Proven
+        } else {
+            super::workspace::ProcessQuiescence::Failed
+        };
+        let _workspace_release = self.release_workspace(quiescence).await;
+        let carriers_independent = carriers_ready
+            && match &prepared {
+                Some(prepared) => verify_prepared_carriers(&artifacts, prepared).await,
+                None => false,
+            };
+        let delivery = match (prepared, carriers_independent) {
+            (Some(prepared), true) => {
                 self.deliver_artifacts(assignment_id, attempt_id, &artifacts, prepared)
                     .await
             }
-            None => Ok(internal_delivery_failure("preparation")),
+            _ => Ok(internal_delivery_failure("preparation")),
         };
         let delivery = match delivery {
             Ok(delivery) => delivery,
@@ -805,14 +950,16 @@ impl ExecutionJob {
                 artifact_delivery,
             },
             RunOutcome::Cancelled { .. } => {
-                return self.abort_unless_fenced(
-                    &post_stop_fence,
-                    assignment_id,
-                    attempt_id,
-                    last_sequence,
-                    "runner_internal_failure",
-                    final_delivery_budget,
-                );
+                return self
+                    .abort_unless_fenced(
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                        last_sequence,
+                        "runner_internal_failure",
+                        final_delivery_budget,
+                    )
+                    .await;
             }
         };
         ExecutionCompletion::with_budget(
@@ -1049,7 +1196,7 @@ impl ExecutionJob {
         }
     }
 
-    fn fail_before_execution(
+    async fn fail_before_execution(
         &self,
         cancellation: &crate::execution::workflow::admission::CancellationSource,
         post_stop_fence: &PostStopFence,
@@ -1057,6 +1204,12 @@ impl ExecutionJob {
         attempt_id: &str,
     ) -> ExecutionCompletion {
         begin_forced_containment(cancellation, post_stop_fence, &self.accepted.process_guards);
+        let quiescence = if self.accepted.process_guards.is_quiescent() {
+            super::workspace::ProcessQuiescence::Proven
+        } else {
+            super::workspace::ProcessQuiescence::Failed
+        };
+        let _ = self.release_workspace(quiescence).await;
         ExecutionCompletion::lease_clock_failed(self.abort(
             assignment_id,
             attempt_id,
@@ -1086,7 +1239,7 @@ impl ExecutionJob {
         }
     }
 
-    fn abort_unless_fenced(
+    async fn abort_unless_fenced(
         &self,
         post_stop_fence: &PostStopFence,
         assignment_id: &str,
@@ -1095,6 +1248,7 @@ impl ExecutionJob {
         reason: &str,
         final_delivery_budget: Option<Duration>,
     ) -> ExecutionCompletion {
+        let _ = self.release_workspace(self.process_quiescence()).await;
         if post_stop_fence.is_fenced() {
             ExecutionCompletion::fenced(None, final_delivery_budget)
         } else {
@@ -1620,8 +1774,8 @@ fn begin_forced_containment(
     post_stop_fence: &PostStopFence,
     process_guards: &AssignmentProcessGuards,
 ) {
-    cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired);
     post_stop_fence.fence();
+    cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired);
     process_guards.begin_forced_containment();
 }
 
@@ -1643,6 +1797,73 @@ async fn wait_for_lease_deadline_or_armed(
     };
     let cancellation = LeaseWaitCancellation::default();
     wait.wait(&cancellation).await.map(|_| ())
+}
+
+async fn verify_prepared_carriers(
+    artifacts: &ArtifactStaging,
+    prepared: &PreparedCloudWorkflowResult,
+) -> bool {
+    let artifacts = artifacts.clone();
+    let carriers = prepared.carriers.clone();
+    tokio::task::spawn_blocking(move || {
+        carriers.iter().all(|carrier| match &carrier.body {
+            CloudCarrierBody::Staged(staged) => {
+                let Ok(mut file) = artifacts.open_artifact(staged.handle()) else {
+                    return false;
+                };
+                let mut context = ring::digest::Context::new(&SHA256);
+                let mut size = 0_u64;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let Ok(read) = file.read(&mut buffer) else {
+                        return false;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    let Ok(read_size) = u64::try_from(read) else {
+                        return false;
+                    };
+                    let Some(next_size) = size.checked_add(read_size) else {
+                        return false;
+                    };
+                    size = next_size;
+                    context.update(&buffer[..read]);
+                }
+                size == carrier.size_bytes
+                    && digest_matches(&carrier.sha256, context.finish().as_ref())
+            }
+            CloudCarrierBody::Bytes(bytes) => {
+                u64::try_from(bytes.len()) == Ok(carrier.size_bytes)
+                    && digest_matches(&carrier.sha256, digest(&SHA256, bytes).as_ref())
+            }
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn digest_matches(expected: &str, digest: &[u8]) -> bool {
+    if expected.len() != digest.len().saturating_mul(2) {
+        return false;
+    }
+    expected
+        .as_bytes()
+        .chunks_exact(2)
+        .zip(digest)
+        .all(|(encoded, byte)| {
+            hex_nibble(encoded[0])
+                .zip(hex_nibble(encoded[1]))
+                .is_some_and(|(high, low)| high << 4 | low == *byte)
+        })
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn release_staging(
@@ -2711,7 +2932,7 @@ mod tests {
         let cancellation = crate::execution::workflow::admission::CancellationSource::new();
         let observed_cancellation = cancellation.clone();
         let outbox = ObservationOutbox::new();
-        let fence = PostStopFence::new();
+        let fence = PostStopFence::with_workflow_git(None);
         let observed_fence = fence.clone();
         let observed_guards = guards.clone();
         let causal_lease = CausalLease::new(authority.basis);
@@ -3035,7 +3256,7 @@ mod tests {
             "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             4,
             outbox.clone(),
-            PostStopFence::new(),
+            PostStopFence::with_workflow_git(None),
             crate::execution::workflow::admission::CancellationSource::new(),
             RunnerInvocationEvidence::default(),
         );
@@ -3118,7 +3339,7 @@ mod tests {
     #[tokio::test]
     async fn post_stop_fence_rejects_late_success_but_allows_lease_terminal() {
         let outbox = ObservationOutbox::new();
-        let fence = PostStopFence::new();
+        let fence = PostStopFence::with_workflow_git(None);
         let observer = RunnerExecutionObserver::new(
             "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -3170,7 +3391,7 @@ mod tests {
         assert!(cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired));
         assert!(cancellation.fixture_begin_finalization_arm());
 
-        let fence = PostStopFence::new();
+        let fence = PostStopFence::with_workflow_git(None);
         fence.fence();
         let observer = RunnerExecutionObserver::new(
             "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),

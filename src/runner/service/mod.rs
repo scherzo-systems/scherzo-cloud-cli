@@ -14,6 +14,7 @@ mod run_inputs;
 mod source;
 #[cfg(test)]
 mod test_support;
+mod workflow_git;
 mod workspace;
 
 use std::fmt;
@@ -309,6 +310,14 @@ impl std::error::Error for ServiceError {
             Self::LeaseClock(error) => Some(error),
         }
     }
+}
+
+pub(crate) fn workflow_git_helper_requested() -> bool {
+    workflow_git::internal_helper_requested()
+}
+
+pub(crate) fn run_workflow_git_helper() -> bool {
+    workflow_git::run_internal_helper()
 }
 
 pub(crate) fn run(config: Config) -> Result<(), ServiceError> {

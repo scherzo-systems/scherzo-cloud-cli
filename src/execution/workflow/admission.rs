@@ -619,6 +619,7 @@ fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
         b"GIT_ASKPASS"
             | b"GIT_ASKPASS_REQUIRE"
             | b"GIT_TERMINAL_PROMPT"
+            | b"GIT_CURL_VERBOSE"
             | b"GIT_CONFIG"
             | b"GIT_CONFIG_COUNT"
             | b"GIT_CONFIG_PARAMETERS"
@@ -635,6 +636,7 @@ fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
             | b"GITHUB_TOKEN"
     ) || name.starts_with(b"GIT_CONFIG_KEY_")
         || name.starts_with(b"GIT_CONFIG_VALUE_")
+        || name.starts_with(b"GIT_TRACE")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,12 +809,28 @@ pub(crate) struct AdmittedWorkflowCapacity {
     pub(crate) maximum_transitions: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourceRevisionProvenance {
+    branch: Arc<str>,
+    commit_oid: Arc<str>,
+}
+
+impl SourceRevisionProvenance {
+    pub(crate) fn new(branch: impl Into<Arc<str>>, commit_oid: impl Into<Arc<str>>) -> Self {
+        Self {
+            branch: branch.into(),
+            commit_oid: commit_oid.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContext {
     root: PathBuf,
     limits: ExecutionPolicyLimits,
     environment: EnvironmentSnapshot,
     cancellation: CancellationPolicy,
+    source_revision: Option<SourceRevisionProvenance>,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
@@ -832,12 +850,21 @@ impl ExecutionContext {
             limits,
             environment,
             cancellation,
+            source_revision: None,
             pi_installation: None,
             claude_code_installation: None,
             codex_installation: None,
             git_capture: GitCaptureAdmission::None,
             capacity_budget: WorkflowCapacityBudget::supported_maximum(),
         }
+    }
+
+    pub(crate) fn with_source_revision(
+        mut self,
+        source_revision: SourceRevisionProvenance,
+    ) -> Self {
+        self.source_revision = Some(source_revision);
+        self
     }
 
     pub(crate) fn with_local_git_capture(mut self) -> Self {
@@ -1421,6 +1448,18 @@ fn admit_workflow_for(
     }
 
     let root = canonical_execution_root(&context.root)?;
+    let mut environment = context.environment.without_engine_reserved_variables();
+    if let Some(source_revision) = context.source_revision {
+        environment = environment
+            .with_variable(
+                OsString::from("SCHERZO_SOURCE_BRANCH"),
+                OsString::from(source_revision.branch.as_ref()),
+            )
+            .with_variable(
+                OsString::from("SCHERZO_SOURCE_COMMIT_OID"),
+                OsString::from(source_revision.commit_oid.as_ref()),
+            );
+    }
     let execution = AdmittedExecutionContext {
         root,
         limits: ExecutionLimits {
@@ -1437,7 +1476,7 @@ fn admit_workflow_for(
             maximum_live_input_bytes,
             maximum_step_log_bytes,
         },
-        environment: context.environment.without_engine_reserved_variables(),
+        environment,
         cancellation: context.cancellation,
     };
     let git_capture = if workflow.requires_git_capture() {
