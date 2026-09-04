@@ -78,13 +78,17 @@ fn chunked_json_response(status: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn run_body() -> serde_json::Value {
+    run_body_with_state("running")
+}
+
+fn run_body_with_state(state: &str) -> serde_json::Value {
     serde_json::json!({
         "id": RUN_ID,
         "organizationId": ORGANIZATION_ID,
         "projectId": PROJECT_ID,
         "displayName": "Release checks",
         "executionSpecId": EXECUTION_SPEC_ID,
-        "state": "running",
+        "state": state,
         "version": 7,
         "currentAttemptId": ATTEMPT_ID,
         "currentAttemptNumber": 2,
@@ -440,6 +444,210 @@ fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
 }
 
 #[test]
+fn run_wait_emits_terminal_json_with_state_specific_exit_status() {
+    for (state, expected_exit) in [
+        ("succeeded", 0),
+        ("failed", 1),
+        ("cancelled", 1),
+        ("interrupted", 1),
+        ("rejected", 1),
+    ] {
+        let (server, _directory, credential_path) = prepared_run(vec![json_http_response(
+            "200 OK",
+            run_body_with_state(state),
+        )]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(
+            &[
+                "run",
+                "wait",
+                ORGANIZATION,
+                RUN_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(expected_exit));
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["schemaVersion"], 1);
+        assert_eq!(result["deployment"], server.api_url);
+        assert_eq!(result["outcome"], state);
+        assert_eq!(result["run"]["id"], RUN_ID);
+        assert_eq!(result["run"]["state"], state);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID} HTTP/1.1\r\n"
+        )));
+    }
+}
+
+#[test]
+fn run_wait_emits_the_terminal_plain_projection() {
+    let (server, _directory, credential_path) = prepared_run(vec![json_http_response(
+        "200 OK",
+        run_body_with_state("failed"),
+    )]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &["run", "wait", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.lines().any(|line| line == "✗ Run failed."));
+    assert!(stdout.lines().any(|line| line == format!("run: {RUN_ID}")));
+    assert!(stdout.lines().any(|line| line == "state: failed"));
+    server.finish();
+}
+
+#[test]
+fn run_wait_refreshes_authentication_and_recovers_from_one_server_failure() {
+    let server = ScriptedServer::respond(vec![
+        problem_http_response(
+            "401 Unauthorized",
+            serde_json::json!({
+                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401
+            }),
+        ),
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "access_token": REFRESHED_TOKEN,
+                "refresh_token": "unique-cloud-run-wait-refreshed-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        ),
+        problem_http_response(
+            "500 Internal Server Error",
+            serde_json::json!({
+                "type": "https://api.scherzo.dev/problems/internal-server-error",
+                "title": "Internal Server Error",
+                "status": 500
+            }),
+        ),
+        json_http_response("200 OK", run_body_with_state("succeeded")),
+    ]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &credential_path,
+        &server.api_url,
+        &server.issuer,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment_with_issuer(
+        &server.api_url,
+        &server.issuer,
+        credential_path.to_str().unwrap(),
+    );
+
+    let output = run_with_env(
+        &[
+            "run",
+            "wait",
+            ORGANIZATION,
+            RUN_ID,
+            "--json",
+            "--timeout",
+            "10s",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "succeeded");
+    assert_eq!(result["run"]["id"], RUN_ID);
+    assert_no_secret_output(&output, &[TOKEN, REFRESHED_TOKEN]);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].starts_with("GET /api/v1/organizations/"));
+    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
+    assert!(requests[2].starts_with("GET /api/v1/organizations/"));
+    assert!(requests[3].starts_with("GET /api/v1/organizations/"));
+    assert_eq!(
+        header_value(&requests[3], "authorization"),
+        format!("Bearer {REFRESHED_TOKEN}")
+    );
+}
+
+#[test]
+fn run_wait_preserves_fatal_response_classifications() {
+    let unauthenticated = run(&["run", "wait", ORGANIZATION, RUN_ID, "--json"]);
+    assert_eq!(unauthenticated.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unauthenticated.stdout).unwrap()["outcome"],
+        "unauthenticated"
+    );
+
+    let cases = [
+        (
+            problem_http_response(
+                "403 Forbidden",
+                serde_json::json!({
+                    "type": "https://api.scherzo.dev/problems/forbidden",
+                    "title": "Forbidden",
+                    "status": 403
+                }),
+            ),
+            "forbidden",
+        ),
+        (
+            problem_http_response(
+                "404 Not Found",
+                serde_json::json!({
+                    "type": "https://api.scherzo.dev/problems/not-found",
+                    "title": "Not Found",
+                    "status": 404
+                }),
+            ),
+            "not_found",
+        ),
+        (
+            json_http_response("200 OK", serde_json::json!({"state": "running"})),
+            "invalid_response",
+        ),
+    ];
+
+    for (response, expected) in cases {
+        let (server, _directory, credential_path) = prepared_run(vec![response]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &[
+                "run",
+                "wait",
+                ORGANIZATION,
+                RUN_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], expected);
+        assert_eq!(result["runId"], RUN_ID);
+        server.finish();
+    }
+}
+
+#[test]
 fn run_show_rejects_a_projection_for_a_different_run() {
     let mut response_body = run_body();
     response_body["id"] = serde_json::json!("run_01k0z6r1w8f4jy2m7q9v3x5abd");
@@ -701,6 +909,109 @@ fn run_failures_use_registered_outcomes_without_exposing_secrets() {
         "unreachable"
     );
     assert_no_secret_output(&output, &[TOKEN]);
+}
+
+#[test]
+fn run_wait_bounds_transport_retries_and_emits_one_unavailable_result() {
+    let (server, _directory, credential_path) = prepared_run(vec![Vec::new(), Vec::new()]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "run",
+            "wait",
+            ORGANIZATION,
+            RUN_ID,
+            "--json",
+            "--timeout",
+            "10s",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "unreachable");
+    assert_eq!(result["category"], "connection");
+    assert_eq!(result["runId"], RUN_ID);
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn timeout_and_signals_stop_only_the_local_run_wait() {
+    let cases = [
+        (None, Some(rustix::process::Signal::INT), 130, None),
+        (None, Some(rustix::process::Signal::TERM), 143, None),
+        (Some("1s"), None, 1, Some("timed_out")),
+    ];
+
+    for (timeout, signal, expected_exit, expected_outcome) in cases {
+        let mut server =
+            ScriptedServer::respond_with_paused_first_response(vec![json_http_response(
+                "200 OK",
+                run_body(),
+            )]);
+        let credential_directory = private_credential_directory();
+        let credential_path = credential_directory.path().join("credentials.json");
+        write_credential_fixture(
+            &credential_path,
+            &server.api_url,
+            TOKEN,
+            "2999-01-01T00:00:00Z",
+        );
+        let environment =
+            deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+        let mut args = vec!["run", "wait", ORGANIZATION, RUN_ID, "--json"];
+        if let Some(timeout) = timeout {
+            args.extend(["--timeout", timeout]);
+        }
+        args.push("--allow-insecure-http");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove(CREDENTIALS_FILE_VARIABLE);
+        for variable in DEPLOYMENT_VARIABLES {
+            command.env_remove(variable);
+        }
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let child = command.spawn().unwrap();
+        let request = server.next_request();
+        assert!(request.starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID} HTTP/1.1\r\n"
+        )));
+
+        if let Some(signal) = signal {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+                signal,
+            )
+            .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        server.release_paused_response();
+
+        assert_eq!(output.status.code(), Some(expected_exit));
+        assert!(output.stderr.is_empty());
+        match expected_outcome {
+            Some(expected_outcome) => {
+                let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(result["outcome"], expected_outcome);
+                assert_eq!(result["organizationRef"], ORGANIZATION);
+                assert_eq!(result["runId"], RUN_ID);
+            }
+            None => assert!(output.stdout.is_empty()),
+        }
+        assert_no_secret_output(&output, &[TOKEN]);
+        assert!(server.finish().is_empty());
+    }
 }
 
 #[cfg(target_os = "linux")]

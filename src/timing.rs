@@ -38,6 +38,14 @@ pub(crate) fn sleep(duration: Duration) {
     thread::sleep(duration);
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this module is the production boundary for asynchronous deadline waits"
+)]
+pub(crate) async fn async_sleep(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}
+
 pub(crate) fn short_retry_delay() -> Duration {
     let mut bytes = [0_u8; 8];
     let random = if getrandom::fill(&mut bytes).is_ok() {

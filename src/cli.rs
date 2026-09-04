@@ -11,7 +11,7 @@ mod workflow;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -217,15 +217,111 @@ fn execute_mutation_with_signals(
     execute_blocking_with_signals(context, operation, incomplete_signal)
 }
 
+// A terminal result and a local stop compete for one output claim so timeout/signal
+// races cannot emit two machine documents or replace a terminal result after it wins.
+const OBSERVATION_ACTIVE: u8 = 0;
+const OBSERVATION_COMPLETING: u8 = 1;
+const OBSERVATION_STOPPED: u8 = 2;
+
+struct BlockingObservationControl {
+    state: AtomicU8,
+}
+
+impl BlockingObservationControl {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(OBSERVATION_ACTIVE),
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.state.load(Ordering::Acquire) == OBSERVATION_STOPPED
+    }
+
+    fn begin_completion(&self) -> bool {
+        self.state
+            .compare_exchange(
+                OBSERVATION_ACTIVE,
+                OBSERVATION_COMPLETING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn stop(&self) -> bool {
+        self.state
+            .compare_exchange(
+                OBSERVATION_ACTIVE,
+                OBSERVATION_STOPPED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+struct ObservationTimeout {
+    duration: Option<Duration>,
+}
+
+impl ObservationTimeout {
+    async fn wait(self) {
+        match self.duration {
+            Some(duration) => crate::timing::async_sleep(duration).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+fn blocking_signal_runtime(context: &str) -> anyhow::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .with_context(|| format!("start {context} runtime"))
+}
+
+fn execute_observation_with_signals_and_timeout(
+    context: &'static str,
+    timeout: Option<Duration>,
+    operation: impl FnOnce(&BlockingObservationControl) -> CommandResult + Send + 'static,
+    timed_out: impl FnOnce() -> CommandResult + 'static,
+) -> CommandResult {
+    let runtime = blocking_signal_runtime(context)?;
+    let result = runtime.block_on(async move {
+        let mut signals = ProcessSignals::install(context)?;
+        let control = Arc::new(BlockingObservationControl::new());
+        let operation_control = Arc::clone(&control);
+        let mut running = tokio::task::spawn_blocking(move || operation(&operation_control));
+        tokio::select! {
+            biased;
+            signal = signals.recv() => {
+                if control.stop() {
+                    Ok(signal)
+                } else {
+                    finish_read_only_operation(context, running.await)
+                }
+            }
+            () = (ObservationTimeout { duration: timeout }).wait() => {
+                if control.stop() {
+                    timed_out()
+                } else {
+                    finish_read_only_operation(context, running.await)
+                }
+            }
+            result = &mut running => finish_read_only_operation(context, result),
+        }
+    });
+    runtime.shutdown_timeout(Duration::ZERO);
+    result
+}
+
 fn execute_blocking_with_signals(
     context: &'static str,
     operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
     incomplete_signal: impl FnOnce(ExitCode) -> CommandResult + 'static,
 ) -> CommandResult {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .with_context(|| format!("start {context} runtime"))?;
+    let runtime = blocking_signal_runtime(context)?;
     let result = runtime.block_on(async move {
         let mut signals = ProcessSignals::install(context)?;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -415,6 +511,7 @@ mod tests {
             "run",
             "run create",
             "run show",
+            "run wait",
             "runner",
             "runner activation",
             "runner activation create",

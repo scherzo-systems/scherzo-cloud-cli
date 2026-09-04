@@ -559,7 +559,8 @@ The human store remains separate from workflow-run state and all runner credenti
 Development deployments that use HTTP require `--allow-insecure-http` on the networked
 leaf command: `auth login`, `auth status`, `auth logout`, `account signup`,
 `organization create`, `organization show`, `organization update`,
-`organization members list`, `run create`, or `run show`. The option is not global.
+`organization members list`, `run create`, `run show`, or `run wait`. The option is not
+global.
 
 ## Account signup
 
@@ -629,6 +630,12 @@ scherzo-cloud run create acme-labs \
 scherzo-cloud run show \
   acme-labs \
   run_01k0z6r1w8f4jy2m7q9v3x5abc
+
+# Wait up to 30 minutes for a terminal projection.
+scherzo-cloud run wait \
+  acme-labs \
+  run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --timeout 30m
 ```
 
 `run create` never selects or stages a Run Input Set. Its receipt reports the accepted
@@ -638,9 +645,17 @@ key is not persisted for a later invocation. An interrupt after dispatch reports
 unknown acceptance commitment rather than claiming that no run was created.
 
 Add `--json` for schema-version-1 output. A create receipt preserves `replayed` as a
-boolean and identifies the submitted `organizationRef`. A show result contains the
-complete public Run projection, including the current attempt, pinned workflow and
-workspace source, input summary, and timestamps.
+boolean and identifies the submitted `organizationRef`. Show and terminal wait results
+contain the complete public Run projection, including the current attempt, pinned
+workflow and workspace source, input summary, and timestamps.
+
+`run wait` polls through `queued`, `assigning`, `preparing`, `assigned`, and `running`.
+A `succeeded` projection exits zero; `failed`, `cancelled`, `interrupted`, and `rejected`
+projections exit nonzero. Omit `--timeout` to wait until a terminal projection or process
+signal. Timeout and SIGINT/SIGTERM stop only local observation; the command sends no Run
+mutation or cancellation request. JSON mode emits one document only after a terminal,
+timeout, or fatal observation result and emits nothing when a process signal stops the
+wait.
 
 ## Runner doctor
 

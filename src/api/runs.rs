@@ -21,6 +21,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
 
 pub(crate) type Run = models::Run;
+pub(crate) type RunState = models::run::State;
 pub(crate) type RunCreationAcceptance = models::RunCreationAcceptance;
 
 pub(crate) struct RunApi {
@@ -198,6 +199,17 @@ impl RunFailure {
                 | Self::Protocol {
                     credential_rejected: true
                 }
+        )
+    }
+
+    pub(crate) fn retryable_observation(&self) -> bool {
+        matches!(
+            self,
+            Self::Unreachable(
+                UnreachableCategory::Connection
+                    | UnreachableCategory::Timeout
+                    | UnreachableCategory::Server
+            )
         )
     }
 

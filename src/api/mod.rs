@@ -48,7 +48,7 @@ pub(crate) use runners::{
     RunnerCredentialStoredState, RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList,
     RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
-pub(crate) use runs::{Run, RunApi, RunCreationAcceptance, RunFailure};
+pub(crate) use runs::{Run, RunApi, RunCreationAcceptance, RunFailure, RunState};
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations
