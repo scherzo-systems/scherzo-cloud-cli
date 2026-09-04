@@ -1159,9 +1159,15 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
     let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
         let (mut running, first, tool_name) = launch_result_case().await;
+        // Keep the candidate valid under the model-facing compatibility
+        // projection so Pi invokes Scherzo's authoritative validator.
         first.release(json!({
             "kind": "toolCalls",
-            "calls": [{"id": "call-invalid", "name": tool_name, "arguments": {"result": {"count": 0}}}]
+            "calls": [{
+                "id": "call-invalid",
+                "name": tool_name,
+                "arguments": {"result": {"count": 1, "y": "regex-only"}}
+            }]
         }));
 
         loop {

@@ -775,7 +775,7 @@ impl<'a> SchemaInspection<'a> {
     }
 }
 
-fn decode_uri_fragment(fragment: &str) -> Result<String, JsonSchemaSupportFailure> {
+pub(super) fn decode_uri_fragment(fragment: &str) -> Result<String, JsonSchemaSupportFailure> {
     let bytes = fragment.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0_usize;
@@ -808,7 +808,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn join_pointer(parent: &str, token: &str) -> String {
+pub(super) fn join_pointer(parent: &str, token: &str) -> String {
     format!("{parent}/{}", escape_pointer_token(token))
 }
 

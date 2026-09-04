@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::num::NonZeroU64;
@@ -21,11 +22,13 @@ use crate::execution::workflow::agent::{
     AgentInvocationIdentity, PositiveDuration, RetainedJsonSchema,
 };
 use crate::execution::workflow::coordinator::CoordinatorClock;
+use crate::execution::workflow::result_validation::{decode_uri_fragment, join_pointer};
 use crate::execution::workflow::schema_common::lowercase_hex;
 use crate::execution::workflow::strict_json;
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const RESOURCE_ID_PREFIX: &str = "https://schemas.scherzo.invalid/workflow-result/";
+const MAX_MODEL_REFERENCE_EXPANSIONS: usize = 128;
 const TOOL_NAME_PREFIX: &str = "scherzo_result_";
 const EXTENSION_FILE_NAME: &str = "pi-json-v1-result-extension.ts";
 const SOCKET_FILE_NAME: &str = "result-validation.sock";
@@ -585,8 +588,6 @@ struct TransportSchema {
     native_parameters: Value,
     #[cfg(test)]
     resource_id: String,
-    #[cfg(test)]
-    used_regex_fallback: bool,
 }
 
 fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchema, ()> {
@@ -616,28 +617,522 @@ fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchem
         "required": ["result"],
         "additionalProperties": false
     });
-    validate_complete_wrapper(&complete_wrapper)?;
+    validate_transport_schema(&complete_wrapper)?;
 
-    let used_regex_fallback = schema_uses_regex(schema.document());
-    let native_parameters = if used_regex_fallback {
-        json!({
-            "type": "object",
-            "properties": {"result": {}},
-            "required": ["result"],
-            "additionalProperties": false
-        })
-    } else {
-        complete_wrapper.clone()
-    };
+    let native_parameters = json!({
+        "type": "object",
+        "properties": {"result": derive_model_result_schema(schema.document())?},
+        "required": ["result"],
+        "additionalProperties": false
+    });
+    validate_transport_schema(&native_parameters)?;
     Ok(TransportSchema {
         #[cfg(test)]
         complete_wrapper,
         native_parameters,
         #[cfg(test)]
         resource_id,
-        #[cfg(test)]
-        used_regex_fallback,
     })
+}
+
+fn derive_model_result_schema(schema: &Value) -> Result<Value, ()> {
+    // This projection is model guidance only. Expose a reference-only root, then
+    // omit external identity and regex keywords that tool-schema consumers do
+    // not handle portably; the complete authored schema remains authoritative.
+    let mut derivation = ModelSchemaDerivation::new(schema);
+    let exposed = derivation.inline_root_references(schema)?;
+    derivation.project_compatibility_schema(&exposed)
+}
+
+struct ModelSchemaDerivation<'a> {
+    root: &'a Value,
+    pattern_schema_pointers: Vec<String>,
+    expanded_reference_targets: BTreeSet<String>,
+    active_reference_targets: Vec<String>,
+    remaining_reference_expansions: usize,
+}
+
+impl<'a> ModelSchemaDerivation<'a> {
+    fn new(root: &'a Value) -> Self {
+        let mut pattern_schema_pointers = Vec::new();
+        collect_pattern_schema_pointers(root, "", &mut pattern_schema_pointers);
+        Self {
+            root,
+            pattern_schema_pointers,
+            expanded_reference_targets: BTreeSet::new(),
+            active_reference_targets: Vec::new(),
+            remaining_reference_expansions: MAX_MODEL_REFERENCE_EXPANSIONS,
+        }
+    }
+
+    fn inline_root_references(&mut self, schema: &Value) -> Result<Value, ()> {
+        let Some(object) = schema.as_object() else {
+            return Ok(schema.clone());
+        };
+        let reference_keywords = ["$ref", "$dynamicRef"];
+        if !reference_keywords
+            .iter()
+            .any(|keyword| object.contains_key(*keyword))
+        {
+            return Ok(schema.clone());
+        }
+
+        let mut exposed = Value::Object(Map::new());
+        for keyword in reference_keywords {
+            let Some(reference) = object.get(keyword) else {
+                continue;
+            };
+            let reference_text = reference.as_str().ok_or(())?;
+            let resolved = resolve_local_reference(self.root, reference_text)?;
+            let mut target = if self.begin_expansion(&resolved.pointer) {
+                let expanded = self.inline_root_references(resolved.schema);
+                self.active_reference_targets.pop();
+                expanded?
+            } else {
+                json!({keyword: reference})
+            };
+            discard_inlined_reference_metadata(&mut target);
+            exposed = combine_schema_constraints(exposed, target);
+        }
+        let mut siblings = object.clone();
+        siblings.remove("$ref");
+        siblings.remove("$dynamicRef");
+        Ok(combine_schema_constraints(Value::Object(siblings), exposed))
+    }
+
+    fn inline_pattern_references(&mut self, schema: &Value) -> Result<Value, ()> {
+        let Some(object) = schema.as_object() else {
+            return Ok(schema.clone());
+        };
+        let mut siblings = object.clone();
+        let mut exposed = Value::Object(Map::new());
+        let mut found = false;
+
+        for keyword in ["$ref", "$dynamicRef"] {
+            let Some(reference) = object.get(keyword) else {
+                continue;
+            };
+            let reference_text = reference.as_str().ok_or(())?;
+            let resolved = resolve_local_reference(self.root, reference_text)?;
+            if !self.target_is_removed_pattern_schema(&resolved.pointer) {
+                continue;
+            }
+
+            found = true;
+            siblings.remove(keyword);
+            let target = if self.begin_expansion(&resolved.pointer) {
+                let expanded = self.inline_pattern_references(resolved.schema);
+                self.active_reference_targets.pop();
+                expanded?
+            } else {
+                Value::Object(Map::new())
+            };
+            exposed = combine_schema_constraints(exposed, target);
+        }
+
+        if found {
+            Ok(combine_schema_constraints(Value::Object(siblings), exposed))
+        } else {
+            Ok(schema.clone())
+        }
+    }
+
+    fn begin_expansion(&mut self, pointer: &str) -> bool {
+        if self.remaining_reference_expansions == 0
+            || self
+                .active_reference_targets
+                .iter()
+                .any(|active| active == pointer)
+            || !self.expanded_reference_targets.insert(pointer.to_owned())
+        {
+            return false;
+        }
+        self.remaining_reference_expansions -= 1;
+        self.active_reference_targets.push(pointer.to_owned());
+        true
+    }
+
+    fn target_is_removed_pattern_schema(&self, pointer: &str) -> bool {
+        self.pattern_schema_pointers.iter().any(|pattern| {
+            pointer == pattern
+                || pointer
+                    .strip_prefix(pattern)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+
+    fn schema_uses_regex_constraint(&self, schema: &Value) -> bool {
+        self.schema_uses_regex_constraint_inner(schema, &mut BTreeSet::new())
+    }
+
+    fn schema_uses_regex_constraint_inner(
+        &self,
+        schema: &Value,
+        visited_references: &mut BTreeSet<String>,
+    ) -> bool {
+        let Some(object) = schema.as_object() else {
+            return false;
+        };
+        if object.contains_key("pattern")
+            || object
+                .get("patternProperties")
+                .and_then(Value::as_object)
+                .is_some_and(|patterns| !patterns.is_empty())
+        {
+            return true;
+        }
+        for keyword in ["$ref", "$dynamicRef"] {
+            let Some(reference) = object.get(keyword).and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(resolved) = resolve_local_reference(self.root, reference) else {
+                continue;
+            };
+            if visited_references.insert(resolved.pointer)
+                && self.schema_uses_regex_constraint_inner(resolved.schema, visited_references)
+            {
+                return true;
+            }
+        }
+        single_schema_keywords()
+            .iter()
+            .filter_map(|keyword| object.get(*keyword))
+            .any(|child| self.schema_uses_regex_constraint_inner(child, visited_references))
+            || array_schema_keywords()
+                .iter()
+                .filter_map(|keyword| object.get(*keyword).and_then(Value::as_array))
+                .flatten()
+                .any(|child| self.schema_uses_regex_constraint_inner(child, visited_references))
+            || ["dependentSchemas", "properties"]
+                .iter()
+                .filter_map(|keyword| object.get(*keyword).and_then(Value::as_object))
+                .flat_map(Map::values)
+                .any(|child| self.schema_uses_regex_constraint_inner(child, visited_references))
+    }
+}
+
+fn collect_pattern_schema_pointers(schema: &Value, pointer: &str, pointers: &mut Vec<String>) {
+    let Some(object) = schema.as_object() else {
+        return;
+    };
+    for keyword in single_schema_keywords() {
+        if let Some(child) = object.get(*keyword) {
+            collect_pattern_schema_pointers(child, &join_pointer(pointer, keyword), pointers);
+        }
+    }
+    for keyword in array_schema_keywords() {
+        if let Some(children) = object.get(*keyword).and_then(Value::as_array) {
+            let container = join_pointer(pointer, keyword);
+            for (index, child) in children.iter().enumerate() {
+                collect_pattern_schema_pointers(
+                    child,
+                    &join_pointer(&container, &index.to_string()),
+                    pointers,
+                );
+            }
+        }
+    }
+    for keyword in map_schema_keywords() {
+        if let Some(children) = object.get(*keyword).and_then(Value::as_object) {
+            let container = join_pointer(pointer, keyword);
+            for (name, child) in children {
+                let child_pointer = join_pointer(&container, name);
+                if *keyword == "patternProperties" {
+                    pointers.push(child_pointer.clone());
+                }
+                collect_pattern_schema_pointers(child, &child_pointer, pointers);
+            }
+        }
+    }
+}
+
+fn discard_inlined_reference_metadata(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    object.remove("$defs");
+    object.remove("$anchor");
+    object.remove("$dynamicAnchor");
+    for keyword in single_schema_keywords() {
+        if let Some(child) = object.get_mut(*keyword) {
+            discard_inlined_reference_metadata(child);
+        }
+    }
+    for keyword in array_schema_keywords() {
+        if let Some(children) = object.get_mut(*keyword).and_then(Value::as_array_mut) {
+            for child in children {
+                discard_inlined_reference_metadata(child);
+            }
+        }
+    }
+    for keyword in map_schema_keywords() {
+        if let Some(children) = object.get_mut(*keyword).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                discard_inlined_reference_metadata(child);
+            }
+        }
+    }
+}
+
+fn combine_schema_constraints(base: Value, additional: Value) -> Value {
+    if schema_is_unconstrained(&base) {
+        return additional;
+    }
+    if schema_is_unconstrained(&additional) {
+        return base;
+    }
+    if base == Value::Bool(false) || additional == Value::Bool(false) {
+        return Value::Bool(false);
+    }
+
+    match (base, additional) {
+        (Value::Object(mut base), Value::Object(additional)) => {
+            let has_conflict = additional.iter().any(|(keyword, value)| {
+                base.get(keyword).is_some_and(|existing| existing != value)
+            });
+            if !has_conflict {
+                base.extend(additional);
+                return Value::Object(base);
+            }
+            if let Some(Value::Array(all_of)) = base.get_mut("allOf") {
+                all_of.push(Value::Object(additional));
+                return Value::Object(base);
+            }
+            if base.contains_key("allOf") {
+                return json!({"allOf": [Value::Object(base), Value::Object(additional)]});
+            }
+            base.insert(
+                "allOf".to_owned(),
+                Value::Array(vec![Value::Object(additional)]),
+            );
+            Value::Object(base)
+        }
+        (base, additional) => json!({"allOf": [base, additional]}),
+    }
+}
+
+struct ResolvedLocalReference<'a> {
+    schema: &'a Value,
+    pointer: String,
+}
+
+fn resolve_local_reference<'a>(
+    root: &'a Value,
+    reference: &str,
+) -> Result<ResolvedLocalReference<'a>, ()> {
+    let fragment = reference.strip_prefix('#').ok_or(())?;
+    let fragment = decode_uri_fragment(fragment).map_err(|_| ())?;
+    if fragment.is_empty() {
+        return Ok(ResolvedLocalReference {
+            schema: root,
+            pointer: fragment,
+        });
+    }
+    if fragment.starts_with('/') {
+        return root
+            .pointer(&fragment)
+            .map(|schema| ResolvedLocalReference {
+                schema,
+                pointer: fragment,
+            })
+            .ok_or(());
+    }
+    find_anchor(root, &fragment, "").ok_or(())
+}
+
+fn find_anchor<'a>(
+    schema: &'a Value,
+    expected: &str,
+    pointer: &str,
+) -> Option<ResolvedLocalReference<'a>> {
+    let object = schema.as_object()?;
+    if ["$anchor", "$dynamicAnchor"].into_iter().any(|keyword| {
+        object
+            .get(keyword)
+            .and_then(Value::as_str)
+            .is_some_and(|anchor| anchor == expected)
+    }) {
+        return Some(ResolvedLocalReference {
+            schema,
+            pointer: pointer.to_owned(),
+        });
+    }
+
+    for keyword in single_schema_keywords() {
+        if let Some(found) = object
+            .get(*keyword)
+            .and_then(|child| find_anchor(child, expected, &join_pointer(pointer, keyword)))
+        {
+            return Some(found);
+        }
+    }
+    for keyword in array_schema_keywords() {
+        if let Some(children) = object.get(*keyword).and_then(Value::as_array) {
+            let container = join_pointer(pointer, keyword);
+            for (index, child) in children.iter().enumerate() {
+                if let Some(found) = find_anchor(
+                    child,
+                    expected,
+                    &join_pointer(&container, &index.to_string()),
+                ) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    for keyword in map_schema_keywords() {
+        if let Some(children) = object.get(*keyword).and_then(Value::as_object) {
+            let container = join_pointer(pointer, keyword);
+            for (name, child) in children {
+                if let Some(found) = find_anchor(child, expected, &join_pointer(&container, name)) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+impl ModelSchemaDerivation<'_> {
+    fn project_compatibility_schema(&mut self, schema: &Value) -> Result<Value, ()> {
+        let exposed = self.inline_pattern_references(schema)?;
+        let Some(object) = exposed.as_object() else {
+            return Ok(exposed);
+        };
+        let mut projected = Map::new();
+        for (keyword, value) in object {
+            match keyword.as_str() {
+                "$schema" | "$id" | "pattern" | "patternProperties" | "additionalProperties" => {}
+                "$ref" | "$dynamicRef" => {
+                    projected.insert(keyword.clone(), rebase_model_reference(value));
+                }
+                "not" if self.schema_uses_regex_constraint(value) => {
+                    // Removing a regex constraint widens its schema. Retaining a
+                    // negation around that projection would instead narrow model
+                    // guidance, so only the complete schema applies the negation.
+                }
+                keyword if single_schema_keywords().contains(&keyword) => {
+                    projected.insert(
+                        keyword.to_owned(),
+                        self.project_compatibility_schema(value)?,
+                    );
+                }
+                keyword if array_schema_keywords().contains(&keyword) => {
+                    let projected_value = if let Some(schemas) = value.as_array() {
+                        let mut children = Vec::with_capacity(schemas.len());
+                        for schema in schemas {
+                            children.push(self.project_compatibility_schema(schema)?);
+                        }
+                        Value::Array(children)
+                    } else {
+                        value.clone()
+                    };
+                    projected.insert(keyword.to_owned(), projected_value);
+                }
+                keyword if map_schema_keywords().contains(&keyword) => {
+                    let projected_value = if let Some(schemas) = value.as_object() {
+                        let mut children = Map::new();
+                        for (name, schema) in schemas {
+                            children
+                                .insert(name.clone(), self.project_compatibility_schema(schema)?);
+                        }
+                        Value::Object(children)
+                    } else {
+                        value.clone()
+                    };
+                    projected.insert(keyword.to_owned(), projected_value);
+                }
+                _ => {
+                    projected.insert(keyword.clone(), value.clone());
+                }
+            }
+        }
+        if let Some(additional_properties) =
+            self.project_additional_properties(object.get("additionalProperties"), object)?
+        {
+            projected.insert("additionalProperties".to_owned(), additional_properties);
+        }
+        if object
+            .get("patternProperties")
+            .and_then(Value::as_object)
+            .is_some_and(|patterns| !patterns.is_empty())
+        {
+            projected.remove("unevaluatedProperties");
+        }
+        Ok(Value::Object(projected))
+    }
+
+    fn project_additional_properties(
+        &mut self,
+        additional_properties: Option<&Value>,
+        schema: &Map<String, Value>,
+    ) -> Result<Option<Value>, ()> {
+        let projected_additional = match additional_properties {
+            Some(additional) => Some(self.project_compatibility_schema(additional)?),
+            None => None,
+        };
+        let Some(patterns) = schema
+            .get("patternProperties")
+            .and_then(Value::as_object)
+            .filter(|patterns| !patterns.is_empty())
+        else {
+            return Ok(projected_additional);
+        };
+        let Some(projected_additional) = projected_additional else {
+            return Ok(None);
+        };
+        if schema_is_unconstrained(&projected_additional) {
+            return Ok(Some(projected_additional));
+        }
+
+        let mut alternatives = Vec::with_capacity(patterns.len().saturating_add(1));
+        if projected_additional != Value::Bool(false) {
+            alternatives.push(projected_additional);
+        }
+        for pattern in patterns.values() {
+            alternatives.push(self.project_compatibility_schema(pattern)?);
+        }
+        Ok(Some(combine_schema_alternatives(alternatives)))
+    }
+}
+
+fn rebase_model_reference(reference: &Value) -> Value {
+    let Some(reference) = reference.as_str() else {
+        return reference.clone();
+    };
+    let Some(fragment) = reference.strip_prefix('#') else {
+        return Value::String(reference.to_owned());
+    };
+    let Ok(decoded) = decode_uri_fragment(fragment) else {
+        return Value::String(reference.to_owned());
+    };
+    if decoded.is_empty() || decoded.starts_with('/') {
+        Value::String(format!("#/properties/result{fragment}"))
+    } else {
+        Value::String(reference.to_owned())
+    }
+}
+
+fn combine_schema_alternatives(alternatives: Vec<Value>) -> Value {
+    let mut combined = Vec::with_capacity(alternatives.len());
+    for alternative in alternatives {
+        if alternative == Value::Bool(false) || combined.contains(&alternative) {
+            continue;
+        }
+        if schema_is_unconstrained(&alternative) {
+            return Value::Object(Map::new());
+        }
+        combined.push(alternative);
+    }
+    match combined.as_slice() {
+        [] => Value::Bool(false),
+        [only] => only.clone(),
+        _ => json!({"anyOf": combined}),
+    }
+}
+
+fn schema_is_unconstrained(schema: &Value) -> bool {
+    schema == &Value::Bool(true) || schema.as_object().is_some_and(Map::is_empty)
 }
 
 struct RejectRetrieval;
@@ -651,7 +1146,7 @@ impl Retrieve for RejectRetrieval {
     }
 }
 
-fn validate_complete_wrapper(wrapper: &Value) -> Result<(), ()> {
+fn validate_transport_schema(wrapper: &Value) -> Result<(), ()> {
     jsonschema::Validator::options()
         .with_draft(Draft::Draft202012)
         .with_pattern_options(PatternOptions::regex())
@@ -659,29 +1154,6 @@ fn validate_complete_wrapper(wrapper: &Value) -> Result<(), ()> {
         .build(wrapper)
         .map(|_| ())
         .map_err(|_| ())
-}
-
-fn schema_uses_regex(schema: &Value) -> bool {
-    let Some(object) = schema.as_object() else {
-        return false;
-    };
-    if object.contains_key("pattern") || object.contains_key("patternProperties") {
-        return true;
-    }
-    single_schema_keywords()
-        .iter()
-        .filter_map(|keyword| object.get(*keyword))
-        .any(schema_uses_regex)
-        || array_schema_keywords()
-            .iter()
-            .filter_map(|keyword| object.get(*keyword).and_then(Value::as_array))
-            .flatten()
-            .any(schema_uses_regex)
-        || map_schema_keywords()
-            .iter()
-            .filter_map(|keyword| object.get(*keyword).and_then(Value::as_object))
-            .flat_map(Map::values)
-            .any(schema_uses_regex)
 }
 
 fn single_schema_keywords() -> &'static [&'static str] {

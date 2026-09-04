@@ -98,6 +98,28 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
             }),
             json!({"result": "value"}),
             json!({"result": 1}),
+            "string",
+        ),
+        (
+            json!({
+                "$schema": JSON_SCHEMA_DIALECT,
+                "$defs": {
+                    "Value": {
+                        "type": "object",
+                        "properties": {"detail": {"$ref": "#/$defs/Detail"}},
+                        "required": ["detail"]
+                    },
+                    "Detail": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                        "required": ["code"]
+                    }
+                },
+                "$ref": "#/$defs/Value"
+            }),
+            json!({"result": {"detail": {"code": "ok"}}}),
+            json!({"result": {"detail": {"code": 1}}}),
+            "object",
         ),
         (
             json!({
@@ -107,6 +129,7 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
             }),
             json!({"result": 1}),
             json!({"result": "value"}),
+            "integer",
         ),
         (
             json!({
@@ -122,6 +145,7 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
             }),
             json!({"result": []}),
             json!({"result": [1]}),
+            "array",
         ),
         (
             json!({
@@ -132,18 +156,22 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
             }),
             json!({"result": true}),
             json!({"result": "true"}),
+            "boolean",
         ),
     ];
 
-    for (document, valid, invalid) in cases {
+    for (document, valid, invalid, expected_native_type) in cases {
         let retained_bytes = serde_json::to_vec_pretty(&document).unwrap();
         let schema = retained(&retained_bytes);
         let retained_document = schema.document().clone();
         let transport = derive_transport_schema(&schema).unwrap();
         let validator = wrapper_validator(&transport.complete_wrapper);
+        let native_validator = wrapper_validator(&transport.native_parameters);
 
         assert!(validator.is_valid(&valid));
         assert!(!validator.is_valid(&invalid));
+        assert!(native_validator.is_valid(&valid));
+        assert!(!native_validator.is_valid(&invalid));
         assert_eq!(schema.bytes(), retained_bytes);
         assert_eq!(schema.document(), &retained_document);
         let expected_resource_id = document
@@ -168,37 +196,369 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
                 document
             );
         }
+        let native_result = &transport.native_parameters["properties"]["result"];
+        assert_eq!(native_result["type"], expected_native_type);
+        assert!(native_result.get("$ref").is_none());
+        assert!(
+            !serde_json::to_string(&transport.native_parameters)
+                .unwrap()
+                .contains(RESOURCE_ID_PREFIX)
+        );
     }
 }
 
 #[test]
-fn unproven_native_regex_paths_use_the_permissive_json_schema_only() {
-    let schema = retained(
-        serde_json::to_vec(&json!({
-            "$schema": JSON_SCHEMA_DIALECT,
-            "type": "object",
-            "patternProperties": {"^(a+)+$": {"type": "string"}}
-        }))
-        .unwrap()
-        .as_slice(),
-    );
+fn repeated_reference_targets_are_expanded_once() {
+    let mut definitions = serde_json::Map::new();
+    for level in (0..=4).rev() {
+        let schema = if level == 4 {
+            json!({
+                "type": "object",
+                "properties": {"detail": {"type": "string"}},
+                "required": ["detail"],
+                "additionalProperties": false
+            })
+        } else {
+            let next = format!("#/$defs/Level{}", level + 1);
+            json!({"$ref": next, "$dynamicRef": next})
+        };
+        definitions.insert(format!("Level{level}"), schema);
+    }
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "$defs": definitions,
+        "$ref": "#/$defs/Level0"
+    });
+    let schema = retained(&serde_json::to_vec(&document).unwrap());
     let transport = derive_transport_schema(&schema).unwrap();
+    let native_result = &transport.native_parameters["properties"]["result"];
+    let candidate = json!({"result": {"detail": "ok"}});
 
-    assert!(transport.used_regex_fallback);
+    assert_eq!(native_result["type"], "object");
+    assert_eq!(
+        native_result["$dynamicRef"],
+        "#/properties/result/$defs/Level4"
+    );
+    assert!(wrapper_validator(&transport.native_parameters).is_valid(&candidate));
+}
+
+#[test]
+fn reference_expansion_budget_retains_a_valid_local_reference() {
+    let mut definitions = serde_json::Map::new();
+    for level in (0..=MAX_MODEL_REFERENCE_EXPANSIONS).rev() {
+        let schema = if level == MAX_MODEL_REFERENCE_EXPANSIONS {
+            json!({"type": "object"})
+        } else {
+            json!({"$ref": format!("#/$defs/Level{}", level + 1)})
+        };
+        definitions.insert(format!("Level{level}"), schema);
+    }
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "$defs": definitions,
+        "$ref": "#/$defs/Level0"
+    });
+    let schema = retained(&serde_json::to_vec(&document).unwrap());
+    let transport = derive_transport_schema(&schema).unwrap();
+    let native_result = &transport.native_parameters["properties"]["result"];
+    let candidate = json!({"result": {}});
+
+    assert_eq!(
+        native_result["$ref"],
+        format!(
+            "#/properties/result/$defs/Level{}",
+            MAX_MODEL_REFERENCE_EXPANSIONS
+        )
+    );
+    assert!(wrapper_validator(&transport.native_parameters).is_valid(&candidate));
+}
+
+#[test]
+fn nested_object_result_shape_is_exposed_inline() {
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "minLength": 1},
+            "details": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {"label": {"type": "string"}},
+                            "required": ["label"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["summary", "details"],
+        "additionalProperties": false
+    });
+    let schema = retained(&serde_json::to_vec(&document).unwrap());
+    let transport = derive_transport_schema(&schema).unwrap();
+    let mut expected_result = document;
+    expected_result.as_object_mut().unwrap().remove("$schema");
+
     assert_eq!(
         transport.native_parameters["properties"]["result"],
-        json!({})
+        expected_result
+    );
+    assert!(transport.native_parameters.get("$defs").is_none());
+    assert!(
+        transport.native_parameters["properties"]["result"]
+            .get("$ref")
+            .is_none()
+    );
+}
+
+#[test]
+fn regex_constraints_project_to_nested_structural_guidance() {
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "type": "object",
+        "properties": {
+            "report": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "minLength": 3,
+                        "pattern": "^[a-z]+$"
+                    },
+                    "sections": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "heading": {
+                                    "type": "string",
+                                    "pattern": "^[A-Z]"
+                                }
+                            },
+                            "required": ["heading"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "patternProperties": {
+                    "^x-": {
+                        "type": "object",
+                        "properties": {
+                            "values": {
+                                "type": "array",
+                                "items": {"type": "integer", "minimum": 0}
+                            }
+                        },
+                        "required": ["values"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["title", "sections"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["report"],
+        "additionalProperties": false
+    });
+    let schema = retained(&serde_json::to_vec(&document).unwrap());
+    let transport = derive_transport_schema(&schema).unwrap();
+
+    assert_eq!(
+        transport.native_parameters["properties"]["result"],
+        json!({
+            "type": "object",
+            "properties": {
+                "report": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "minLength": 3},
+                        "sections": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {"heading": {"type": "string"}},
+                                "required": ["heading"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["title", "sections"],
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "values": {
+                                "type": "array",
+                                "items": {"type": "integer", "minimum": 0}
+                            }
+                        },
+                        "required": ["values"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["report"],
+            "additionalProperties": false
+        })
     );
     assert!(
-        transport.complete_wrapper["$defs"]["workflowResult"]
+        transport.complete_wrapper["$defs"]["workflowResult"]["properties"]["report"]
             .get("patternProperties")
             .is_some()
     );
+}
+
+#[test]
+fn regex_projection_does_not_reject_values_allowed_by_negation() {
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "not": {"pattern": "^bad$"}
+            }
+        },
+        "required": ["code"],
+        "additionalProperties": false
+    });
+    let schema = retained(&serde_json::to_vec(&document).unwrap());
+    let transport = derive_transport_schema(&schema).unwrap();
+    let candidate = json!({"code": "ok"});
+
+    assert!(schema.is_valid(&candidate));
     assert!(
-        transport.native_parameters["properties"]["result"]
-            .get("patternProperties")
-            .is_none()
+        wrapper_validator(&transport.native_parameters).is_valid(&json!({"result": candidate}))
     );
+}
+
+#[test]
+fn compatibility_shape_does_not_replace_reference_and_regex_authority() {
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "$id": "https://author.example/result.json",
+        "$defs": {
+            "Outcome": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "pattern": "^ok-[0-9]+$"}
+                },
+                "required": ["code"],
+                "additionalProperties": false
+            }
+        },
+        "$ref": "#/$defs/Outcome"
+    });
+    let retained_bytes = serde_json::to_vec_pretty(&document).unwrap();
+    let schema = retained(&retained_bytes);
+    let transport = derive_transport_schema(&schema).unwrap();
+    let validator = wrapper_validator(&transport.complete_wrapper);
+    let conforming = json!({"result": {"code": "ok-12"}});
+    let encoded_string = json!({"result": r#"{"code":"ok-12"}"#});
+    let regex_invalid = json!({"result": {"code": "not-ok"}});
+
+    assert_eq!(
+        transport.native_parameters["properties"]["result"],
+        json!({
+            "$defs": {
+                "Outcome": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string"}},
+                    "required": ["code"],
+                    "additionalProperties": false
+                }
+            },
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+            "additionalProperties": false
+        })
+    );
+    assert!(validator.is_valid(&conforming));
+    assert!(!validator.is_valid(&encoded_string));
+    assert!(!validator.is_valid(&regex_invalid));
+    assert!(schema.is_valid(&conforming["result"]));
+    assert!(!schema.is_valid(&encoded_string["result"]));
+    assert!(!schema.is_valid(&regex_invalid["result"]));
+    assert_eq!(
+        transport.complete_wrapper["$defs"]["workflowResult"],
+        document
+    );
+    assert_eq!(schema.bytes(), retained_bytes);
+}
+
+#[test]
+fn inlined_reference_preserves_root_unevaluated_properties_scope() {
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "description": "Root result",
+        "$defs": {
+            "Outcome": {
+                "description": "Referenced outcome",
+                "type": "object",
+                "properties": {"detail": {"type": "string"}},
+                "required": ["detail"]
+            }
+        },
+        "$ref": "#/$defs/Outcome",
+        "unevaluatedProperties": false
+    });
+    let schema = retained(&serde_json::to_vec(&document).unwrap());
+    let transport = derive_transport_schema(&schema).unwrap();
+    let candidate = json!({"detail": "ok"});
+
+    assert!(schema.is_valid(&candidate));
+    let validator = wrapper_validator(&transport.native_parameters);
+    assert!(validator.is_valid(&json!({"result": candidate})));
+}
+
+#[test]
+fn regex_projection_preserves_referenced_pointer_targets() {
+    let document = json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "type": "object",
+        "patternProperties": {
+            "^x-": {
+                "$defs": {
+                    "Detail": {
+                        "type": "object",
+                        "properties": {"summary": {"type": "string"}},
+                        "required": ["summary"],
+                        "additionalProperties": false
+                    }
+                },
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "$ref": "#/patternProperties/%5Ex-/$defs/Detail"
+                    }
+                },
+                "required": ["detail"],
+                "additionalProperties": false
+            }
+        },
+        "additionalProperties": false
+    });
+    let schema = retained(&serde_json::to_vec(&document).unwrap());
+    let transport = derive_transport_schema(&schema).unwrap();
+    let candidate = json!({"x-item": {"detail": {"summary": "ok"}}});
+
+    assert!(schema.is_valid(&candidate));
+    let validator = Validator::options()
+        .with_draft(Draft::Draft202012)
+        .with_pattern_options(PatternOptions::regex())
+        .with_retriever(RejectRetrieval)
+        .build(&transport.native_parameters)
+        .expect("the generated model-facing schema must not contain dangling references");
+    assert!(validator.is_valid(&json!({"result": candidate})));
 }
 
 #[test]

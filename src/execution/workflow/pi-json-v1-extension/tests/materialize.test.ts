@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
@@ -35,27 +34,4 @@ test("materialization rejects a template without exactly one marker", () => {
   assert.throws(() =>
     materializePiJsonV1Extension("export {};\n", fixedConfig),
   );
-});
-
-test("the representative resource id matches the retained schema bytes", async () => {
-  const [schemaBytes, inputBytes] = await Promise.all([
-    readFile(
-      new URL("../fixtures/workflow-result.schema.json", import.meta.url),
-    ),
-    readFile(
-      new URL("../fixtures/materialization-input.json", import.meta.url),
-      "utf8",
-    ),
-  ]);
-  const input = JSON.parse(inputBytes) as {
-    parameters: {
-      $defs: { workflowResult: { $id: string } };
-      properties: { result: { $ref: string } };
-    };
-  };
-  const digest = createHash("sha256").update(schemaBytes).digest("hex");
-  const resourceId = `https://schemas.scherzo.invalid/workflow-result/${digest}`;
-
-  assert.equal(input.parameters.$defs.workflowResult.$id, resourceId);
-  assert.equal(input.parameters.properties.result.$ref, resourceId);
 });

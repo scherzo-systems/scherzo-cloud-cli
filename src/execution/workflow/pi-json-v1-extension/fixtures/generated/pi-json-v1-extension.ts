@@ -8,7 +8,7 @@ import { Type } from "typebox";
 
 // The materializer replaces this string without invoking a formatter.
 // prettier-ignore
-const GENERATED_CONFIG_JSON = "{\"toolName\":\"scherzo_result_8f3c2a1d\",\"socketPath\":\"/tmp/scherzo/invocation-fixed/result-validation.sock\",\"parameters\":{\"$defs\":{\"workflowResult\":{\"$defs\":{\"Change\":{\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"$id\":\"https://schemas.scherzo.invalid/workflow-result/d9925fc96e15d98f45c13b1f9c14b30482dd085671195c4d01461b165f5dd296\",\"$ref\":\"#/$defs/Change\",\"$schema\":\"https://json-schema.org/draft/2020-12/schema\"}},\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"additionalProperties\":false,\"properties\":{\"result\":{\"$ref\":\"https://schemas.scherzo.invalid/workflow-result/d9925fc96e15d98f45c13b1f9c14b30482dd085671195c4d01461b165f5dd296\"}},\"required\":[\"result\"],\"type\":\"object\"}}";
+const GENERATED_CONFIG_JSON = "{\"toolName\":\"scherzo_result_8f3c2a1d\",\"socketPath\":\"/tmp/scherzo/invocation-fixed/result-validation.sock\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"result\":{\"$defs\":{\"Change\":{\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"required\":[\"result\"],\"type\":\"object\"}}";
 const MAX_PROTOCOL_FRAME_BYTES = 16 * 1024 * 1024;
 
 export interface PiJsonV1ExtensionConfig {
