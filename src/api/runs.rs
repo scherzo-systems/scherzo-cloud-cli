@@ -6,7 +6,6 @@ use reqwest::header::{CONTENT_TYPE, HeaderValue, LOCATION};
 use reqwest::{Method, StatusCode, Url};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use zeroize::Zeroize as _;
 
 use super::generated::{apis, models};
 use super::http_client::generated_configuration;
@@ -174,9 +173,7 @@ impl RunApi {
 
 impl Drop for RunApi {
     fn drop(&mut self) {
-        if let Some(access_token) = &mut self.configuration.bearer_access_token {
-            access_token.zeroize();
-        }
+        super::clear_generated_access_token(&mut self.configuration);
     }
 }
 

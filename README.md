@@ -166,16 +166,17 @@ The current release supports:
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, logout, account signup, organization
-  profile management, one-page member-directory reads, and inputless Cloud run creation
-  and inspection;
-- runner prerequisite diagnostics; and
+  discovery and profile management, complete project and repository configuration, and
+  inputless Cloud run creation and inspection;
+- runner and runner-pool administration plus prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
 
-The Cloud management surface is not complete. The CLI can create an organization, read
-or update its initial profile, list one page of active members, and create or inspect an
-inputless run for a configured project. It cannot yet configure repositories, invite or
-change members, stage run inputs, or guide the rest of Cloud onboarding.
+The Cloud management surface is not complete. The CLI can discover and manage accessible
+organizations, discover selected GitHub repositories, manage projects and runner pools,
+and create or inspect an inputless run for a ready project. It cannot yet connect a new
+GitHub installation, invite or change members, stage run inputs, or guide the rest of
+Cloud onboarding.
 
 ## Local workflow validation
 
@@ -556,11 +557,9 @@ and ask Auth0 to revoke its refresh token. The result distinguishes confirmed an
 unconfirmed server revocation; local removal still completes when Auth0 is unreachable.
 The human store remains separate from workflow-run state and all runner credentials.
 
-Development deployments that use HTTP require `--allow-insecure-http` on the networked
-leaf command: `auth login`, `auth status`, `auth logout`, `account signup`,
-`organization create`, `organization show`, `organization update`,
-`organization members list`, `run create`, `run show`, or `run wait`. The option is not
-global.
+Development deployments that use HTTP require `--allow-insecure-http` on each networked
+leaf command. This includes authentication, account, organization, project, Cloud run,
+and runner administration commands; the option is not global.
 
 ## Account signup
 
@@ -579,6 +578,9 @@ an organization ID or exact slug and are passed to the deployment without local
 normalization.
 
 ```sh
+# Discover your organization memberships and their organization IDs and slugs.
+scherzo-cloud organization list --limit 50
+
 # Create an organization. The deployment may assign the slug when it is omitted.
 scherzo-cloud organization create \
   --display-name "Acme Research" \
@@ -611,6 +613,87 @@ response. Do not issue a new mutation merely because an earlier result was uncon
 These commands are a direct human management surface. Authentication status may carry a
 server-advertised `organization.create` action, but the CLI only transports that value;
 a trusted external guide owns action selection, explanation, and approval.
+
+## Project management
+
+Project commands use the selected human OAuth credential and existing public API
+operations. Project IDs, GitHub installation binding IDs, provider repository IDs, and
+runner pool IDs remain exact authority inputs; repository full names are display metadata
+only. Start by discovering those values:
+
+```sh
+# Discover the current account's organization memberships.
+scherzo-cloud organization list
+
+# Discover active and retained GitHub installation bindings for one organization.
+scherzo-cloud project repository installation list acme-labs
+
+# Discover the repositories currently selected for one installation.
+scherzo-cloud project repository list \
+  acme-labs \
+  ghi_01k0z6r1w8f4jy2m7q9v3x5abc
+
+# Discover existing runner pools and copy an exact pool ID when needed.
+scherzo-cloud runner pool list acme-labs
+```
+
+Create a project from one discovered repository. Omit `--default-branch` to select the
+provider-observed default branch, and omit `--runner-pool-id` to create a valid project
+that reports `runner_pool_unassigned` until configured:
+
+```sh
+scherzo-cloud project create acme-labs \
+  --name scherzo-cloud \
+  --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --repository-id 123456789 \
+  --default-branch release \
+  --runner-pool-id rpl_01k0z6r1w8f4jy2m7q9v3x5abc
+
+# Page projects and show one complete configuration and readiness projection.
+scherzo-cloud project list acme-labs --limit 50
+scherzo-cloud project show \
+  acme-labs \
+  prj_01k0z6r1w8f4jy2m7q9v3x5abc
+
+# Rename without changing execution configuration.
+scherzo-cloud project rename \
+  acme-labs \
+  prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --name scherzo-cloud-release
+```
+
+Repository and runner-pool settings are independent. `set` assigns or atomically
+replaces the current value. Repeated removals are API-defined no-ops:
+
+```sh
+# Read, replace, update, or detach the repository binding.
+scherzo-cloud project repository show \
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud project repository set \
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --repository-id 123456789
+scherzo-cloud project repository update \
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --default-branch stable
+scherzo-cloud project repository detach \
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+
+# Assign, replace, or remove the runner pool.
+scherzo-cloud project runner-pool set \
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  rpl_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud project runner-pool remove \
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+Human output always includes the complete project's `ready` or `blocked` verdict and its
+ordered blockers. JSON mode wraps the public project representation in a
+schema-version-1 command result and preserves `nextCursor` on one-page list operations.
+Every mutation generates one fresh opaque idempotency key. An ambiguous connection or
+response-body failure is retried once with the same key and serialized request, and an
+access-token refresh within the invocation also retains them. Owner authorization and
+same-organization repository and runner-pool checks remain server-enforced.
 
 ## Cloud runs
 

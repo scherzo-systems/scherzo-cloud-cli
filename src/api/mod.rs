@@ -7,12 +7,19 @@ pub(crate) mod http_util;
 mod human_principal;
 mod organizations;
 mod problem;
+mod projects;
 mod runners;
 mod runs;
 mod signup;
 
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
+
+fn clear_generated_access_token(configuration: &mut generated::apis::configuration::Configuration) {
+    if let Some(access_token) = &mut configuration.bearer_access_token {
+        access_token.zeroize();
+    }
+}
 
 fn bearer_authorization(access_token: &str) -> Result<HeaderValue, InvalidHeaderValue> {
     let mut value = Zeroizing::new(String::with_capacity("Bearer ".len() + access_token.len()));
@@ -42,6 +49,11 @@ pub(crate) use organizations::{
     OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationOutcome, create_organization, get_organization,
     list_organization_memberships, update_organization,
+};
+pub(crate) use projects::{
+    CreateProjectInput, GitHubInstallation, GitHubInstallationList, GitHubRepository,
+    GitHubRepositoryList, OrganizationMembershipList, Project, ProjectApi, ProjectFailure,
+    ProjectList, ProjectReadinessBlocker, ProjectRepository,
 };
 pub(crate) use runners::{
     RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,

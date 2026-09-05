@@ -3,6 +3,7 @@ mod artifact;
 mod auth;
 mod organization;
 mod principal;
+mod project;
 mod run;
 mod runner;
 mod version;
@@ -117,6 +118,8 @@ enum Command {
     Auth(auth::Command),
     #[command(about = organization::ABOUT)]
     Organization(organization::Command),
+    #[command(about = project::ABOUT)]
+    Project(project::Command),
     #[command(about = run::ABOUT)]
     Run(run::Command),
     #[command(about = version::ABOUT)]
@@ -143,6 +146,7 @@ impl Cli {
             Some(Command::Artifact(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
+            Some(Command::Project(command)) => command.execute(),
             Some(Command::Run(command)) => command.execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
@@ -162,6 +166,18 @@ pub(crate) const fn unreachable_outcome_class(
         | crate::api::UnreachableCategory::Tls
         | crate::api::UnreachableCategory::Server => OutcomeClass::Unreachable,
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudFailureResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after: Option<u64>,
 }
 
 fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
@@ -504,10 +520,27 @@ mod tests {
             "auth status",
             "organization",
             "organization create",
+            "organization list",
             "organization members",
             "organization members list",
             "organization show",
             "organization update",
+            "project",
+            "project create",
+            "project list",
+            "project rename",
+            "project repository",
+            "project repository detach",
+            "project repository installation",
+            "project repository installation list",
+            "project repository list",
+            "project repository set",
+            "project repository show",
+            "project repository update",
+            "project runner-pool",
+            "project runner-pool remove",
+            "project runner-pool set",
+            "project show",
             "run",
             "run create",
             "run show",

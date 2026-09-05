@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud project runner-pool remove --help
+Remove a project's runner pool
+
+Usage: scherzo-cloud project runner-pool remove [OPTIONS] <ORGANIZATION> <PROJECT>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <PROJECT>       Exact project ID
+
+Options:
+      --json                 Print the project result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

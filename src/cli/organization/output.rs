@@ -301,7 +301,7 @@ fn write_failure(
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     if json {
-        write_json(&FailureResult {
+        write_json(&super::super::CloudFailureResult {
             schema_version: 1,
             deployment,
             outcome,
@@ -362,16 +362,4 @@ struct MembershipListResult<'a> {
     items: &'a [OrganizationMembershipDirectoryEntry],
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FailureResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    category: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retry_after: Option<u64>,
 }

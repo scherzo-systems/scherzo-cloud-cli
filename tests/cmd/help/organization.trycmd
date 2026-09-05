@@ -6,6 +6,7 @@ Usage: scherzo-cloud organization [COMMAND]
 
 Commands:
   create   Create a Scherzo Cloud organization
+  list     List your Scherzo Cloud organization memberships
   show     Show a Scherzo Cloud organization
   update   Update a Scherzo Cloud organization
   members  Manage Scherzo Cloud organization members

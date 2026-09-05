@@ -1,0 +1,19 @@
+```console
+$ scherzo-cloud project --help
+Manage Scherzo Cloud projects
+
+Usage: scherzo-cloud project [COMMAND]
+
+Commands:
+  create       Create a Scherzo Cloud project
+  list         List Scherzo Cloud projects
+  show         Show a Scherzo Cloud project
+  rename       Rename a Scherzo Cloud project
+  repository   Manage a project's repository binding
+  runner-pool  Manage a project's runner pool
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

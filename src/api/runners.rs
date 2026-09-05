@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, TRANSFER_ENCODING};
 use reqwest::{StatusCode, Url};
-use zeroize::Zeroize as _;
 
 use super::generated::apis::{self, runners_api};
 use super::generated::models;
@@ -585,9 +584,7 @@ impl RunnerFailure {
 
 impl Drop for RunnerApi {
     fn drop(&mut self) {
-        if let Some(access_token) = &mut self.configuration.bearer_access_token {
-            access_token.zeroize();
-        }
+        super::clear_generated_access_token(&mut self.configuration);
     }
 }
 

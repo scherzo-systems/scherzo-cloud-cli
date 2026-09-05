@@ -1,4 +1,5 @@
 mod create;
+mod list;
 mod members;
 mod output;
 mod show;
@@ -29,6 +30,8 @@ pub(super) struct Command {
 enum OrganizationCommand {
     #[command(about = create::ABOUT)]
     Create(create::Command),
+    #[command(about = list::ABOUT)]
+    List(list::Command),
     #[command(about = show::ABOUT)]
     Show(show::Command),
     #[command(about = update::ABOUT)]
@@ -88,6 +91,9 @@ impl Command {
             None => super::print_help(&[NAME]),
             Some(OrganizationCommand::Create(command)) => {
                 execute_leaf(command, create::Command::execute)
+            }
+            Some(OrganizationCommand::List(command)) => {
+                execute_leaf(command, list::Command::execute)
             }
             Some(OrganizationCommand::Show(command)) => {
                 execute_leaf(command, show::Command::execute)
