@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -14,6 +15,9 @@ use crate::execution::workflow::admission::{
 };
 use crate::execution::workflow::artifact::{
     CaptureBoundary, CaptureBoundaryObserver, CarrierBudgetClass,
+};
+use crate::execution::workflow::git_artifact::{
+    GitArtifactDescriptor, GitArtifactValidationBudget, validate_git_bundle,
 };
 use crate::execution::workflow::resolution;
 
@@ -233,6 +237,21 @@ fn changed_capture_has_verified_bundle_profile_metadata_size_and_digest() {
     assert_eq!(
         &bytes[..bundle_header(&baseline, &head).len()],
         bundle_header(&baseline, &head)
+    );
+    let mut bundle = tempfile::tempfile().unwrap();
+    bundle.write_all(&bytes).unwrap();
+    assert_eq!(
+        validate_git_bundle(
+            &mut bundle,
+            GitArtifactDescriptor {
+                base_oid: &baseline,
+                head_oid: &head,
+                tree_oid: &tree,
+            },
+            &mut GitArtifactValidationBudget::default(),
+            &AtomicBool::new(false),
+        ),
+        Ok(())
     );
     let body = &bytes[bundle_header(&baseline, &head).len()..];
     assert_eq!(&body[..4], b"PACK");

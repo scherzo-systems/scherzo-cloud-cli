@@ -183,6 +183,12 @@ fn valid_refname(bytes: &[u8]) -> bool {
 }
 
 impl GitArtifactValidationBudget {
+    fn require_inflated_capacity(&self, bytes: u64) -> Result<(), GitArtifactFailure> {
+        bounded_add(self.inflated_bytes, bytes)?;
+        bounded_add(self.scratch_bytes, bytes)?;
+        Ok(())
+    }
+
     fn add_inflated(&mut self, bytes: u64) -> Result<(), GitArtifactFailure> {
         self.inflated_bytes = bounded_add(self.inflated_bytes, bytes)?;
         self.scratch_bytes = bounded_add(self.scratch_bytes, bytes)?;
@@ -338,6 +344,7 @@ fn parse_pack(
             }
             _ => None,
         };
+        budget.require_inflated_capacity(declared_size)?;
         let inflated_path = scratch.join(format!("inflated-{index:07}"));
         let inflated = create_scratch_file(&inflated_path)?;
         let observed = reader.inflate_to(inflated, declared_size, budget, cancelled)?;
@@ -666,18 +673,21 @@ fn resolve_and_validate_objects(
         }
     }
 
-    let unresolved = entries
-        .iter()
-        .filter(|entry| matches!(entry, PackEntry::Delta(_)))
-        .count();
     let head = parse_hex_oid(descriptor.head_oid).ok_or(GitArtifactFailure::Content)?;
-    if let Some(index) = objects.get(&head).copied() {
-        let PackEntry::Object(head) = &entries[index] else {
-            return Err(GitArtifactFailure::Content);
-        };
-        validate_head_object(head, descriptor.tree_oid)?;
-    } else if unresolved == 0 {
+    let index = objects
+        .get(&head)
+        .copied()
+        .ok_or(GitArtifactFailure::Content)?;
+    let PackEntry::Object(head) = &entries[index] else {
         return Err(GitArtifactFailure::Content);
+    };
+    validate_head_object(head, descriptor.tree_oid)?;
+
+    if entries
+        .iter()
+        .any(|entry| matches!(entry, PackEntry::Delta(_)))
+    {
+        return Err(GitArtifactFailure::Pack);
     }
     Ok(())
 }
@@ -957,30 +967,4 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), GitArtifactFailure> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bundle_profile_ignores_an_empty_prerequisite_comment() {
-        let baseline = "0".repeat(40);
-        let head = "1".repeat(40);
-        let tree = "2".repeat(40);
-        let header = format!("# v2 git bundle\n-{baseline} \n{head} refs/scherzo/head\n\n");
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("carrier.bundle");
-        std::fs::write(&path, &header).unwrap();
-        let mut file = File::open(path).unwrap();
-
-        assert_eq!(
-            validate_bundle_header(
-                &mut file,
-                GitArtifactDescriptor {
-                    base_oid: &baseline,
-                    head_oid: &head,
-                    tree_oid: &tree,
-                },
-            ),
-            Ok(u64::try_from(header.len()).unwrap()),
-        );
-    }
-}
+pub(super) mod tests;

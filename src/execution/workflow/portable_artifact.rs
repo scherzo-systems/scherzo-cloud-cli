@@ -1501,29 +1501,8 @@ fn validate_carrier(
                             git_budget,
                             cancelled,
                         );
-                        let code = match result {
-                            Ok(()) => None,
-                            Err(GitArtifactFailure::Header) => Some("git_bundle_header_invalid"),
-                            Err(GitArtifactFailure::Profile) => Some("git_bundle_profile_invalid"),
-                            Err(GitArtifactFailure::Pack) => Some("git_pack_invalid"),
-                            Err(GitArtifactFailure::Checksum) => Some("git_pack_checksum_mismatch"),
-                            Err(GitArtifactFailure::Content) => Some("git_content_invalid"),
-                            Err(GitArtifactFailure::StructureLimit) => {
-                                Some("git_structure_limit_exceeded")
-                            }
-                            Err(GitArtifactFailure::Unavailable) => {
-                                diagnostics.carrier("carrier_unavailable", path, 0);
-                                None
-                            }
-                            Err(GitArtifactFailure::Scratch) => {
-                                return Err(PortableArtifactValidationFailure::ScratchUnavailable);
-                            }
-                            Err(GitArtifactFailure::Interrupted) => {
-                                return Err(PortableArtifactValidationFailure::Interrupted);
-                            }
-                        };
-                        if let Some(code) = code {
-                            diagnostics.carrier(code, path, 7);
+                        if let Err(failure) = result {
+                            diagnose_git_artifact_failure(failure, path, diagnostics)?;
                         }
                     }
                 }
@@ -1534,6 +1513,33 @@ fn validate_carrier(
     if retained_file_changed(exports, name, &file, &before) {
         diagnose_current_carrier(exports, name, path, diagnostics);
     }
+    Ok(())
+}
+
+fn diagnose_git_artifact_failure(
+    failure: GitArtifactFailure,
+    path: &str,
+    diagnostics: &mut Diagnostics,
+) -> Result<(), PortableArtifactValidationFailure> {
+    let code = match failure {
+        GitArtifactFailure::Header => "git_bundle_header_invalid",
+        GitArtifactFailure::Profile => "git_bundle_profile_invalid",
+        GitArtifactFailure::Pack => "git_pack_invalid",
+        GitArtifactFailure::Checksum => "git_pack_checksum_mismatch",
+        GitArtifactFailure::Content => "git_content_invalid",
+        GitArtifactFailure::StructureLimit => "git_structure_limit_exceeded",
+        GitArtifactFailure::Unavailable => {
+            diagnostics.carrier("carrier_unavailable", path, 0);
+            return Ok(());
+        }
+        GitArtifactFailure::Scratch => {
+            return Err(PortableArtifactValidationFailure::ScratchUnavailable);
+        }
+        GitArtifactFailure::Interrupted => {
+            return Err(PortableArtifactValidationFailure::Interrupted);
+        }
+    };
+    diagnostics.carrier(code, path, 7);
     Ok(())
 }
 
@@ -1686,5 +1692,47 @@ impl<Reader: Seek> Seek for CancellableReader<'_, Reader> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.ensure_active()?;
         self.inner.seek(position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::workflow::git_artifact::tests::{BundleMutation, RealBundleFixture};
+
+    #[test]
+    fn real_bundle_failures_emit_their_portable_diagnostic_codes() {
+        let fixture = RealBundleFixture::new();
+
+        for (mutation, expected_code) in [
+            (BundleMutation::InvalidHeader, "git_bundle_header_invalid"),
+            (
+                BundleMutation::MismatchedProfile,
+                "git_bundle_profile_invalid",
+            ),
+            (BundleMutation::TruncatedPack, "git_pack_invalid"),
+            (BundleMutation::BadChecksum, "git_pack_checksum_mismatch"),
+            (BundleMutation::MissingHeadObject, "git_content_invalid"),
+            (
+                BundleMutation::OversizedObject,
+                "git_structure_limit_exceeded",
+            ),
+            (
+                BundleMutation::OverdeepDeltaChain,
+                "git_structure_limit_exceeded",
+            ),
+        ] {
+            let mut diagnostics = Diagnostics::default();
+            diagnose_git_artifact_failure(
+                fixture.failure(mutation),
+                "exports/0001",
+                &mut diagnostics,
+            )
+            .unwrap();
+            let diagnostics = diagnostics.finish();
+
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code(), expected_code);
+        }
     }
 }
