@@ -59,9 +59,48 @@ impl CoordinatorClock for TestClock {
     }
 }
 
-type TestAction = RequestedAction<String, String, String, TestInstant>;
+type TestAction<Provisional = String> = RequestedAction<Provisional, String, String, TestInstant>;
 type TestCommit = CommittedReduction<String, String, TestInstant>;
 type TestResult = CoordinationResult<String, String, TestInstant>;
+
+#[derive(Clone)]
+struct DistinctProvisional(&'static str);
+
+impl std::fmt::Debug for DistinctProvisional {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("DistinctProvisional")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl DriverOccurrenceContent for DistinctProvisional {
+    fn update_occurrence_digest(&self, digest: &mut OccurrenceDigestEncoder<'_>) {
+        digest.write_bytes(self.0.as_bytes());
+    }
+}
+
+impl runtime::ProvisionalStepResources for DistinctProvisional {
+    fn requires_release(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReleasableProvisional(&'static str);
+
+impl DriverOccurrenceContent for ReleasableProvisional {
+    fn update_occurrence_digest(&self, digest: &mut OccurrenceDigestEncoder<'_>) {
+        digest.write_bytes(self.0.as_bytes());
+    }
+}
+
+impl runtime::ProvisionalStepResources for ReleasableProvisional {
+    fn requires_release(&self) -> bool {
+        true
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TimelineEntry {
@@ -111,18 +150,18 @@ impl CommitPort<TestCommit> for ControlledCommitPort {
     }
 }
 
-struct ActionRelease {
-    action: TestAction,
+struct ActionRelease<Provisional = String> {
+    action: TestAction<Provisional>,
     resume: oneshot::Sender<()>,
 }
 
-struct ControlledActionPort {
-    actions: mpsc::UnboundedSender<ActionRelease>,
+struct ControlledActionPort<Provisional = String> {
+    actions: mpsc::UnboundedSender<ActionRelease<Provisional>>,
     timeline: Arc<Mutex<Vec<TimelineEntry>>>,
 }
 
-impl ActionPort<TestAction> for ControlledActionPort {
-    fn release(&mut self, action: TestAction) -> impl Future<Output = ()> {
+impl<Provisional> ActionPort<TestAction<Provisional>> for ControlledActionPort<Provisional> {
+    fn release(&mut self, action: TestAction<Provisional>) -> impl Future<Output = ()> {
         self.timeline
             .lock()
             .unwrap()
@@ -134,6 +173,17 @@ impl ActionPort<TestAction> for ControlledActionPort {
                 let _ = resumed.await;
             }
         }
+    }
+}
+
+struct RecordingActionPort<Provisional> {
+    actions: Arc<Mutex<Vec<TestAction<Provisional>>>>,
+}
+
+impl<Provisional> ActionPort<TestAction<Provisional>> for RecordingActionPort<Provisional> {
+    fn release(&mut self, action: TestAction<Provisional>) -> impl Future<Output = ()> {
+        self.actions.lock().unwrap().push(action);
+        ready(())
     }
 }
 
@@ -691,6 +741,55 @@ async fn acknowledged_completion_claim_precedes_later_cancellation() {
 }
 
 #[tokio::test]
+async fn discarded_completion_claim_releases_provisional_resources() {
+    let fixture = admitted_fixture(CancellationSource::new(), Duration::from_secs(7));
+    let (sender, receiver) =
+        occurrence_channel::<ReleasableProvisional, String, String>(NonZeroUsize::new(2).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let coordinator = Coordinator::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline,
+        },
+        RecordingActionPort {
+            actions: Arc::clone(&actions),
+        },
+    );
+
+    let driver = async {
+        let initialized = commits.recv().await.unwrap();
+        let start = initialized.actions[0].id;
+        let claim = sender
+            .claim(DriverOccurrence::step_execution_completed(
+                "task".to_owned(),
+                start,
+                ReleasableProvisional("staging"),
+            ))
+            .await
+            .unwrap();
+        claim.discard();
+        drop(sender);
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert_eq!(result, Err(CoordinationError::OccurrenceChannelClosed));
+    let actions = actions.lock().unwrap();
+    assert_eq!(actions.len(), 2);
+    let Action::ReleaseStepResources { provisional } = &actions[1].action else {
+        panic!("discarded completion did not release its provisional resources");
+    };
+    assert_eq!(provisional.0, "staging");
+}
+
+#[tokio::test]
 async fn execution_start_samples_an_already_admitted_cancellation() {
     let cancellation = CancellationSource::new();
     assert!(cancellation.request_cancellation(CancellationReason::RunnerShutdown));
@@ -778,7 +877,7 @@ steps:
     let (sender, receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
     let timeline = Arc::new(Mutex::new(Vec::new()));
     let (commit_sender, mut commits) = mpsc::unbounded_channel();
-    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel::<ActionRelease<String>>();
     let coordinator = Coordinator::new(
         fixture.admitted,
         receiver,
@@ -941,7 +1040,7 @@ steps:
     let (sender, receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
     let timeline = Arc::new(Mutex::new(Vec::new()));
     let (commit_sender, mut commits) = mpsc::unbounded_channel();
-    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel::<ActionRelease<String>>();
     let coordinator = Coordinator::new(
         fixture.admitted,
         receiver,
@@ -1019,6 +1118,91 @@ steps:
                 wrong_round,
                 handler_id,
                 RecoveryDecision::recheck("changed", "same identity"),
+            ))
+            .await
+            .unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert_eq!(result, Err(CoordinationError::OccurrenceConflict));
+}
+
+#[tokio::test]
+async fn conflicting_provisional_payload_uses_content_digest_without_payload_equality() {
+    const CAPTURE_WORKFLOW: &str = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result:
+        kind: file
+        from: path
+        path: result.txt
+        mediaType: text/plain
+"#;
+    let fixture = admitted_fixture_for_workflow(
+        CancellationSource::new(),
+        Duration::from_secs(7),
+        CAPTURE_WORKFLOW,
+    );
+    let (sender, receiver) =
+        occurrence_channel::<DistinctProvisional, String, String>(NonZeroUsize::new(4).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) =
+        mpsc::unbounded_channel::<ActionRelease<DistinctProvisional>>();
+    let coordinator = Coordinator::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline,
+        },
+    );
+
+    let driver = async {
+        let _ = commits.recv().await.unwrap();
+        let start = actions.recv().await.unwrap();
+        let action = start.action.id;
+        sender
+            .send(DriverOccurrence::step_started("task".into(), action))
+            .await
+            .unwrap();
+        start.resume.send(()).unwrap();
+        let _ = commits.recv().await.unwrap();
+
+        sender
+            .send(DriverOccurrence::step_execution_completed(
+                "task".into(),
+                action,
+                DistinctProvisional("first"),
+            ))
+            .await
+            .unwrap();
+        let capturing = commits.recv().await.unwrap();
+        assert!(capturing.occurrence_accepted);
+        let capture = actions.recv().await.unwrap();
+        assert!(matches!(
+            capture.action.action,
+            Action::CaptureOutputs { .. }
+        ));
+        capture.resume.send(()).unwrap();
+
+        sender
+            .send(DriverOccurrence::step_execution_completed(
+                "task".into(),
+                action,
+                DistinctProvisional("changed"),
             ))
             .await
             .unwrap();

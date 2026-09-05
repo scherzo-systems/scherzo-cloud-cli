@@ -38,7 +38,7 @@ use super::child_guard::{StoppedChildGuard, force_stop_direct_child};
 use super::coordinator::{
     ActionPort, CommitPort, CommittedReduction, CoordinationError, CoordinationResult, Coordinator,
     CoordinatorClock, DriverOccurrence, DriverOccurrenceAcceptance, DriverOccurrenceClaim,
-    OccurrenceSender, occurrence_channel,
+    DriverOccurrenceContent, OccurrenceDigestEncoder, OccurrenceSender, occurrence_channel,
 };
 use super::diagnostic::{PendingStepDiagnostic, StepDiagnosticLog};
 use super::document::Output;
@@ -59,8 +59,8 @@ use super::recovery::{
     parse_recovery_decision, recovery_definition, recovery_handler_cwd,
 };
 use super::runtime::{
-    Action, ActionId, ActionInput, RecoveryDecision, RecoveryRoundNumber, RecoveryRoundRecord,
-    RequestedAction,
+    Action, ActionId, ActionInput, ProvisionalStepResources, RecoveryDecision, RecoveryRoundNumber,
+    RecoveryRoundRecord, RequestedAction,
 };
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
@@ -172,6 +172,12 @@ impl ProvisionalStepOutputs {
     }
 }
 
+impl ProvisionalStepResources for ProvisionalStepOutputs {
+    fn requires_release(&self) -> bool {
+        self.agent_staging.is_some()
+    }
+}
+
 impl Default for ProvisionalStepOutputs {
     fn default() -> Self {
         Self::command()
@@ -180,21 +186,114 @@ impl Default for ProvisionalStepOutputs {
 
 impl std::fmt::Debug for ProvisionalStepOutputs {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let agent_staging = self
+            .agent_staging
+            .as_deref()
+            .map(AgentInputStagingLease::replay_identity);
         formatter
             .debug_struct("ProvisionalStepOutputs")
             .field("values", &self.values)
-            .field("has_agent_staging", &self.agent_staging.is_some())
+            .field("agent_staging", &agent_staging)
             .finish()
     }
 }
 
 impl PartialEq for ProvisionalStepOutputs {
     fn eq(&self, other: &Self) -> bool {
-        self.values == other.values && self.agent_staging.is_some() == other.agent_staging.is_some()
+        self.values == other.values
+            && match (&self.agent_staging, &other.agent_staging) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            }
     }
 }
 
 impl Eq for ProvisionalStepOutputs {}
+
+async fn release_shared_agent_staging(staging: Option<Arc<AgentInputStagingLease>>) {
+    let Some(staging) = staging else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || match Arc::try_unwrap(staging) {
+        Ok(staging) => {
+            let _ = staging.release();
+        }
+        Err(staging) => drop(staging),
+    })
+    .await;
+}
+
+async fn release_provisional_step_resources(provisional: ProvisionalStepOutputs) {
+    release_shared_agent_staging(provisional.agent_staging).await;
+}
+
+impl DriverOccurrenceContent for ProvisionalStepOutputs {
+    fn update_occurrence_digest(&self, digest: &mut OccurrenceDigestEncoder<'_>) {
+        digest.write_u64(u64::try_from(self.values.len()).unwrap_or(u64::MAX));
+        for (name, value) in &self.values {
+            digest.write_bytes(name.as_bytes());
+            value.update_occurrence_digest(digest);
+        }
+        match self.agent_staging.as_deref() {
+            Some(staging) => {
+                let (root, view) = staging.replay_identity();
+                digest.write_tag(1);
+                digest.write_bytes(root.as_bytes());
+                digest.write_bytes(view.as_bytes());
+            }
+            None => digest.write_tag(0),
+        }
+    }
+}
+
+impl DriverOccurrenceContent for StepFailureCause {
+    fn update_occurrence_digest(&self, digest: &mut OccurrenceDigestEncoder<'_>) {
+        digest.write_debug(self);
+    }
+}
+
+impl DriverOccurrenceContent for CapturedValue {
+    fn update_occurrence_digest(&self, digest: &mut OccurrenceDigestEncoder<'_>) {
+        match self {
+            Self::Text(value) => {
+                digest.write_tag(0);
+                digest.write_bytes(value.carrier());
+            }
+            Self::Json(value) => {
+                digest.write_tag(1);
+                digest.write_bytes(value.canonical_json());
+            }
+            Self::File(value) => {
+                digest.write_tag(2);
+                digest.write_bytes(value.output_identity().as_bytes());
+                digest.write_u64(value.size());
+                digest.write_bytes(value.media_type().as_bytes());
+                digest.write_bytes(value.sha256().as_bytes());
+            }
+            Self::GitBranch(value) => {
+                digest.write_tag(3);
+                digest.write_bytes(value.output_identity().as_bytes());
+                let metadata = value.metadata();
+                digest.write_tag(metadata.artifact_version());
+                digest.write_bytes(metadata.object_format().as_str().as_bytes());
+                digest.write_bytes(metadata.base_oid().as_bytes());
+                digest.write_bytes(metadata.head_oid().as_bytes());
+                digest.write_bytes(metadata.tree_oid().as_bytes());
+                match value.carrier() {
+                    Some(carrier) => {
+                        digest.write_tag(1);
+                        digest.write_bytes(carrier.staged().output_identity().as_bytes());
+                        digest.write_u64(carrier.size());
+                        digest.write_bytes(carrier.media_type().as_bytes());
+                        digest.write_bytes(carrier.sha256().as_bytes());
+                    }
+                    None => digest.write_tag(0),
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct NoAgentDispatcher;
@@ -522,13 +621,15 @@ where
                         let settling_worker = capture_worker.clone();
                         let (started, settlement_started) = oneshot::channel();
                         capture_tasks.spawn(async move {
-                            settling_worker
-                                .settle_cancelled(request.action, started)
-                                .await;
+                            let action = request.action;
+                            release_provisional_step_resources(request.provisional).await;
+                            settling_worker.settle_cancelled(action, started).await;
                         });
                         let _ = settlement_started.await;
                     }
-                    BeginCapture::Gone => {}
+                    BeginCapture::Gone => {
+                        release_provisional_step_resources(request.provisional).await;
+                    }
                 }
             }
         });
@@ -1911,25 +2012,28 @@ where
         operation(&mut lock_registry(&self.work))
     }
 
-    fn register_capture(
+    async fn register_capture(
         &self,
         step: String,
         action: ActionId,
         provisional: ProvisionalStepOutputs,
     ) {
         if !self.with_capture_work(|work| work.register(step.clone(), action)) {
+            release_provisional_step_resources(provisional).await;
             return;
         }
-        if self
-            .capture_requests
-            .send(CaptureWorkerMessage::Capture(CaptureRequest {
-                step,
-                action,
-                provisional,
-            }))
-            .is_err()
+        if let Err(failure) =
+            self.capture_requests
+                .send(CaptureWorkerMessage::Capture(CaptureRequest {
+                    step,
+                    action,
+                    provisional,
+                }))
         {
             self.with_capture_work(|work| work.finish(action));
+            if let CaptureWorkerMessage::Capture(request) = failure.0 {
+                release_provisional_step_resources(request.provisional).await;
+            }
         }
     }
 
@@ -2005,7 +2109,8 @@ where
         step: String,
         action: ActionId,
     ) -> Result<(), StepRuntimeError> {
-        self.register_capture(step, action, ProvisionalStepOutputs::command());
+        self.register_capture(step, action, ProvisionalStepOutputs::command())
+            .await;
         Ok(())
     }
 
@@ -2173,7 +2278,7 @@ impl CaptureWorker {
             Ok(candidates) => self.settle_candidates(request, candidates, started).await,
             Err(CaptureWorkerFailure::Cancelled) => {
                 let action = request.action;
-                drop(request.provisional);
+                release_provisional_step_resources(request.provisional).await;
                 self.settle_cancelled(action, started).await;
             }
             Err(CaptureWorkerFailure::Failed(failure)) => {
@@ -2199,7 +2304,7 @@ impl CaptureWorker {
         } = provisional;
         if self.with_work(|work| work.is_cancelled(action)) {
             candidates.abort();
-            drop(agent_staging);
+            release_shared_agent_staging(agent_staging).await;
             self.settle_cancelled(action, started).await;
             return;
         }
@@ -2216,13 +2321,13 @@ impl CaptureWorker {
             Ok(DriverOccurrenceAcceptance::Accepted(commit)) => {
                 drop(candidates.commit());
                 self.with_work(|work| work.finish(action));
-                drop(agent_staging);
+                release_shared_agent_staging(agent_staging).await;
                 commit.finalize();
             }
             Ok(DriverOccurrenceAcceptance::Rejected(finalization)) => {
                 candidates.abort();
                 let cancellation = self.with_work(|work| work.finish(action));
-                drop(agent_staging);
+                release_shared_agent_staging(agent_staging).await;
                 finalization.finalize();
                 if let Some(cancellation) = cancellation {
                     self.send_quiesced(cancellation).await;
@@ -2231,7 +2336,7 @@ impl CaptureWorker {
             Err(_) => {
                 candidates.abort();
                 self.with_work(|work| work.finish(action));
-                drop(agent_staging);
+                release_shared_agent_staging(agent_staging).await;
             }
         }
     }
@@ -2248,7 +2353,7 @@ impl CaptureWorker {
             provisional,
         } = request;
         if self.with_work(|work| work.is_cancelled(action)) {
-            drop(provisional);
+            release_provisional_step_resources(provisional).await;
             self.settle_cancelled(action, started).await;
             return;
         }
@@ -2262,12 +2367,12 @@ impl CaptureWorker {
         match self.occurrences.send_acknowledged(occurrence).await {
             Ok(DriverOccurrenceAcceptance::Accepted(commit)) => {
                 self.with_work(|work| work.finish(action));
-                drop(provisional);
+                release_provisional_step_resources(provisional).await;
                 commit.finalize();
             }
             Ok(DriverOccurrenceAcceptance::Rejected(finalization)) => {
                 let cancellation = self.with_work(|work| work.finish(action));
-                drop(provisional);
+                release_provisional_step_resources(provisional).await;
                 finalization.finalize();
                 if let Some(cancellation) = cancellation {
                     self.send_quiesced(cancellation).await;
@@ -2275,7 +2380,7 @@ impl CaptureWorker {
             }
             Err(_) => {
                 self.with_work(|work| work.finish(action));
-                drop(provisional);
+                release_provisional_step_resources(provisional).await;
             }
         }
     }
@@ -3049,7 +3154,12 @@ where
                 Action::CaptureOutputs { step, provisional } => {
                     // Registration preserves reducer action order while the queue remains
                     // independently revocable and occurrence delivery waits for acceptance.
-                    runtime.register_capture(step, requested.id, provisional);
+                    runtime
+                        .register_capture(step, requested.id, provisional)
+                        .await;
+                }
+                Action::ReleaseStepResources { provisional } => {
+                    release_provisional_step_resources(provisional).await;
                 }
                 Action::FinishRun { .. } => {}
             }

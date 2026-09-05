@@ -2579,6 +2579,105 @@ async fn run_no_value_agent_transcript() -> AgentEngineTranscript {
 }
 
 #[tokio::test]
+async fn committed_agent_steps_release_staging_while_a_dependent_step_runs() {
+    with_watchdog(async {
+        for (first_outputs, response) in [
+            ("", None),
+            (
+                r#"    outputs:
+      response:
+        kind: text
+        from: agent_response
+"#,
+                Some("captured response"),
+            ),
+        ] {
+            let source = format!(
+                r#"schemaVersion: 1
+{AGENT_PROFILE}steps:
+  first:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+{first_outputs}  second:
+    kind: agent
+    dependsOn: [first]
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+"#
+            );
+            let fixture = execution_fixture_with_source_files(
+                &source,
+                &[("prompt.md", b"complete each step")],
+                ResolvedImports::default(),
+                EnvironmentSnapshot::default(),
+                CancellationSource::new(),
+                1,
+                1024,
+            );
+            let (adapter, mut control) = scripted_agent_dispatcher();
+            let agents = agent_runtime(&fixture, adapter);
+            let (observer, _entries, mut observed) = RecordingObserver::new();
+            let artifacts = fixture.artifacts.clone();
+            let inputs = fixture.inputs.clone();
+            let execution = tokio::spawn({
+                let admitted = fixture.admitted.clone();
+                async move {
+                    execute_workflow(
+                        admitted,
+                        &artifacts,
+                        &inputs,
+                        &StepDiagnosticLog::default(),
+                        agents,
+                        TestClock,
+                        observer,
+                    )
+                    .await
+                }
+            });
+
+            let first = control.wait_until_started().await.unwrap();
+            assert_eq!(first.identity().step(), "first");
+            let first_staging = first.result_endpoint_directory().to_owned();
+            first.control().start().await.unwrap();
+            if let Some(response) = response {
+                first
+                    .control()
+                    .propose(ScriptedAgentValue::Response(Arc::from(response)))
+                    .await
+                    .unwrap();
+            }
+            first.control().complete().await.unwrap();
+
+            let second = control.wait_until_started().await.unwrap();
+            assert_eq!(second.identity().step(), "second");
+            second.control().start().await.unwrap();
+            wait_for_step_transition(&mut observed, "second", StepStateKind::Running).await;
+
+            assert!(!first_staging.exists());
+            assert_eq!(fixture.agent_inputs.active_view_count(), 1);
+            assert!(!execution.is_finished());
+
+            second.control().complete().await.unwrap();
+            assert_eq!(
+                execution.await.unwrap().unwrap().outcome,
+                RunOutcome::Succeeded
+            );
+            assert_eq!(fixture.agent_inputs.active_view_count(), 0);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn committed_agent_completion_wins_a_later_cancellation_before_delivery_finishes() {
     with_watchdog(async {
         let source = format!(

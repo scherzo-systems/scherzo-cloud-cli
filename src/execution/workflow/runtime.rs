@@ -29,6 +29,17 @@ pub(crate) trait ConditionOutput {
     fn condition_json(&self) -> Option<&serde_json::Value>;
 }
 
+pub(crate) trait ProvisionalStepResources {
+    fn requires_release(&self) -> bool;
+}
+
+#[cfg(test)]
+impl ProvisionalStepResources for String {
+    fn requires_release(&self) -> bool {
+        false
+    }
+}
+
 impl ConditionOutput for CapturedValue {
     fn condition_text(&self) -> Option<&str> {
         match self {
@@ -846,6 +857,9 @@ pub(crate) enum Action<Provisional, Cause, Output, Deadline> {
         step: String,
         provisional: Provisional,
     },
+    ReleaseStepResources {
+        provisional: Provisional,
+    },
     CancelStep {
         step: String,
         active: ActiveStepInvocation,
@@ -1011,21 +1025,24 @@ pub(crate) fn reduce<Provisional, Cause, Output, Deadline>(
     occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
+    Provisional: ProvisionalStepResources,
     Cause: Clone + NodeFailureSource,
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
+    if matches!(
+        &current.workflow,
+        WorkflowState::Succeeded | WorkflowState::Failed { .. } | WorkflowState::Cancelled { .. }
+    ) {
+        return discard_occurrence(current, occurrence);
+    }
     let mut reduction = Reduction {
         state: current.clone(),
         events: Vec::new(),
         actions: Vec::new(),
         occurrence_accepted: false,
     };
-    if matches!(
-        &reduction.state.workflow,
-        WorkflowState::Succeeded | WorkflowState::Failed { .. } | WorkflowState::Cancelled { .. }
-    ) || !apply_occurrence(&mut reduction, occurrence)
-    {
+    if !apply_occurrence(&mut reduction, occurrence) {
         return reduction;
     }
     reduction.occurrence_accepted = true;
@@ -1033,11 +1050,52 @@ where
     reduction
 }
 
+pub(crate) fn discard_occurrence<Provisional, Cause, Output, Deadline>(
+    current: &RuntimeState<Cause, Output, Deadline>,
+    occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
+) -> Reduction<Provisional, Cause, Output, Deadline>
+where
+    Provisional: ProvisionalStepResources,
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    Reduction {
+        state: current.clone(),
+        events: Vec::new(),
+        actions: occurrence_resource_release(occurrence)
+            .into_iter()
+            .collect(),
+        occurrence_accepted: false,
+    }
+}
+
+pub(crate) fn occurrence_resource_release<Provisional, Cause, Output, Deadline>(
+    occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
+) -> Option<RequestedAction<Provisional, Cause, Output, Deadline>>
+where
+    Provisional: ProvisionalStepResources,
+{
+    let Occurrence::StepExecutionCompleted {
+        action,
+        provisional,
+        ..
+    } = occurrence
+    else {
+        return None;
+    };
+    provisional.requires_release().then_some(RequestedAction {
+        id: action,
+        action: Action::ReleaseStepResources { provisional },
+    })
+}
+
 fn apply_occurrence<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     occurrence: Occurrence<Provisional, Cause, Output, Deadline>,
 ) -> bool
 where
+    Provisional: ProvisionalStepResources,
     Cause: Clone + NodeFailureSource,
     Output: Clone,
     Deadline: Clone,
@@ -1069,6 +1127,12 @@ where
             provisional,
         } => {
             if !step_accepts(&reduction.state, &step, StepStateKind::Running, action) {
+                if provisional.requires_release() {
+                    reduction.actions.push(RequestedAction {
+                        id: action,
+                        action: Action::ReleaseStepResources { provisional },
+                    });
+                }
                 return false;
             }
             let sequence = transition_step(reduction, &step, StepState::CapturingOutputs, None);
@@ -1080,6 +1144,10 @@ where
                     action: Action::CaptureOutputs { step, provisional },
                 });
             } else {
+                let release_resources = provisional.requires_release().then(|| RequestedAction {
+                    id: ActionId::for_transition(sequence),
+                    action: Action::ReleaseStepResources { provisional },
+                });
                 mark_recovered(reduction, &step);
                 transition_step(
                     reduction,
@@ -1090,6 +1158,10 @@ where
                     None,
                 );
                 clear_active_invocation(&mut reduction.state, &step);
+                if let Some(release_resources) = release_resources {
+                    // Resource release must precede any dependent starts appended by stabilize.
+                    reduction.actions.push(release_resources);
+                }
             }
         }
         Occurrence::StepExecutionFailed {

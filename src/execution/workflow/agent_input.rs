@@ -268,6 +268,10 @@ impl AgentInputStagingLease {
         &self.path
     }
 
+    pub(crate) fn replay_identity(&self) -> (&str, &str) {
+        (&self.inner.staging_identity, &self.identity)
+    }
+
     fn attachment_path(&self) -> &Path {
         &self.attachment_path
     }

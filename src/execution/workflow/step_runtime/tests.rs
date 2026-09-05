@@ -4155,6 +4155,7 @@ fn start_actions(admitted: &AdmittedWorkflow) -> BTreeMap<String, ActionId> {
         Action::StartStep { step, .. } => Some((step, requested.id)),
         Action::StartRecoveryHandler { .. }
         | Action::CaptureOutputs { .. }
+        | Action::ReleaseStepResources { .. }
         | Action::CancelStep { .. }
         | Action::ForceAbortStep { .. }
         | Action::FinishRun { .. } => None,

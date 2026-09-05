@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Write as _};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::Add;
@@ -10,7 +11,8 @@ use super::admission::{AdmittedWorkflow, CancellationOperation};
 use super::evidence::NodeFailureSource;
 use super::runtime::{
     self, ActionId, CancellationRequest, ConditionOutput, Occurrence, OutputSet, RecoveryDecision,
-    RecoveryRoundNumber, Reduction, RequestedAction, RuntimeState, TransitionEvent, WorkflowState,
+    RecoveryDecisionKind, RecoveryRoundNumber, Reduction, RequestedAction, RuntimeState,
+    TransitionEvent, WorkflowState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -29,18 +31,221 @@ impl OccurrenceOrdinal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DriverDeadline {}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DriverOccurrence<Provisional, Cause, Output>(
-    Occurrence<Provisional, Cause, Output, DriverDeadline>,
-);
+const OCCURRENCE_DIGEST_BYTES: usize = 32;
+const OCCURRENCE_DIGEST_DOMAIN: &[u8] = b"scherzo-driver-occurrence-content\0";
 
-impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DriverOccurrenceContentDigest([u8; OCCURRENCE_DIGEST_BYTES]);
+
+// Implementations must encode every field that can distinguish two occurrence payloads.
+pub(crate) trait DriverOccurrenceContent {
+    fn update_occurrence_digest(&self, digest: &mut OccurrenceDigestEncoder<'_>);
+}
+
+pub(crate) struct OccurrenceDigestEncoder<'a>(&'a mut ring::digest::Context);
+
+impl OccurrenceDigestEncoder<'_> {
+    pub(crate) fn write_tag(&mut self, tag: u8) {
+        self.0.update(&[tag]);
+    }
+
+    pub(crate) fn write_u64(&mut self, value: u64) {
+        self.0.update(&value.to_be_bytes());
+    }
+
+    pub(crate) fn write_bytes(&mut self, content: &[u8]) {
+        let length = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        self.write_u64(length);
+        self.0.update(content);
+    }
+
+    pub(crate) fn write_debug(&mut self, content: &impl Debug) {
+        let formatting = write!(OccurrenceDigestWriter(self.0), "{content:?}");
+        if formatting.is_err() {
+            self.0.update(b"\0formatting-failed");
+        }
+    }
+}
+
+struct OccurrenceDigestWriter<'a>(&'a mut ring::digest::Context);
+
+impl fmt::Write for OccurrenceDigestWriter<'_> {
+    fn write_str(&mut self, content: &str) -> fmt::Result {
+        self.0.update(content.as_bytes());
+        Ok(())
+    }
+}
+
+impl DriverOccurrenceContent for String {
+    fn update_occurrence_digest(&self, digest: &mut OccurrenceDigestEncoder<'_>) {
+        digest.write_bytes(self.as_bytes());
+    }
+}
+
+fn occurrence_content_digest<Provisional, Cause, Output>(
+    occurrence: &Occurrence<Provisional, Cause, Output, DriverDeadline>,
+) -> DriverOccurrenceContentDigest
+where
+    Provisional: DriverOccurrenceContent,
+    Cause: DriverOccurrenceContent,
+    Output: DriverOccurrenceContent,
+{
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(OCCURRENCE_DIGEST_DOMAIN);
+    let mut digest = OccurrenceDigestEncoder(&mut context);
+    match occurrence {
+        Occurrence::StepStarted { step, action } => {
+            digest.write_tag(0);
+            write_step_action(&mut digest, step, *action);
+        }
+        Occurrence::StepStartFailed {
+            step,
+            action,
+            cause,
+        } => {
+            digest.write_tag(1);
+            write_step_action(&mut digest, step, *action);
+            cause.update_occurrence_digest(&mut digest);
+        }
+        Occurrence::StepExecutionCompleted {
+            step,
+            action,
+            provisional,
+        } => {
+            digest.write_tag(2);
+            write_step_action(&mut digest, step, *action);
+            provisional.update_occurrence_digest(&mut digest);
+        }
+        Occurrence::StepExecutionFailed {
+            step,
+            action,
+            cause,
+        } => {
+            digest.write_tag(3);
+            write_step_action(&mut digest, step, *action);
+            cause.update_occurrence_digest(&mut digest);
+        }
+        Occurrence::OutputsCaptured {
+            step,
+            action,
+            outputs,
+        } => {
+            digest.write_tag(4);
+            write_step_action(&mut digest, step, *action);
+            digest.write_u64(u64::try_from(outputs.len()).unwrap_or(u64::MAX));
+            for (name, output) in outputs {
+                digest.write_bytes(name.as_bytes());
+                output.update_occurrence_digest(&mut digest);
+            }
+        }
+        Occurrence::OutputCaptureFailed {
+            step,
+            action,
+            cause,
+        } => {
+            digest.write_tag(5);
+            write_step_action(&mut digest, step, *action);
+            cause.update_occurrence_digest(&mut digest);
+        }
+        Occurrence::RecoveryHandlerStarted {
+            step,
+            round,
+            action,
+        } => {
+            digest.write_tag(6);
+            write_step_round_action(&mut digest, step, *round, *action);
+        }
+        Occurrence::RecoveryHandlerStartFailed {
+            step,
+            round,
+            action,
+            cause,
+        } => {
+            digest.write_tag(7);
+            write_step_round_action(&mut digest, step, *round, *action);
+            cause.update_occurrence_digest(&mut digest);
+        }
+        Occurrence::RecoveryHandlerCompleted {
+            step,
+            round,
+            action,
+            decision,
+        } => {
+            digest.write_tag(8);
+            write_step_round_action(&mut digest, step, *round, *action);
+            digest.write_tag(match decision.kind {
+                RecoveryDecisionKind::Recheck => 0,
+                RecoveryDecisionKind::GaveUp => 1,
+            });
+            digest.write_bytes(decision.summary.as_bytes());
+            digest.write_bytes(decision.reason.as_bytes());
+        }
+        Occurrence::RecoveryHandlerExecutionFailed {
+            step,
+            round,
+            action,
+            cause,
+        } => {
+            digest.write_tag(9);
+            write_step_round_action(&mut digest, step, *round, *action);
+            cause.update_occurrence_digest(&mut digest);
+        }
+        Occurrence::StepQuiesced { step, action } => {
+            digest.write_tag(10);
+            write_step_action(&mut digest, step, *action);
+        }
+        #[cfg(test)]
+        Occurrence::CancellationRequested { deadline, .. } => match *deadline {},
+        Occurrence::CancellationOperationRequested { deadline, .. }
+        | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
+    }
+    let digest = context.finish();
+    let mut bytes = [0_u8; OCCURRENCE_DIGEST_BYTES];
+    bytes.copy_from_slice(digest.as_ref());
+    DriverOccurrenceContentDigest(bytes)
+}
+
+fn write_step_action(digest: &mut OccurrenceDigestEncoder<'_>, step: &str, action: ActionId) {
+    digest.write_bytes(step.as_bytes());
+    digest.write_u64(action.transition_sequence.get());
+}
+
+fn write_step_round_action(
+    digest: &mut OccurrenceDigestEncoder<'_>,
+    step: &str,
+    round: RecoveryRoundNumber,
+    action: ActionId,
+) {
+    write_step_action(digest, step, action);
+    digest.write_tag(round.get());
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DriverOccurrence<Provisional, Cause, Output> {
+    occurrence: Occurrence<Provisional, Cause, Output, DriverDeadline>,
+    content_digest: DriverOccurrenceContentDigest,
+}
+
+impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output>
+where
+    Provisional: DriverOccurrenceContent,
+    Cause: DriverOccurrenceContent,
+    Output: DriverOccurrenceContent,
+{
+    fn new(occurrence: Occurrence<Provisional, Cause, Output, DriverDeadline>) -> Self {
+        let content_digest = occurrence_content_digest(&occurrence);
+        Self {
+            occurrence,
+            content_digest,
+        }
+    }
+
     pub(crate) fn step_started(step: String, action: ActionId) -> Self {
-        Self(Occurrence::StepStarted { step, action })
+        Self::new(Occurrence::StepStarted { step, action })
     }
 
     pub(crate) fn step_start_failed(step: String, action: ActionId, cause: Cause) -> Self {
-        Self(Occurrence::StepStartFailed {
+        Self::new(Occurrence::StepStartFailed {
             step,
             action,
             cause,
@@ -52,7 +257,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         action: ActionId,
         provisional: Provisional,
     ) -> Self {
-        Self(Occurrence::StepExecutionCompleted {
+        Self::new(Occurrence::StepExecutionCompleted {
             step,
             action,
             provisional,
@@ -60,7 +265,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
     }
 
     pub(crate) fn step_execution_failed(step: String, action: ActionId, cause: Cause) -> Self {
-        Self(Occurrence::StepExecutionFailed {
+        Self::new(Occurrence::StepExecutionFailed {
             step,
             action,
             cause,
@@ -72,7 +277,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         action: ActionId,
         outputs: OutputSet<Output>,
     ) -> Self {
-        Self(Occurrence::OutputsCaptured {
+        Self::new(Occurrence::OutputsCaptured {
             step,
             action,
             outputs,
@@ -80,7 +285,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
     }
 
     pub(crate) fn output_capture_failed(step: String, action: ActionId, cause: Cause) -> Self {
-        Self(Occurrence::OutputCaptureFailed {
+        Self::new(Occurrence::OutputCaptureFailed {
             step,
             action,
             cause,
@@ -92,7 +297,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         round: RecoveryRoundNumber,
         action: ActionId,
     ) -> Self {
-        Self(Occurrence::RecoveryHandlerStarted {
+        Self::new(Occurrence::RecoveryHandlerStarted {
             step,
             round,
             action,
@@ -105,7 +310,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         action: ActionId,
         cause: Cause,
     ) -> Self {
-        Self(Occurrence::RecoveryHandlerStartFailed {
+        Self::new(Occurrence::RecoveryHandlerStartFailed {
             step,
             round,
             action,
@@ -119,7 +324,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         action: ActionId,
         decision: RecoveryDecision,
     ) -> Self {
-        Self(Occurrence::RecoveryHandlerCompleted {
+        Self::new(Occurrence::RecoveryHandlerCompleted {
             step,
             round,
             action,
@@ -133,7 +338,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
         action: ActionId,
         cause: Cause,
     ) -> Self {
-        Self(Occurrence::RecoveryHandlerExecutionFailed {
+        Self::new(Occurrence::RecoveryHandlerExecutionFailed {
             step,
             round,
             action,
@@ -142,11 +347,17 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
     }
 
     pub(crate) fn step_quiesced(step: String, action: ActionId) -> Self {
-        Self(Occurrence::StepQuiesced { step, action })
+        Self::new(Occurrence::StepQuiesced { step, action })
+    }
+}
+
+impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
+    fn content_digest(&self) -> DriverOccurrenceContentDigest {
+        self.content_digest
     }
 
     pub(crate) fn into_runtime<Deadline>(self) -> Occurrence<Provisional, Cause, Output, Deadline> {
-        match self.0 {
+        match self.occurrence {
             Occurrence::StepStarted { step, action } => Occurrence::StepStarted { step, action },
             Occurrence::StepStartFailed {
                 step,
@@ -275,7 +486,7 @@ struct DriverOccurrenceIdentity {
 
 impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
     fn identity(&self) -> DriverOccurrenceIdentity {
-        let (action, kind, round) = match &self.0 {
+        let (action, kind, round) = match &self.occurrence {
             Occurrence::StepStarted { action, .. } => {
                 (*action, DriverOccurrenceKind::StepStarted, None)
             }
@@ -413,43 +624,45 @@ enum SelectedDriverOccurrence<Provisional, Cause, Output> {
         occurrence: DriverOccurrence<Provisional, Cause, Output>,
         resolution: oneshot::Receiver<ClaimResolution>,
     },
+    Discarded(DriverOccurrence<Provisional, Cause, Output>),
 }
 
 impl<Provisional, Cause, Output> DriverOccurrenceDelivery<Provisional, Cause, Output> {
-    fn select(self) -> Option<SelectedDriverOccurrence<Provisional, Cause, Output>> {
+    fn select(self) -> SelectedDriverOccurrence<Provisional, Cause, Output> {
         match self {
-            Self::Ready(occurrence) => Some(SelectedDriverOccurrence::Resolved(
-                ResolvedDriverOccurrence {
+            Self::Ready(occurrence) => {
+                SelectedDriverOccurrence::Resolved(ResolvedDriverOccurrence {
                     occurrence,
                     acknowledgement: None,
-                },
-            )),
+                })
+            }
             Self::Claimed {
                 occurrence,
                 observed,
                 resolution,
             } => {
-                observed.send(()).ok()?;
-                Some(SelectedDriverOccurrence::Claimed {
-                    occurrence,
-                    resolution,
-                })
+                if observed.send(()).is_ok() {
+                    SelectedDriverOccurrence::Claimed {
+                        occurrence,
+                        resolution,
+                    }
+                } else {
+                    SelectedDriverOccurrence::Discarded(occurrence)
+                }
             }
             Self::Acknowledged {
                 occurrence,
                 acknowledgement,
-            } => Some(SelectedDriverOccurrence::Resolved(
-                ResolvedDriverOccurrence {
-                    occurrence,
-                    acknowledgement: Some(acknowledgement),
-                },
-            )),
+            } => SelectedDriverOccurrence::Resolved(ResolvedDriverOccurrence {
+                occurrence,
+                acknowledgement: Some(acknowledgement),
+            }),
         }
     }
 
     #[cfg(test)]
     async fn resolve(self) -> Option<ResolvedDriverOccurrence<Provisional, Cause, Output>> {
-        self.select()?.resolve().await
+        self.select().resolve().await.ok()
     }
 }
 
@@ -458,18 +671,25 @@ impl<Provisional, Cause, Output> SelectedDriverOccurrence<Provisional, Cause, Ou
         matches!(self, Self::Resolved(_))
     }
 
-    async fn resolve(self) -> Option<ResolvedDriverOccurrence<Provisional, Cause, Output>> {
+    async fn resolve(
+        self,
+    ) -> Result<
+        ResolvedDriverOccurrence<Provisional, Cause, Output>,
+        DriverOccurrence<Provisional, Cause, Output>,
+    > {
         match self {
-            Self::Resolved(resolved) => Some(resolved),
+            Self::Resolved(resolved) => Ok(resolved),
             Self::Claimed {
                 occurrence,
                 resolution,
-            } => matches!(resolution.await, Ok(ClaimResolution::Publish)).then_some(
-                ResolvedDriverOccurrence {
+            } => match resolution.await {
+                Ok(ClaimResolution::Publish) => Ok(ResolvedDriverOccurrence {
                     occurrence,
                     acknowledgement: None,
-                },
-            ),
+                }),
+                Err(_) => Err(occurrence),
+            },
+            Self::Discarded(occurrence) => Err(occurrence),
         }
     }
 }
@@ -729,9 +949,9 @@ where
 impl<Provisional, Cause, Output, Clock, Commits, Actions>
     Coordinator<Provisional, Cause, Output, Clock, Commits, Actions>
 where
-    Provisional: Clone + Eq,
-    Cause: Clone + Eq + NodeFailureSource,
-    Output: Clone + Eq + ConditionOutput,
+    Provisional: Clone + runtime::ProvisionalStepResources,
+    Cause: Clone + NodeFailureSource,
+    Output: Clone + ConditionOutput,
     Clock: CoordinatorClock,
     Commits: CommitPort<CommittedReduction<Cause, Output, Clock::Instant>>,
     Actions: ActionPort<RequestedAction<Provisional, Cause, Output, Clock::Instant>>,
@@ -773,7 +993,10 @@ where
         let mut ordinal = OccurrenceOrdinal(0)
             .next()
             .ok_or(CoordinationError::OccurrenceOrdinalExhausted)?;
-        let mut observed_driver_occurrences = BTreeMap::new();
+        let mut observed_driver_occurrences: BTreeMap<
+            DriverOccurrenceIdentity,
+            DriverOccurrenceContentDigest,
+        > = BTreeMap::new();
         let occurrence_identity_capacity = self.admitted.capacity().maximum_transitions;
         let initialization =
             runtime::initialize_with_operation::<Provisional, Cause, Output, Clock::Instant>(
@@ -848,9 +1071,7 @@ where
                             };
                             CoordinatorInput::Cancellation(occurrence)
                         } else {
-                            let Some(selected) = driver_occurrence.select() else {
-                                continue;
-                            };
+                            let selected = driver_occurrence.select();
                             let ordinal_assigned = selected.is_resolved();
                             if ordinal_assigned {
                                 ordinal = ordinal.next().ok_or(
@@ -874,14 +1095,28 @@ where
                     } => {
                         // An acknowledged claim owns arbitration until its adapter settles, so
                         // later cancellation cannot gain priority from diagnostic drain timing.
-                        let Some(resolved) = selected.resolve().await else {
-                            continue;
+                        let resolved = match selected.resolve().await {
+                            Ok(resolved) => resolved,
+                            Err(discarded) => {
+                                if let Some(release) =
+                                    runtime::occurrence_resource_release(discarded.into_runtime())
+                                {
+                                    self.actions.release(release).await;
+                                }
+                                continue;
+                            }
                         };
                         let identity = resolved.occurrence.identity();
-                        let exact_replay = if let Some(observed) =
+                        let content_digest = resolved.occurrence.content_digest();
+                        let exact_replay = if let Some(observed_digest) =
                             observed_driver_occurrences.get(&identity)
                         {
-                            if observed != &resolved.occurrence {
+                            if observed_digest != &content_digest {
+                                if let Some(release) = runtime::occurrence_resource_release(
+                                    resolved.occurrence.into_runtime(),
+                                ) {
+                                    self.actions.release(release).await;
+                                }
                                 return Err(CoordinationError::OccurrenceConflict);
                             }
                             true
@@ -889,10 +1124,14 @@ where
                             if u64::try_from(observed_driver_occurrences.len()).unwrap_or(u64::MAX)
                                 >= occurrence_identity_capacity
                             {
+                                if let Some(release) = runtime::occurrence_resource_release(
+                                    resolved.occurrence.into_runtime(),
+                                ) {
+                                    self.actions.release(release).await;
+                                }
                                 return Err(CoordinationError::OccurrenceIdentityCapacityExceeded);
                             }
-                            observed_driver_occurrences
-                                .insert(identity, resolved.occurrence.clone());
+                            observed_driver_occurrences.insert(identity, content_digest);
                             false
                         };
                         break (
@@ -914,16 +1153,12 @@ where
             };
             let current_state = state.clone();
             let reduction = if exact_replay {
-                Reduction {
-                    state: current_state.clone(),
-                    events: Vec::new(),
-                    actions: Vec::new(),
-                    occurrence_accepted: false,
-                }
+                runtime::discard_occurrence(&current_state, occurrence)
             } else {
                 runtime::reduce(&current_state, occurrence)
             };
             if reduction.state.transition_capacity_exceeded() {
+                self.release_action_resources(reduction.actions).await;
                 self.commit_coordination_diagnostic(
                     ordinal,
                     current_state,
@@ -993,7 +1228,7 @@ where
             }
             _ => false,
         });
-        let committed_actions = actions.iter().map(committed_action).collect();
+        let committed_actions = actions.iter().filter_map(committed_action).collect();
         let committed_state = state.clone();
         let cancellation = self.admitted.execution().cancellation().source();
         let finalization_arm_started =
@@ -1014,6 +1249,7 @@ where
             if finalization_arm_started {
                 cancellation.abort_finalization_arm();
             }
+            self.release_action_resources(actions).await;
             return Err(CoordinationError::CommitFailed);
         }
         self.state = Some(state);
@@ -1034,6 +1270,17 @@ where
         Ok(terminal)
     }
 
+    async fn release_action_resources(
+        &mut self,
+        actions: Vec<RequestedAction<Provisional, Cause, Output, Clock::Instant>>,
+    ) {
+        for requested in actions {
+            if let Some(release) = action_resource_release(requested) {
+                self.actions.release(release).await;
+            }
+        }
+    }
+
     fn result(
         &self,
         last_occurrence_ordinal: OccurrenceOrdinal,
@@ -1048,9 +1295,35 @@ where
     }
 }
 
+fn action_resource_release<Provisional, Cause, Output, Deadline>(
+    requested: RequestedAction<Provisional, Cause, Output, Deadline>,
+) -> Option<RequestedAction<Provisional, Cause, Output, Deadline>>
+where
+    Provisional: runtime::ProvisionalStepResources,
+{
+    let RequestedAction { id, action } = requested;
+    match action {
+        runtime::Action::CaptureOutputs { provisional, .. } if provisional.requires_release() => {
+            Some(RequestedAction {
+                id,
+                action: runtime::Action::ReleaseStepResources { provisional },
+            })
+        }
+        action @ runtime::Action::ReleaseStepResources { .. } => {
+            Some(RequestedAction { id, action })
+        }
+        runtime::Action::StartStep { .. }
+        | runtime::Action::StartRecoveryHandler { .. }
+        | runtime::Action::CaptureOutputs { .. }
+        | runtime::Action::CancelStep { .. }
+        | runtime::Action::ForceAbortStep { .. }
+        | runtime::Action::FinishRun { .. } => None,
+    }
+}
+
 fn committed_action<Provisional, Cause, Output, Deadline>(
     requested: &RequestedAction<Provisional, Cause, Output, Deadline>,
-) -> CommittedAction {
+) -> Option<CommittedAction> {
     let (kind, step, execution_number, recovery_round) = match &requested.action {
         runtime::Action::StartStep {
             step,
@@ -1074,6 +1347,8 @@ fn committed_action<Provisional, Cause, Output, Deadline>(
             None,
             None,
         ),
+        // Cleanup is post-commit process housekeeping, not a reconstructable workflow action.
+        runtime::Action::ReleaseStepResources { .. } => return None,
         runtime::Action::CancelStep { step, .. } => (
             CommittedActionKind::CancelStep,
             Some(step.clone()),
@@ -1088,13 +1363,13 @@ fn committed_action<Provisional, Cause, Output, Deadline>(
         ),
         runtime::Action::FinishRun { .. } => (CommittedActionKind::FinishRun, None, None, None),
     };
-    CommittedAction {
+    Some(CommittedAction {
         id: requested.id,
         kind,
         step,
         execution_number,
         recovery_round,
-    }
+    })
 }
 
 #[cfg(test)]
