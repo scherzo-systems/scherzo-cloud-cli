@@ -26,17 +26,20 @@ use crate::execution::workflow::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInputKind, AgentInvocation,
     AgentInvocationIdentity, AgentInvocationLimits, AgentInvocationStaging,
     AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessContext,
-    AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiveError,
-    AgentTerminalReceiver, AgentToolCallPhase, AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES,
-    PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, WorkflowRunId,
-    agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
+    AgentProcessControl, AgentPrompt, AgentStartReceiveError, AgentStartReceiver,
+    AgentTerminalReceiveError, AgentTerminalReceiver, AgentToolCallPhase, AgentValueMode,
+    MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, RetainedJsonSchema, StagedAgentAttachment,
+    WorkflowRunId, agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
 };
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use crate::execution::workflow::execution_root::AdmittedExecutionRoot;
 use crate::execution::workflow::observation::NoopExecutionObserver;
 use crate::execution::workflow::pi::{PiConfig, Thinking};
-use crate::execution::workflow::process_group::process_group_is_quiescent;
+use crate::execution::workflow::process_group::{
+    AuthenticatedProcessGroup, DurableProcessGuardStore, ProcessGuardRegistry,
+    process_group_is_quiescent,
+};
 use crate::execution::workflow::result_validation::{
     ResultValidationWorker, RunningResultValidation, ValidationWorkerDecision,
     ValidationWorkerRequest,
@@ -55,6 +58,7 @@ const NATIVE_RECOVERY: &str = include_str!("fixtures/native-recovery.jsonl");
 const TERMINAL_TOOL_USE: &str = include_str!("fixtures/terminal-tool-use.jsonl");
 const STREAMED_THINKING: &str = "**Reading package.json contents**";
 const EXPECTED_RESPONSE: &str = "package contents";
+const SPAWN_DIAGNOSTIC_SECRET: &str = "SENTINEL_PI_SPAWN_ENVIRONMENT_SECRET";
 
 fn assert_agent_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
     let AgentOutcome::Failed(failure) = outcome else {
@@ -276,6 +280,27 @@ impl AgentObservationSink for RecordingObservationSink {
 
 type TestInvocation = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, RecordingObservationSink>;
 
+struct AcceptingProcessGuardStore;
+
+impl DurableProcessGuardStore for AcceptingProcessGuardStore {
+    fn register(
+        &self,
+        _step: &str,
+        _action_id: u64,
+        _identity: &AuthenticatedProcessGroup,
+    ) -> Result<String, ()> {
+        Ok("test-guard".to_owned())
+    }
+
+    fn mark_released(&self, _guard_id: &str) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn mark_quiesced(&self, _guard_id: &str) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
 struct ProcessFixture {
     _temporary: tempfile::TempDir,
     invocation: TestInvocation,
@@ -316,6 +341,18 @@ impl ProcessFixture {
             message,
             "worktree",
             AgentValueMode::None,
+            ProcessGuardRegistry::default(),
+        )
+    }
+
+    fn new_with_durable_process_guard(mode: &str, system_prompt: String, message: String) -> Self {
+        Self::new_with_declared_cwd_and_value_mode(
+            mode,
+            system_prompt,
+            message,
+            "worktree",
+            AgentValueMode::None,
+            ProcessGuardRegistry::durable(Arc::new(AcceptingProcessGuardStore)),
         )
     }
 
@@ -331,6 +368,7 @@ impl ProcessFixture {
             message,
             "worktree",
             value_mode,
+            ProcessGuardRegistry::default(),
         )
     }
 
@@ -346,6 +384,7 @@ impl ProcessFixture {
             message,
             declared_cwd,
             AgentValueMode::None,
+            ProcessGuardRegistry::default(),
         )
     }
 
@@ -355,6 +394,7 @@ impl ProcessFixture {
         message: String,
         declared_cwd: &str,
         value_mode: AgentValueMode,
+        process_guards: ProcessGuardRegistry,
     ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
@@ -438,6 +478,10 @@ impl ProcessFixture {
             (
                 OsString::from("ONLY_RUNNER_VALUE"),
                 OsString::from("runner exact"),
+            ),
+            (
+                OsString::from("PI_FIXTURE_SPAWN_SECRET"),
+                OsString::from(SPAWN_DIAGNOSTIC_SECRET),
             ),
             (OsString::from("PI_FIXTURE_MODE"), OsString::from(mode)),
             (
@@ -574,7 +618,7 @@ impl ProcessFixture {
             value_mode,
             invocation_limits(),
             CancellationSource::new(),
-            crate::execution::workflow::process_group::ProcessGuardRegistry::default(),
+            process_guards,
             RecordingObservationSink {
                 observations: observation_sender,
                 gate: Arc::clone(&observation_gate),
@@ -1487,6 +1531,66 @@ async fn run_and_surface_protocol_rejection(fixture: ProcessFixture) -> (Capture
     };
     let surfaced = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
     (run, surfaced)
+}
+
+fn assert_permission_denied_spawn_diagnostic(diagnostics: &StepDiagnosticLog) {
+    let diagnostic = diagnostics.get("agent-step").unwrap();
+    assert!(diagnostic.standard_output().bytes().is_empty());
+    assert!(diagnostic.standard_output().fully_drained());
+    assert!(diagnostic.standard_error().fully_drained());
+    assert_eq!(diagnostic.standard_error().truncation(), None);
+    let bytes = diagnostic.standard_error().bytes();
+    let retained: Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(retained["schemaVersion"], 1);
+    assert_eq!(retained["stage"], "process_spawn");
+    assert_eq!(retained["errorCategory"], "PermissionDenied");
+    assert_eq!(retained["rawOsError"], libc::EACCES);
+    assert!(
+        retained["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())
+    );
+    assert!(!String::from_utf8_lossy(bytes).contains(SPAWN_DIAGNOSTIC_SECRET));
+}
+
+async fn assert_permission_denied_spawn_failure(fixture: ProcessFixture) {
+    fs::set_permissions(
+        fixture.invocation.adapter().executable(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let diagnostics = fixture.diagnostics.clone();
+    let (task, started, terminal) = start_invocation(fixture.invocation, diagnostics.clone());
+
+    assert_eq!(
+        started.receive().await,
+        Err(AgentStartReceiveError::CallbackDropped)
+    );
+    let outcome = terminal.receive().await.unwrap();
+    task.await.unwrap();
+
+    assert_agent_failure(&outcome, AgentFailureCause::HarnessStartFailed);
+    assert_permission_denied_spawn_diagnostic(&diagnostics);
+}
+
+#[tokio::test]
+async fn process_spawn_failure_retains_safe_os_diagnostic_and_typed_outcome() {
+    assert_permission_denied_spawn_failure(ProcessFixture::new(
+        "success",
+        "system".to_owned(),
+        "message".to_owned(),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn guarded_process_spawn_failure_retains_os_diagnostic() {
+    assert_permission_denied_spawn_failure(ProcessFixture::new_with_durable_process_guard(
+        "success",
+        "system".to_owned(),
+        "message".to_owned(),
+    ))
+    .await;
 }
 
 #[tokio::test]

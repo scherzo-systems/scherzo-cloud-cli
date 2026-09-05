@@ -28,6 +28,18 @@ used by CI. The canonical check performs a
 locked npm install before checking the extension; run
 `./scripts/check-pi-json-v1-extension` for that focused path.
 
+Rust unit and integration tests run through cargo-nextest with the checked-in
+`.config/nextest.toml` policy. Both `./scripts/check` and the production Nix package select the
+locked workspace with all targets and all features; the local suite additionally rebuilds the
+version tests with a fixed development version, while Nix injects the package version and build
+identity into its complete run. The current workspace is binary-only and has no documentation-test
+target; formatting, Clippy, structural checks, and the release build remain explicit parts of the
+broader local suite rather than Nix package checks.
+
+Nextest gives each selected test its own process, preventing a child forked by one test from
+inheriting another test's open descriptors. This isolation does not prevent races among processes
+created within one test, and it does not change production process behavior.
+
 ## Rust baseline upgrades
 
 `package.rust-version` in `Cargo.toml` is the single Rust baseline declaration. Express

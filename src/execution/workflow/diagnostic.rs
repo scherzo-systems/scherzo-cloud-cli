@@ -3,6 +3,7 @@ use std::io;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::JoinHandle;
 
@@ -13,6 +14,28 @@ use super::observation::{
 use super::runtime::ActionId;
 
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessSpawnDiagnostic {
+    schema_version: u8,
+    stage: &'static str,
+    error_category: String,
+    raw_os_error: Option<i32>,
+    message: String,
+}
+
+impl ProcessSpawnDiagnostic {
+    fn from_error(error: &io::Error) -> Self {
+        Self {
+            schema_version: 1,
+            stage: "process_spawn",
+            error_category: format!("{:?}", error.kind()),
+            raw_os_error: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DiagnosticTruncation {
@@ -197,6 +220,27 @@ impl StepDiagnosticLog {
             standard_error,
             observer,
         )
+    }
+
+    pub(super) fn record_process_spawn_failure(
+        &self,
+        step: String,
+        invocation: ActionId,
+        maximum_stream_bytes: NonZeroU64,
+        error: &io::Error,
+    ) -> Result<(), serde_json::Error> {
+        let mut bytes = serde_json::to_vec(&ProcessSpawnDiagnostic::from_error(error))?;
+        bytes.push(b'\n');
+        let standard_output = DiagnosticStreamCapture::new(maximum_stream_bytes).finish(true);
+        let mut standard_error = DiagnosticStreamCapture::new(maximum_stream_bytes);
+        standard_error.capture(&bytes);
+        self.record(
+            step,
+            invocation,
+            standard_output,
+            standard_error.finish(true),
+        );
+        Ok(())
     }
 
     pub(super) fn record(

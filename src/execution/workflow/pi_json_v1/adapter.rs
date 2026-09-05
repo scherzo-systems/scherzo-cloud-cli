@@ -182,13 +182,18 @@ where
             let _ = shutdown_result_bridge(result_bridge).await;
             return failed(AgentFailureCause::HarnessStartFailed);
         };
-        let (process, standard_error) = match launch_process(&invocation, &plan).await {
-            Ok(launched) => launched,
-            Err(cause) => {
-                let _ = shutdown_result_bridge(result_bridge).await;
-                return failed(cause);
-            }
+        let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
+            log: &self.diagnostics,
+            maximum_stream_bytes: self.maximum_diagnostic_stream_bytes,
         };
+        let (process, standard_error) =
+            match launch_process(&invocation, &plan, spawn_diagnostics).await {
+                Ok(launched) => launched,
+                Err(cause) => {
+                    let _ = shutdown_result_bridge(result_bridge).await;
+                    return failed(cause);
+                }
+            };
         let diagnostic = self.diagnostics.start_standard_error_capture(
             invocation.identity().step().to_owned(),
             invocation.identity().invocation(),
@@ -424,12 +429,17 @@ where
 async fn launch_process<Sink>(
     invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
     plan: &PiJsonV1LaunchPlan,
+    spawn_diagnostics: ProcessSpawnDiagnosticCapture<'_>,
 ) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
 where
     Sink: AgentObservationSink,
 {
     if !invocation.process_guards().is_durable() {
-        return launch_direct_process(invocation, plan).await;
+        let mut command = build_command(invocation, plan)?;
+        let child = command
+            .spawn()
+            .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
+        return finish_direct_process_launch(child).await;
     }
 
     let environment = invocation
@@ -450,7 +460,7 @@ where
                 .map_err(|_| io::Error::other("agent working directory is unavailable"))
         },
     )
-    .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
     let process_group = child.identity().process_group();
     let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
     else {
@@ -468,15 +478,25 @@ where
             return Err(AgentFailureCause::HarnessStartFailed);
         }
     };
-    if release_guarded_pi(invocation.diagnostic_session(), || {
-        child.continue_execution().map_err(|_| ())?;
-        registration.mark_released()
-    })
-    .is_err()
-    {
+    if let Err(failure) = release_guarded_pi(invocation.diagnostic_session(), || {
+        child
+            .continue_execution()
+            .map_err(GuardedPiReleaseFailure::ProcessExec)?;
+        registration
+            .mark_released()
+            .map_err(|()| GuardedPiReleaseFailure::GuardState)
+    }) {
+        let cause = match failure {
+            GuardedPiReleaseFailure::ProcessExec(error) => {
+                spawn_diagnostics.capture(invocation, &error)
+            }
+            GuardedPiReleaseFailure::SessionBinding | GuardedPiReleaseFailure::GuardState => {
+                AgentFailureCause::HarnessStartFailed
+            }
+        };
         let _ = child.force_stop().await;
         let _ = registration.mark_quiesced();
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(cause);
     }
 
     Ok((
@@ -492,27 +512,25 @@ where
     ))
 }
 
-fn release_guarded_pi(
-    diagnostic_session: &AgentDiagnosticSession,
-    release: impl FnOnce() -> Result<(), ()>,
-) -> Result<(), AgentFailureCause> {
-    diagnostic_session
-        .verify_pi_native_session_path_binding()
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
-    release().map_err(|()| AgentFailureCause::HarnessStartFailed)
+enum GuardedPiReleaseFailure {
+    SessionBinding,
+    ProcessExec(io::Error),
+    GuardState,
 }
 
-async fn launch_direct_process<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
-    plan: &PiJsonV1LaunchPlan,
-) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
-    let mut command = build_command(invocation, plan)?;
-    let mut child = command
-        .spawn()
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+fn release_guarded_pi(
+    diagnostic_session: &AgentDiagnosticSession,
+    release: impl FnOnce() -> Result<(), GuardedPiReleaseFailure>,
+) -> Result<(), GuardedPiReleaseFailure> {
+    diagnostic_session
+        .verify_pi_native_session_path_binding()
+        .map_err(|_| GuardedPiReleaseFailure::SessionBinding)?;
+    release()
+}
+
+async fn finish_direct_process_launch(
+    mut child: Child,
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause> {
     let Some(process_group) = child
         .id()
         .and_then(|process_id| i32::try_from(process_id).ok())
@@ -534,6 +552,31 @@ where
         },
         standard_error,
     ))
+}
+
+#[derive(Clone, Copy)]
+struct ProcessSpawnDiagnosticCapture<'a> {
+    log: &'a StepDiagnosticLog,
+    maximum_stream_bytes: NonZeroU64,
+}
+
+impl ProcessSpawnDiagnosticCapture<'_> {
+    fn capture<Sink>(
+        self,
+        invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+        error: &io::Error,
+    ) -> AgentFailureCause
+    where
+        Sink: AgentObservationSink,
+    {
+        let _ = self.log.record_process_spawn_failure(
+            invocation.identity().step().to_owned(),
+            invocation.identity().invocation(),
+            self.maximum_stream_bytes,
+            error,
+        );
+        AgentFailureCause::HarnessStartFailed
+    }
 }
 
 // Pi 0.84 treats the CLI append value as a replacement for the trusted
@@ -1185,7 +1228,7 @@ mod guarded_release_tests {
                 release_attempted = true;
                 Ok(())
             }),
-            Err(AgentFailureCause::HarnessStartFailed)
+            Err(GuardedPiReleaseFailure::SessionBinding)
         ));
         assert!(!release_attempted);
     }
