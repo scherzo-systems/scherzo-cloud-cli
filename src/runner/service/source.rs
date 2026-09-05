@@ -12,7 +12,7 @@ use std::time::Duration;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use opentelemetry::KeyValue;
 use reqwest::StatusCode;
-use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE};
+use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
@@ -29,6 +29,7 @@ use crate::runner_protocol::ExecutionSpecV1RunnerProjection;
 
 const SOURCE_BROKER_RESPONSE_LIMIT: usize = 128 * 1024;
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_RETRY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -74,6 +75,34 @@ pub(super) enum CredentialBrokerFailure {
     InvalidResponse,
 }
 
+trait ProviderRetryWaiter: Send + Sync {
+    fn wait(
+        &self,
+        retry_after: Duration,
+        cancellation: &CaptureCancellation,
+    ) -> Result<(), CredentialBrokerFailure>;
+}
+
+struct SystemProviderRetryWaiter;
+
+impl ProviderRetryWaiter for SystemProviderRetryWaiter {
+    fn wait(
+        &self,
+        retry_after: Duration,
+        cancellation: &CaptureCancellation,
+    ) -> Result<(), CredentialBrokerFailure> {
+        let started = crate::timing::monotonic_now();
+        loop {
+            ensure_broker_current(cancellation)?;
+            let remaining = retry_after.saturating_sub(crate::timing::elapsed(started));
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            crate::timing::sleep(remaining.min(PROVIDER_RETRY_POLL_INTERVAL));
+        }
+    }
+}
+
 pub(super) struct ProviderCredential {
     pub(super) repository_url: Arc<str>,
     pub(super) token: ProviderSecret,
@@ -108,6 +137,7 @@ pub(super) struct HttpSourceCredentialBroker {
     boot_id: Arc<str>,
     repository_url_policy: RepositoryUrlPolicy,
     recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    retry_waiter: Arc<dyn ProviderRetryWaiter>,
 }
 
 pub(super) fn private_runner_http_endpoint(endpoint: &Url, path: &str) -> Result<Url, ()> {
@@ -147,6 +177,7 @@ impl HttpSourceCredentialBroker {
             boot_id: Arc::from(boot_id),
             repository_url_policy,
             recorder: None,
+            retry_waiter: Arc::new(SystemProviderRetryWaiter),
         })
     }
 
@@ -247,6 +278,7 @@ struct WorkflowGitRevocationRequest<'a> {
 struct BrokerResponse {
     status: StatusCode,
     encoded: ProviderSecret,
+    retry_after: Option<Duration>,
 }
 
 impl HttpSourceCredentialBroker {
@@ -254,9 +286,31 @@ impl HttpSourceCredentialBroker {
         &self,
         endpoint: &Url,
         assignment_id: &str,
-        cancellation: &CaptureCancellation,
+        retry_cancellation: &CaptureCancellation,
+        request_cancellation: &CaptureCancellation,
     ) -> Result<BrokerResponse, CredentialBrokerFailure> {
-        ensure_broker_current(cancellation)?;
+        loop {
+            let response = self.request_current_once(
+                endpoint,
+                assignment_id,
+                retry_cancellation,
+                request_cancellation,
+            )?;
+            let Some(retry_after) = response.retry_after else {
+                return Ok(response);
+            };
+            self.retry_waiter.wait(retry_after, retry_cancellation)?;
+        }
+    }
+
+    fn request_current_once(
+        &self,
+        endpoint: &Url,
+        assignment_id: &str,
+        retry_cancellation: &CaptureCancellation,
+        request_cancellation: &CaptureCancellation,
+    ) -> Result<BrokerResponse, CredentialBrokerFailure> {
+        ensure_broker_current(retry_cancellation)?;
         let body = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 1,
             "bootId": self.boot_id.as_ref(),
@@ -264,7 +318,7 @@ impl HttpSourceCredentialBroker {
         }))
         .map(ProviderSecret)
         .map_err(|_| CredentialBrokerFailure::Unavailable)?;
-        self.request_encoded(endpoint, body, Some(cancellation))
+        self.request_encoded(endpoint, body, Some(request_cancellation))
     }
 
     fn request_encoded(
@@ -304,6 +358,18 @@ impl HttpSourceCredentialBroker {
                     .map_err(|_| CredentialBrokerFailure::Unavailable)?
             };
             let status = response.status();
+            let retry_after = match response.headers().get(RETRY_AFTER) {
+                Some(value) if status == StatusCode::SERVICE_UNAVAILABLE => {
+                    let seconds = value
+                        .to_str()
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|seconds| *seconds > 0)
+                        .ok_or(CredentialBrokerFailure::InvalidResponse)?;
+                    Some(Duration::from_secs(seconds))
+                }
+                _ => None,
+            };
             if response
                 .headers()
                 .get(CACHE_CONTROL)
@@ -349,7 +415,11 @@ impl HttpSourceCredentialBroker {
                     encoded.0.extend_from_slice(&chunk);
                 }
             }
-            Ok(BrokerResponse { status, encoded })
+            Ok(BrokerResponse {
+                status,
+                encoded,
+                retry_after,
+            })
         })
     }
 
@@ -359,7 +429,22 @@ impl HttpSourceCredentialBroker {
         assignment_id: &str,
         cancellation: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure> {
-        let response = self.request_current(endpoint, assignment_id, cancellation)?;
+        self.issue_current_with_cancellation(endpoint, assignment_id, cancellation, cancellation)
+    }
+
+    fn issue_current_with_cancellation(
+        &self,
+        endpoint: &Url,
+        assignment_id: &str,
+        retry_cancellation: &CaptureCancellation,
+        request_cancellation: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        let response = self.request_current(
+            endpoint,
+            assignment_id,
+            retry_cancellation,
+            request_cancellation,
+        )?;
         match response.status {
             StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
             StatusCode::FAILED_DEPENDENCY => {
@@ -376,7 +461,7 @@ impl HttpSourceCredentialBroker {
             StatusCode::OK => {}
             _ => return Err(CredentialBrokerFailure::Unavailable),
         }
-        ensure_broker_current(cancellation)?;
+        ensure_broker_current(request_cancellation)?;
         let parsed: CredentialResponse = serde_json::from_slice(&response.encoded.0)
             .map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
         let CredentialResponse {
@@ -455,8 +540,12 @@ impl HttpSourceCredentialBroker {
         assignment_id: &str,
         cancellation: &CaptureCancellation,
     ) -> Result<CommitAvailability, CredentialBrokerFailure> {
-        let response =
-            self.request_current(&self.availability_endpoint, assignment_id, cancellation)?;
+        let response = self.request_current(
+            &self.availability_endpoint,
+            assignment_id,
+            cancellation,
+            cancellation,
+        )?;
         match response.status {
             StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
             StatusCode::OK => {}
@@ -513,9 +602,10 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
     ) -> Result<ProviderCredential, CredentialBrokerFailure> {
         ensure_broker_current(cancellation)?;
         let request_lifetime = CaptureCancellation::default();
-        self.issue_current(
+        self.issue_current_with_cancellation(
             &self.workflow_git_endpoint,
             assignment_id,
+            cancellation,
             &request_lifetime,
         )
     }
@@ -1587,6 +1677,8 @@ mod tests {
     use std::sync::{Mutex, mpsc};
 
     use base64::Engine as _;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
 
     use super::*;
     use crate::execution::workflow::admission::{
@@ -3085,8 +3177,43 @@ mod tests {
         );
     }
 
+    struct GatedProviderRetryWaiter {
+        started: mpsc::SyncSender<Duration>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl ProviderRetryWaiter for GatedProviderRetryWaiter {
+        fn wait(
+            &self,
+            retry_after: Duration,
+            cancellation: &CaptureCancellation,
+        ) -> Result<(), CredentialBrokerFailure> {
+            self.started
+                .send(retry_after)
+                .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+            ensure_broker_current(cancellation)
+        }
+    }
+
     fn source_broker_response_fixture(
         status: &str,
+        body: &str,
+    ) -> (
+        Url,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        source_broker_response_fixture_with_headers(status, "", body)
+    }
+
+    fn source_broker_response_fixture_with_headers(
+        status: &str,
+        additional_headers: &str,
         body: &str,
     ) -> (
         Url,
@@ -3097,53 +3224,70 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
         let status = status.to_owned();
+        let additional_headers = additional_headers.to_owned();
         let body = body.to_owned();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let header_end = loop {
-                let read = stream.read(&mut buffer).unwrap();
-                assert_ne!(read, 0);
-                request.extend_from_slice(&buffer[..read]);
-                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                        .and_then(|value| value.parse::<usize>().ok())
-                })
-                .unwrap();
-            while request.len() < header_end + content_length {
-                let read = stream.read(&mut buffer).unwrap();
-                assert_ne!(read, 0);
-                request.extend_from_slice(&buffer[..read]);
-            }
+            drop(listener);
             request_sender
-                .send(
-                    String::from_utf8(request[header_end..header_end + content_length].to_vec())
-                        .unwrap(),
-                )
+                .send(read_source_broker_request(&mut stream))
                 .unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nCache-Control: private, no-store\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            )
-            .unwrap();
-            stream.flush().unwrap();
+            write_source_broker_response(&mut stream, &status, &additional_headers, &body);
         });
         (
             Url::parse(&format!("ws://{address}/v1/runner/connect")).unwrap(),
             request_receiver,
             server,
         )
+    }
+
+    fn read_source_broker_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0);
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(request[header_end..header_end + content_length].to_vec()).unwrap()
+    }
+
+    fn write_source_broker_response(
+        stream: &mut TcpStream,
+        status: &str,
+        additional_headers: &str,
+        body: &str,
+    ) {
+        let content_type = if body.is_empty() {
+            ""
+        } else {
+            "Content-Type: application/json\r\n"
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nCache-Control: private, no-store\r\n{additional_headers}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+        .unwrap();
+        stream.flush().unwrap();
     }
 
     fn http_source_broker(endpoint: &Url) -> HttpSourceCredentialBroker {
@@ -3216,6 +3360,105 @@ mod tests {
             records[0][crate::runner::telemetry::attribute::ERROR_TYPE],
             "source_repository_unavailable"
         );
+    }
+
+    #[test]
+    fn broker_honors_provider_retry_delay_before_retrying() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("ws://{address}/v1/runner/connect")).unwrap();
+        let (retry_started, retry_observed) = mpsc::sync_channel(1);
+        let (release_retry, retry_release) = mpsc::sync_channel(1);
+        let mut broker = http_source_broker(&endpoint);
+        broker.retry_waiter = Arc::new(GatedProviderRetryWaiter {
+            started: retry_started,
+            release: Mutex::new(retry_release),
+        });
+        let worker = std::thread::spawn(move || {
+            broker.issue(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                &CaptureCancellation::default(),
+            )
+        });
+
+        let (mut first, _) = listener.accept().unwrap();
+        let first_request = read_source_broker_request(&mut first);
+        write_source_broker_response(
+            &mut first,
+            "503 Service Unavailable",
+            "Retry-After: 37\r\n",
+            "",
+        );
+        assert_eq!(retry_observed.recv().unwrap(), Duration::from_secs(37));
+        release_retry.send(()).unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        let second_request = read_source_broker_request(&mut second);
+        write_source_broker_response(
+            &mut second,
+            "200 OK",
+            "",
+            r#"{"schemaVersion":1,"repositoryUrl":"https://github.example/acme/private.git","token":"provider-token","expiresAt":"2099-08-20T13:00:00Z"}"#,
+        );
+
+        let credential = worker.join().unwrap().unwrap();
+        assert_eq!(credential.token.0, b"provider-token");
+        assert_eq!(first_request, second_request);
+    }
+
+    #[test]
+    fn workflow_git_broker_finishes_in_flight_issuance_after_fencing() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("ws://{address}/v1/runner/connect")).unwrap();
+        let (request_started, request_observed) = mpsc::sync_channel(1);
+        let (release_response, response_release) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_source_broker_request(&mut stream);
+            request_started.send(()).unwrap();
+            response_release.recv().unwrap();
+            write_source_broker_response(
+                &mut stream,
+                "200 OK",
+                "",
+                r#"{"schemaVersion":1,"repositoryUrl":"https://github.example/acme/private.git","token":"provider-token","expiresAt":"2099-08-20T13:00:00Z"}"#,
+            );
+        });
+        let broker = http_source_broker(&endpoint);
+        let cancellation = CaptureCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            broker.issue_workflow_git("asn_01k0z6r1w8f4jy2m7q9v3x5abc", &worker_cancellation)
+        });
+
+        request_observed.recv().unwrap();
+        cancellation.cancel();
+        release_response.send(()).unwrap();
+
+        let credential = worker.join().unwrap().unwrap();
+        assert_eq!(credential.token.0, b"provider-token");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn broker_rejects_zero_retry_delay_to_avoid_immediate_retries() {
+        let (endpoint, request, server) = source_broker_response_fixture_with_headers(
+            "503 Service Unavailable",
+            "Retry-After: 0\r\n",
+            "",
+        );
+        let broker = http_source_broker(&endpoint);
+
+        assert!(matches!(
+            broker.issue(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                &CaptureCancellation::default(),
+            ),
+            Err(CredentialBrokerFailure::InvalidResponse)
+        ));
+        request.recv().unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -3366,10 +3609,12 @@ mod tests {
         let git = bin.join("git");
         fs::write(
             &git,
-            b"#!/bin/sh\nfor argument do\n  case \"$argument\" in\n    status)\n      : > git-status-ready\n      # Stop after publishing readiness so only managed cleanup can end the fixture.\n      kill -STOP \"$$\"\n      ;;\n  esac\ndone\nexit 2\n",
+            b"#!/bin/sh\nfor argument do\n  case \"$argument\" in\n    status)\n      : > git-status-ready\n      # Block after publishing readiness so only managed cleanup can end the fixture.\n      IFS= read -r unexpected < git-status-release\n      ;;\n  esac\ndone\nexit 2\n",
         )
         .unwrap();
         fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+        let release = temporary.path().join("git-status-release");
+        mkfifo(&release, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let ready = temporary.path().join("git-status-ready");
         let cancellation = CaptureCancellation::default();
         let cancel = cancellation.clone();
