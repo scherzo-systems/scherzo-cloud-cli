@@ -627,11 +627,3 @@ pub(in crate::cli) fn with_api<T>(
     }
 }
 // jscpd:ignore-end
-
-pub(in crate::cli) fn write_organization_list(
-    deployment: &str,
-    result: Result<crate::api::OrganizationMembershipList, ProjectFailure>,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    output::write_organization_list(deployment, result, json)
-}

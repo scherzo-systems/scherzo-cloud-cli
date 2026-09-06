@@ -4,8 +4,7 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::api::{
-    OrganizationMembershipList, Project, ProjectFailure,
-    ProjectGitHubInstallation as GitHubInstallation,
+    Project, ProjectFailure, ProjectGitHubInstallation as GitHubInstallation,
     ProjectGitHubInstallationList as GitHubInstallationList,
     ProjectGitHubRepository as GitHubRepository,
     ProjectGitHubRepositoryList as GitHubRepositoryList, ProjectList, ProjectReadinessBlocker,
@@ -200,51 +199,6 @@ pub(super) fn write_repositories(
     }
     // jscpd:ignore-end
 }
-
-// Organization membership discovery intentionally renders membership lifecycle fields;
-// project listing renders readiness, so their similar pagination shells remain separate.
-// jscpd:ignore-start
-pub(in crate::cli) fn write_organization_list(
-    deployment: &str,
-    result: Result<OrganizationMembershipList, ProjectFailure>,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    match result {
-        Ok(page) => {
-            if json {
-                write_paginated_list_json(deployment, &page.items, page.next_cursor.as_deref())?;
-            } else {
-                let mut stdout = io::stdout().lock();
-                writeln!(stdout, "✓ Organization memberships listed.\n")?;
-                for membership in &page.items {
-                    writeln!(
-                        stdout,
-                        "organization: {} · slug: {} · role: {} · membership: {}",
-                        membership.organization_id,
-                        membership
-                            .organization_slug
-                            .as_deref()
-                            .unwrap_or("unavailable"),
-                        enum_text(&membership.role)?,
-                        enum_text(&membership.state)?
-                    )?;
-                    if let Some(display_name) = &membership.organization_display_name {
-                        writeln!(stdout, "  name: {display_name}")?;
-                    }
-                }
-                write_list_footer(
-                    &mut stdout,
-                    !page.items.is_empty(),
-                    page.next_cursor.as_deref(),
-                    deployment,
-                )?;
-            }
-            Ok(ExitCode::Success)
-        }
-        Err(failure) => write_failure(deployment, failure, json),
-    }
-}
-// jscpd:ignore-end
 
 fn write_paginated_list_json(
     deployment: &str,

@@ -36,7 +36,6 @@ pub(crate) type GitHubInstallation = models::GitHubInstallation;
 pub(crate) type GitHubInstallationList = models::GitHubInstallationList;
 pub(crate) type GitHubRepository = models::GitHubRepository;
 pub(crate) type GitHubRepositoryList = models::GitHubRepositoryList;
-pub(crate) type OrganizationMembershipList = models::CurrentPrincipalMembershipList;
 
 pub(crate) struct ProjectApi {
     configuration: apis::configuration::Configuration,
@@ -336,24 +335,6 @@ impl ProjectApi {
         validate_repository_list(list)
     }
 
-    pub(crate) fn list_organization_memberships(
-        &self,
-        limit: Option<u16>,
-        cursor: Option<&str>,
-    ) -> Result<OrganizationMembershipList, ProjectFailure> {
-        let query = pagination_query(limit, cursor);
-        let (page, _) = self.request_json(JsonRequest {
-            operation: Operation::MembershipList,
-            method: Method::GET,
-            path: &["v1", "me", "memberships"],
-            query: &query,
-            idempotency_key: None,
-            content_type: None,
-            body: None,
-        })?;
-        validate_membership_list(page)
-    }
-
     fn project_bodyless_mutation(
         &self,
         project_id: &str,
@@ -523,7 +504,6 @@ impl Drop for ProjectApi {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Operation {
-    MembershipList,
     InstallationList,
     RepositoryList,
     ProjectRead,
@@ -554,10 +534,9 @@ impl Operation {
         match status {
             StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => true,
             StatusCode::NOT_FOUND => {
-                !matches!(self, Self::MembershipList)
-                    && (problem_type == NOT_FOUND
-                        || matches!(self, Self::RepositoryRead | Self::RepositoryUpdate)
-                            && problem_type == REPOSITORY_NOT_BOUND)
+                problem_type == NOT_FOUND
+                    || matches!(self, Self::RepositoryRead | Self::RepositoryUpdate)
+                        && problem_type == REPOSITORY_NOT_BOUND
             }
             StatusCode::CONFLICT => matches!(
                 self,
@@ -823,7 +802,7 @@ fn validate_project(project: Project) -> Result<Project, ProjectFailure> {
         .is_none_or(valid_repository_fields);
     let valid = crate::public_id::valid_typed_id(&project.id, "prj_")
         && crate::public_id::valid_typed_id(&project.organization_id, "org_")
-        && valid_name(&project.name)
+        && super::valid_url_safe_name(&project.name)
         && pool_valid
         && repository_valid
         && project.execution_readiness.blockers == expected_blockers
@@ -850,35 +829,6 @@ fn valid_repository_fields(repository: &ProjectRepository) -> bool {
         && valid_provider_id(&repository.provider_repository_id)
         && valid_bounded_text(&repository.full_name, 1, 255)
         && valid_bounded_text(&repository.default_branch, 1, 1024)
-}
-
-fn validate_membership_list(
-    list: OrganizationMembershipList,
-) -> Result<OrganizationMembershipList, ProjectFailure> {
-    let valid = list.next_cursor.as_deref() != Some("")
-        && list.items.iter().all(|membership| {
-            crate::public_id::valid_typed_id(&membership.id, "mem_")
-                && crate::public_id::valid_typed_id(&membership.organization_id, "org_")
-                && membership
-                    .organization_display_name
-                    .as_deref()
-                    .is_none_or(|name| valid_bounded_text(name, 1, 200))
-                && membership
-                    .organization_slug
-                    .as_deref()
-                    .is_none_or(valid_name)
-                && OffsetDateTime::parse(&membership.created_at, &Rfc3339).is_ok()
-                && OffsetDateTime::parse(&membership.updated_at, &Rfc3339).is_ok()
-                && membership
-                    .terminal_at
-                    .as_deref()
-                    .is_none_or(|time| OffsetDateTime::parse(time, &Rfc3339).is_ok())
-        });
-    if valid {
-        Ok(list)
-    } else {
-        Err(ProjectFailure::protocol(false))
-    }
 }
 
 fn validate_installation_list(
@@ -913,16 +863,6 @@ fn valid_installation(installation: &models::GitHubInstallation) -> bool {
         && valid_provider_id(&installation.provider_account_id)
         && OffsetDateTime::parse(&installation.created_at, &Rfc3339).is_ok()
         && OffsetDateTime::parse(&installation.updated_at, &Rfc3339).is_ok()
-}
-
-fn valid_name(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 fn valid_provider_id(value: &str) -> bool {

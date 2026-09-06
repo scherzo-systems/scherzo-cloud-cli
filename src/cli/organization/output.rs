@@ -4,8 +4,9 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::api::{
-    CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome,
-    ListOrganizationMembershipsOutcome, MembershipRole, Organization,
+    CommonOrganizationFailure, CreateOrganizationOutcome, CurrentPrincipalMembership,
+    GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
+    ListOrganizationMembershipsOutcome, MembershipRole, MembershipState, Organization,
     OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationOutcome,
 };
@@ -135,6 +136,30 @@ pub(super) fn write_update(
     }
 }
 
+pub(super) fn write_list(
+    deployment: &str,
+    outcome: &ListCurrentPrincipalMembershipsOutcome,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    match outcome {
+        ListCurrentPrincipalMembershipsOutcome::Listed(page) => {
+            if json {
+                write_list_json(deployment, &page.items, page.next_cursor.as_deref())?;
+            } else {
+                write_current_memberships_human(
+                    deployment,
+                    &page.items,
+                    page.next_cursor.as_deref(),
+                )?;
+            }
+            Ok(ExitCode::Success)
+        }
+        ListCurrentPrincipalMembershipsOutcome::Common(common) => {
+            write_current_membership_failure(deployment, common, json)
+        }
+    }
+}
+
 pub(super) fn write_members_list(
     deployment: &str,
     outcome: &ListOrganizationMembershipsOutcome,
@@ -143,13 +168,7 @@ pub(super) fn write_members_list(
     match outcome {
         ListOrganizationMembershipsOutcome::Listed(page) => {
             if json {
-                write_json(&MembershipListResult {
-                    schema_version: 1,
-                    deployment,
-                    outcome: "listed",
-                    items: &page.items,
-                    next_cursor: page.next_cursor.as_deref(),
-                })?;
+                write_list_json(deployment, &page.items, page.next_cursor.as_deref())?;
             } else {
                 write_members_human(deployment, &page.items, page.next_cursor.as_deref())?;
             }
@@ -259,6 +278,62 @@ fn write_organization_success(
     }
 }
 
+fn write_list_json(
+    deployment: &str,
+    items: &[impl Serialize],
+    next_cursor: Option<&str>,
+) -> anyhow::Result<()> {
+    write_json(&ListResult {
+        schema_version: 1,
+        deployment,
+        outcome: "listed",
+        items,
+        next_cursor,
+    })
+}
+
+fn write_current_memberships_human(
+    deployment: &str,
+    items: &[CurrentPrincipalMembership],
+    next_cursor: Option<&str>,
+) -> anyhow::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "✓ Organization memberships listed.\n")?;
+    for item in items {
+        writeln!(
+            stdout,
+            "membership: {} · role: {} · membership state: {}",
+            item.id,
+            membership_role(item.role),
+            membership_state(item.state)
+        )?;
+        writeln!(
+            stdout,
+            "organization: {} · organization state: {}",
+            item.organization_id,
+            organization_state(item.organization_state)
+        )?;
+        if let Some(display_name) = &item.organization_display_name {
+            writeln!(stdout, "organization name: {display_name}")?;
+        }
+        if let Some(slug) = &item.organization_slug {
+            writeln!(stdout, "organization slug: {slug}")?;
+        }
+        writeln!(stdout, "created: {}", item.created_at)?;
+        writeln!(stdout, "updated: {}", item.updated_at)?;
+        if let Some(terminal_at) = &item.terminal_at {
+            writeln!(stdout, "terminal: {terminal_at}")?;
+        }
+        writeln!(stdout)?;
+    }
+    if let Some(next_cursor) = next_cursor {
+        writeln!(stdout, "next cursor: {next_cursor}")?;
+    }
+    writeln!(stdout, "deployment: {deployment}")?;
+    Ok(())
+}
+
 fn write_members_human(
     deployment: &str,
     items: &[OrganizationMembershipDirectoryEntry],
@@ -289,6 +364,56 @@ fn write_members_human(
     }
     writeln!(stdout, "  Deployment: {deployment}")?;
     Ok(())
+}
+
+fn write_current_membership_failure(
+    deployment: &str,
+    failure: &CommonOrganizationFailure,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let (outcome, category, human, outcome_class) = match failure {
+        CommonOrganizationFailure::Unauthenticated => (
+            "unauthenticated",
+            None,
+            "error: organization membership history requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            OutcomeClass::Unauthenticated,
+        ),
+        CommonOrganizationFailure::Forbidden => (
+            "forbidden",
+            None,
+            "error: organization membership history unavailable for this account\n\nAsk the deployment operator to restore account access.".to_owned(),
+            OutcomeClass::Forbidden,
+        ),
+        CommonOrganizationFailure::InvalidInput => (
+            "invalid_input",
+            None,
+            format!(
+                "error: organization membership cursor rejected by {deployment}\n\nRestart the listing without --cursor."
+            ),
+            OutcomeClass::GeneralFailure,
+        ),
+        CommonOrganizationFailure::Unreachable(category) => (
+            "unreachable",
+            Some(category.as_str()),
+            format!(
+                "error: contact Scherzo Cloud API at {deployment}: {}\n\nCheck network access to the deployment and try again.",
+                category.as_str()
+            ),
+            super::super::unreachable_outcome_class(*category),
+        ),
+    };
+    if json {
+        write_json(&super::super::CloudFailureResult {
+            schema_version: 1,
+            deployment,
+            outcome,
+            category,
+            retry_after: None,
+        })?;
+    } else {
+        writeln!(io::stderr().lock(), "{human}")?;
+    }
+    Ok(outcome_class.exit_code())
 }
 
 fn write_failure(
@@ -327,6 +452,9 @@ fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
 const fn organization_state(state: OrganizationState) -> &'static str {
     match state {
         OrganizationState::Active => "active",
+        OrganizationState::Suspended => "suspended",
+        OrganizationState::DeletionPending => "deletion_pending",
+        OrganizationState::Deleted => "deleted",
     }
 }
 
@@ -344,6 +472,14 @@ const fn membership_role(role: MembershipRole) -> &'static str {
     }
 }
 
+const fn membership_state(state: MembershipState) -> &'static str {
+    match state {
+        MembershipState::Active => "active",
+        MembershipState::Suspended => "suspended",
+        MembershipState::Ended => "ended",
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OrganizationResult<'a> {
@@ -355,11 +491,11 @@ struct OrganizationResult<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MembershipListResult<'a> {
+struct ListResult<'a, T> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    items: &'a [OrganizationMembershipDirectoryEntry],
+    items: &'a [T],
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<&'a str>,
 }

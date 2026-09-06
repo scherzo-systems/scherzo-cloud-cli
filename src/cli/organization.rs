@@ -10,8 +10,8 @@ use clap::{Args, Subcommand};
 
 use crate::api::{
     CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
-    HttpTransportPolicy, ListOrganizationMembershipsOutcome, OrganizationError,
-    UpdateOrganizationOutcome,
+    HttpTransportPolicy, ListCurrentPrincipalMembershipsOutcome,
+    ListOrganizationMembershipsOutcome, OrganizationError, UpdateOrganizationOutcome,
 };
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
@@ -151,6 +151,7 @@ impl_human_credential_outcome!(
     CreateOrganizationOutcome,
     GetOrganizationOutcome,
     UpdateOrganizationOutcome,
+    ListCurrentPrincipalMembershipsOutcome,
     ListOrganizationMembershipsOutcome,
 );
 

@@ -600,9 +600,15 @@ scherzo-cloud organization members list acme-labs \
   --cursor opaque-continuation
 ```
 
-Add `--json` to any of these leaves for its schema-version-1 result. Member listing
-returns exactly one page, preserves `nextCursor`, and does not follow it automatically;
-`--limit` accepts 1 through 200.
+Add `--json` to any of these leaves for its schema-version-1 result. Organization
+listing returns one oldest-first page of the signed-in principal's membership history.
+Every row includes the membership and organization IDs plus lifecycle state. The
+organization name and slug appear only while both the organization and membership are
+active; suspended and ended rows retain history without exposing mutable organization
+profile data. Pass the returned `nextCursor` back with `--cursor` to continue.
+
+Organization and member listing each return exactly one page, preserve `nextCursor`, and
+do not follow it automatically. Their `--limit` options accept 1 through 200.
 
 Create and update generate a fresh opaque idempotency key per process invocation. After
 an ambiguous transport failure, the CLI retries once with the same key and serialized

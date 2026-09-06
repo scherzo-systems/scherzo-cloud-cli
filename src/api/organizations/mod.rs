@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION};
 use reqwest::{Method, Response, StatusCode, Url};
+use serde::de::DeserializeOwned;
 
 use super::bearer_authorization;
 use super::generated::models as generated_models;
@@ -17,7 +18,8 @@ use super::problem::{
 use super::{UnreachableCategory, classify_reqwest_error};
 
 pub(crate) use models::{
-    MembershipRole, Organization, OrganizationMembershipDirectoryEntry, OrganizationMembershipPage,
+    CurrentPrincipalMembership, CurrentPrincipalMembershipPage, MembershipRole, MembershipState,
+    Organization, OrganizationMembershipDirectoryEntry, OrganizationMembershipPage,
     OrganizationState, PrincipalType,
 };
 
@@ -65,6 +67,12 @@ pub(crate) enum UpdateOrganizationOutcome {
     NotFound,
     SlugUnavailable,
     IdempotencyConflict,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ListCurrentPrincipalMembershipsOutcome {
+    Listed(CurrentPrincipalMembershipPage),
+    Common(CommonOrganizationFailure),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -151,6 +159,7 @@ enum Operation {
     Create,
     Get,
     Update,
+    ListCurrentMemberships,
     ListMemberships,
 }
 
@@ -160,6 +169,7 @@ impl Operation {
             Self::Create => "create",
             Self::Get => "show",
             Self::Update => "update",
+            Self::ListCurrentMemberships => "current-membership-list",
             Self::ListMemberships => "membership-list",
         }
     }
@@ -331,6 +341,33 @@ pub(crate) fn update_organization(
     }
 }
 
+pub(crate) fn list_current_principal_memberships(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    limit: Option<u16>,
+    cursor: Option<&str>,
+) -> Result<ListCurrentPrincipalMembershipsOutcome, OrganizationError> {
+    let spec = membership_list_request_spec(
+        client,
+        Operation::ListCurrentMemberships,
+        api_url,
+        &["v1", "me", "memberships"],
+        access_token,
+        limit,
+        cursor,
+    )?;
+
+    match execute_request(client, &spec, REQUEST_TIMEOUT)? {
+        RequestExecution::Response(response) => decode_current_membership_list_response(response),
+        RequestExecution::Unreachable(category) => {
+            Ok(ListCurrentPrincipalMembershipsOutcome::Common(
+                CommonOrganizationFailure::Unreachable(category),
+            ))
+        }
+    }
+}
+
 pub(crate) fn list_organization_memberships(
     client: &HttpClient,
     api_url: &str,
@@ -339,17 +376,36 @@ pub(crate) fn list_organization_memberships(
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ListOrganizationMembershipsOutcome, OrganizationError> {
-    let mut endpoint = client
-        .endpoint(
-            api_url,
-            &["v1", "organizations", organization_ref, "memberships"],
-        )
-        .map_err(|error| {
-            OrganizationError::local(
-                Operation::ListMemberships,
-                OrganizationErrorKind::Endpoint(error),
-            )
-        })?;
+    let spec = membership_list_request_spec(
+        client,
+        Operation::ListMemberships,
+        api_url,
+        &["v1", "organizations", organization_ref, "memberships"],
+        access_token,
+        limit,
+        cursor,
+    )?;
+
+    match execute_request(client, &spec, REQUEST_TIMEOUT)? {
+        RequestExecution::Response(response) => decode_list_response(response),
+        RequestExecution::Unreachable(category) => Ok(ListOrganizationMembershipsOutcome::Common(
+            CommonOrganizationFailure::Unreachable(category),
+        )),
+    }
+}
+
+fn membership_list_request_spec(
+    client: &HttpClient,
+    operation: Operation,
+    api_url: &str,
+    path: &[&str],
+    access_token: &str,
+    limit: Option<u16>,
+    cursor: Option<&str>,
+) -> Result<RequestSpec, OrganizationError> {
+    let mut endpoint = client.endpoint(api_url, path).map_err(|error| {
+        OrganizationError::local(operation, OrganizationErrorKind::Endpoint(error))
+    })?;
     if limit.is_some() || cursor.is_some() {
         let mut query = endpoint.query_pairs_mut();
         if let Some(limit) = limit {
@@ -359,8 +415,8 @@ pub(crate) fn list_organization_memberships(
             query.append_pair("cursor", cursor);
         }
     }
-    let spec = request_spec_for_endpoint(
-        Operation::ListMemberships,
+    request_spec_for_endpoint(
+        operation,
         Method::GET,
         endpoint,
         access_token,
@@ -368,14 +424,7 @@ pub(crate) fn list_organization_memberships(
         None,
         None,
         READ_ATTEMPTS,
-    )?;
-
-    match execute_request(client, &spec, REQUEST_TIMEOUT)? {
-        RequestExecution::Response(response) => decode_list_response(response),
-        RequestExecution::Unreachable(category) => Ok(ListOrganizationMembershipsOutcome::Common(
-            CommonOrganizationFailure::Unreachable(category),
-        )),
-    }
+    )
 }
 
 #[expect(
@@ -875,25 +924,63 @@ fn decode_update_response(
     }
 }
 
+fn decode_current_membership_list_response(
+    response: ReceivedResponse,
+) -> Result<ListCurrentPrincipalMembershipsOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::OK => {
+            let value = decode_json_value(
+                Operation::ListCurrentMemberships,
+                &response,
+                "the current-membership-list response body is invalid",
+            )?;
+            let has_null_optional_field = value
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        ["organizationDisplayName", "organizationSlug", "terminalAt"]
+                            .into_iter()
+                            .any(|field| item.get(field).is_some_and(serde_json::Value::is_null))
+                    })
+                });
+            if value
+                .get("nextCursor")
+                .is_some_and(serde_json::Value::is_null)
+                || has_null_optional_field
+            {
+                return Err(OrganizationError::protocol(
+                    Operation::ListCurrentMemberships,
+                    "the current-membership-list response contains an explicit null optional field",
+                    false,
+                ));
+            }
+            let generated: generated_models::CurrentPrincipalMembershipList = decode_json_model(
+                Operation::ListCurrentMemberships,
+                value,
+                "the current-membership-list response body is invalid",
+            )?;
+            CurrentPrincipalMembershipPage::try_from(generated)
+                .map(ListCurrentPrincipalMembershipsOutcome::Listed)
+                .map_err(|reason| {
+                    OrganizationError::protocol(Operation::ListCurrentMemberships, reason, false)
+                })
+        }
+        _ => decode_common_list_failure(Operation::ListCurrentMemberships, &response)
+            .map(ListCurrentPrincipalMembershipsOutcome::Common),
+    }
+}
+
 fn decode_list_response(
     response: ReceivedResponse,
 ) -> Result<ListOrganizationMembershipsOutcome, OrganizationError> {
     match response.status {
         StatusCode::OK => {
-            require_media_type(
+            let value = decode_json_value(
                 Operation::ListMemberships,
                 &response,
-                JSON_MEDIA_TYPE,
-                false,
+                "the membership-list response body is invalid",
             )?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&response.body).map_err(|_| {
-                    OrganizationError::protocol(
-                        Operation::ListMemberships,
-                        "the membership-list response body is invalid",
-                        false,
-                    )
-                })?;
             let has_null_display_name = value
                 .get("items")
                 .and_then(serde_json::Value::as_array)
@@ -914,52 +1001,72 @@ fn decode_list_response(
                     false,
                 ));
             }
-            let generated: generated_models::OrganizationMembershipList =
-                serde_json::from_value(value).map_err(|_| {
-                    OrganizationError::protocol(
-                        Operation::ListMemberships,
-                        "the membership-list response body is invalid",
-                        false,
-                    )
-                })?;
+            let generated: generated_models::OrganizationMembershipList = decode_json_model(
+                Operation::ListMemberships,
+                value,
+                "the membership-list response body is invalid",
+            )?;
             OrganizationMembershipPage::try_from(generated)
                 .map(ListOrganizationMembershipsOutcome::Listed)
                 .map_err(|reason| {
                     OrganizationError::protocol(Operation::ListMemberships, reason, false)
                 })
         }
-        StatusCode::BAD_REQUEST => {
-            require_problem(Operation::ListMemberships, &response, BAD_REQUEST, false)?;
-            Ok(ListOrganizationMembershipsOutcome::Common(
-                CommonOrganizationFailure::InvalidInput,
-            ))
-        }
-        StatusCode::UNAUTHORIZED => {
-            require_problem(Operation::ListMemberships, &response, UNAUTHORIZED, true)?;
-            Ok(ListOrganizationMembershipsOutcome::Common(
-                CommonOrganizationFailure::Unauthenticated,
-            ))
-        }
-        StatusCode::FORBIDDEN => {
-            require_problem(Operation::ListMemberships, &response, FORBIDDEN, false)?;
-            Ok(ListOrganizationMembershipsOutcome::Common(
-                CommonOrganizationFailure::Forbidden,
-            ))
-        }
         StatusCode::NOT_FOUND => {
             require_problem(Operation::ListMemberships, &response, NOT_FOUND, false)?;
             Ok(ListOrganizationMembershipsOutcome::NotFound)
         }
-        status if status.is_server_error() => Ok(ListOrganizationMembershipsOutcome::Common(
-            CommonOrganizationFailure::Unreachable(UnreachableCategory::Server),
+        _ => decode_common_list_failure(Operation::ListMemberships, &response)
+            .map(ListOrganizationMembershipsOutcome::Common),
+    }
+}
+
+fn decode_json_value(
+    operation: Operation,
+    response: &ReceivedResponse,
+    invalid_body_reason: &'static str,
+) -> Result<serde_json::Value, OrganizationError> {
+    require_media_type(operation, response, JSON_MEDIA_TYPE, false)?;
+    serde_json::from_slice(&response.body)
+        .map_err(|_| OrganizationError::protocol(operation, invalid_body_reason, false))
+}
+
+fn decode_json_model<T: DeserializeOwned>(
+    operation: Operation,
+    value: serde_json::Value,
+    invalid_body_reason: &'static str,
+) -> Result<T, OrganizationError> {
+    serde_json::from_value(value)
+        .map_err(|_| OrganizationError::protocol(operation, invalid_body_reason, false))
+}
+
+fn decode_common_list_failure(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<CommonOrganizationFailure, OrganizationError> {
+    match response.status {
+        StatusCode::BAD_REQUEST => {
+            require_problem(operation, response, BAD_REQUEST, false)?;
+            Ok(CommonOrganizationFailure::InvalidInput)
+        }
+        StatusCode::UNAUTHORIZED => {
+            require_problem(operation, response, UNAUTHORIZED, true)?;
+            Ok(CommonOrganizationFailure::Unauthenticated)
+        }
+        StatusCode::FORBIDDEN => {
+            require_problem(operation, response, FORBIDDEN, false)?;
+            Ok(CommonOrganizationFailure::Forbidden)
+        }
+        status if status.is_server_error() => Ok(CommonOrganizationFailure::Unreachable(
+            UnreachableCategory::Server,
         )),
         status if status.is_redirection() => Err(OrganizationError::protocol(
-            Operation::ListMemberships,
+            operation,
             "redirect responses are not permitted",
             false,
         )),
         _ => Err(OrganizationError::protocol(
-            Operation::ListMemberships,
+            operation,
             "the HTTP status is not valid for this operation",
             false,
         )),

@@ -29,6 +29,16 @@ fn bearer_authorization(access_token: &str) -> Result<HeaderValue, InvalidHeader
     HeaderValue::from_str(&value)
 }
 
+fn valid_url_safe_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -49,18 +59,19 @@ pub(crate) use github::{
 pub(crate) use http_client::{HttpClient, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use organizations::{
-    CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome,
-    ListOrganizationMembershipsOutcome, MembershipRole, Organization, OrganizationError,
-    OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
+    CommonOrganizationFailure, CreateOrganizationOutcome, CurrentPrincipalMembership,
+    GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
+    ListOrganizationMembershipsOutcome, MembershipRole, MembershipState, Organization,
+    OrganizationError, OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationOutcome, create_organization, get_organization,
-    list_organization_memberships, update_organization,
+    list_current_principal_memberships, list_organization_memberships, update_organization,
 };
 pub(crate) use projects::{
     CreateProjectInput, GitHubInstallation as ProjectGitHubInstallation,
     GitHubInstallationList as ProjectGitHubInstallationList,
     GitHubRepository as ProjectGitHubRepository,
-    GitHubRepositoryList as ProjectGitHubRepositoryList, OrganizationMembershipList, Project,
-    ProjectApi, ProjectFailure, ProjectList, ProjectReadinessBlocker, ProjectRepository,
+    GitHubRepositoryList as ProjectGitHubRepositoryList, Project, ProjectApi, ProjectFailure,
+    ProjectList, ProjectReadinessBlocker, ProjectRepository,
 };
 pub(crate) use runners::{
     RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,

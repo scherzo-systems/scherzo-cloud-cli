@@ -6,8 +6,10 @@ use crate::human_auth::deployment::Deployment;
 use super::LeafOptions;
 
 pub(super) const ABOUT: &str = "List your Scherzo Cloud organization memberships";
+const AFTER_HELP: &str = "Visibility:\n  Organization names and slugs appear only for active memberships in active\n  organizations. Historical rows retain organization IDs and lifecycle states.\n\nPagination:\n  This command returns one page. Pass --cursor <CURSOR> to continue.";
 
 #[derive(Debug, Args)]
+#[command(after_help = AFTER_HELP)]
 pub(super) struct Command {
     #[command(flatten)]
     pagination: super::super::PaginationArgs,
@@ -18,20 +20,18 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = super::super::project::with_api(
+        self.options.execute(
             deployment,
-            self.options.http.transport_policy(),
-            |api| {
-                api.list_organization_memberships(
+            |client, api_url, access_token| {
+                crate::api::list_current_principal_memberships(
+                    client,
+                    api_url,
+                    access_token,
                     self.pagination.limit,
                     self.pagination.cursor.as_deref(),
                 )
             },
-        )?;
-        super::super::project::write_organization_list(
-            deployment.fingerprint().api_url(),
-            result,
-            self.options.json,
+            super::output::write_list,
         )
     }
 }

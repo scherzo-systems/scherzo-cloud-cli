@@ -115,6 +115,33 @@ fn membership_success(items: serde_json::Value, next_cursor: Option<&str>) -> Ve
     json_http_response("200 OK", page)
 }
 
+fn current_membership_items() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "organizationState": "active",
+            "organizationDisplayName": "Acme Research",
+            "organizationSlug": "acme-research",
+            "role": "owner",
+            "state": "active",
+            "createdAt": "2026-07-22T20:32:00Z",
+            "updatedAt": "2026-07-23T10:00:00Z",
+            "future": { "accepted": true }
+        },
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "organizationState": "suspended",
+            "role": "member",
+            "state": "ended",
+            "createdAt": "2026-08-01T12:00:00Z",
+            "updatedAt": "2026-09-01T12:00:00Z",
+            "terminalAt": "2026-09-01T12:00:00Z"
+        }
+    ])
+}
+
 fn organization_problem(status_text: &str, status: u16, problem_type: &str) -> Vec<u8> {
     problem_http_response(
         status_text,
@@ -1010,9 +1037,12 @@ fn private_not_found_outputs_are_identical_for_all_target_states() {
 }
 
 #[test]
-fn update_and_members_list_reject_invalid_cli_input_before_deployment_loading() {
+fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
     for args in [
         &["organization", "update", "acme"][..],
+        &["organization", "list", "--limit", "0"][..],
+        &["organization", "list", "--limit", "201"][..],
+        &["organization", "list", "--cursor", ""][..],
         &["organization", "members", "list", "acme", "--limit", "0"][..],
         &["organization", "members", "list", "acme", "--limit", "201"][..],
         &["organization", "members", "list", "acme", "--cursor", ""][..],
@@ -1316,6 +1346,249 @@ fn update_transport_and_protocol_failures_have_closed_statuses() {
     assert!(!stderr.contains("protocol-response-sentinel"));
     assert!(!stderr.contains(TOKEN));
     server.finish();
+}
+
+#[test]
+fn organization_list_emits_one_visibility_preserving_page() {
+    let cursor = "next page /+=";
+    let response_items = current_membership_items();
+    let (server, _directory, _path, credential_path) = prepared_organization(
+        vec![membership_success(response_items.clone(), Some(cursor))],
+        TOKEN,
+    );
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "organization",
+            "list",
+            "--limit",
+            "2",
+            "--cursor",
+            "opaque /+=?&",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    let mut expected_items = response_items;
+    expected_items[0].as_object_mut().unwrap().remove("future");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "listed",
+            "items": expected_items,
+            "nextCursor": cursor
+        })
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["items"][0]["organizationSlug"], "acme-research");
+    assert!(value["items"][1].get("organizationDisplayName").is_none());
+    assert!(value["items"][1].get("organizationSlug").is_none());
+    assert!(output.stdout.ends_with(b"\n"));
+    assert!(output.stderr.is_empty());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1, "nextCursor must not trigger pagination");
+    assert!(requests[0].starts_with(
+        "GET /api/v1/me/memberships?limit=2&cursor=opaque+%2F%2B%3D%3F%26 HTTP/1.1\r\n"
+    ));
+    assert_eq!(
+        header_value(&requests[0], "authorization"),
+        format!("Bearer {TOKEN}")
+    );
+    assert!(!requests[0].contains("idempotency-key:"));
+}
+
+#[test]
+fn human_organization_list_exposes_identity_and_history_without_synthesizing_profile_data() {
+    let (server, _directory, _path, credential_path) = prepared_organization(
+        vec![membership_success(current_membership_items(), None)],
+        TOKEN,
+    );
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &["organization", "list", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "organization: org_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "organization slug: acme-research",
+        "organization: org_01k0z6r1w8f4jy2m7q9v3x5abd · organization state: suspended",
+        "membership: mem_01k0z6r1w8f4jy2m7q9v3x5abd · role: member · membership state: ended",
+        "terminal: 2026-09-01T12:00:00Z",
+    ] {
+        assert!(stdout.contains(expected));
+    }
+    assert!(!stdout.contains("unavailable"));
+    assert!(output.stderr.is_empty());
+    server.finish();
+}
+
+#[test]
+fn organization_list_api_failures_have_structured_outcomes_and_registered_statuses() {
+    let cases = [
+        (
+            organization_problem(
+                "400 Bad Request",
+                400,
+                "https://api.scherzo.dev/problems/bad-request",
+            ),
+            "invalid_input",
+            1,
+        ),
+        (
+            organization_problem(
+                "401 Unauthorized",
+                401,
+                "https://api.scherzo.dev/problems/unauthorized",
+            ),
+            "unauthenticated",
+            3,
+        ),
+        (
+            organization_problem(
+                "403 Forbidden",
+                403,
+                "https://api.scherzo.dev/problems/forbidden",
+            ),
+            "forbidden",
+            1,
+        ),
+        (
+            http_response("500 Internal Server Error", None, &[]),
+            "unreachable",
+            4,
+        ),
+    ];
+
+    for (response, expected_outcome, expected_status) in cases {
+        let (server, _directory, _path, credential_path) =
+            prepared_organization_refresh(vec![response], TOKEN);
+        let environment =
+            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
+
+        let output = run_with_env(
+            &["organization", "list", "--json", "--allow-insecure-http"],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(expected_status));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["deployment"], server.api_url);
+        assert_eq!(value["outcome"], expected_outcome);
+        if expected_outcome == "unreachable" {
+            assert_eq!(value["category"], "server");
+        } else {
+            assert!(value.get("category").is_none());
+        }
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            server.finish().len(),
+            if expected_outcome == "unauthenticated" {
+                2
+            } else {
+                1
+            }
+        );
+    }
+}
+
+#[test]
+fn human_organization_list_api_failure_uses_the_diagnostic_stream() {
+    let response = organization_problem(
+        "400 Bad Request",
+        400,
+        "https://api.scherzo.dev/problems/bad-request",
+    );
+    let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &["organization", "list", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("error: "));
+    assert!(stderr.contains("\n\n"));
+    assert!(!stderr.contains(TOKEN));
+    server.finish();
+}
+
+#[test]
+fn organization_list_rejects_responses_that_violate_profile_visibility() {
+    let malformed_pages = [
+        serde_json::json!({
+            "items": [{
+                "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "organizationState": "active",
+                "role": "owner",
+                "state": "active",
+                "createdAt": "2026-07-22T20:32:00Z",
+                "updatedAt": "2026-07-22T20:32:00Z"
+            }]
+        }),
+        serde_json::json!({
+            "items": [{
+                "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "organizationState": "suspended",
+                "organizationDisplayName": "private-profile-sentinel",
+                "organizationSlug": "private-slug-sentinel",
+                "role": "owner",
+                "state": "active",
+                "createdAt": "2026-07-22T20:32:00Z",
+                "updatedAt": "2026-07-22T20:32:00Z"
+            }]
+        }),
+        serde_json::json!({
+            "items": [{
+                "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "organizationState": "active",
+                "organizationDisplayName": "private-profile-sentinel",
+                "organizationSlug": "private-slug-sentinel",
+                "role": "owner",
+                "state": "ended",
+                "createdAt": "2026-07-22T20:32:00Z",
+                "updatedAt": "2026-07-22T20:32:00Z",
+                "terminalAt": "2026-07-22T20:32:00Z"
+            }]
+        }),
+        serde_json::json!({"items": [], "nextCursor": null}),
+    ];
+
+    for page in malformed_pages {
+        let (server, _directory, _path, credential_path) =
+            prepared_organization(vec![json_http_response("200 OK", page)], TOKEN);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(
+            &["organization", "list", "--json", "--allow-insecure-http"],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("private-profile-sentinel"));
+        assert!(!stderr.contains(TOKEN));
+        server.finish();
+    }
 }
 
 #[test]
@@ -1710,7 +1983,7 @@ fn members_list_rejects_explicit_null_optional_fields() {
 }
 
 #[test]
-fn update_and_members_list_report_missing_credentials_without_network_requests() {
+fn organization_commands_report_missing_credentials_without_network_requests() {
     for args in [
         &[
             "organization",
@@ -1721,6 +1994,7 @@ fn update_and_members_list_report_missing_credentials_without_network_requests()
             "--json",
             "--allow-insecure-http",
         ][..],
+        &["organization", "list", "--json", "--allow-insecure-http"][..],
         &[
             "organization",
             "members",
