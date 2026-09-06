@@ -702,6 +702,24 @@ fn start_fixture_with_clock<Clock: CoordinatorClock>(
     AgentStartReceiver,
     AgentTerminalReceiver,
 ) {
+    start_fixture_with_clock_and_synthetic_model_provider(
+        invocation,
+        diagnostics,
+        clock,
+        Some(Arc::from(PROVIDER)),
+    )
+}
+
+fn start_fixture_with_clock_and_synthetic_model_provider<Clock: CoordinatorClock>(
+    invocation: TestInvocation,
+    diagnostics: StepDiagnosticLog,
+    clock: Clock,
+    synthetic_model_provider: Option<Arc<str>>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    AgentStartReceiver,
+    AgentTerminalReceiver,
+) {
     let value_mode = invocation.value_mode().clone();
     let adapter = CodexAppServerV1Adapter::with_validation_worker(
         diagnostics,
@@ -709,7 +727,7 @@ fn start_fixture_with_clock<Clock: CoordinatorClock>(
         clock,
         NoopExecutionObserver,
         InlineValidationWorker,
-        Some(Arc::from(PROVIDER)),
+        synthetic_model_provider,
     );
     let (started, start) = agent_start_channel();
     let (terminal, outcome) = agent_terminal_channel(&value_mode);
@@ -767,9 +785,21 @@ impl RunningCancellationFixture {
 // Process-record inspection is specific to this guarded App Server fixture's quiescence
 // proof, so it remains separate from other harness fixture runners.
 // jscpd:ignore-start
-async fn run_fixture(mut fixture: ProcessFixture) -> (ProcessFixture, AgentOutcome, bool) {
+async fn run_fixture(fixture: ProcessFixture) -> (ProcessFixture, AgentOutcome, bool) {
+    run_fixture_with_synthetic_model_provider(fixture, Some(Arc::from(PROVIDER))).await
+}
+
+async fn run_fixture_with_synthetic_model_provider(
+    mut fixture: ProcessFixture,
+    synthetic_model_provider: Option<Arc<str>>,
+) -> (ProcessFixture, AgentOutcome, bool) {
     let invocation = fixture.invocation.take().unwrap();
-    let (task, start, outcome) = start_fixture(invocation, fixture.diagnostics.clone());
+    let (task, start, outcome) = start_fixture_with_clock_and_synthetic_model_provider(
+        invocation,
+        fixture.diagnostics.clone(),
+        PendingClock,
+        synthetic_model_provider,
+    );
     task.await.unwrap();
     let outcome = outcome.receive().await.unwrap();
     let started = start.receive().await.is_ok();
@@ -2729,11 +2759,15 @@ pub(super) mod exact_binary {
         with_watchdog(async {
             let (mut provider, release_response) =
                 LoopbackResponsesProvider::start_blocked(RESPONSE).await;
-            let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
+            let (fixture, stdin_capture) = ProcessFixture::with_exact_binary_stdin_capture(
+                provider.address,
+                response_mode(),
+            );
             let codex_home = fixture.codex_home.clone();
             let sqlite_staging = fixture.sqlite_staging.clone();
+            let expected_cwd = fixture.expected_cwd.clone();
             let config = std::fs::read(codex_home.join("config.toml")).unwrap();
-            let mut run = tokio::spawn(run_fixture(fixture));
+            let mut run = tokio::spawn(run_fixture_with_synthetic_model_provider(fixture, None));
             let request = tokio::select! {
                 request = provider.next_request() => request,
                 finished = &mut run => {
@@ -2749,6 +2783,7 @@ pub(super) mod exact_binary {
             assert_eq!(request.path, "/responses");
             assert_eq!(request.authorization, format!("Bearer {PLACEHOLDER_KEY}"));
             assert_eq!(request.body["model"], MODEL);
+            assert_eq!(request.body["reasoning"]["effort"], "high");
             let serialized_request = serde_json::to_string(&request.body).unwrap();
             for marker in ["root resource marker", "scherzo system instructions"] {
                 assert!(
@@ -2777,6 +2812,24 @@ pub(super) mod exact_binary {
                 panic!("exact Codex must complete one loopback response: {outcome:?}");
             };
             assert_eq!(response.as_str(), RESPONSE);
+            let requests = captured_requests(&stdin_capture);
+            let thread_start = requests
+                .iter()
+                .find(|request| request["method"] == "thread/start")
+                .unwrap();
+            assert_eq!(thread_start["params"]["model"], MODEL);
+            assert_eq!(thread_start["params"]["cwd"], expected_cwd.to_str().unwrap());
+            assert_eq!(thread_start["params"]["approvalPolicy"], "never");
+            assert_eq!(thread_start["params"]["sandbox"], "danger-full-access");
+            assert_eq!(thread_start["params"]["ephemeral"], true);
+            assert!(thread_start["params"].get("modelProvider").is_none());
+            let turn_start = requests
+                .iter()
+                .find(|request| request["method"] == "turn/start")
+                .unwrap();
+            assert_eq!(turn_start["params"]["model"], MODEL);
+            assert_eq!(turn_start["params"]["effort"], "high");
+            assert_eq!(turn_start["params"]["cwd"], expected_cwd.to_str().unwrap());
             assert_no_native_rollout(&fixture);
             assert_eq!(
                 std::fs::read(codex_home.join("config.toml")).unwrap(),

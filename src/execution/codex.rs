@@ -16,7 +16,7 @@ use crate::process::CommandRunner;
 use crate::process::{CommandOutput, SystemCommandRunner};
 
 pub(crate) const CODEX_APP_SERVER_V1_SUPPORTED_RANGE: &str = ">=0.147.0 <0.154.0";
-pub(crate) const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.153.0";
+pub(crate) const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.153.4";
 const CODEX_APP_SERVER_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 147, 0);
 const CODEX_APP_SERVER_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 154, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 4] =
@@ -744,7 +744,7 @@ mod tests {
             "0.151.999",
             "0.152.0",
             "0.152.999",
-            "0.153.0",
+            "0.153.4",
             "0.153.999",
         ] {
             let runner = compatible_runner(version);

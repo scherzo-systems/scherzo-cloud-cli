@@ -205,7 +205,7 @@ fn doctor_reports_exact_codex_identity_without_credentials_or_native_configurati
     assert_eq!(check["details"]["version"], "0.153.23");
     assert_eq!(check["details"]["profile"], "CodexAppServerV1");
     assert_eq!(check["details"]["supportedRange"], ">=0.147.0 <0.154.0");
-    assert_eq!(check["details"]["qualificationVersion"], "0.153.0");
+    assert_eq!(check["details"]["qualificationVersion"], "0.153.4");
     assert_eq!(check["details"]["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
         Path::new(check["details"]["executablePath"].as_str().unwrap()),
@@ -329,28 +329,28 @@ fn doctor_rejects_out_of_range_decorated_and_schema_incompatible_codex() {
             b"--version\n".as_slice(),
         ),
         (
-            "0.153.0-rc.1",
+            "0.153.4-rc.1",
             true,
             true,
             "malformed_codex_version",
             b"--version\n".as_slice(),
         ),
         (
-            "0.153.0+vendor",
+            "0.153.4+vendor",
             true,
             true,
             "malformed_codex_version",
             b"--version\n".as_slice(),
         ),
         (
-            "0.153.0",
+            "0.153.4",
             false,
             true,
             "unsupported_codex_capability",
             CLOSED_PROBES,
         ),
         (
-            "0.153.0",
+            "0.153.4",
             true,
             false,
             "unexecutable_codex_installation",

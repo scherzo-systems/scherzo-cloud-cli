@@ -93,7 +93,7 @@ Claude Code maps canonical stable versions in
 qualifies exact release `2.1.260`. Codex maps stable `>=0.147.0 <0.154.0`
 installations with the maintained App Server schema capabilities into
 `ValidatedCodexInstallation`; the repository separately qualifies exact release
-`0.153.0`. Each immutable value carries the absolute path, exact
+`0.153.4`. Each immutable value carries the absolute path, exact
 observed version, closed profile, and closed capability set. Local and runner admission
 inspect resolved workflows and require only each selected installation. Admission and
 later execution use those values without another `PATH` lookup or native probe, so later
