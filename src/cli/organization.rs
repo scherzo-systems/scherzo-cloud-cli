@@ -15,7 +15,6 @@ use crate::api::{
 };
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organizations";
 const NAME: &str = "organization";
@@ -166,35 +165,28 @@ where
     let client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare organization networking")?;
-    match session::execute_required(
+    super::execute_human_api_operation(
         &client,
         deployment,
-        |access_token| {
-            operation(
-                &client,
-                deployment.fingerprint().api_url(),
-                access_token.expose(),
-            )
-        },
+        |access_token| operation(&client, deployment.fingerprint().api_url(), access_token),
         |result| {
             result.as_ref().is_ok_and(O::is_unauthenticated)
                 || result
                     .as_ref()
                     .is_err_and(OrganizationError::credential_rejected)
         },
-    ) {
-        Ok(RequiredOperation::Unauthenticated) => Ok(O::unauthenticated()),
-        Ok(RequiredOperation::Completed(result)) => {
-            result.map_err(|error| anyhow!(error)).with_context(|| {
-                format!(
-                    "contact organization API at {}",
-                    deployment.fingerprint().api_url()
-                )
-            })
-        }
-        Err(error) => match error.unreachable_category() {
-            Some(category) => Ok(O::unreachable(category)),
-            None => Err(anyhow!(error).context("acquire human session")),
+        super::HumanApiOutcomeAdapters {
+            unauthenticated: O::unauthenticated,
+            unreachable: O::unreachable,
+            operation_error: organization_api_error,
         },
-    }
+        format!(
+            "contact organization API at {}",
+            deployment.fingerprint().api_url()
+        ),
+    )
+}
+
+fn organization_api_error(error: OrganizationError) -> anyhow::Error {
+    anyhow!(error)
 }

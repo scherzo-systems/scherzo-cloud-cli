@@ -22,7 +22,9 @@ use serde::Serialize;
 
 use crate::api::HttpTransportPolicy;
 use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
+use crate::human_auth::session::{self, RequiredOperation};
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
@@ -174,14 +176,45 @@ pub(crate) const fn unreachable_outcome_class(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CloudFailureResult<'a> {
+struct ApiFailureResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    category: Option<&'a str>,
+    category: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after: Option<u64>,
+}
+
+impl<'a> ApiFailureResult<'a> {
+    const fn new(
+        deployment: &'a str,
+        outcome: &'static str,
+        category: Option<&'static str>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            deployment,
+            outcome,
+            category,
+            retry_after: None,
+        }
+    }
+
+    const fn with_retry_after(
+        deployment: &'a str,
+        outcome: &'static str,
+        category: Option<&'static str>,
+        retry_after: Option<u64>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            deployment,
+            outcome,
+            category,
+            retry_after,
+        }
+    }
 }
 
 fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
@@ -227,6 +260,33 @@ fn execute_read_only_with_signals(
     operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
 ) -> CommandResult {
     execute_blocking_with_signals(context, operation, Ok)
+}
+
+fn execute_cancellable_with_signals(
+    context: &'static str,
+    operation: impl FnOnce(&Cancellation) -> CommandResult + Send + 'static,
+) -> CommandResult {
+    let runtime = blocking_signal_runtime(context)?;
+    let result = runtime.block_on(async move {
+        let mut signals = ProcessSignals::install(context)?;
+        let cancellation = Cancellation::new();
+        let operation_cancellation = cancellation.clone();
+        let mut running = tokio::task::spawn_blocking(move || operation(&operation_cancellation));
+        tokio::select! {
+            biased;
+            signal = signals.recv() => {
+                cancellation.cancel();
+                let result = finish_read_only_operation(context, running.await);
+                match result {
+                    Ok(ExitCode::Interrupted) => Ok(signal),
+                    result => result,
+                }
+            }
+            result = &mut running => finish_read_only_operation(context, result),
+        }
+    });
+    runtime.shutdown_timeout(Duration::ZERO);
+    result
 }
 
 fn execute_mutation_with_signals(
@@ -373,6 +433,37 @@ fn finish_read_only_operation(
     result: Result<CommandResult, tokio::task::JoinError>,
 ) -> CommandResult {
     result.with_context(|| format!("complete {context} operation"))?
+}
+
+struct HumanApiOutcomeAdapters<O, E> {
+    unauthenticated: fn() -> O,
+    unreachable: fn(crate::api::UnreachableCategory) -> O,
+    operation_error: fn(E) -> anyhow::Error,
+}
+
+fn execute_human_api_operation<O, E>(
+    client: &crate::api::HttpClient,
+    deployment: &Deployment,
+    mut operation: impl FnMut(&str) -> Result<O, E>,
+    credential_rejected: impl Fn(&Result<O, E>) -> bool,
+    adapters: HumanApiOutcomeAdapters<O, E>,
+    api_context: String,
+) -> anyhow::Result<O> {
+    match session::execute_required(
+        client,
+        deployment,
+        |access_token| operation(access_token.expose()),
+        credential_rejected,
+    ) {
+        Ok(RequiredOperation::Unauthenticated) => Ok((adapters.unauthenticated)()),
+        Ok(RequiredOperation::Completed(result)) => result
+            .map_err(adapters.operation_error)
+            .context(api_context),
+        Err(error) => match error.unreachable_category() {
+            Some(category) => Ok((adapters.unreachable)(category)),
+            None => Err(anyhow!(error).context("acquire human session")),
+        },
+    }
 }
 
 fn execute_deployment_leaf<T>(
@@ -533,6 +624,10 @@ mod tests {
             "artifact download",
             "artifact validate",
             "auth",
+            "auth identities",
+            "auth identities link",
+            "auth identities list",
+            "auth identities remove",
             "auth login",
             "auth logout",
             "auth status",

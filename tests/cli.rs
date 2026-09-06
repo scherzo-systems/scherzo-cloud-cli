@@ -40,6 +40,8 @@ mod claude_code_installation;
 mod codex_installation;
 #[path = "cli/github.rs"]
 mod github;
+#[path = "cli/identities.rs"]
+mod identities;
 #[path = "cli/organization.rs"]
 mod organization;
 #[path = "cli/pi_installation.rs"]

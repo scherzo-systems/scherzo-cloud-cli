@@ -10,6 +10,24 @@ pub(super) const UNAUTHORIZED: &str = "https://api.scherzo.dev/problems/unauthor
 pub(super) const FORBIDDEN: &str = "https://api.scherzo.dev/problems/forbidden";
 pub(super) const NOT_FOUND: &str = "https://api.scherzo.dev/problems/not-found";
 
+pub(super) fn decode_type(
+    response: &super::http_util::BufferedResponse,
+) -> Result<String, &'static str> {
+    super::http_util::require_media_type(response.content_type.as_deref(), PROBLEM_MEDIA_TYPE)?;
+    decode(&response.body, response.status).map(|problem| problem.r#type)
+}
+
+pub(super) fn require_type(
+    response: &super::http_util::BufferedResponse,
+    expected_type: &str,
+) -> Result<(), &'static str> {
+    if decode_type(response)? == expected_type {
+        Ok(())
+    } else {
+        Err("the problem type is not valid for its HTTP status")
+    }
+}
+
 pub(super) fn decode(
     body: &[u8],
     expected_status: StatusCode,

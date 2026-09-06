@@ -20,7 +20,8 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 const DEVICE_CODE_PATH: [&str; 3] = ["oauth", "device", "code"];
 const TOKEN_PATH: [&str; 2] = ["oauth", "token"];
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const SCOPES: &str = "openid profile email offline_access";
+const SESSION_SCOPES: &str = "openid profile email offline_access";
+const IDENTITY_PROOF_SCOPES: &str = "openid profile email";
 
 pub(crate) struct DeviceAuthorization {
     device_code: String,
@@ -62,6 +63,11 @@ impl DeviceAuthorization {
         self.verification_uri_complete.as_deref()
     }
 
+    pub(crate) fn activation_uri(&self) -> &str {
+        self.verification_uri_complete()
+            .unwrap_or_else(|| self.verification_uri())
+    }
+
     pub(crate) fn expires_in(&self) -> Duration {
         self.expires_in
     }
@@ -72,12 +78,12 @@ impl DeviceAuthorization {
 }
 
 #[derive(Debug)]
-pub(crate) enum TokenPoll {
+pub(crate) enum TokenPoll<T> {
     Pending,
     SlowDown,
     Denied,
     Expired,
-    Issued(IssuedToken),
+    Issued(T),
 }
 
 pub(crate) struct IssuedToken {
@@ -115,13 +121,28 @@ pub(crate) fn authorize(
     client: &HttpClient,
     deployment: &Deployment,
 ) -> Result<DeviceAuthorization, AuthorizationError> {
+    authorize_with_scopes(client, deployment, SESSION_SCOPES)
+}
+
+pub(crate) fn authorize_identity_proof(
+    client: &HttpClient,
+    deployment: &Deployment,
+) -> Result<DeviceAuthorization, AuthorizationError> {
+    authorize_with_scopes(client, deployment, IDENTITY_PROOF_SCOPES)
+}
+
+fn authorize_with_scopes(
+    client: &HttpClient,
+    deployment: &Deployment,
+    scopes: &str,
+) -> Result<DeviceAuthorization, AuthorizationError> {
     let endpoint = client
         .endpoint(deployment.fingerprint().issuer(), &DEVICE_CODE_PATH)
         .map_err(|error| AuthorizationError::Local(AuthorizationLocalError::Endpoint(error)))?;
     let fields = [
         ("client_id", deployment.fingerprint().client_id()),
         ("audience", deployment.fingerprint().audience()),
-        ("scope", SCOPES),
+        ("scope", scopes),
     ];
     let response = post_form(client, endpoint, &fields)?;
 
@@ -149,7 +170,24 @@ pub(crate) fn poll_token(
     client: &HttpClient,
     deployment: &Deployment,
     device_code: &str,
-) -> Result<TokenPoll, AuthorizationError> {
+) -> Result<TokenPoll<IssuedToken>, AuthorizationError> {
+    poll_token_with(client, deployment, device_code, decode_issued_token)
+}
+
+pub(crate) fn poll_identity_proof(
+    client: &HttpClient,
+    deployment: &Deployment,
+    device_code: &str,
+) -> Result<TokenPoll<SecretToken>, AuthorizationError> {
+    poll_token_with(client, deployment, device_code, decode_identity_proof)
+}
+
+fn poll_token_with<T>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    device_code: &str,
+    decode: impl FnOnce(&[u8]) -> Result<T, AuthorizationError>,
+) -> Result<TokenPoll<T>, AuthorizationError> {
     let endpoint = client
         .endpoint(deployment.fingerprint().issuer(), &TOKEN_PATH)
         .map_err(|error| AuthorizationError::Local(AuthorizationLocalError::Endpoint(error)))?;
@@ -162,7 +200,7 @@ pub(crate) fn poll_token(
 
     if response.status == StatusCode::OK {
         require_json(&response)?;
-        return decode_issued_token(&response.body).map(TokenPoll::Issued);
+        return decode(&response.body).map(TokenPoll::Issued);
     }
     if response.status.is_redirection() {
         return Err(AuthorizationError::Protocol {
@@ -460,6 +498,40 @@ pub(super) fn decode_issued_token(body: &[u8]) -> Result<IssuedToken, Authorizat
         refresh_token: response.refresh_token,
         expires_in,
     })
+}
+
+#[derive(Deserialize)]
+struct IssuedIdentityProofResponse {
+    access_token: SecretToken,
+    token_type: String,
+    expires_in: u64,
+}
+
+fn decode_identity_proof(body: &[u8]) -> Result<SecretToken, AuthorizationError> {
+    let response: IssuedIdentityProofResponse =
+        serde_json::from_slice(body).map_err(|_| AuthorizationError::Protocol {
+            reason: "the successful identity-proof token body is invalid",
+        })?;
+    if response.access_token.expose().is_empty() {
+        return Err(AuthorizationError::Protocol {
+            reason: "the issued identity-proof access token is empty",
+        });
+    }
+    if response.access_token.expose().len() > MAX_ACCESS_TOKEN_BYTES {
+        return Err(AuthorizationError::Protocol {
+            reason: "the issued identity-proof access token exceeds 64 KiB",
+        });
+    }
+    if !response.token_type.eq_ignore_ascii_case("Bearer") {
+        return Err(AuthorizationError::Protocol {
+            reason: "the issued identity-proof token is not a bearer token",
+        });
+    }
+    let _ = positive_duration(
+        response.expires_in,
+        "the issued identity-proof access-token lifetime is not positive",
+    )?;
+    Ok(response.access_token)
 }
 
 #[derive(Deserialize)]

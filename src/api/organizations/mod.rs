@@ -10,10 +10,11 @@ use serde::de::DeserializeOwned;
 use super::bearer_authorization;
 use super::generated::models as generated_models;
 use super::http_client::{HttpClient, HttpEndpointError};
-use super::http_util::{self, BoundedBodyError};
+use super::http_util;
+#[cfg(test)]
+use super::problem::PROBLEM_MEDIA_TYPE;
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
-    PROBLEM_MEDIA_TYPE, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, classify_reqwest_error};
 
@@ -193,23 +194,12 @@ struct RequestSpec {
     max_attempts: usize,
 }
 
-struct ReceivedResponse {
-    status: StatusCode,
-    content_type: Option<String>,
-    idempotency_key: Option<HeaderValue>,
-    location: Option<HeaderValue>,
-    retry_after: Option<HeaderValue>,
-    body: Vec<u8>,
-}
+type ReceivedResponse = http_util::BufferedResponse;
+type AttemptError = http_util::ApiAttemptError<OrganizationError>;
 
 enum RequestExecution {
     Response(ReceivedResponse),
     Unreachable(UnreachableCategory),
-}
-
-enum AttemptError {
-    Protocol(OrganizationError),
-    Transport(UnreachableCategory),
 }
 
 pub(crate) fn create_organization(
@@ -406,15 +396,7 @@ fn membership_list_request_spec(
     let mut endpoint = client.endpoint(api_url, path).map_err(|error| {
         OrganizationError::local(operation, OrganizationErrorKind::Endpoint(error))
     })?;
-    if limit.is_some() || cursor.is_some() {
-        let mut query = endpoint.query_pairs_mut();
-        if let Some(limit) = limit {
-            query.append_pair("limit", &limit.to_string());
-        }
-        if let Some(cursor) = cursor {
-            query.append_pair("cursor", cursor);
-        }
-    }
+    http_util::append_pagination(&mut endpoint, limit, cursor);
     request_spec_for_endpoint(
         operation,
         Method::GET,
@@ -677,52 +659,10 @@ async fn receive_response(
     operation: Operation,
     response: Response,
 ) -> Result<ReceivedResponse, AttemptError> {
-    let status = response.status();
-    let credential_rejected = status == StatusCode::UNAUTHORIZED;
-    let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    let idempotency_key = response.headers().get("Idempotency-Key").cloned();
-    let location = response.headers().get(LOCATION).cloned();
-    let retry_after = response.headers().get("Retry-After").cloned();
-    let body = match http_util::read_bounded_body(response).await {
-        Ok(body) => body,
-        Err(BoundedBodyError::TooLarge) => {
-            return Err(AttemptError::Protocol(OrganizationError::protocol(
-                operation,
-                "the response body exceeds 1 MiB",
-                credential_rejected,
-            )));
-        }
-        Err(BoundedBodyError::Transport(_)) if credential_rejected => {
-            return Err(AttemptError::Protocol(OrganizationError::protocol(
-                operation,
-                "the unauthorized response body could not be read",
-                true,
-            )));
-        }
-        Err(BoundedBodyError::Transport(error)) => {
-            return Err(AttemptError::Transport(classify_reqwest_error(&error)));
-        }
-    };
-    let content_type = content_type
-        .as_ref()
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|()| {
-            AttemptError::Protocol(OrganizationError::protocol(
-                operation,
-                "the Content-Type header is not valid text",
-                credential_rejected,
-            ))
-        })?;
-
-    Ok(ReceivedResponse {
-        status,
-        content_type,
-        idempotency_key,
-        location,
-        retry_after,
-        body,
+    http_util::buffer_api_response(response, |reason, rejected| {
+        OrganizationError::protocol(operation, reason, rejected)
     })
+    .await
 }
 
 fn decode_create_response(
@@ -1078,12 +1018,7 @@ fn require_response_idempotency_key(
     response: &ReceivedResponse,
     expected: &str,
 ) -> Result<(), OrganizationError> {
-    if response
-        .idempotency_key
-        .as_ref()
-        .and_then(|value| value.to_str().ok())
-        == Some(expected)
-    {
+    if http_util::header_matches(response.idempotency_key.as_ref(), expected) {
         Ok(())
     } else {
         Err(OrganizationError::protocol(
@@ -1099,12 +1034,7 @@ fn require_create_location(
     organization_id: &str,
 ) -> Result<(), OrganizationError> {
     let expected = format!("/v1/organizations/{organization_id}");
-    if response
-        .location
-        .as_ref()
-        .and_then(|value| value.to_str().ok())
-        == Some(expected.as_str())
-    {
+    if http_util::header_matches(response.location.as_ref(), &expected) {
         Ok(())
     } else {
         Err(OrganizationError::protocol(
@@ -1138,16 +1068,8 @@ fn require_problem(
     expected_type: &'static str,
     credential_rejected: bool,
 ) -> Result<(), OrganizationError> {
-    let actual = decode_problem_type(operation, response, credential_rejected)?;
-    if actual == expected_type {
-        Ok(())
-    } else {
-        Err(OrganizationError::protocol(
-            operation,
-            "the problem type is not valid for its HTTP status",
-            credential_rejected,
-        ))
-    }
+    problem::require_type(response, expected_type)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, credential_rejected))
 }
 
 fn decode_problem_type(
@@ -1155,10 +1077,8 @@ fn decode_problem_type(
     response: &ReceivedResponse,
     credential_rejected: bool,
 ) -> Result<String, OrganizationError> {
-    require_media_type(operation, response, PROBLEM_MEDIA_TYPE, credential_rejected)?;
-    let decoded = problem::decode(&response.body, response.status)
-        .map_err(|reason| OrganizationError::protocol(operation, reason, credential_rejected))?;
-    Ok(decoded.r#type)
+    problem::decode_type(response)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, credential_rejected))
 }
 
 fn require_media_type(
@@ -1167,15 +1087,8 @@ fn require_media_type(
     expected: &'static str,
     credential_rejected: bool,
 ) -> Result<(), OrganizationError> {
-    if response.content_type.as_deref() == Some(expected) {
-        Ok(())
-    } else {
-        Err(OrganizationError::protocol(
-            operation,
-            "the response Content-Type is not valid for its HTTP status",
-            credential_rejected,
-        ))
-    }
+    http_util::require_media_type(response.content_type.as_deref(), expected)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, credential_rejected))
 }
 
 #[cfg(test)]

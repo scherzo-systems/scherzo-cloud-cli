@@ -1,8 +1,11 @@
+mod identities;
 mod login;
 mod logout;
 mod status;
 
 use clap::{Args, Subcommand};
+
+use crate::human_auth::deployment::Deployment;
 
 pub(super) const ABOUT: &str = "Manage your Scherzo Cloud sign-in";
 const NAME: &str = "auth";
@@ -21,19 +24,30 @@ enum AuthCommand {
     Status(status::Command),
     #[command(about = logout::ABOUT)]
     Logout(logout::Command),
+    #[command(about = identities::ABOUT)]
+    Identities(identities::Command),
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
-        super::execute_deployment_command(
-            self.command,
-            &[NAME],
-            "configure Scherzo Cloud sign-in",
-            |command, deployment| match command {
-                AuthCommand::Login(command) => command.execute(deployment),
-                AuthCommand::Status(command) => command.execute(deployment),
-                AuthCommand::Logout(command) => command.execute(deployment),
-            },
-        )
+        match self.command {
+            None => super::print_help(&[NAME]),
+            Some(AuthCommand::Login(command)) => execute_leaf(command, login::Command::execute),
+            Some(AuthCommand::Status(command)) => execute_leaf(command, status::Command::execute),
+            Some(AuthCommand::Logout(command)) => execute_leaf(command, logout::Command::execute),
+            Some(AuthCommand::Identities(command)) => command.execute(),
+        }
     }
+}
+
+fn execute_leaf<T>(
+    command: T,
+    execute: impl FnOnce(T, &Deployment) -> super::CommandResult,
+) -> super::CommandResult {
+    super::execute_deployment_command(
+        Some(command),
+        &[NAME],
+        "configure Scherzo Cloud sign-in",
+        execute,
+    )
 }

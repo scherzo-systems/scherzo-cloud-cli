@@ -165,10 +165,11 @@ The current release supports:
   concurrency, recovery, finalizers, imports, exports, durable status, retry, and
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
-- OAuth device login, renewable human sessions, logout, account signup, organization
-  discovery and profile management, one-page member-directory reads, actor-bound GitHub App
-  setup, installation and repository discovery, complete project and repository configuration,
-  and inputless Cloud run creation and inspection;
+- OAuth device login, renewable human sessions, linked sign-in identity management,
+  logout, account signup, organization discovery and profile management, one-page
+  member-directory reads, actor-bound GitHub App setup, installation and repository
+  discovery, complete project and repository configuration, and inputless Cloud run
+  creation and inspection;
 - runner and runner-pool administration plus prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
@@ -546,6 +547,50 @@ results preserve any server actions as complete opaque JSON values. The CLI does
 validate action IDs or guide origins, fetch guides, infer commands, or execute actions.
 Status always contacts the public API, including when no local credential exists.
 
+Manage the OIDC identities linked to the signed-in account under `auth identities`:
+
+```sh
+# List one page; the current local-session identity is marked when that page contains it.
+scherzo-cloud auth identities list --limit 50
+
+# Continue when the result includes a next cursor.
+scherzo-cloud auth identities list --limit 50 --cursor "$NEXT_CURSOR"
+
+# Prove control of another identity in a fresh browser/device flow and link it.
+scherzo-cloud auth identities link
+
+# Remove a non-current identity by the opaque ID returned by list.
+scherzo-cloud auth identities remove idn_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+`auth identities link` keeps the session that passed preflight as the acting identity
+and uses a separately issued access token only as the proposed identity proof. It
+requests fresh browser/device authorization without `offline_access` and never writes
+the proof to the credential store. The final request stays bound to the preflight
+session; if that credential is rejected after another local sign-in replaces it, the
+command stops instead of retargeting the proof. Standard rejected-credential cleanup
+can remove an invalid acting session, and the JSON terminal event then reports
+`localSessionIdentity` as `removed` rather than `unchanged`. The deployment still
+enforces the proof audience, approved issuer, identity type, and ten-minute issuance
+window. An identity already linked to any account produces the same
+identity-unavailable result; linking never merges accounts.
+
+Identity removal uses the current local session and never starts a weaker proof path.
+The deployment requires that session's access token to have been issued within ten
+minutes and refuses to remove either its exact identity or the last usable identity. To
+remove the identity currently used on this device, first find the item marked `current`
+in `list`. Listing is oldest-first and returns one page, so follow each `nextCursor` with
+`--cursor` until the marked identity appears. Record that ID, run
+`scherzo-cloud auth login --force`, and choose a different identity already linked to
+the same account. That fresh login replaces the local session. Removing the former
+identity then leaves the replacement local session signed in and unchanged. A removal
+command never deletes or revokes the current local credential.
+
+Identity list and remove use one schema-version-1 JSON document with `--json`. Linking
+uses newline-delimited schema-version-1 activation and terminal-result events because it
+waits for browser authorization. Listing returns exactly one page and preserves
+`nextCursor`; `--limit` accepts 1 through 200.
+
 One successful login establishes a renewable human session. The CLI stores the one-hour
 access token, its expiration, and a rotating refresh token in
 `~/.scherzo/credentials.json`, then silently renews access for every human-authenticated
@@ -558,8 +603,9 @@ unconfirmed server revocation; local removal still completes when Auth0 is unrea
 The human store remains separate from workflow-run state and all runner credentials.
 
 Development deployments that use HTTP require `--allow-insecure-http` on each networked
-leaf command. This includes authentication, account, organization, GitHub connection,
-project, Cloud run, and runner administration commands; the option is not global.
+leaf command. This includes authentication and linked identity management, account,
+organization, GitHub connection, project, Cloud run, and runner administration commands;
+the option is not global.
 
 ## Account signup
 

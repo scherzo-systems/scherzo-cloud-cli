@@ -95,14 +95,20 @@ impl TryFrom<models::Organization> for Organization {
     type Error = &'static str;
 
     fn try_from(value: models::Organization) -> Result<Self, Self::Error> {
-        require_nonempty(&value.id, "the organization ID is empty")?;
-        require_nonempty(
+        super::super::http_util::require_nonempty(&value.id, "the organization ID is empty")?;
+        super::super::http_util::require_nonempty(
             &value.display_name,
             "the organization display name is empty",
         )?;
-        require_nonempty(&value.slug, "the organization slug is empty")?;
-        require_nonempty(&value.created_at, "the organization creation time is empty")?;
-        require_nonempty(&value.updated_at, "the organization update time is empty")?;
+        super::super::http_util::require_nonempty(&value.slug, "the organization slug is empty")?;
+        super::super::http_util::require_nonempty(
+            &value.created_at,
+            "the organization creation time is empty",
+        )?;
+        super::super::http_util::require_nonempty(
+            &value.updated_at,
+            "the organization update time is empty",
+        )?;
 
         Ok(Self {
             id: value.id,
@@ -232,8 +238,11 @@ impl TryFrom<models::OrganizationMembershipDirectoryEntry>
     type Error = &'static str;
 
     fn try_from(value: models::OrganizationMembershipDirectoryEntry) -> Result<Self, Self::Error> {
-        require_nonempty(&value.id, "the organization membership ID is empty")?;
-        require_nonempty(
+        super::super::http_util::require_nonempty(
+            &value.id,
+            "the organization membership ID is empty",
+        )?;
+        super::super::http_util::require_nonempty(
             &value.principal_id,
             "the organization membership principal ID is empty",
         )?;
@@ -262,14 +271,6 @@ impl TryFrom<models::OrganizationMembershipDirectoryEntry>
                 }
             },
         })
-    }
-}
-
-fn require_nonempty(value: &str, reason: &'static str) -> Result<(), &'static str> {
-    if value.is_empty() {
-        Err(reason)
-    } else {
-        Ok(())
     }
 }
 

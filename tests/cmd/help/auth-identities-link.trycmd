@@ -1,0 +1,12 @@
+```console
+$ scherzo-cloud auth identities link --help
+Link another sign-in identity
+
+Usage: scherzo-cloud auth identities link [OPTIONS]
+
+Options:
+      --json                 Emit newline-delimited JSON events
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

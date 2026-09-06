@@ -403,13 +403,9 @@ fn write_current_membership_failure(
         ),
     };
     if json {
-        write_json(&super::super::CloudFailureResult {
-            schema_version: 1,
-            deployment,
-            outcome,
-            category,
-            retry_after: None,
-        })?;
+        write_json(&super::super::ApiFailureResult::new(
+            deployment, outcome, category,
+        ))?;
     } else {
         writeln!(io::stderr().lock(), "{human}")?;
     }
@@ -426,13 +422,12 @@ fn write_failure(
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     if json {
-        write_json(&super::super::CloudFailureResult {
-            schema_version: 1,
+        write_json(&super::super::ApiFailureResult::with_retry_after(
             deployment,
             outcome,
             category,
             retry_after,
-        })?;
+        ))?;
     } else {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
@@ -442,11 +437,7 @@ fn write_failure(
 }
 
 fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, value)
-        .context("serialize JSON organization result")?;
-    writeln!(stdout).context("write organization result")
+    super::super::write_pretty_json(value).context("write JSON organization result")
 }
 
 const fn organization_state(state: OrganizationState) -> &'static str {

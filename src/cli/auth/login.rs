@@ -1,11 +1,10 @@
 use std::io::{self, Write};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use crate::api::{HttpClient, UnreachableCategory};
 use crate::exit_code::OutcomeClass;
@@ -13,14 +12,14 @@ use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::credentials::CredentialStore;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::device_authorization::{
-    self, AuthorizationError, DeviceAuthorization, IssuedToken, TokenPoll,
+    AuthorizationError, DeviceAuthorization, IssuedToken,
 };
+use crate::human_auth::device_flow::{self, DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus, StatusError};
 
 use super::status::{StatusResult, write_human_status};
 
 pub(super) const ABOUT: &str = "Sign in to Scherzo Cloud";
-const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -39,36 +38,11 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("start sign-in runtime")?;
-        let cancellation = Cancellation::new();
-        let operation_cancellation = cancellation.clone();
         let deployment = deployment.clone();
-        let result = runtime.block_on(async move {
-            let mut signals = super::super::ProcessSignals::install("sign-in")?;
-            let mut running =
-                tokio::task::spawn_blocking(move || self.run(&deployment, &operation_cancellation));
-            tokio::select! {
-                biased;
-                signal = signals.recv() => {
-                    cancellation.cancel();
-                    running
-                        .await
-                        .context("complete cancelled sign-in operation")?
-                        .map(|outcome| match outcome {
-                            OutcomeClass::Interrupted => signal,
-                            outcome => outcome.exit_code(),
-                        })
-                }
-                result = &mut running => result
-                    .context("complete sign-in operation")?
-                    .map(OutcomeClass::exit_code),
-            }
-        });
-        runtime.shutdown_timeout(Duration::ZERO);
-        result
+        super::super::execute_cancellable_with_signals("sign-in", move |cancellation| {
+            self.run(&deployment, cancellation)
+                .map(OutcomeClass::exit_code)
+        })
     }
     // jscpd:ignore-end
 
@@ -126,156 +100,60 @@ impl Command {
             }
         }
 
-        if cancellation.is_cancelled() {
-            output.cancelled(deployment)?;
-            return Ok(OutcomeClass::Interrupted);
-        }
-
-        let authorization = match device_authorization::authorize(&client, deployment) {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                if cancellation.is_cancelled() {
-                    output.cancelled(deployment)?;
-                    return Ok(OutcomeClass::Interrupted);
-                }
-                return handle_authorization_error(
-                    &mut output,
+        let flow = device_flow::session(
+            &client,
+            deployment,
+            cancellation,
+            |authorization, expires_at| output.activation(deployment, authorization, expires_at),
+        );
+        match flow {
+            Ok(DeviceFlowOutcome::Issued(token)) => finish_login(
+                &mut output,
+                &client,
+                deployment,
+                &store,
+                cancellation,
+                token,
+            ),
+            Ok(DeviceFlowOutcome::Denied) => {
+                output.failed(
                     deployment,
-                    Phase::DeviceAuthorization,
-                    error,
-                );
+                    FailureOutcome::Denied,
+                    Phase::TokenPolling,
+                    None,
+                )?;
+                Ok(OutcomeClass::GeneralFailure)
             }
-        };
-        if cancellation.is_cancelled() {
-            output.cancelled(deployment)?;
-            return Ok(OutcomeClass::Interrupted);
-        }
-        let Some(mut schedule) = PollSchedule::new(
-            crate::timing::monotonic_now(),
-            authorization.interval(),
-            authorization.expires_in(),
-        ) else {
-            return handle_protocol_error(
-                &mut output,
-                deployment,
-                Phase::DeviceAuthorization,
-                anyhow!("the device-authorization expiration is out of range"),
-            );
-        };
-        let Some(activation_expires_at) = expiration_after(authorization.expires_in()) else {
-            return handle_protocol_error(
-                &mut output,
-                deployment,
-                Phase::DeviceAuthorization,
-                anyhow!("the device-authorization expiration is out of range"),
-            );
-        };
-        output.activation(deployment, &authorization, activation_expires_at)?;
-
-        loop {
-            if cancellation.is_cancelled() {
-                output.cancelled(deployment)?;
-                return Ok(OutcomeClass::Interrupted);
-            }
-            let Some(wait) = schedule.next_wait(crate::timing::monotonic_now()) else {
+            Ok(DeviceFlowOutcome::Expired) => {
                 output.failed(
                     deployment,
                     FailureOutcome::Expired,
                     Phase::TokenPolling,
                     None,
                 )?;
-                return Ok(OutcomeClass::GeneralFailure);
-            };
-            if cancellation.wait(wait) {
+                Ok(OutcomeClass::GeneralFailure)
+            }
+            Ok(DeviceFlowOutcome::Cancelled) => {
                 output.cancelled(deployment)?;
-                return Ok(OutcomeClass::Interrupted);
+                Ok(OutcomeClass::Interrupted)
             }
-            if let Some(completion) =
-                polling_interruption(&mut output, deployment, cancellation, &schedule)?
-            {
-                return Ok(completion);
+            Err(DeviceFlowError::Authorization { phase, error }) => {
+                if cancellation.is_cancelled() {
+                    output.cancelled(deployment)?;
+                    Ok(OutcomeClass::Interrupted)
+                } else {
+                    handle_authorization_error(&mut output, deployment, phase.into(), error)
+                }
             }
-
-            let poll = match device_authorization::poll_token(
-                &client,
+            Err(DeviceFlowError::ExpirationOutOfRange) => handle_protocol_error(
+                &mut output,
                 deployment,
-                authorization.device_code(),
-            ) {
-                Ok(poll) => poll,
-                Err(error) => {
-                    if cancellation.is_cancelled() {
-                        output.cancelled(deployment)?;
-                        return Ok(OutcomeClass::Interrupted);
-                    }
-                    return handle_authorization_error(
-                        &mut output,
-                        deployment,
-                        Phase::TokenPolling,
-                        error,
-                    );
-                }
-            };
-            if let Some(completion) =
-                polling_interruption(&mut output, deployment, cancellation, &schedule)?
-            {
-                return Ok(completion);
-            }
-            match poll {
-                TokenPoll::Pending => {}
-                TokenPoll::SlowDown => schedule.slow_down(),
-                TokenPoll::Denied => {
-                    output.failed(
-                        deployment,
-                        FailureOutcome::Denied,
-                        Phase::TokenPolling,
-                        None,
-                    )?;
-                    return Ok(OutcomeClass::GeneralFailure);
-                }
-                TokenPoll::Expired => {
-                    output.failed(
-                        deployment,
-                        FailureOutcome::Expired,
-                        Phase::TokenPolling,
-                        None,
-                    )?;
-                    return Ok(OutcomeClass::GeneralFailure);
-                }
-                TokenPoll::Issued(token) => {
-                    return finish_login(
-                        &mut output,
-                        &client,
-                        deployment,
-                        &store,
-                        cancellation,
-                        token,
-                    );
-                }
-            }
+                Phase::DeviceAuthorization,
+                anyhow!("the device-authorization expiration is out of range"),
+            ),
+            Err(DeviceFlowError::ActivationOutput(error)) => Err(error.into()),
         }
     }
-}
-
-fn polling_interruption(
-    output: &mut LoginOutput,
-    deployment: &Deployment,
-    cancellation: &Cancellation,
-    schedule: &PollSchedule,
-) -> LoginResult<Option<OutcomeClass>> {
-    if cancellation.is_cancelled() {
-        output.cancelled(deployment)?;
-        return Ok(Some(OutcomeClass::Interrupted));
-    }
-    if schedule.expired(crate::timing::monotonic_now()) {
-        output.failed(
-            deployment,
-            FailureOutcome::Expired,
-            Phase::TokenPolling,
-            None,
-        )?;
-        return Ok(Some(OutcomeClass::GeneralFailure));
-    }
-    Ok(None)
 }
 
 fn finish_login(
@@ -417,36 +295,6 @@ fn handle_authorization_error(
 
 type LoginResult<T> = Result<T, super::super::CommandFailure>;
 
-struct PollSchedule {
-    interval: Duration,
-    deadline: Instant,
-}
-
-impl PollSchedule {
-    fn new(started_at: Instant, interval: Duration, lifetime: Duration) -> Option<Self> {
-        Some(Self {
-            interval,
-            deadline: started_at.checked_add(lifetime)?,
-        })
-    }
-
-    fn next_wait(&self, now: Instant) -> Option<Duration> {
-        let remaining = self.deadline.checked_duration_since(now)?;
-        (!remaining.is_zero()).then_some(self.interval.min(remaining))
-    }
-
-    fn expired(&self, now: Instant) -> bool {
-        now >= self.deadline
-    }
-
-    fn slow_down(&mut self) {
-        self.interval = self
-            .interval
-            .checked_add(SLOW_DOWN_INCREMENT)
-            .unwrap_or(Duration::MAX);
-    }
-}
-
 fn expiration_after(duration: Duration) -> Option<OffsetDateTime> {
     let seconds = i64::try_from(duration.as_secs()).ok()?;
     crate::timing::utc_now().checked_add(time::Duration::seconds(seconds))
@@ -477,6 +325,15 @@ enum Phase {
     DeviceAuthorization,
     TokenPolling,
     PrincipalConfirmation,
+}
+
+impl From<DeviceFlowPhase> for Phase {
+    fn from(value: DeviceFlowPhase) -> Self {
+        match value {
+            DeviceFlowPhase::DeviceAuthorization => Self::DeviceAuthorization,
+            DeviceFlowPhase::TokenPolling => Self::TokenPolling,
+        }
+    }
 }
 
 impl Phase {
@@ -523,26 +380,15 @@ impl LoginOutput {
         expires_at: OffsetDateTime,
     ) -> anyhow::Result<()> {
         if self.json {
-            let expires_at = expires_at
-                .format(&Rfc3339)
+            let event = device_flow::activation_event(deployment, authorization, expires_at, None)
                 .context("format sign-in expiration")?;
-            self.json_line(&ActivationEvent {
-                schema_version: 1,
-                event: "activation_required",
-                deployment: deployment.fingerprint().api_url(),
-                verification_uri: authorization.verification_uri(),
-                verification_uri_complete: authorization.verification_uri_complete(),
-                user_code: authorization.user_code(),
-                expires_at: &expires_at,
-            })
+            self.json_line(&event)
         } else {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            let activation_uri = authorization
-                .verification_uri_complete()
-                .unwrap_or_else(|| authorization.verification_uri());
             writeln!(stdout, "Sign in to Scherzo Cloud\n").context("write sign-in output")?;
-            writeln!(stdout, "  Open: {activation_uri}").context("write sign-in output")?;
+            writeln!(stdout, "  Open: {}", authorization.activation_uri())
+                .context("write sign-in output")?;
             writeln!(stdout, "  Code: {}", authorization.user_code())
                 .context("write sign-in output")?;
             writeln!(stdout, "\nWaiting for authorization...\n").context("write sign-in output")?;
@@ -625,19 +471,6 @@ impl LoginOutput {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ActivationEvent<'a> {
-    schema_version: u8,
-    event: &'static str,
-    deployment: &'a str,
-    verification_uri: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verification_uri_complete: Option<&'a str>,
-    user_code: &'a str,
-    expires_at: &'a str,
-}
-
-#[derive(Serialize)]
 struct StatusEvent<'a> {
     #[serde(rename = "schemaVersion")]
     schema_version: u8,
@@ -663,29 +496,4 @@ struct CancelledEvent<'a> {
     schema_version: u8,
     event: &'static str,
     deployment: &'a str,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn poll_schedule_honors_interval_and_slow_down() {
-        let start = crate::timing::monotonic_now();
-        let mut schedule =
-            PollSchedule::new(start, Duration::from_secs(2), Duration::from_secs(30)).unwrap();
-
-        assert_eq!(schedule.next_wait(start), Some(Duration::from_secs(2)));
-        schedule.slow_down();
-        assert_eq!(schedule.next_wait(start), Some(Duration::from_secs(7)));
-        assert_eq!(
-            schedule.next_wait(start + Duration::from_secs(29)),
-            Some(Duration::from_secs(1))
-        );
-        assert!(
-            schedule
-                .next_wait(start + Duration::from_secs(30))
-                .is_none()
-        );
-    }
 }

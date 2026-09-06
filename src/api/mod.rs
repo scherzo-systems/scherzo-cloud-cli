@@ -6,6 +6,7 @@ mod github;
 mod http_client;
 pub(crate) mod http_util;
 mod human_principal;
+mod identities;
 mod organizations;
 mod problem;
 mod projects;
@@ -58,6 +59,10 @@ pub(crate) use github::{
 };
 pub(crate) use http_client::{HttpClient, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
+pub(crate) use identities::{
+    CommonIdentityFailure, IdentityApiError, LinkIdentityOutcome, ListIdentitiesOutcome,
+    OidcIdentity, RemoveIdentityOutcome, link_identity, list_identities, remove_identity,
+};
 pub(crate) use organizations::{
     CommonOrganizationFailure, CreateOrganizationOutcome, CurrentPrincipalMembership,
     GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,

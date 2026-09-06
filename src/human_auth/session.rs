@@ -21,6 +21,35 @@ pub(crate) enum RequiredOperation<T, E> {
     Unauthenticated,
 }
 
+pub(crate) struct SessionBinding {
+    credential: StoredCredential,
+}
+
+pub(crate) enum RequiredOperationWithBinding<T, E> {
+    Completed {
+        result: Result<T, E>,
+        binding: SessionBinding,
+    },
+    Unauthenticated,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LocalCredentialState {
+    Retained,
+    Removed,
+}
+
+pub(crate) enum BoundRequiredOperation<T, E> {
+    Completed {
+        result: Result<T, E>,
+        credential_state: LocalCredentialState,
+    },
+    Unauthenticated {
+        credential_state: LocalCredentialState,
+    },
+    ActingSessionChanged,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RevocationState {
     Confirmed,
@@ -74,29 +103,110 @@ pub(crate) fn execute_optional<T, E>(
 pub(crate) fn execute_required<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
-    mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
+    operation: impl FnMut(&SecretToken) -> Result<T, E>,
     credential_rejected: impl Fn(&Result<T, E>) -> bool,
 ) -> Result<RequiredOperation<T, E>, SessionError> {
+    match execute_required_with_binding(client, deployment, operation, credential_rejected)? {
+        RequiredOperationWithBinding::Completed { result, .. } => {
+            Ok(RequiredOperation::Completed(result))
+        }
+        RequiredOperationWithBinding::Unauthenticated => Ok(RequiredOperation::Unauthenticated),
+    }
+}
+
+pub(crate) fn execute_required_with_binding<T, E>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
+    credential_rejected: impl Fn(&Result<T, E>) -> bool,
+) -> Result<RequiredOperationWithBinding<T, E>, SessionError> {
     let store = CredentialStore::from_environment().map_err(SessionError::CredentialStore)?;
     let Some(credential) = credential_for_use(&store, client, deployment)? else {
-        return Ok(RequiredOperation::Unauthenticated);
+        return Ok(RequiredOperationWithBinding::Unauthenticated);
     };
 
     let first = operation(credential.access_token());
     if !credential_rejected(&first) {
-        return Ok(RequiredOperation::Completed(first));
+        return Ok(RequiredOperationWithBinding::Completed {
+            result: first,
+            binding: SessionBinding { credential },
+        });
     }
 
     let Some(credential) =
         refresh_after_rejection(&store, client, deployment, credential.access_token())?
     else {
-        return Ok(RequiredOperation::Unauthenticated);
+        return Ok(RequiredOperationWithBinding::Unauthenticated);
     };
     let second = operation(credential.access_token());
     if credential_rejected(&second) {
         remove_rejected_credential(&store, deployment, credential.access_token())?;
     }
-    Ok(RequiredOperation::Completed(second))
+    Ok(RequiredOperationWithBinding::Completed {
+        result: second,
+        binding: SessionBinding { credential },
+    })
+}
+
+pub(crate) fn execute_bound_required<T, E>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    binding: &SessionBinding,
+    mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
+    credential_rejected: impl Fn(&Result<T, E>) -> bool,
+) -> Result<BoundRequiredOperation<T, E>, SessionError> {
+    let first = operation(binding.credential.access_token());
+    if !credential_rejected(&first) {
+        return Ok(BoundRequiredOperation::Completed {
+            result: first,
+            credential_state: LocalCredentialState::Retained,
+        });
+    }
+
+    let store = CredentialStore::from_environment().map_err(SessionError::CredentialStore)?;
+    let _authority = store
+        .refresh_authority(deployment.fingerprint())
+        .map_err(SessionError::CredentialStore)?;
+    let Some(current) = store
+        .selected(deployment.fingerprint())
+        .map_err(SessionError::CredentialStore)?
+    else {
+        return Ok(BoundRequiredOperation::ActingSessionChanged);
+    };
+    if current.refresh_token().expose() != binding.credential.refresh_token().expose() {
+        return Ok(BoundRequiredOperation::ActingSessionChanged);
+    }
+
+    let Some(credential) = coordinated_refresh_under_authority(
+        &store,
+        client,
+        deployment,
+        RefreshReason::Rejected(binding.credential.access_token()),
+    )?
+    else {
+        return Ok(BoundRequiredOperation::Unauthenticated {
+            credential_state: LocalCredentialState::Removed,
+        });
+    };
+    let second = operation(credential.access_token());
+    let credential_state = if credential_rejected(&second) {
+        let removed = store
+            .remove_if_access_token_matches_under_authority(
+                deployment.fingerprint(),
+                credential.access_token(),
+            )
+            .map_err(SessionError::CredentialStore)?;
+        if !removed {
+            return Ok(BoundRequiredOperation::ActingSessionChanged);
+        }
+        LocalCredentialState::Removed
+    } else {
+        LocalCredentialState::Retained
+    };
+    Ok(BoundRequiredOperation::Completed {
+        result: second,
+        credential_state,
+    })
 }
 
 pub(crate) fn logout(
@@ -173,6 +283,15 @@ fn coordinated_refresh(
     let _authority = store
         .refresh_authority(deployment.fingerprint())
         .map_err(SessionError::CredentialStore)?;
+    coordinated_refresh_under_authority(store, client, deployment, reason)
+}
+
+fn coordinated_refresh_under_authority(
+    store: &CredentialStore,
+    client: &HttpClient,
+    deployment: &Deployment,
+    reason: RefreshReason<'_>,
+) -> Result<Option<StoredCredential>, SessionError> {
     let Some(current) = store
         .selected(deployment.fingerprint())
         .map_err(SessionError::CredentialStore)?

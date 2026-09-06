@@ -390,13 +390,12 @@ fn write_failure(
         _ => None,
     };
     if json {
-        write_json(&super::super::CloudFailureResult {
-            schema_version: 1,
+        write_json(&super::super::ApiFailureResult::with_retry_after(
             deployment,
             outcome,
             category,
             retry_after,
-        })?;
+        ))?;
     } else {
         writeln!(io::stderr().lock(), "{human}")?;
     }
