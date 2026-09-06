@@ -253,15 +253,19 @@ struct RealPiFixture {
 
 impl RealPiFixture {
     fn new(value_mode: AgentValueMode, retry: bool, hold_settlement: bool) -> Option<Self> {
-        Self::new_with_options(value_mode, retry, hold_settlement, false, 600_000)
+        Self::new_with_options(value_mode, retry, hold_settlement, false, 600_000, false)
     }
 
     fn with_immediate_retry(value_mode: AgentValueMode) -> Option<Self> {
-        Self::new_with_options(value_mode, true, false, false, 0)
+        Self::new_with_options(value_mode, true, false, false, 0, false)
     }
 
     fn with_threshold_compaction(value_mode: AgentValueMode) -> Option<Self> {
-        Self::new_with_options(value_mode, false, false, true, 600_000)
+        Self::new_with_options(value_mode, false, false, true, 600_000, false)
+    }
+
+    fn with_bash_only_tools(value_mode: AgentValueMode) -> Option<Self> {
+        Self::new_with_options(value_mode, false, false, false, 600_000, true)
     }
 
     fn new_with_options(
@@ -270,6 +274,7 @@ impl RealPiFixture {
         hold_settlement: bool,
         force_compaction: bool,
         retry_base_delay_ms: u64,
+        bash_only_tools: bool,
     ) -> Option<Self> {
         let executable = conformance_executable()?;
         let temporary = tempfile::tempdir().unwrap();
@@ -300,7 +305,12 @@ impl RealPiFixture {
         }
         fs::set_permissions(&result_endpoint, fs::Permissions::from_mode(0o700)).unwrap();
 
-        materialize_project(&project_directory, retry, retry_base_delay_ms);
+        materialize_project(
+            &project_directory,
+            retry,
+            retry_base_delay_ms,
+            bash_only_tools,
+        );
         let mut settings = json!({"defaultProjectTrust": "ask"});
         if force_compaction {
             settings["compaction"] = json!({"keepRecentTokens": 100});
@@ -362,6 +372,12 @@ impl RealPiFixture {
         if hold_settlement {
             environment.insert(
                 OsString::from("SCHERZO_PI_FAKE_HOLD_SETTLEMENT"),
+                OsString::from("1"),
+            );
+        }
+        if bash_only_tools {
+            environment.insert(
+                OsString::from("SCHERZO_PI_FAKE_BASH_ONLY_TOOLS"),
                 OsString::from("1"),
             );
         }
@@ -485,7 +501,7 @@ impl RealPiFixture {
         self.assert_retained_diagnostic_state();
         assert!(
             self.native_sessions().is_empty(),
-            "Pi 0.84 must not synthesize a session file before an assistant message completes"
+            "Pi must not synthesize a session file before an assistant message completes"
         );
     }
 
@@ -543,7 +559,12 @@ impl RealPiFixture {
     }
 }
 
-fn materialize_project(project: &Path, retry: bool, retry_base_delay_ms: u64) {
+fn materialize_project(
+    project: &Path,
+    retry: bool,
+    retry_base_delay_ms: u64,
+    bash_only_tools: bool,
+) {
     fs::create_dir_all(project.join(".pi/extensions")).unwrap();
     fs::create_dir_all(project.join(".pi/prompts")).unwrap();
     fs::create_dir_all(project.join(".pi/skills/pi-resource-skill")).unwrap();
@@ -600,18 +621,21 @@ fn materialize_project(project: &Path, retry: bool, retry_base_delay_ms: u64) {
         ),
     )
     .unwrap();
+    let mut settings = json!({
+        "extensions": ["../settings-proof.ts"],
+        "skills": ["skills/pi-resource-skill/SKILL.md"],
+        "retry": {
+            "enabled": retry,
+            "maxRetries": 3,
+            "baseDelayMs": retry_base_delay_ms
+        }
+    });
+    if bash_only_tools {
+        settings["defaultTools"] = json!(["bash"]);
+    }
     fs::write(
         project.join(".pi/settings.json"),
-        serde_json::to_vec_pretty(&json!({
-            "extensions": ["../settings-proof.ts"],
-            "skills": ["skills/pi-resource-skill/SKILL.md"],
-            "retry": {
-                "enabled": retry,
-                "maxRetries": 3,
-                "baseDelayMs": retry_base_delay_ms
-            }
-        }))
-        .unwrap(),
+        serde_json::to_vec_pretty(&settings).unwrap(),
     )
     .unwrap();
 }
@@ -1092,6 +1116,69 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
     })
     .await
     .expect("pinned real-Pi launch conformance watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_pi_02_bash_only_skills_and_tool_cwd_conform() {
+    let _executable = require_conformance_executable();
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let fixture = RealPiFixture::with_bash_only_tools(AgentValueMode::None).unwrap();
+        let mut running = RunningRealPi::launch(fixture);
+        let startup = running.release_startup().await;
+        assert_eq!(startup["projectTrusted"], true);
+
+        let model_request = running.fixture.controller.next("model").await;
+        assert_eq!(tool_names(&model_request.value), BTreeSet::from(["bash"]));
+        let system_prompt = model_request.value["systemPrompt"].as_str().unwrap();
+        for skill in ["pi-resource-skill", "agents-resource-skill"] {
+            assert!(system_prompt.contains(skill), "missing skill {skill}");
+        }
+        model_request.release(json!({
+            "kind": "toolCalls",
+            "calls": [{
+                "id": "call-cwd",
+                "name": "bash",
+                "arguments": {"command": "pwd"}
+            }]
+        }));
+        running.await_started().await;
+
+        let final_request = running.fixture.controller.next("model").await;
+        let expected_cwd = fs::canonicalize(&running.fixture.project_directory).unwrap();
+        let expected_cwd = expected_cwd.to_str().unwrap();
+        let cwd_result = final_request.value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "toolResult" && message["toolCallId"] == "call-cwd")
+            .unwrap();
+        assert!(
+            serde_json::to_string(cwd_result)
+                .unwrap()
+                .contains(expected_cwd),
+            "bash did not execute in the invocation cwd"
+        );
+        final_request.release(json!({
+            "kind": "text",
+            "blocks": ["cwd verified"],
+            "stopReason": "stop"
+        }));
+
+        let (fixture, outcome) = running.finish().await;
+        assert_eq!(
+            outcome,
+            AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+        );
+        fixture.assert_configuration_unchanged();
+        fixture.controller.shutdown().await;
+    })
+    .await
+    .expect("pinned real-Pi bash-only conformance watchdog expired");
 }
 
 #[expect(

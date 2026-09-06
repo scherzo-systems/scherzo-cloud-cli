@@ -98,7 +98,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
     let executable = std::env::current_exe().unwrap();
     let runner = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"0.84.4\n"),
+        version: output(b"0.85.0\n"),
         capabilities: output(COMPLETE_HELP.as_bytes()),
     };
 
@@ -109,7 +109,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
         installation.executable(),
         fs::canonicalize(executable).unwrap()
     );
-    assert_eq!(installation.version().as_str(), "0.84.4");
+    assert_eq!(installation.version().as_str(), "0.85.0");
     assert_eq!(installation.profile().as_str(), "PiJsonV1");
     assert_eq!(
         installation.capabilities().required(),
@@ -143,7 +143,7 @@ fn lower_bound_help_banner_remains_compatible() {
 #[test]
 fn version_range_and_capabilities_are_both_required() {
     let executable = std::env::current_exe().unwrap();
-    for unsupported in ["0.83.0", "0.84.1", "0.85.0"] {
+    for unsupported in ["0.83.0", "0.84.1", "0.86.0"] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{unsupported}\n").as_bytes()),
@@ -205,7 +205,7 @@ fn version_range_and_capabilities_are_both_required() {
     ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
-            version: output(b"0.84.4\n"),
+            version: output(b"0.85.0\n"),
             capabilities: output(COMPLETE_HELP.replace(advertisement, replacement).as_bytes()),
         };
         assert_eq!(
@@ -213,7 +213,7 @@ fn version_range_and_capabilities_are_both_required() {
             Err(PiInstallationFailure::Unsupported(
                 PiIncompatibility::Capability {
                     capability,
-                    version: "0.84.4".to_owned(),
+                    version: "0.85.0".to_owned(),
                 }
             ))
         );

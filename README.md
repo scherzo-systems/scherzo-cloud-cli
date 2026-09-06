@@ -940,8 +940,8 @@ probe and one capability-help probe. The probes clear the child environment exce
 the captured inherited `PATH`, fresh temporary Pi state and working-directory paths, and
 the required isolation controls. Retaining `PATH` lets an environment-based launcher
 resolve its interpreter without allowing another `pi` selection. It admits
-canonical stable versions in the range `>=0.84.2 <0.85.0`; the repository qualifies
-exact Pi 0.84.4. The capability probe accepts both the 0.84.2
+canonical stable versions in the range `>=0.84.2 <0.86.0`; the repository qualifies
+exact Pi 0.85.0. The capability probe accepts both the 0.84.2
 `pi [options] [@files...] [messages...]` usage line and the 0.84.3+
 `pi [options] [--] [@files...] [messages...]` line, while still requiring the JSON
 event, custom-session-directory, extension, system-prompt append, and
@@ -1035,7 +1035,7 @@ artifact or runner state while transferring or verifying it.
 Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
 operator-controlled `PATH`. Scherzo installs none of them. Each successful installation
 is validated once and retained as an immutable executable, exact-version, profile, and
-capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.85.0`, Claude Code
+capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.86.0`, Claude Code
 requires `>=2.1.234 <2.2.0`, and Codex requires capability-compatible stable
 `>=0.147.0 <0.154.0` with exact repository qualification anchor `0.153.4`. Admission and invocation never repeat a lookup or probe. A missing
 or incompatible installation leaves only that harness unavailable, so Runner Serve

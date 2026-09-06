@@ -174,7 +174,7 @@ fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
 fn conformance_executable() -> Option<PathBuf> {
     std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
-        .filter(|path| path.to_string_lossy().ends_with("-pi-0.84.4/bin/pi"))
+        .filter(|path| path.to_string_lossy().ends_with("-pi-0.85.0/bin/pi"))
 }
 
 fn report_code(output: &std::process::Output) -> String {
@@ -190,7 +190,7 @@ fn assert_invalid_runner_gateway(output: &std::process::Output) {
 
 #[test]
 fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
-    let fixture = PiFixture::new("0.84.4", COMPLETE_HELP, true);
+    let fixture = PiFixture::new("0.85.0", COMPLETE_HELP, true);
     let first_agent_directory = tempfile::tempdir().expect("first Pi agent directory");
     let second_agent_directory = tempfile::tempdir().expect("second Pi agent directory");
     let first_settings = br#"{"defaultProjectTrust":"never"}"#;
@@ -232,11 +232,11 @@ fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
     assert_eq!(reports[0], reports[1]);
     assert_eq!(reports[0]["checks"][0]["id"], PI_CHECK_ID);
     assert_eq!(reports[0]["checks"][0]["status"], "pass");
-    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.84.4");
+    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.85.0");
     assert_eq!(reports[0]["checks"][0]["details"]["profile"], "PiJsonV1");
     assert_eq!(
         reports[0]["checks"][0]["details"]["supportedRange"],
-        ">=0.84.2 <0.85.0"
+        ">=0.84.2 <0.86.0"
     );
     assert_eq!(
         reports[0]["checks"][0]["details"]["capabilities"],
@@ -293,7 +293,7 @@ fn human_doctor_reports_pi_policy_when_missing_and_unsupported() {
         assert_human_doctor_detail_matches_json(&missing_human, &missing_report, label, key);
     }
 
-    let unsupported = PiFixture::new("0.85.0", COMPLETE_HELP, true);
+    let unsupported = PiFixture::new("0.86.0", COMPLETE_HELP, true);
     let unsupported_human = pi_doctor_human(unsupported.path_directory(), &[]);
     let unsupported_json = pi_doctor_json(unsupported.path_directory(), &[]);
     let unsupported_report: serde_json::Value =
@@ -423,7 +423,7 @@ fn doctor_reports_every_closed_installation_failure_with_exact_probe_boundaries(
             b"--version\n".as_slice(),
         ),
         (
-            "0.85.0",
+            "0.86.0",
             COMPLETE_HELP,
             "unsupported_pi_version",
             b"--version\n".as_slice(),
@@ -495,7 +495,7 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
     assert_invalid_runner_gateway(&output);
     assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
 
-    let incompatible = PiFixture::new("0.85.0", COMPLETE_HELP, true);
+    let incompatible = PiFixture::new("0.86.0", COMPLETE_HELP, true);
     let output = run_with_env(
         &serve_args,
         &[("PATH", incompatible.path_directory().to_str().unwrap())],
@@ -623,9 +623,9 @@ fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
 
     assert_eq!(reports[0], reports[1]);
     let details = &reports[0]["checks"][0]["details"];
-    assert_eq!(details["version"], "0.84.4");
+    assert_eq!(details["version"], "0.85.0");
     assert_eq!(details["profile"], "PiJsonV1");
-    assert_eq!(details["supportedRange"], ">=0.84.2 <0.85.0");
+    assert_eq!(details["supportedRange"], ">=0.84.2 <0.86.0");
     assert_eq!(details["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
         Path::new(details["executablePath"].as_str().unwrap()),

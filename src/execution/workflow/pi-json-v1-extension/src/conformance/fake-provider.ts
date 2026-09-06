@@ -8,7 +8,10 @@ import type {
   ToolCall,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createBashToolDefinition,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { createConnection } from "node:net";
 import { Type } from "typebox";
@@ -560,7 +563,7 @@ function emitTruncatedToolCall(
     delta,
     partial: snapshot(output),
   });
-  // Pi 0.84 must receive the terminal length event while this tool-call
+  // Pi must receive the terminal length event while this tool-call
   // block is still open; emitting toolcall_end would not reproduce its
   // truncated-call recovery path.
   output.stopReason = "length";
@@ -640,6 +643,10 @@ function streamFakeProvider(
 }
 
 export default function fakeProviderExtension(pi: ExtensionAPI): void {
+  // Seed the definition with a deliberately wrong cwd. Pi must supply the
+  // active invocation cwd through ExtensionContext when the tool executes.
+  pi.registerTool(createBashToolDefinition("/"));
+
   pi.registerProvider("scherzo-fake", {
     name: "Scherzo deterministic fake provider",
     baseUrl: "http://offline.invalid",
@@ -798,6 +805,9 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    if (process.env.SCHERZO_PI_FAKE_BASH_ONLY_TOOLS === "1") {
+      pi.setActiveTools(["bash"]);
+    }
     const response = await exchange(
       {
         kind: "before_agent_start",
