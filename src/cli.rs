@@ -12,6 +12,8 @@ mod workflow;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
@@ -27,6 +29,29 @@ use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
+
+#[derive(Clone, Debug)]
+struct OrganizationRef(String);
+
+impl FromStr for OrganizationRef {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if crate::public_id::valid_organization_ref(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err("must be an organization ID or lowercase organization slug".to_owned())
+        }
+    }
+}
+
+impl Deref for OrganizationRef {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 pub(crate) struct CommandFailure {
     error: anyhow::Error,

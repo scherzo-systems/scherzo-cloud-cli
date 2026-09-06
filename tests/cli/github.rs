@@ -211,7 +211,7 @@ fn installation_and_repository_lists_expose_current_provider_state() {
             "github",
             "installation",
             "list",
-            "acme/research",
+            ORGANIZATION,
             "--json",
             "--allow-insecure-http",
         ],
@@ -221,7 +221,7 @@ fn installation_and_repository_lists_expose_current_provider_state() {
     let installations_json: serde_json::Value =
         serde_json::from_slice(&installations.stdout).unwrap();
     assert_eq!(installations_json["outcome"], "listed");
-    assert_eq!(installations_json["organizationRef"], "acme/research");
+    assert_eq!(installations_json["organizationRef"], ORGANIZATION);
     assert_eq!(installations_json["items"][0]["state"], "active");
     assert_eq!(installations_json["items"][1]["state"], "disconnected");
     assert_eq!(
@@ -236,7 +236,7 @@ fn installation_and_repository_lists_expose_current_provider_state() {
             "github",
             "repository",
             "list",
-            "acme/research",
+            ORGANIZATION,
             INSTALLATION,
             "--json",
             "--allow-insecure-http",
@@ -249,7 +249,7 @@ fn installation_and_repository_lists_expose_current_provider_state() {
         serde_json::json!({
             "schemaVersion": 1,
             "deployment": server.api_url,
-            "organizationRef": "acme/research",
+            "organizationRef": ORGANIZATION,
             "outcome": "listed",
             "installation": {
                 "id": INSTALLATION,
@@ -277,11 +277,13 @@ fn installation_and_repository_lists_expose_current_provider_state() {
     assert!(repositories.stderr.is_empty());
 
     let requests = server.finish();
-    assert!(requests[0].starts_with(
-        "GET /api/v1/organizations/acme%2Fresearch/github/installations HTTP/1.1\r\n"
-    ));
+    assert!(
+        requests[0].starts_with(
+            "GET /api/v1/organizations/acme-research/github/installations HTTP/1.1\r\n"
+        )
+    );
     assert!(requests[1].starts_with(&format!(
-        "GET /api/v1/organizations/acme%2Fresearch/github/installations/{INSTALLATION}/repositories HTTP/1.1\r\n"
+        "GET /api/v1/organizations/acme-research/github/installations/{INSTALLATION}/repositories HTTP/1.1\r\n"
     )));
 }
 

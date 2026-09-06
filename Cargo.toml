@@ -61,7 +61,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 ulid = "3.0.0"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
-url = { version = "2.5.8", features = ["serde"] }
+url = "2.5.8"
 yaml-rust2 = { version = "0.11.0", default-features = false }
 zeroize = "1.9.0"
 
@@ -70,12 +70,3 @@ rustix = { version = "1.1.4", features = ["event", "pty"] }
 trycmd = "1.2.1"
 tokio = { version = "1.53.1", features = ["sync"] }
 
-# Opaque dot-only path segments are valid API inputs but do not round-trip through
-# the WHATWG URL parser. The endpoint builder uses url's internal Serde boundary
-# with unchanged structural offsets, so dependency debug builds must
-# not reject that intentionally non-round-tripping representation.
-[profile.dev.package.url]
-debug-assertions = false
-
-[profile.test.package.url]
-debug-assertions = false

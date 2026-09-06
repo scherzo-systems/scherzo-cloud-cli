@@ -15,7 +15,7 @@ pub(super) const ABOUT: &str = "Download and verify a run's Artifact Set";
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: crate::cli::OrganizationRef,
 
     #[arg(
         value_name = "RUN",

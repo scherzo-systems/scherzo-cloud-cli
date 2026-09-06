@@ -176,7 +176,8 @@ impl TryFrom<models::CurrentPrincipalMembershipEntry> for CurrentPrincipalMember
             value.organization_slug.as_deref(),
         ) {
             (true, Some(name), Some(slug))
-                if valid_bounded_text(name, 1, 200) && super::super::valid_url_safe_name(slug) => {}
+                if valid_bounded_text(name, 1, 200)
+                    && crate::public_id::valid_url_safe_name(slug) => {}
             (true, _, _) => {
                 return Err("an active membership is missing its organization profile");
             }

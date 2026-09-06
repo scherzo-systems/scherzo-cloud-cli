@@ -1,7 +1,10 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
 
-use super::{CloudOptions, Deployment, ExitCode, PaginationArgs, cloud, generate_idempotency_key};
+use super::{
+    CloudOptions, Deployment, ExitCode, OrganizationRef, PaginationArgs, cloud,
+    generate_idempotency_key,
+};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud runner pools";
 const COMMAND_PATH: &[&str] = &["runner", "pool"];
@@ -29,7 +32,7 @@ enum PoolCommand {
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(long, help = "Set the exact runner pool name")]
     name: String,
@@ -44,7 +47,7 @@ struct CreateCommand {
 #[derive(Debug, Args)]
 struct ListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[command(flatten)]
     pagination: PaginationArgs,
@@ -56,7 +59,7 @@ struct ListCommand {
 #[derive(Debug, Args)]
 struct ShowCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(value_name = "POOL", help = "Runner pool ID or exact name")]
     pool: String,
@@ -68,7 +71,7 @@ struct ShowCommand {
 #[derive(Debug, Args)]
 struct RenameCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(value_name = "POOL", help = "Runner pool ID or exact name")]
     pool: String,
@@ -84,7 +87,7 @@ struct RenameCommand {
 #[derive(Debug, Args)]
 struct DeleteCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(value_name = "POOL", help = "Runner pool ID or exact name")]
     pool: String,

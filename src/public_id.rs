@@ -12,3 +12,17 @@ pub(crate) fn valid_typed_id(value: &str, prefix: &str) -> bool {
             )
         })
 }
+
+pub(crate) fn valid_organization_ref(value: &str) -> bool {
+    valid_typed_id(value, "org_") || valid_url_safe_name(value)
+}
+
+pub(crate) fn valid_url_safe_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}

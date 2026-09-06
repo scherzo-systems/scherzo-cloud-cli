@@ -18,7 +18,7 @@ use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::idempotency::generate_idempotency_key;
 
-use super::PaginationArgs;
+use super::{OrganizationRef, PaginationArgs};
 
 pub(super) const ABOUT: &str = "Work with the Scherzo Cloud runner";
 const NAME: &str = "runner";
@@ -81,7 +81,7 @@ struct CloudOptions {
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(long, value_name = "POOL", help = "Runner pool ID or exact name")]
     pool: String,
@@ -104,7 +104,7 @@ struct CreateCommand {
 #[derive(Debug, Args)]
 struct ListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[command(flatten)]
     pagination: PaginationArgs,
@@ -116,7 +116,7 @@ struct ListCommand {
 #[derive(Debug, Args)]
 struct RegistrationTarget {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
@@ -155,7 +155,7 @@ struct MoveCommand {
 #[derive(Debug, Args)]
 struct RenameCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
@@ -525,7 +525,7 @@ enum DeletionKind {
 }
 
 struct DeletionInvocation {
-    organization: String,
+    organization: OrganizationRef,
     resource_ref: String,
     options: CloudOptions,
     kind: DeletionKind,
@@ -560,7 +560,7 @@ impl DeletionDispatchState {
 }
 
 fn execute_pool_deletion(
-    organization: String,
+    organization: OrganizationRef,
     pool: String,
     options: CloudOptions,
 ) -> super::CommandResult {

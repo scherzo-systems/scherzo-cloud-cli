@@ -257,34 +257,15 @@ fn rate_limit_requires_matching_problem_and_positive_retry_after() {
 }
 
 #[test]
-fn show_encodes_the_reference_as_one_path_segment_and_uses_one_attempt() {
+fn show_preserves_a_valid_reference_and_uses_one_attempt() {
     let server = ScriptedHttpServer::respond(success("200 OK"));
-    let outcome = get_organization(&http_client(), &server.api_url, TOKEN, "org/ Mixed Case")
+    let outcome = get_organization(&http_client(), &server.api_url, TOKEN, "acme-research")
         .expect("show should succeed");
 
     assert!(matches!(outcome, GetOrganizationOutcome::Found(_)));
     let request = server.finish_one();
-    assert!(request.starts_with("GET /api/v1/organizations/org%2F%20Mixed%20Case HTTP/1.1\r\n"));
+    assert!(request.starts_with("GET /api/v1/organizations/acme-research HTTP/1.1\r\n"));
     assert!(!request.contains("idempotency-key:"));
-}
-
-#[test]
-fn review_dot_segment_reference_is_sent_as_one_literal_segment() {
-    let server =
-        ScriptedHttpServer::respond(problem_response("400 Bad Request", 400, BAD_REQUEST, &[]));
-
-    let outcome = get_organization(&http_client(), &server.api_url, TOKEN, "..")
-        .expect("server-invalid reference should reach the organization endpoint");
-
-    assert_eq!(
-        outcome,
-        GetOrganizationOutcome::Common(CommonOrganizationFailure::InvalidInput)
-    );
-    let request = server.finish_one();
-    assert!(
-        request.starts_with("GET /api/v1/organizations/%2E%2E HTTP/1.1\r\n"),
-        "request unexpectedly reinterpreted the opaque reference: {request:?}"
-    );
 }
 
 #[test]
@@ -336,7 +317,7 @@ fn update_retries_failures_before_and_during_an_updated_response() {
             &http_client(),
             &server.api_url,
             TOKEN,
-            "acme/research",
+            "acme-research",
             KEY,
             Some("Acme Labs"),
             None,
@@ -347,9 +328,7 @@ fn update_retries_failures_before_and_during_an_updated_response() {
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
-        assert!(
-            requests[0].starts_with("PATCH /api/v1/organizations/acme%2Fresearch HTTP/1.1\r\n")
-        );
+        assert!(requests[0].starts_with("PATCH /api/v1/organizations/acme-research HTTP/1.1\r\n"));
         assert_eq!(
             header_value(&requests[0], "authorization"),
             format!("Bearer {TOKEN}")
@@ -414,7 +393,7 @@ fn membership_list_preserves_optional_query_and_decodes_models() {
         &http_client(),
         &server.api_url,
         TOKEN,
-        "acme/research",
+        "acme-research",
         Some(200),
         Some("opaque cursor"),
     )
@@ -427,7 +406,7 @@ fn membership_list_preserves_optional_query_and_decodes_models() {
     assert_eq!(page.next_cursor.as_deref(), Some("opaque cursor"));
     let request = server.finish_one();
     assert!(request.starts_with(
-        "GET /api/v1/organizations/acme%2Fresearch/memberships?limit=200&cursor=opaque+cursor HTTP/1.1\r\n"
+        "GET /api/v1/organizations/acme-research/memberships?limit=200&cursor=opaque+cursor HTTP/1.1\r\n"
     ));
 }
 

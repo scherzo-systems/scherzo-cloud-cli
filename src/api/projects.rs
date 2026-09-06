@@ -802,7 +802,7 @@ fn validate_project(project: Project) -> Result<Project, ProjectFailure> {
         .is_none_or(valid_repository_fields);
     let valid = crate::public_id::valid_typed_id(&project.id, "prj_")
         && crate::public_id::valid_typed_id(&project.organization_id, "org_")
-        && super::valid_url_safe_name(&project.name)
+        && crate::public_id::valid_url_safe_name(&project.name)
         && pool_valid
         && repository_valid
         && project.execution_readiness.blockers == expected_blockers

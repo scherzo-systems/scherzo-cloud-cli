@@ -31,16 +31,6 @@ fn bearer_authorization(access_token: &str) -> Result<HeaderValue, InvalidHeader
     HeaderValue::from_str(&value)
 }
 
-fn valid_url_safe_name(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-}
-
 #[cfg(test)]
 pub(crate) mod test_support;
 

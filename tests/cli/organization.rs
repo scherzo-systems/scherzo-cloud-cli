@@ -739,7 +739,7 @@ fn insecure_http_is_rejected_before_the_credential_is_transmitted() {
 }
 
 #[test]
-fn show_success_preserves_schema_and_encodes_one_reference_segment() {
+fn show_success_preserves_schema_and_the_valid_reference_target() {
     let (server, _directory, _path, credential_path) =
         prepared_organization(vec![organization_success("200 OK")], TOKEN);
     let environment = deployment_environment(&server.api_url, &credential_path);
@@ -748,7 +748,7 @@ fn show_success_preserves_schema_and_encodes_one_reference_segment() {
         &[
             "organization",
             "show",
-            "org/ Mixed Case",
+            "acme-research",
             "--json",
             "--allow-insecure-http",
         ],
@@ -775,7 +775,7 @@ fn show_success_preserves_schema_and_encodes_one_reference_segment() {
     assert!(output.stdout.ends_with(b"\n"));
     assert!(output.stderr.is_empty());
     let request = server.finish().pop().unwrap();
-    assert!(request.starts_with("GET /api/v1/organizations/org%2F%20Mixed%20Case HTTP/1.1\r\n"));
+    assert!(request.starts_with("GET /api/v1/organizations/acme-research HTTP/1.1\r\n"));
     assert_eq!(
         header_value(&request, "authorization"),
         format!("Bearer {TOKEN}")
@@ -1039,6 +1039,10 @@ fn private_not_found_outputs_are_identical_for_all_target_states() {
 #[test]
 fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
     for args in [
+        &["organization", "show", "."][..],
+        &["organization", "show", ".."][..],
+        &["organization", "show", "acme/research"][..],
+        &["organization", "show", "acme\\research"][..],
         &["organization", "update", "acme"][..],
         &["organization", "list", "--limit", "0"][..],
         &["organization", "list", "--limit", "201"][..],
@@ -1080,7 +1084,7 @@ fn update_accepts_each_patch_shape_and_preserves_the_request_contract() {
         let mut args = vec![
             "organization",
             "update",
-            "org/ Mixed Case",
+            "acme-research",
             "--json",
             "--allow-insecure-http",
         ];
@@ -1103,9 +1107,7 @@ fn update_accepts_each_patch_shape_and_preserves_the_request_contract() {
         assert!(output.stderr.is_empty());
 
         let request = server.finish().pop().unwrap();
-        assert!(
-            request.starts_with("PATCH /api/v1/organizations/org%2F%20Mixed%20Case HTTP/1.1\r\n")
-        );
+        assert!(request.starts_with("PATCH /api/v1/organizations/acme-research HTTP/1.1\r\n"));
         assert_eq!(
             header_value(&request, "authorization"),
             format!("Bearer {TOKEN}")
@@ -1594,22 +1596,22 @@ fn organization_list_rejects_responses_that_violate_profile_visibility() {
 #[test]
 fn members_list_preserves_omitted_and_opaque_query_values() {
     let cases = [
-        (&[][..], "/api/v1/organizations/acme%2Fresearch/memberships"),
+        (&[][..], "/api/v1/organizations/acme-research/memberships"),
         (
             &["--limit", "1"][..],
-            "/api/v1/organizations/acme%2Fresearch/memberships?limit=1",
+            "/api/v1/organizations/acme-research/memberships?limit=1",
         ),
         (
             &["--limit", "200"][..],
-            "/api/v1/organizations/acme%2Fresearch/memberships?limit=200",
+            "/api/v1/organizations/acme-research/memberships?limit=200",
         ),
         (
             &["--cursor", "opaque /+=?&"][..],
-            "/api/v1/organizations/acme%2Fresearch/memberships?cursor=opaque+%2F%2B%3D%3F%26",
+            "/api/v1/organizations/acme-research/memberships?cursor=opaque+%2F%2B%3D%3F%26",
         ),
         (
             &["--limit", "42", "--cursor", "opaque /+=?&"][..],
-            "/api/v1/organizations/acme%2Fresearch/memberships?limit=42&cursor=opaque+%2F%2B%3D%3F%26",
+            "/api/v1/organizations/acme-research/memberships?limit=42&cursor=opaque+%2F%2B%3D%3F%26",
         ),
     ];
 
@@ -1621,7 +1623,7 @@ fn members_list_preserves_omitted_and_opaque_query_values() {
             "organization",
             "members",
             "list",
-            "acme/research",
+            "acme-research",
             "--json",
             "--allow-insecure-http",
         ];

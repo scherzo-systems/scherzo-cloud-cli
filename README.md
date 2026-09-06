@@ -639,9 +639,9 @@ Structured failures report one of `invalid_display_name`, `unauthenticated`, `fo
 ## Organization management
 
 Organization commands use only the selected human OAuth credential. They do not start a
-login or signup flow and never read runner credentials. Organization references may be
-an organization ID or exact slug and are passed to the deployment without local
-normalization.
+login or signup flow and never read runner credentials. Organization references must be
+an exact `org_` ID or lowercase URL-safe slug. The CLI rejects invalid references locally
+and passes accepted references to the deployment without normalization.
 
 ```sh
 # Discover your organization memberships and their organization IDs and slugs.

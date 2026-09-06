@@ -12,6 +12,8 @@ use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 
+use super::OrganizationRef;
+
 pub(super) const ABOUT: &str = "Work with Scherzo Cloud runs";
 const NAME: &str = "run";
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -48,7 +50,7 @@ struct RunOptions {
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(long, value_name = "PROJECT", help = "Exact Project ID")]
     project_id: String,
@@ -81,7 +83,7 @@ struct CreateCommand {
 #[derive(Debug, Args)]
 struct RunReference {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(value_name = "RUN", help = "Exact Run ID")]
     run_id: String,

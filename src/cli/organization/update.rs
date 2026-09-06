@@ -17,7 +17,7 @@ pub(super) const ABOUT: &str = "Update a Scherzo Cloud organization";
 ))]
 pub(super) struct Command {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: String,
+    organization_ref: crate::cli::OrganizationRef,
 
     #[arg(long, help = "Set the organization display name")]
     display_name: Option<String>,

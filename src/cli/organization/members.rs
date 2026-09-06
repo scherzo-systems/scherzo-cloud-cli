@@ -38,7 +38,7 @@ impl Command {
 #[derive(Debug, Args)]
 struct ListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: String,
+    organization_ref: crate::cli::OrganizationRef,
 
     #[command(flatten)]
     pagination: PaginationArgs,

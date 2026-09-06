@@ -11,7 +11,7 @@ pub(super) const ABOUT: &str = "Show a Scherzo Cloud organization";
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: String,
+    organization_ref: crate::cli::OrganizationRef,
 
     // Clap input ownership remains operation-local; shared execution policy lives in LeafOptions.
     // jscpd:ignore-start

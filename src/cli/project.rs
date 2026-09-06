@@ -8,6 +8,8 @@ use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 
+use super::OrganizationRef;
+
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud projects";
 const NAME: &str = "project";
 
@@ -72,7 +74,7 @@ struct RepositorySelectionArgs {
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(long, help = "Set the canonical project name")]
     name: String,
@@ -94,7 +96,7 @@ struct CreateCommand {
 #[derive(Debug, Args)]
 struct ListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[command(flatten)]
     pagination: super::PaginationArgs,
@@ -106,7 +108,7 @@ struct ListCommand {
 #[derive(Debug, Args)]
 struct ProjectReference {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(value_name = "PROJECT", help = "Exact project ID")]
     project_id: String,
@@ -171,7 +173,7 @@ enum InstallationSubcommand {
 #[derive(Debug, Args)]
 struct InstallationListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[command(flatten)]
     options: Options,
@@ -180,7 +182,7 @@ struct InstallationListCommand {
 #[derive(Debug, Args)]
 struct RepositoryListCommand {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: String,
+    organization: OrganizationRef,
 
     #[arg(
         value_name = "INSTALLATION",
