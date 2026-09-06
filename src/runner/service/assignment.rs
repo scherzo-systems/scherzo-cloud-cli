@@ -3669,7 +3669,7 @@ for argument in "$@"; do
   previous=$argument
 done
 while IFS= read -r _; do :; done
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.259"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.260"}\n' "$PWD" "$session" "$model"
 if [ "${CLAUDE_FIXTURE_FAIL-}" = 1 ]; then exit 23; fi
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-runner","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"

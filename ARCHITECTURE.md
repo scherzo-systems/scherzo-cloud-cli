@@ -90,7 +90,7 @@ Pi maps canonical stable versions in `>=0.84.2 <0.85.0` into
 `ValidatedPiInstallation`; the repository separately qualifies exact release `0.84.4`.
 Claude Code maps canonical stable versions in
 `>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
-qualifies exact release `2.1.259`. Codex maps stable `>=0.147.0 <0.154.0`
+qualifies exact release `2.1.260`. Codex maps stable `>=0.147.0 <0.154.0`
 installations with the maintained App Server schema capabilities into
 `ValidatedCodexInstallation`; the repository separately qualifies exact release
 `0.153.0`. Each immutable value carries the absolute path, exact
