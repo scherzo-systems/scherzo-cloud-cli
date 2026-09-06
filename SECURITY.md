@@ -59,11 +59,14 @@ configured API deployment. They never discover or read runner credentials, initi
 interactive OAuth, or accept credentials or idempotency keys as command input. HTTP is rejected
 unless the individual leaf explicitly opts into insecure development transport.
 
-Create and update serialize one request and keep one random idempotency key only in
-memory. They retry one ambiguous transport failure with the same request and key, but do
-not retry explicit HTTP responses or claim that two ambiguous attempts failed to commit.
-Show and member listing make one request; member listing follows no continuation cursor
-automatically.
+Organization creation, profile updates, membership role updates, member removal, and
+self-leave keep one random idempotency key only in memory and serialize request bodies
+once when present. They retry one ambiguous transport failure with the same request and
+key, but do not retry explicit HTTP responses or claim that two ambiguous attempts
+failed to commit. Reads make one request; active-member and owner-only membership-history
+listing follow no continuation cursor automatically. The API remains authoritative for
+owner access, self-target rejection, transition validity, and the effective-human-owner
+invariant.
 
 Organization output and diagnostics never copy bearer tokens, idempotency keys, complete
 response bodies, or API problem title and detail. Private absent, inactive, and
@@ -72,6 +75,8 @@ inaccessible organizations share one `not_found` result. A contracted or malform
 only the matching renewable credential, while 403 and other failures retain it.
 Successful response values are decoded through generated contract DTOs and projected
 into the documented schema-version-1 output rather than printing generated debug data.
+Owner-visible history preserves omitted display names for inactive principals, while
+private absent, inactive, and inaccessible membership targets remain one result.
 
 ## Runner service telemetry
 

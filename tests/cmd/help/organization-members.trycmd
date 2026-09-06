@@ -5,8 +5,11 @@ Manage Scherzo Cloud organization members
 Usage: scherzo-cloud organization members [COMMAND]
 
 Commands:
-  list  List organization members
-  help  Print this message or the help of the given subcommand(s)
+  list     List organization members
+  history  List organization membership history
+  update   Update an organization member's role
+  remove   Remove an organization member
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help

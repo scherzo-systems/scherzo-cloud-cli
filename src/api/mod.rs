@@ -57,10 +57,13 @@ pub(crate) use identities::{
 pub(crate) use organizations::{
     CommonOrganizationFailure, CreateOrganizationOutcome, CurrentPrincipalMembership,
     GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
-    ListOrganizationMembershipsOutcome, MembershipRole, MembershipState, Organization,
-    OrganizationError, OrganizationMembershipDirectoryEntry, OrganizationState, PrincipalType,
-    UpdateOrganizationOutcome, create_organization, get_organization,
-    list_current_principal_memberships, list_organization_memberships, update_organization,
+    ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome, MembershipRole,
+    MembershipState, MembershipTerminationOutcome, Organization, OrganizationError,
+    OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry, OrganizationState,
+    PrincipalType, UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
+    create_organization, end_organization_membership, get_organization, leave_organization,
+    list_current_principal_memberships, list_organization_membership_history,
+    list_organization_memberships, update_organization, update_organization_membership_role,
 };
 pub(crate) use profile::{UpdateProfileError, UpdateProfileOutcome, update_current_principal};
 pub(crate) use projects::{

@@ -48,6 +48,36 @@ fn organization_body() -> Vec<u8> {
     .expect("organization fixture should serialize")
 }
 
+fn membership_history_entry() -> serde_json::Value {
+    serde_json::json!({
+        "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "principalType": "human",
+        "displayName": "Ada Lovelace",
+        "role": "owner",
+        "state": "active",
+        "createdAt": "2026-07-29T12:00:00Z",
+        "updatedAt": "2026-07-29T12:00:00Z",
+        "future": { "accepted": true }
+    })
+}
+
+fn membership_update_success() -> Vec<u8> {
+    let mut entry = membership_history_entry();
+    entry["role"] = serde_json::Value::String("member".to_owned());
+    response(
+        "200 OK",
+        Some(JSON_MEDIA_TYPE),
+        &[("Idempotency-Key", KEY)],
+        &serde_json::to_vec(&entry).unwrap(),
+    )
+}
+
+fn termination_success() -> Vec<u8> {
+    response("204 No Content", None, &[("Idempotency-Key", KEY)], &[])
+}
+
 fn success(status: &str) -> Vec<u8> {
     let headers = match status {
         "201 Created" => vec![
@@ -408,6 +438,179 @@ fn membership_list_preserves_optional_query_and_decodes_models() {
     assert!(request.starts_with(
         "GET /api/v1/organizations/acme-research/memberships?limit=200&cursor=opaque+cursor HTTP/1.1\r\n"
     ));
+}
+
+#[test]
+fn membership_history_preserves_pagination_and_decodes_lifecycle_rows() {
+    let page = serde_json::to_vec(&serde_json::json!({
+        "items": [membership_history_entry()],
+        "nextCursor": "opaque cursor"
+    }))
+    .unwrap();
+    let server = ScriptedHttpServer::respond(response("200 OK", Some(JSON_MEDIA_TYPE), &[], &page));
+
+    let outcome = list_organization_membership_history(
+        &http_client(),
+        &server.api_url,
+        TOKEN,
+        "acme/research",
+        Some(42),
+        Some("opaque cursor"),
+    )
+    .expect("membership history should decode");
+
+    let ListOrganizationMembershipHistoryOutcome::Listed(page) = outcome else {
+        panic!("expected listed membership history");
+    };
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].role, MembershipRole::Owner);
+    assert_eq!(page.items[0].state, MembershipState::Active);
+    assert_eq!(page.next_cursor.as_deref(), Some("opaque cursor"));
+    let request = server.finish_one();
+    assert!(request.starts_with(
+        "GET /api/v1/organizations/acme%2Fresearch/memberships/history?limit=42&cursor=opaque+cursor HTTP/1.1\r\n"
+    ));
+}
+
+#[test]
+fn membership_role_update_retries_with_one_key_and_exact_merge_patch() {
+    let server =
+        ScriptedHttpServer::respond_in_sequence(vec![Vec::new(), membership_update_success()]);
+
+    let outcome = update_organization_membership_role(
+        &http_client(),
+        &server.api_url,
+        TOKEN,
+        "acme/research",
+        "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+        KEY,
+        MembershipRole::Member,
+    )
+    .expect("membership role update should succeed after an ambiguous failure");
+
+    assert!(matches!(
+        outcome,
+        UpdateOrganizationMembershipOutcome::Updated(OrganizationMembershipHistoryEntry {
+            role: MembershipRole::Member,
+            ..
+        })
+    ));
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(requests[0].starts_with(
+        "PATCH /api/v1/organizations/acme%2Fresearch/memberships/mem_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1\r\n"
+    ));
+    assert_eq!(header_value(&requests[0], "idempotency-key"), KEY);
+    assert_eq!(
+        header_value(&requests[0], "content-type"),
+        MERGE_PATCH_MEDIA_TYPE
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
+        serde_json::json!({"role": "member"})
+    );
+}
+
+#[test]
+fn membership_termination_retries_exactly_on_distinct_member_and_self_routes() {
+    let cases = [
+        (
+            Some("mem_01k0z6r1w8f4jy2m7q9v3x5abc"),
+            "/api/v1/organizations/acme%2Fresearch/memberships/mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ),
+        (None, "/api/v1/organizations/acme%2Fresearch/memberships/me"),
+    ];
+
+    for (membership_id, expected_path) in cases {
+        let server =
+            ScriptedHttpServer::respond_in_sequence(vec![Vec::new(), termination_success()]);
+        let outcome = match membership_id {
+            Some(membership_id) => end_organization_membership(
+                &http_client(),
+                &server.api_url,
+                TOKEN,
+                "acme/research",
+                membership_id,
+                KEY,
+            ),
+            None => {
+                leave_organization(&http_client(), &server.api_url, TOKEN, "acme/research", KEY)
+            }
+        }
+        .expect("membership termination should succeed");
+
+        assert_eq!(outcome, MembershipTerminationOutcome::Ended);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(requests[0].starts_with(&format!("DELETE {expected_path} HTTP/1.1\r\n")));
+        assert_eq!(header_value(&requests[0], "idempotency-key"), KEY);
+        assert_eq!(body(&requests[0]), "");
+    }
+}
+
+#[test]
+fn membership_termination_rejects_malformed_no_content_successes() {
+    let malformed_responses: [(Option<&str>, Option<&str>, &[u8]); 4] = [
+        (None, None, &[]),
+        (None, Some("different-key"), &[]),
+        (Some(JSON_MEDIA_TYPE), Some(KEY), &[]),
+        (None, Some(KEY), b"unexpected representation"),
+    ];
+
+    for operation in [Operation::EndMembership, Operation::Leave] {
+        for (content_type, idempotency_key, body) in malformed_responses {
+            let response = ReceivedResponse {
+                status: StatusCode::NO_CONTENT,
+                content_type: content_type.map(str::to_owned),
+                idempotency_key: idempotency_key.map(HeaderValue::from_static),
+                location: None,
+                retry_after: None,
+                body: body.to_vec(),
+            };
+
+            let error = decode_membership_termination_response(operation, response, KEY)
+                .expect_err("malformed terminal success should be rejected");
+            assert_protocol_error(&error);
+        }
+    }
+}
+
+#[test]
+fn membership_mutations_classify_owner_and_transition_conflicts() {
+    let cases = [
+        (
+            MEMBERSHIP_TRANSITION_UNAVAILABLE,
+            UpdateOrganizationMembershipOutcome::TransitionUnavailable,
+        ),
+        (
+            HUMAN_OWNER_REQUIRED,
+            UpdateOrganizationMembershipOutcome::HumanOwnerRequired,
+        ),
+        (
+            IDEMPOTENCY_CONFLICT,
+            UpdateOrganizationMembershipOutcome::IdempotencyConflict,
+        ),
+    ];
+
+    for (problem_type, expected) in cases {
+        let server =
+            ScriptedHttpServer::respond(problem_response("409 Conflict", 409, problem_type, &[]));
+        let outcome = update_organization_membership_role(
+            &http_client(),
+            &server.api_url,
+            TOKEN,
+            "acme",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            KEY,
+            MembershipRole::Member,
+        )
+        .expect("contracted membership conflict should decode");
+
+        assert_eq!(outcome, expected);
+        server.finish_one();
+    }
 }
 
 #[test]

@@ -211,6 +211,17 @@ struct ApiFailureResult<'a> {
     retry_after: Option<u64>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudListResult<'a, T> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    items: &'a [T],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<&'a str>,
+}
+
 impl<'a> ApiFailureResult<'a> {
     const fn new(
         deployment: &'a str,
@@ -249,6 +260,20 @@ fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
     let mut stdout = stdout.lock();
     stdout.write_all(&bytes)?;
     stdout.flush()
+}
+
+fn write_cloud_list_json(
+    deployment: &str,
+    items: &[impl Serialize],
+    next_cursor: Option<&str>,
+) -> io::Result<()> {
+    write_pretty_json(&CloudListResult {
+        schema_version: 1,
+        deployment,
+        outcome: "listed",
+        items,
+        next_cursor,
+    })
 }
 
 struct ProcessSignals {
@@ -707,9 +732,13 @@ mod tests {
             "github setup complete",
             "organization",
             "organization create",
+            "organization leave",
             "organization list",
             "organization members",
+            "organization members history",
             "organization members list",
+            "organization members remove",
+            "organization members update",
             "organization show",
             "organization update",
             "project",

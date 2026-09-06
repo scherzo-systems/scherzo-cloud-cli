@@ -175,9 +175,10 @@ The current release supports:
   Cloud-issued endpoint and waits for explicit start authorization.
 
 The Cloud management surface is not complete. The CLI can discover and manage accessible
-organizations, connect GitHub App installations, discover authorized repositories, manage
-projects and runner pools, and create or inspect an inputless run for a ready project. It
-cannot yet invite or change members, stage run inputs, or guide the rest of Cloud onboarding.
+organizations, change member roles, remove members, leave organizations, connect GitHub App
+installations, discover authorized repositories, manage projects and runner pools, and create
+or inspect an inputless run for a ready project. It cannot yet invite members, stage run inputs,
+or guide the rest of Cloud onboarding.
 
 ## Local workflow validation
 
@@ -660,10 +661,26 @@ scherzo-cloud organization update acme-research \
   --display-name "Acme Labs" \
   --slug acme-labs
 
-# Read one member-directory page. Both pagination options are optional.
+# Read one active member-directory page. Both pagination options are optional.
 scherzo-cloud organization members list acme-labs \
   --limit 50 \
   --cursor opaque-continuation
+
+# Read one owner-only page containing active, suspended, and ended memberships.
+scherzo-cloud organization members history acme-labs --limit 50
+
+# Change another member's organization role.
+scherzo-cloud organization members update acme-labs \
+  mem_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --role owner
+
+# Permanently end another member's membership.
+scherzo-cloud organization members remove acme-labs \
+  mem_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --yes
+
+# Permanently end your own membership.
+scherzo-cloud organization leave acme-labs --yes
 ```
 
 Add `--json` to any of these leaves for its schema-version-1 result. Organization
@@ -673,14 +690,23 @@ organization name and slug appear only while both the organization and membershi
 active; suspended and ended rows retain history without exposing mutable organization
 profile data. Pass the returned `nextCursor` back with `--cursor` to continue.
 
-Organization and member listing each return exactly one page, preserve `nextCursor`, and
-do not follow it automatically. Their `--limit` options accept 1 through 200.
+Organization, active-member, and membership-history listing each return exactly one
+page, preserve `nextCursor`, and do not follow it automatically. Their `--limit` options
+accept 1 through 200. Active-member listing remains available to effective members;
+membership history and member changes require an active owner. History preserves
+lifecycle fields while leaving an inactive principal's omitted display name absent.
 
-Create and update generate a fresh opaque idempotency key per process invocation. After
-an ambiguous transport failure, the CLI retries once with the same key and serialized
-request. If both attempts are ambiguous, it reports `unreachable` because the mutation
-result cannot be confirmed. It does not persist the key or retry a contracted HTTP
-response. Do not issue a new mutation merely because an earlier result was unconfirmed.
+Role update accepts only `owner` or `member`. It does not expose membership suspension
+or reactivation. Member removal and self-leave are terminal and require `--yes`. The
+deployment enforces self-targeting, active-owner authorization, valid transitions, and
+the requirement to retain an effective human owner.
+
+Create, organization update, role update, removal, and leave generate a fresh opaque
+idempotency key per process invocation. After an ambiguous transport failure, the CLI
+retries once with the same key and serialized request. If both attempts are ambiguous,
+it reports `unreachable` because the mutation result cannot be confirmed. It does not
+persist the key or retry a contracted HTTP response. Do not issue a new mutation merely
+because an earlier result was unconfirmed.
 
 These commands are a direct human management surface. Authentication status may carry a
 server-advertised `organization.create` action, but the CLI only transports that value;

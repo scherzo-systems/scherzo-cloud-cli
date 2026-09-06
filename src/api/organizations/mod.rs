@@ -20,8 +20,9 @@ use super::{UnreachableCategory, classify_reqwest_error};
 
 pub(crate) use models::{
     CurrentPrincipalMembership, CurrentPrincipalMembershipPage, MembershipRole, MembershipState,
-    Organization, OrganizationMembershipDirectoryEntry, OrganizationMembershipPage,
-    OrganizationState, PrincipalType,
+    Organization, OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry,
+    OrganizationMembershipHistoryPage, OrganizationMembershipPage, OrganizationState,
+    PrincipalType,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,6 +35,9 @@ const SLUG_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/slug-unavailabl
 const QUANTITY_LIMIT_REACHED: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
 const RATE_LIMITED: &str = "https://api.scherzo.dev/problems/rate-limit-exceeded";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
+const MEMBERSHIP_TRANSITION_UNAVAILABLE: &str =
+    "https://api.scherzo.dev/problems/membership-transition-unavailable";
+const HUMAN_OWNER_REQUIRED: &str = "https://api.scherzo.dev/problems/human-owner-required";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CommonOrganizationFailure {
@@ -81,6 +85,33 @@ pub(crate) enum ListOrganizationMembershipsOutcome {
     Listed(OrganizationMembershipPage),
     Common(CommonOrganizationFailure),
     NotFound,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ListOrganizationMembershipHistoryOutcome {
+    Listed(OrganizationMembershipHistoryPage),
+    Common(CommonOrganizationFailure),
+    NotFound,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum UpdateOrganizationMembershipOutcome {
+    Updated(OrganizationMembershipHistoryEntry),
+    Common(CommonOrganizationFailure),
+    NotFound,
+    TransitionUnavailable,
+    HumanOwnerRequired,
+    IdempotencyConflict,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum MembershipTerminationOutcome {
+    Ended,
+    Common(CommonOrganizationFailure),
+    NotFound,
+    TransitionUnavailable,
+    HumanOwnerRequired,
+    IdempotencyConflict,
 }
 
 #[derive(Debug)]
@@ -162,6 +193,10 @@ enum Operation {
     Update,
     ListCurrentMemberships,
     ListMemberships,
+    ListMembershipHistory,
+    UpdateMembership,
+    EndMembership,
+    Leave,
 }
 
 impl Operation {
@@ -172,14 +207,24 @@ impl Operation {
             Self::Update => "update",
             Self::ListCurrentMemberships => "current-membership-list",
             Self::ListMemberships => "membership-list",
+            Self::ListMembershipHistory => "membership-history-list",
+            Self::UpdateMembership => "membership-update",
+            Self::EndMembership => "membership-removal",
+            Self::Leave => "leave",
         }
     }
 
     fn can_retry_interrupted_response(self, status: StatusCode) -> bool {
         matches!(
             (self, status),
-            (Self::Create, StatusCode::CREATED) | (Self::Update, StatusCode::OK)
+            (Self::Create, StatusCode::CREATED)
+                | (Self::Update | Self::UpdateMembership, StatusCode::OK)
+                | (Self::EndMembership | Self::Leave, StatusCode::NO_CONTENT)
         )
+    }
+
+    fn success_has_json_body(self) -> bool {
+        matches!(self, Self::Create | Self::Update | Self::UpdateMembership)
     }
 }
 
@@ -310,17 +355,14 @@ pub(crate) fn update_organization(
     request.display_name = display_name.map(str::to_owned);
     request.slug = slug.map(str::to_owned);
     let body = serialize_request(Operation::Update, &request)?;
-    let spec = request_spec(
+    let spec = merge_patch_request_spec(
         client,
         Operation::Update,
-        Method::PATCH,
         api_url,
         &["v1", "organizations", organization_ref],
         access_token,
-        Some(idempotency_key),
-        Some(MERGE_PATCH_MEDIA_TYPE),
-        Some(body),
-        MUTATION_ATTEMPTS,
+        idempotency_key,
+        body,
     )?;
 
     match execute_request(client, &spec, REQUEST_TIMEOUT)? {
@@ -382,6 +424,180 @@ pub(crate) fn list_organization_memberships(
             CommonOrganizationFailure::Unreachable(category),
         )),
     }
+}
+
+pub(crate) fn list_organization_membership_history(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    limit: Option<u16>,
+    cursor: Option<&str>,
+) -> Result<ListOrganizationMembershipHistoryOutcome, OrganizationError> {
+    let spec = membership_list_request_spec(
+        client,
+        Operation::ListMembershipHistory,
+        api_url,
+        &[
+            "v1",
+            "organizations",
+            organization_ref,
+            "memberships",
+            "history",
+        ],
+        access_token,
+        limit,
+        cursor,
+    )?;
+
+    match execute_request(client, &spec, REQUEST_TIMEOUT)? {
+        RequestExecution::Response(response) => decode_membership_history_response(response),
+        RequestExecution::Unreachable(category) => {
+            Ok(ListOrganizationMembershipHistoryOutcome::Common(
+                CommonOrganizationFailure::Unreachable(category),
+            ))
+        }
+    }
+}
+
+pub(crate) fn update_organization_membership_role(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    membership_id: &str,
+    idempotency_key: &str,
+    role: MembershipRole,
+) -> Result<UpdateOrganizationMembershipOutcome, OrganizationError> {
+    let mut request = generated_models::UpdateOrganizationMembershipPatch::new();
+    request.role = Some(match role {
+        MembershipRole::Owner => {
+            generated_models::update_organization_membership_patch::Role::MembershipPatchRoleOwner
+        }
+        MembershipRole::Member => {
+            generated_models::update_organization_membership_patch::Role::MembershipPatchRoleMember
+        }
+    });
+    let body = serialize_request(Operation::UpdateMembership, &request)?;
+    let spec = merge_patch_request_spec(
+        client,
+        Operation::UpdateMembership,
+        api_url,
+        &[
+            "v1",
+            "organizations",
+            organization_ref,
+            "memberships",
+            membership_id,
+        ],
+        access_token,
+        idempotency_key,
+        body,
+    )?;
+
+    match execute_request(client, &spec, REQUEST_TIMEOUT)? {
+        RequestExecution::Response(response) => {
+            decode_update_membership_response(response, idempotency_key)
+        }
+        RequestExecution::Unreachable(category) => Ok(UpdateOrganizationMembershipOutcome::Common(
+            CommonOrganizationFailure::Unreachable(category),
+        )),
+    }
+}
+
+pub(crate) fn end_organization_membership(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    membership_id: &str,
+    idempotency_key: &str,
+) -> Result<MembershipTerminationOutcome, OrganizationError> {
+    execute_membership_termination(
+        client,
+        api_url,
+        access_token,
+        &[
+            "v1",
+            "organizations",
+            organization_ref,
+            "memberships",
+            membership_id,
+        ],
+        idempotency_key,
+        Operation::EndMembership,
+    )
+}
+
+pub(crate) fn leave_organization(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    idempotency_key: &str,
+) -> Result<MembershipTerminationOutcome, OrganizationError> {
+    execute_membership_termination(
+        client,
+        api_url,
+        access_token,
+        &["v1", "organizations", organization_ref, "memberships", "me"],
+        idempotency_key,
+        Operation::Leave,
+    )
+}
+
+fn execute_membership_termination(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    path: &[&str],
+    idempotency_key: &str,
+    operation: Operation,
+) -> Result<MembershipTerminationOutcome, OrganizationError> {
+    let spec = request_spec(
+        client,
+        operation,
+        Method::DELETE,
+        api_url,
+        path,
+        access_token,
+        Some(idempotency_key),
+        None,
+        None,
+        MUTATION_ATTEMPTS,
+    )?;
+
+    match execute_request(client, &spec, REQUEST_TIMEOUT)? {
+        RequestExecution::Response(response) => {
+            decode_membership_termination_response(operation, response, idempotency_key)
+        }
+        RequestExecution::Unreachable(category) => Ok(MembershipTerminationOutcome::Common(
+            CommonOrganizationFailure::Unreachable(category),
+        )),
+    }
+}
+
+fn merge_patch_request_spec(
+    client: &HttpClient,
+    operation: Operation,
+    api_url: &str,
+    path: &[&str],
+    access_token: &str,
+    idempotency_key: &str,
+    body: Vec<u8>,
+) -> Result<RequestSpec, OrganizationError> {
+    request_spec(
+        client,
+        operation,
+        Method::PATCH,
+        api_url,
+        path,
+        access_token,
+        Some(idempotency_key),
+        Some(MERGE_PATCH_MEDIA_TYPE),
+        Some(body),
+        MUTATION_ATTEMPTS,
+    )
 }
 
 fn membership_list_request_spec(
@@ -584,24 +800,26 @@ fn require_replayable_success_headers(
         ));
     }
 
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|()| {
-            OrganizationError::protocol(
+    if spec.operation.success_has_json_body() {
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(http_util::media_type)
+            .transpose()
+            .map_err(|()| {
+                OrganizationError::protocol(
+                    spec.operation,
+                    "the Content-Type header is not valid text",
+                    false,
+                )
+            })?;
+        if content_type.as_deref() != Some(JSON_MEDIA_TYPE) {
+            return Err(OrganizationError::protocol(
                 spec.operation,
-                "the Content-Type header is not valid text",
+                "the response Content-Type is not valid for its HTTP status",
                 false,
-            )
-        })?;
-    if content_type.as_deref() != Some(JSON_MEDIA_TYPE) {
-        return Err(OrganizationError::protocol(
-            spec.operation,
-            "the response Content-Type is not valid for its HTTP status",
-            false,
-        ));
+            ));
+        }
     }
 
     if matches!(spec.operation, Operation::Create)
@@ -961,6 +1179,204 @@ fn decode_list_response(
     }
 }
 
+fn decode_membership_history_response(
+    response: ReceivedResponse,
+) -> Result<ListOrganizationMembershipHistoryOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::OK => {
+            let value = decode_json_value(
+                Operation::ListMembershipHistory,
+                &response,
+                "the membership-history-list response body is invalid",
+            )?;
+            reject_null_membership_history_optionals(Operation::ListMembershipHistory, &value)?;
+            let generated: generated_models::OrganizationMembershipHistoryList = decode_json_model(
+                Operation::ListMembershipHistory,
+                value,
+                "the membership-history-list response body is invalid",
+            )?;
+            OrganizationMembershipHistoryPage::try_from(generated)
+                .map(ListOrganizationMembershipHistoryOutcome::Listed)
+                .map_err(|reason| {
+                    OrganizationError::protocol(Operation::ListMembershipHistory, reason, false)
+                })
+        }
+        StatusCode::NOT_FOUND => {
+            require_problem(
+                Operation::ListMembershipHistory,
+                &response,
+                NOT_FOUND,
+                false,
+            )?;
+            Ok(ListOrganizationMembershipHistoryOutcome::NotFound)
+        }
+        _ => decode_common_list_failure(Operation::ListMembershipHistory, &response)
+            .map(ListOrganizationMembershipHistoryOutcome::Common),
+    }
+}
+
+fn decode_update_membership_response(
+    response: ReceivedResponse,
+    expected_idempotency_key: &str,
+) -> Result<UpdateOrganizationMembershipOutcome, OrganizationError> {
+    if response.status == StatusCode::OK {
+        require_response_idempotency_key(
+            Operation::UpdateMembership,
+            &response,
+            expected_idempotency_key,
+        )?;
+        let value = decode_json_value(
+            Operation::UpdateMembership,
+            &response,
+            "the membership-update response body is invalid",
+        )?;
+        reject_null_membership_history_optionals(Operation::UpdateMembership, &value)?;
+        let generated: generated_models::OrganizationMembershipHistoryEntry = decode_json_model(
+            Operation::UpdateMembership,
+            value,
+            "the membership-update response body is invalid",
+        )?;
+        return OrganizationMembershipHistoryEntry::try_from(generated)
+            .map(UpdateOrganizationMembershipOutcome::Updated)
+            .map_err(|reason| {
+                OrganizationError::protocol(Operation::UpdateMembership, reason, false)
+            });
+    }
+
+    decode_membership_mutation_failure(Operation::UpdateMembership, &response).map(|failure| {
+        match failure {
+            MembershipMutationFailure::Common(common) => {
+                UpdateOrganizationMembershipOutcome::Common(common)
+            }
+            MembershipMutationFailure::NotFound => UpdateOrganizationMembershipOutcome::NotFound,
+            MembershipMutationFailure::TransitionUnavailable => {
+                UpdateOrganizationMembershipOutcome::TransitionUnavailable
+            }
+            MembershipMutationFailure::HumanOwnerRequired => {
+                UpdateOrganizationMembershipOutcome::HumanOwnerRequired
+            }
+            MembershipMutationFailure::IdempotencyConflict => {
+                UpdateOrganizationMembershipOutcome::IdempotencyConflict
+            }
+        }
+    })
+}
+
+fn decode_membership_termination_response(
+    operation: Operation,
+    response: ReceivedResponse,
+    expected_idempotency_key: &str,
+) -> Result<MembershipTerminationOutcome, OrganizationError> {
+    if response.status == StatusCode::NO_CONTENT {
+        require_response_idempotency_key(operation, &response, expected_idempotency_key)?;
+        if response.content_type.is_some() || !response.body.is_empty() {
+            return Err(OrganizationError::protocol(
+                operation,
+                "the successful response contains an unexpected representation",
+                false,
+            ));
+        }
+        return Ok(MembershipTerminationOutcome::Ended);
+    }
+
+    decode_membership_mutation_failure(operation, &response).map(|failure| match failure {
+        MembershipMutationFailure::Common(common) => MembershipTerminationOutcome::Common(common),
+        MembershipMutationFailure::NotFound => MembershipTerminationOutcome::NotFound,
+        MembershipMutationFailure::TransitionUnavailable => {
+            MembershipTerminationOutcome::TransitionUnavailable
+        }
+        MembershipMutationFailure::HumanOwnerRequired => {
+            MembershipTerminationOutcome::HumanOwnerRequired
+        }
+        MembershipMutationFailure::IdempotencyConflict => {
+            MembershipTerminationOutcome::IdempotencyConflict
+        }
+    })
+}
+
+fn reject_null_membership_history_optionals(
+    operation: Operation,
+    value: &serde_json::Value,
+) -> Result<(), OrganizationError> {
+    let has_null_optional = |entry: &serde_json::Value| {
+        ["displayName", "terminalAt"]
+            .into_iter()
+            .any(|field| entry.get(field).is_some_and(serde_json::Value::is_null))
+    };
+    let null_entry_optional = has_null_optional(value)
+        || value
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(has_null_optional));
+    let null_page_optional = value
+        .get("nextCursor")
+        .is_some_and(serde_json::Value::is_null);
+    if null_entry_optional || null_page_optional {
+        return Err(OrganizationError::protocol(
+            operation,
+            "the membership history response contains an explicit null optional field",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MembershipMutationFailure {
+    Common(CommonOrganizationFailure),
+    NotFound,
+    TransitionUnavailable,
+    HumanOwnerRequired,
+    IdempotencyConflict,
+}
+
+fn decode_membership_mutation_failure(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<MembershipMutationFailure, OrganizationError> {
+    match response.status {
+        StatusCode::BAD_REQUEST => {
+            require_problem(operation, response, BAD_REQUEST, false)?;
+            Ok(MembershipMutationFailure::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        StatusCode::UNAUTHORIZED => {
+            require_problem(operation, response, UNAUTHORIZED, true)?;
+            Ok(MembershipMutationFailure::Common(
+                CommonOrganizationFailure::Unauthenticated,
+            ))
+        }
+        StatusCode::FORBIDDEN => {
+            require_problem(operation, response, FORBIDDEN, false)?;
+            Ok(MembershipMutationFailure::Common(
+                CommonOrganizationFailure::Forbidden,
+            ))
+        }
+        StatusCode::NOT_FOUND => {
+            require_problem(operation, response, NOT_FOUND, false)?;
+            Ok(MembershipMutationFailure::NotFound)
+        }
+        StatusCode::CONFLICT => {
+            let problem_type = decode_problem_type(operation, response, false)?;
+            match problem_type.as_str() {
+                MEMBERSHIP_TRANSITION_UNAVAILABLE => {
+                    Ok(MembershipMutationFailure::TransitionUnavailable)
+                }
+                HUMAN_OWNER_REQUIRED => Ok(MembershipMutationFailure::HumanOwnerRequired),
+                IDEMPOTENCY_CONFLICT => Ok(MembershipMutationFailure::IdempotencyConflict),
+                _ => Err(OrganizationError::protocol(
+                    operation,
+                    "a 409 response has an unrecognized problem type",
+                    false,
+                )),
+            }
+        }
+        _ => decode_server_or_invalid_response(operation, response)
+            .map(MembershipMutationFailure::Common),
+    }
+}
+
 fn decode_json_value(
     operation: Operation,
     response: &ReceivedResponse,
@@ -997,20 +1413,25 @@ fn decode_common_list_failure(
             require_problem(operation, response, FORBIDDEN, false)?;
             Ok(CommonOrganizationFailure::Forbidden)
         }
-        status if status.is_server_error() => Ok(CommonOrganizationFailure::Unreachable(
-            UnreachableCategory::Server,
-        )),
-        status if status.is_redirection() => Err(OrganizationError::protocol(
-            operation,
-            "redirect responses are not permitted",
-            false,
-        )),
-        _ => Err(OrganizationError::protocol(
-            operation,
-            "the HTTP status is not valid for this operation",
-            false,
-        )),
+        _ => decode_server_or_invalid_response(operation, response),
     }
+}
+
+fn decode_server_or_invalid_response(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<CommonOrganizationFailure, OrganizationError> {
+    if response.status.is_server_error() {
+        return Ok(CommonOrganizationFailure::Unreachable(
+            UnreachableCategory::Server,
+        ));
+    }
+    let reason = if response.status.is_redirection() {
+        "redirect responses are not permitted"
+    } else {
+        "the HTTP status is not valid for this operation"
+    };
+    Err(OrganizationError::protocol(operation, reason, false))
 }
 
 fn require_response_idempotency_key(

@@ -69,6 +69,35 @@ pub(crate) struct OrganizationMembershipPage {
     pub(crate) next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrganizationMembershipHistoryEntry {
+    // Owner history and current-principal history intentionally remain separate models: their
+    // optional profiles belong to different principals and obey different privacy rules.
+    // jscpd:ignore-start
+    pub(crate) id: String,
+    pub(crate) organization_id: String,
+    pub(crate) principal_id: String,
+    pub(crate) principal_type: PrincipalType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) display_name: Option<String>,
+    pub(crate) role: MembershipRole,
+    pub(crate) state: MembershipState,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_at: Option<String>,
+    // jscpd:ignore-end
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrganizationMembershipHistoryPage {
+    pub(crate) items: Vec<OrganizationMembershipHistoryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_cursor: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PrincipalType {
@@ -271,6 +300,91 @@ impl TryFrom<models::OrganizationMembershipDirectoryEntry>
                     MembershipRole::Member
                 }
             },
+        })
+    }
+}
+
+impl TryFrom<models::OrganizationMembershipHistoryList> for OrganizationMembershipHistoryPage {
+    type Error = &'static str;
+
+    fn try_from(value: models::OrganizationMembershipHistoryList) -> Result<Self, Self::Error> {
+        let (items, next_cursor) = convert_page(
+            value.items,
+            value.next_cursor,
+            "the organization membership history cursor is empty",
+        )?;
+        Ok(Self { items, next_cursor })
+    }
+}
+
+impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembershipHistoryEntry {
+    type Error = &'static str;
+
+    fn try_from(value: models::OrganizationMembershipHistoryEntry) -> Result<Self, Self::Error> {
+        if !crate::public_id::valid_typed_id(&value.id, "mem_") {
+            return Err("the organization membership history ID is invalid");
+        }
+        if !crate::public_id::valid_typed_id(&value.organization_id, "org_") {
+            return Err("the organization membership history organization ID is invalid");
+        }
+        if !crate::public_id::valid_typed_id(&value.principal_id, "prn_") {
+            return Err("the organization membership history principal ID is invalid");
+        }
+        if value
+            .display_name
+            .as_deref()
+            .is_some_and(|name| !valid_bounded_text(name, 1, 200))
+        {
+            return Err("the organization membership history display name is invalid");
+        }
+        parse_timestamp(
+            &value.created_at,
+            "the organization membership history creation time is invalid",
+        )?;
+        parse_timestamp(
+            &value.updated_at,
+            "the organization membership history update time is invalid",
+        )?;
+        if let Some(terminal_at) = value.terminal_at.as_deref() {
+            parse_timestamp(
+                terminal_at,
+                "the organization membership history terminal time is invalid",
+            )?;
+        }
+
+        Ok(Self {
+            id: value.id,
+            organization_id: value.organization_id,
+            principal_id: value.principal_id,
+            principal_type: match value.principal_type {
+                models::organization_membership_history_entry::PrincipalType::Human => {
+                    PrincipalType::Human
+                }
+                models::organization_membership_history_entry::PrincipalType::Service => {
+                    PrincipalType::Service
+                }
+            },
+            display_name: value.display_name,
+            role: match value.role {
+                models::organization_membership_history_entry::Role::Owner => MembershipRole::Owner,
+                models::organization_membership_history_entry::Role::Member => {
+                    MembershipRole::Member
+                }
+            },
+            state: match value.state {
+                models::organization_membership_history_entry::State::Active => {
+                    MembershipState::Active
+                }
+                models::organization_membership_history_entry::State::Suspended => {
+                    MembershipState::Suspended
+                }
+                models::organization_membership_history_entry::State::Ended => {
+                    MembershipState::Ended
+                }
+            },
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            terminal_at: value.terminal_at,
         })
     }
 }

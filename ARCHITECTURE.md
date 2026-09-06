@@ -6,7 +6,7 @@ This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, OAuth Device Authorization, server-confirmed
 authentication status, explicit human-principal signup, revoking logout, organization
-profile management, one-page active member-directory reads, inputless Cloud run creation
+profile and membership management, one-page active member-directory and owner-only membership-history reads, inputless Cloud run creation
 and current projection reads, local Workflow V1 definition validation, and an outbound,
 enrolled runner transport.
 `scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
@@ -189,11 +189,13 @@ expired or near-expiry access tokens, refreshes once after HTTP 401, and retries
 operation once. A refresher holds deployment-specific authority, re-reads current state,
 and conditionally commits only a rotation of the token it exchanged. One ambiguous
 refresh response may be retried once inside Auth0's bounded overlap. Terminal OAuth
-rejection removes the matching session; transient failures preserve it. Create and
-update serialize their request once and retry at most one ambiguous transport failure under one in-memory idempotency key. Reads make one
-attempt, and member listing returns one server page without following its opaque
-continuation cursor. Private not-found responses remain one indistinguishable CLI
-outcome. Logout removes the local selected session and asks Auth0 to revoke its refresh
+rejection removes the matching session; transient failures preserve it. Organization creation, profile updates, membership role updates, membership removal,
+and self-leave serialize their request once when applicable and retry at most one
+ambiguous transport failure under one in-memory idempotency key. Reads make one attempt,
+and active-member and membership-history listing return one server page without
+following its opaque continuation cursor. Private not-found responses remain one
+indistinguishable CLI outcome. Membership commands rely on API authorization and
+last-human-owner enforcement rather than making stale client-side preflight decisions. Logout removes the local selected session and asks Auth0 to revoke its refresh
 token, reporting when server revocation cannot be confirmed. These commands do not
 interpret status actions; action selection and approval remain responsibilities of the
 governing agent guide.
@@ -312,7 +314,9 @@ Organization request and response DTOs follow the same boundary. The handwritten
 decode successful API representations, then converts successes into validated
 handwritten organization and membership models. It owns route-specific outcomes,
 problem classification, opaque path and query construction, bounded responses, and the
-mutation retry contract. Generated blocking organization transport is not called by the
+mutation retry contract. Owner-only membership history, role updates, bodyless terminal
+removal, and self-leave use the same boundary; generated blocking transport is never a
+substitute for those command implementations. Generated blocking organization transport is not called by the
 command layer. The Run API adapter similarly owns status, receipt-header, response-size,
 and projection validation around generated request and response DTOs. API contract
 validation reuses the crate's shared public-ID syntax validator rather than defining a
@@ -339,9 +343,9 @@ rendered help come from the same structure. Bare command groups may print their 
 help, but only an explicit leaf command may start long-running behavior.
 
 Organization parsing and credential policy live in `src/cli/organization.rs`; its
-`create.rs`, `show.rs`, `update.rs`, and `members.rs` children own leaf arguments and API
-calls. `output.rs` exhaustively maps the four route-specific outcomes to human text,
-schema-version-1 JSON, and process status. The command modules never expose generated
+`create.rs`, `show.rs`, `update.rs`, `leave.rs`, and `members.rs` children own leaf
+arguments and API calls. `output.rs` exhaustively maps route-specific outcomes to human
+text, schema-version-1 JSON, and process status. The command modules never expose generated
 DTOs or map raw HTTP statuses independently.
 
 `release.toml` schema 2 is a static public policy contract: initial version `0.1.0`,

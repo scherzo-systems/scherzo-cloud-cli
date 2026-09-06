@@ -115,6 +115,63 @@ fn membership_success(items: serde_json::Value, next_cursor: Option<&str>) -> Ve
     json_http_response("200 OK", page)
 }
 
+fn membership_history_items() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalType": "human",
+            "displayName": "Ada Lovelace",
+            "role": "owner",
+            "state": "active",
+            "createdAt": "2026-07-29T12:00:00Z",
+            "updatedAt": "2026-07-29T12:00:00Z",
+            "future": { "accepted": true }
+        },
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "principalType": "service",
+            "role": "member",
+            "state": "ended",
+            "createdAt": "2026-07-29T12:01:00Z",
+            "updatedAt": "2026-07-29T12:02:00Z",
+            "terminalAt": "2026-07-29T12:02:00Z"
+        }
+    ])
+}
+
+fn membership_update_success() -> Vec<u8> {
+    let body = serde_json::json!({
+        "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "principalType": "human",
+        "displayName": "Ada Lovelace",
+        "role": "member",
+        "state": "active",
+        "createdAt": "2026-07-29T12:00:00Z",
+        "updatedAt": "2026-09-05T12:00:00Z"
+    });
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &serde_json::to_vec(&body).unwrap(),
+    )
+}
+
+fn membership_termination_success() -> Vec<u8> {
+    http_response_with_headers(
+        "204 No Content",
+        None,
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &[],
+    )
+}
+
 fn current_membership_items() -> serde_json::Value {
     serde_json::json!([
         {
@@ -1043,6 +1100,25 @@ fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
         &["organization", "show", ".."][..],
         &["organization", "show", "acme/research"][..],
         &["organization", "show", "acme\\research"][..],
+        &["organization", "leave", "acme/research", "--yes"][..],
+        &["organization", "members", "history", "acme/research"][..],
+        &[
+            "organization",
+            "members",
+            "update",
+            "acme/research",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--role",
+            "member",
+        ][..],
+        &[
+            "organization",
+            "members",
+            "remove",
+            "acme/research",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--yes",
+        ][..],
         &["organization", "update", "acme"][..],
         &["organization", "list", "--limit", "0"][..],
         &["organization", "list", "--limit", "201"][..],
@@ -1050,6 +1126,23 @@ fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
         &["organization", "members", "list", "acme", "--limit", "0"][..],
         &["organization", "members", "list", "acme", "--limit", "201"][..],
         &["organization", "members", "list", "acme", "--cursor", ""][..],
+        &[
+            "organization",
+            "members",
+            "history",
+            "acme",
+            "--limit",
+            "201",
+        ][..],
+        &[
+            "organization",
+            "members",
+            "update",
+            "acme",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--role",
+            "administrator",
+        ][..],
     ] {
         let output = run_with_env(
             args,
@@ -1982,6 +2075,341 @@ fn members_list_rejects_explicit_null_optional_fields() {
 
     assert_eq!(statuses, [Some(1), Some(1)]);
     assert!(standard_outputs.iter().all(Vec::is_empty));
+}
+
+#[test]
+fn membership_management_workflow_has_stable_json_and_request_contracts() {
+    let history_items = membership_history_items();
+    let (server, _directory, _path, credential_path) = prepared_organization(
+        vec![
+            membership_success(history_items.clone(), Some("next history page")),
+            membership_update_success(),
+            membership_termination_success(),
+            membership_termination_success(),
+        ],
+        TOKEN,
+    );
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let history = run_with_env(
+        &[
+            "organization",
+            "members",
+            "history",
+            "acme-research",
+            "--limit",
+            "2",
+            "--cursor",
+            "opaque /+=?&",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(history.status.success());
+    let mut expected_history = history_items;
+    expected_history[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("future");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&history.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "listed",
+            "items": expected_history,
+            "nextCursor": "next history page"
+        })
+    );
+    assert!(history.stderr.is_empty());
+
+    let update = run_with_env(
+        &[
+            "organization",
+            "members",
+            "update",
+            "acme-research",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--role",
+            "member",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(update.status.success());
+    let update_json: serde_json::Value = serde_json::from_slice(&update.stdout).unwrap();
+    assert_eq!(update_json["schemaVersion"], 1);
+    assert_eq!(update_json["deployment"], server.api_url);
+    assert_eq!(update_json["outcome"], "updated");
+    assert_eq!(update_json["membership"]["role"], "member");
+    assert_eq!(update_json["membership"]["state"], "active");
+    assert!(update.stderr.is_empty());
+
+    let remove = run_with_env(
+        &[
+            "organization",
+            "members",
+            "remove",
+            "acme-research",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(remove.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&remove.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "removed",
+            "organization": "acme-research",
+            "membershipId": "mem_01k0z6r1w8f4jy2m7q9v3x5abd"
+        })
+    );
+    assert!(remove.stderr.is_empty());
+
+    let leave = run_with_env(
+        &[
+            "organization",
+            "leave",
+            "acme-research",
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(leave.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&leave.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "left",
+            "organization": "acme-research"
+        })
+    );
+    assert!(leave.stderr.is_empty());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].starts_with(
+        "GET /api/v1/organizations/acme-research/memberships/history?limit=2&cursor=opaque+%2F%2B%3D%3F%26 HTTP/1.1\r\n"
+    ));
+    assert!(requests[1].starts_with(
+        "PATCH /api/v1/organizations/acme-research/memberships/mem_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1\r\n"
+    ));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request_body(&requests[1])).unwrap(),
+        serde_json::json!({"role": "member"})
+    );
+    assert!(requests[2].starts_with(
+        "DELETE /api/v1/organizations/acme-research/memberships/mem_01k0z6r1w8f4jy2m7q9v3x5abd HTTP/1.1\r\n"
+    ));
+    assert!(
+        requests[3]
+            .starts_with("DELETE /api/v1/organizations/acme-research/memberships/me HTTP/1.1\r\n")
+    );
+    for request in &requests[1..] {
+        let key = header_value(request, "idempotency-key");
+        assert_eq!(key.len(), 64);
+        assert!(!key.is_empty());
+    }
+}
+
+#[test]
+fn membership_management_preserves_closed_authorization_and_conflict_outcomes() {
+    let cases = [
+        (
+            vec![
+                "organization",
+                "members",
+                "history",
+                "acme",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            organization_problem(
+                "403 Forbidden",
+                403,
+                "https://api.scherzo.dev/problems/forbidden",
+            ),
+            "forbidden",
+        ),
+        (
+            vec![
+                "organization",
+                "members",
+                "update",
+                "acme",
+                "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "--role",
+                "member",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            organization_problem(
+                "409 Conflict",
+                409,
+                "https://api.scherzo.dev/problems/human-owner-required",
+            ),
+            "human_owner_required",
+        ),
+        (
+            vec![
+                "organization",
+                "members",
+                "remove",
+                "acme",
+                "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "--yes",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            organization_problem(
+                "409 Conflict",
+                409,
+                "https://api.scherzo.dev/problems/membership-transition-unavailable",
+            ),
+            "transition_unavailable",
+        ),
+        (
+            vec![
+                "organization",
+                "leave",
+                "private-target",
+                "--yes",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            response_with_detail("The target is inactive."),
+            "not_found",
+        ),
+    ];
+
+    for (args, response, expected_outcome) in cases {
+        let (server, _directory, _path, credential_path) =
+            prepared_organization(vec![response], TOKEN);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(&args, &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["deployment"], server.api_url);
+        assert_eq!(value["outcome"], expected_outcome);
+        assert!(value.get("title").is_none());
+        assert!(value.get("detail").is_none());
+        assert!(output.stderr.is_empty());
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[test]
+fn membership_management_human_reports_use_the_expected_streams() {
+    let (server, _directory, _path, credential_path) = prepared_organization(
+        vec![membership_success(membership_history_items(), None)],
+        TOKEN,
+    );
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let history = run_with_env(
+        &[
+            "organization",
+            "members",
+            "history",
+            "acme",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(history.status.success());
+    let report = String::from_utf8(history.stdout).unwrap();
+    assert!(report.contains("membership: mem_01k0z6r1w8f4jy2m7q9v3x5abd"));
+    assert!(report.contains("principal: prn_01k0z6r1w8f4jy2m7q9v3x5abd · type: service"));
+    assert!(report.contains("role: member · state: ended"));
+    assert!(report.contains("terminal: 2026-07-29T12:02:00Z"));
+    assert!(!report.contains("unavailable"));
+    assert!(history.stderr.is_empty());
+    server.finish();
+
+    let response = organization_problem(
+        "409 Conflict",
+        409,
+        "https://api.scherzo.dev/problems/human-owner-required",
+    );
+    let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let rejected = run_with_env(
+        &[
+            "organization",
+            "members",
+            "update",
+            "acme",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--role",
+            "member",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    let diagnostic = String::from_utf8(rejected.stderr).unwrap();
+    assert!(diagnostic.starts_with("error: "));
+    assert!(diagnostic.contains("\n\n"));
+    assert!(!diagnostic.contains("organization-problem-detail-sentinel"));
+    server.finish();
+}
+
+#[test]
+fn organization_member_remove_rejects_self_route_alias() {
+    let output = run_with_env(
+        &[
+            "organization",
+            "members",
+            "remove",
+            "acme",
+            "me",
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn terminal_membership_commands_require_explicit_confirmation() {
+    for args in [
+        &[
+            "organization",
+            "members",
+            "remove",
+            "acme",
+            "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ][..],
+        &["organization", "leave", "acme"][..],
+    ] {
+        let output = run_with_env(
+            args,
+            &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
+        );
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
 }
 
 #[test]

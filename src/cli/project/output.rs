@@ -205,13 +205,8 @@ fn write_paginated_list_json(
     items: &[impl Serialize],
     next_cursor: Option<&str>,
 ) -> anyhow::Result<()> {
-    write_json(&PaginatedListResult {
-        schema_version: 1,
-        deployment,
-        outcome: "listed",
-        items,
-        next_cursor,
-    })
+    super::super::write_cloud_list_json(deployment, items, next_cursor)
+        .context("write JSON project list result")
 }
 
 fn write_list_footer(
@@ -413,17 +408,6 @@ struct ProjectResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     project: &'a Project,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PaginatedListResult<'a, T> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    items: &'a [T],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<&'a str>,
 }
 
 #[derive(Serialize)]
