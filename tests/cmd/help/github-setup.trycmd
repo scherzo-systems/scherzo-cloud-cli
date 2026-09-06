@@ -1,0 +1,15 @@
+```console
+$ scherzo-cloud github setup --help
+Connect organizations to GitHub
+
+Usage: scherzo-cloud github setup [COMMAND]
+
+Commands:
+  begin     Begin browser-based GitHub setup
+  complete  Complete browser-based GitHub setup
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

@@ -8,6 +8,7 @@ Commands:
   account       Manage your Scherzo Cloud account
   artifact      Work with portable workflow artifacts
   auth          Manage your Scherzo Cloud sign-in
+  github        Manage GitHub connections
   organization  Manage Scherzo Cloud organizations
   project       Manage Scherzo Cloud projects
   run           Work with Scherzo Cloud runs

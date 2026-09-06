@@ -166,17 +166,17 @@ The current release supports:
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, logout, account signup, organization
-  discovery and profile management, complete project and repository configuration, and
-  inputless Cloud run creation and inspection;
+  discovery and profile management, one-page member-directory reads, actor-bound GitHub App
+  setup, installation and repository discovery, complete project and repository configuration,
+  and inputless Cloud run creation and inspection;
 - runner and runner-pool administration plus prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
 
 The Cloud management surface is not complete. The CLI can discover and manage accessible
-organizations, discover selected GitHub repositories, manage projects and runner pools,
-and create or inspect an inputless run for a ready project. It cannot yet connect a new
-GitHub installation, invite or change members, stage run inputs, or guide the rest of
-Cloud onboarding.
+organizations, connect GitHub App installations, discover authorized repositories, manage
+projects and runner pools, and create or inspect an inputless run for a ready project. It
+cannot yet invite or change members, stage run inputs, or guide the rest of Cloud onboarding.
 
 ## Local workflow validation
 
@@ -558,8 +558,8 @@ unconfirmed server revocation; local removal still completes when Auth0 is unrea
 The human store remains separate from workflow-run state and all runner credentials.
 
 Development deployments that use HTTP require `--allow-insecure-http` on each networked
-leaf command. This includes authentication, account, organization, project, Cloud run,
-and runner administration commands; the option is not global.
+leaf command. This includes authentication, account, organization, GitHub connection,
+project, Cloud run, and runner administration commands; the option is not global.
 
 ## Account signup
 
@@ -613,6 +613,76 @@ response. Do not issue a new mutation merely because an earlier result was uncon
 These commands are a direct human management surface. Authentication status may carry a
 server-advertised `organization.create` action, but the CLI only transports that value;
 a trusted external guide owns action selection, explanation, and approval.
+
+## GitHub connections
+
+GitHub commands use only the selected human OAuth credential. The deployment requires
+the exact acting principal to be a current active organization owner; the CLI does not
+use a runner credential, service credential, GitHub personal access token, or local Git
+credential.
+
+Setup is deliberately split around browser consent. The CLI neither opens a browser nor
+listens for an inbound callback. Begin a ten-minute, single-use setup session:
+
+```sh
+scherzo-cloud github setup begin acme-labs
+```
+
+Open the reported URL in a browser and approve the GitHub account and repositories.
+After GitHub returns from setup, copy the decimal installation ID from the browser return
+URL and complete the same session while signed in as the same Scherzo Cloud principal:
+
+```sh
+scherzo-cloud github setup complete \
+  acme-labs \
+  ghs_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --provider-installation-id 12345678
+```
+
+Completion reauthenticates the current human session, while the deployment enforces the
+setup session's exact actor and organization binding and verifies the installation with
+the platform GitHub App credential. An expired or rejected completion does not let the
+CLI substitute another actor, account, repository list, or provider credential. Begin a
+new setup session when the old session has expired.
+
+List the organization's stable installation bindings and their current `active`,
+`disconnected`, or `revoked` state:
+
+```sh
+scherzo-cloud github installation list acme-labs
+```
+
+Discover the repositories currently authorized through one active binding. This is a
+live provider-backed read and may update existing repository availability projections;
+it does not bind a project or create repository connections eagerly:
+
+```sh
+scherzo-cloud github repository list \
+  acme-labs \
+  ghi_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+Disconnect an installation from Scherzo Cloud with its stable binding ID:
+
+```sh
+scherzo-cloud github installation disconnect \
+  acme-labs \
+  ghi_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+Disconnection marks the binding and its repository connections unavailable for new
+source use; it does not uninstall the GitHub App or rewrite accepted run provenance. A
+still-valid disconnected installation can be reactivated only through a new verified
+browser setup session. A revoked provider installation is terminal.
+
+Add `--json` to any GitHub leaf for one schema-version-1 result. Setup begin returns
+`pending` and the session, setup complete returns `completed`, installation disconnect
+returns `disconnected`, and both list commands return `listed`. Expected failures use a
+closed outcome without copying provider responses or API problem prose. Setup completion
+and disconnection retry one ambiguous transport failure with the same session or binding
+identity because the API defines exact replay; setup initiation and reads make one
+request attempt. A later completion retry must reuse the same setup session and provider
+installation ID.
 
 ## Project management
 

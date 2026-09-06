@@ -4,8 +4,11 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::api::{
-    GitHubInstallation, GitHubInstallationList, GitHubRepository, GitHubRepositoryList,
-    OrganizationMembershipList, Project, ProjectFailure, ProjectList, ProjectReadinessBlocker,
+    OrganizationMembershipList, Project, ProjectFailure,
+    ProjectGitHubInstallation as GitHubInstallation,
+    ProjectGitHubInstallationList as GitHubInstallationList,
+    ProjectGitHubRepository as GitHubRepository,
+    ProjectGitHubRepositoryList as GitHubRepositoryList, ProjectList, ProjectReadinessBlocker,
     ProjectRepository,
 };
 use crate::exit_code::{ExitCode, OutcomeClass};

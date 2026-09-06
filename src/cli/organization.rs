@@ -110,11 +110,11 @@ fn execute_leaf<T>(
     command: T,
     execute: impl FnOnce(T, &Deployment) -> anyhow::Result<ExitCode>,
 ) -> super::CommandResult {
-    super::execute_deployment_command(
-        Some(command),
+    super::execute_deployment_leaf(
+        command,
         &[NAME],
         "configure Scherzo Cloud organization access",
-        |command, deployment| execute(command, deployment).map_err(Into::into),
+        execute,
     )
 }
 

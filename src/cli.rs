@@ -1,6 +1,7 @@
 mod account;
 mod artifact;
 mod auth;
+mod github;
 mod organization;
 mod principal;
 mod project;
@@ -116,6 +117,8 @@ enum Command {
     Artifact(artifact::Command),
     #[command(about = auth::ABOUT)]
     Auth(auth::Command),
+    #[command(about = github::ABOUT)]
+    Github(github::Command),
     #[command(about = organization::ABOUT)]
     Organization(organization::Command),
     #[command(about = project::ABOUT)]
@@ -145,6 +148,7 @@ impl Cli {
             Some(Command::Account(command)) => command.execute(),
             Some(Command::Artifact(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
+            Some(Command::Github(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Project(command)) => command.execute(),
             Some(Command::Run(command)) => command.execute(),
@@ -371,6 +375,20 @@ fn finish_read_only_operation(
     result.with_context(|| format!("complete {context} operation"))?
 }
 
+fn execute_deployment_leaf<T>(
+    command: T,
+    command_path: &[&str],
+    error_context: &'static str,
+    execute: impl FnOnce(T, &Deployment) -> anyhow::Result<ExitCode>,
+) -> CommandResult {
+    execute_deployment_command(
+        Some(command),
+        command_path,
+        error_context,
+        |command, deployment| execute(command, deployment).map_err(Into::into),
+    )
+}
+
 fn execute_deployment_command<T>(
     command: Option<T>,
     command_path: &[&str],
@@ -518,6 +536,15 @@ mod tests {
             "auth login",
             "auth logout",
             "auth status",
+            "github",
+            "github installation",
+            "github installation disconnect",
+            "github installation list",
+            "github repository",
+            "github repository list",
+            "github setup",
+            "github setup begin",
+            "github setup complete",
             "organization",
             "organization create",
             "organization list",

@@ -1,0 +1,21 @@
+```console
+$ scherzo-cloud github setup complete --help
+Complete browser-based GitHub setup
+
+Usage: scherzo-cloud github setup complete [OPTIONS] --provider-installation-id <INSTALLATION_ID> <ORGANIZATION> <SETUP_SESSION>
+
+Arguments:
+  <ORGANIZATION>   Organization ID or exact slug
+  <SETUP_SESSION>  GitHub setup session ID returned by setup begin
+
+Options:
+      --provider-installation-id <INSTALLATION_ID>
+          Decimal GitHub installation ID returned after browser setup
+      --json
+          Print the GitHub result as JSON
+      --allow-insecure-http
+          Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help
+          Print help
+
+```

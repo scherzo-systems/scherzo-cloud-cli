@@ -8,6 +8,7 @@ use std::time::Duration;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Url};
+use zeroize::Zeroize as _;
 
 use super::generated::apis;
 use super::http_util;
@@ -128,6 +129,14 @@ pub(super) fn generated_configuration(
     configuration.bearer_access_token = Some(access_token.to_owned());
     configuration.client = client;
     Ok(configuration)
+}
+
+pub(super) fn zeroize_generated_bearer_access_token(
+    configuration: &mut apis::configuration::Configuration,
+) {
+    if let Some(access_token) = &mut configuration.bearer_access_token {
+        access_token.zeroize();
+    }
 }
 
 pub(super) fn categorized_dns_resolver() -> Arc<impl Resolve> {

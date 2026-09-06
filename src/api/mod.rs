@@ -2,6 +2,7 @@ mod artifacts;
 #[cfg(test)]
 mod artifacts_tests;
 mod current_principal;
+mod github;
 mod http_client;
 pub(crate) mod http_util;
 mod human_principal;
@@ -41,6 +42,10 @@ pub(crate) use current_principal::{
     AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory,
     classify_reqwest_error, get_current_principal,
 };
+pub(crate) use github::{
+    GitHubAccountType, GitHubApi, GitHubFailure, GitHubInstallation, GitHubInstallationState,
+    GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
+};
 pub(crate) use http_client::{HttpClient, HttpEndpointError, HttpTransportPolicy};
 pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use organizations::{
@@ -51,9 +56,11 @@ pub(crate) use organizations::{
     list_organization_memberships, update_organization,
 };
 pub(crate) use projects::{
-    CreateProjectInput, GitHubInstallation, GitHubInstallationList, GitHubRepository,
-    GitHubRepositoryList, OrganizationMembershipList, Project, ProjectApi, ProjectFailure,
-    ProjectList, ProjectReadinessBlocker, ProjectRepository,
+    CreateProjectInput, GitHubInstallation as ProjectGitHubInstallation,
+    GitHubInstallationList as ProjectGitHubInstallationList,
+    GitHubRepository as ProjectGitHubRepository,
+    GitHubRepositoryList as ProjectGitHubRepositoryList, OrganizationMembershipList, Project,
+    ProjectApi, ProjectFailure, ProjectList, ProjectReadinessBlocker, ProjectRepository,
 };
 pub(crate) use runners::{
     RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,

@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud github --help
+Manage GitHub connections
+
+Usage: scherzo-cloud github [COMMAND]
+
+Commands:
+  setup         Connect organizations to GitHub
+  installation  Manage GitHub installation bindings
+  repository    Discover GitHub repositories
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```
