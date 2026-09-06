@@ -1,0 +1,14 @@
+```console
+$ scherzo-cloud account update --help
+Update your Scherzo Cloud account
+
+Usage: scherzo-cloud account update [OPTIONS] <--display-name <NAME>|--clear-display-name>
+
+Options:
+      --display-name <NAME>  Set your account display name
+      --clear-display-name   Clear your account display name
+      --json                 Print the account result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

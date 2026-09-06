@@ -6,6 +6,7 @@ Usage: scherzo-cloud account [COMMAND]
 
 Commands:
   signup  Create your Scherzo Cloud account
+  update  Update your Scherzo Cloud account
   help    Print this message or the help of the given subcommand(s)
 
 Options:

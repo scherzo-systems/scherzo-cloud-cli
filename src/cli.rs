@@ -20,7 +20,7 @@ use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
-use crate::api::HttpTransportPolicy;
+use crate::api::{HttpClient, HttpTransportPolicy, UnreachableCategory};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
@@ -466,6 +466,45 @@ fn execute_human_api_operation<O, E>(
     }
 }
 
+trait HumanCredentialOutcome: Sized {
+    type Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
+
+    fn unauthenticated() -> Self;
+    fn unreachable(category: UnreachableCategory) -> Self;
+    fn is_unauthenticated(&self) -> bool;
+    fn credential_rejected(error: &Self::Error) -> bool;
+}
+
+fn execute_with_human_credential<O>(
+    deployment: &Deployment,
+    transport_policy: HttpTransportPolicy,
+    network_context: &'static str,
+    api_context: &'static str,
+    mut operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, O::Error>,
+) -> anyhow::Result<O>
+where
+    O: HumanCredentialOutcome,
+{
+    let client = HttpClient::new(transport_policy)
+        .map_err(|error| anyhow!(error))
+        .context(network_context)?;
+    execute_human_api_operation(
+        &client,
+        deployment,
+        |access_token| operation(&client, deployment.fingerprint().api_url(), access_token),
+        |result| {
+            result.as_ref().is_ok_and(O::is_unauthenticated)
+                || result.as_ref().is_err_and(O::credential_rejected)
+        },
+        HumanApiOutcomeAdapters {
+            unauthenticated: O::unauthenticated,
+            unreachable: O::unreachable,
+            operation_error: |error: O::Error| anyhow!(error),
+        },
+        format!("{api_context} {}", deployment.fingerprint().api_url()),
+    )
+}
+
 fn execute_deployment_leaf<T>(
     command: T,
     command_path: &[&str],
@@ -620,6 +659,7 @@ mod tests {
         let expected = [
             "account",
             "account signup",
+            "account update",
             "artifact",
             "artifact download",
             "artifact validate",

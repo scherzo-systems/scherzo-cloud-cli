@@ -1,94 +1,28 @@
-// Signup and status have independent output contracts, so their command-local
-// adapters stay separate rather than coupling unrelated command behavior.
-// jscpd:ignore-start
 use std::io::{self, Write};
 
-use anyhow::{Context, anyhow};
-use clap::Args;
+use anyhow::Context;
 use serde::Serialize;
-// jscpd:ignore-end
 
-use crate::api::{HttpClient, HumanPrincipal, SignupError, SignupOutcome, signup_human};
+use crate::api::{HumanPrincipal, SignupError, SignupOutcome};
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
-use crate::idempotency::generate_idempotency_key;
 
 use super::super::principal::PrincipalResult;
 
 pub(super) const ABOUT: &str = "Create your Scherzo Cloud account";
 
-// Signup keeps its idempotency and output contracts local while shared session
-// acquisition owns refresh, bounded authentication retry, and rejection cleanup.
-// jscpd:ignore-start
-#[derive(Debug, Args)]
-pub(super) struct Command {
-    #[arg(long, help = "Print the signup result as JSON")]
+impl_authenticated_account_outcome!(SignupOutcome, SignupError);
+
+pub(super) fn write_outcome(
     json: bool,
-
-    #[command(flatten)]
-    http: super::super::HttpOptions,
-}
-
-impl Command {
-    pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
-        self.run(deployment).map_err(Into::into)
+    deployment: &str,
+    outcome: &SignupOutcome,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_json_result(deployment, outcome)?;
+    } else {
+        write_human_result(deployment, outcome)?;
     }
-
-    fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let idempotency_key =
-            generate_idempotency_key().context("create signup request identity")?;
-        // jscpd:ignore-end
-        let client = HttpClient::new(self.http.transport_policy())
-            .map_err(|error| anyhow!(error))
-            .context("prepare signup networking")?;
-        let outcome = match session::execute_required(
-            &client,
-            deployment,
-            |access_token| {
-                signup_human(
-                    &client,
-                    deployment.fingerprint().api_url(),
-                    access_token.expose(),
-                    &idempotency_key,
-                )
-            },
-            |outcome| {
-                matches!(outcome, Ok(SignupOutcome::Unauthenticated))
-                    || outcome
-                        .as_ref()
-                        .is_err_and(SignupError::credential_rejected)
-            },
-        ) {
-            Ok(RequiredOperation::Unauthenticated) => SignupOutcome::Unauthenticated,
-            Ok(RequiredOperation::Completed(outcome)) => {
-                outcome.map_err(|error| anyhow!(error)).with_context(|| {
-                    format!(
-                        "create Scherzo Cloud account through {}",
-                        deployment.fingerprint().api_url()
-                    )
-                })?
-            }
-            Err(error) => match error.unreachable_category() {
-                Some(category) => SignupOutcome::Unreachable(category),
-                None => return Err(anyhow!(error).context("acquire human session")),
-            },
-        };
-        self.write_outcome(deployment, &outcome)
-    }
-
-    fn write_outcome(
-        self,
-        deployment: &Deployment,
-        outcome: &SignupOutcome,
-    ) -> anyhow::Result<ExitCode> {
-        if self.json {
-            write_json_result(deployment.fingerprint().api_url(), outcome)?;
-        } else {
-            write_human_result(deployment.fingerprint().api_url(), outcome)?;
-        }
-        Ok(outcome_class(outcome).exit_code())
-    }
+    Ok(outcome_class(outcome).exit_code())
 }
 
 fn outcome_class(outcome: &SignupOutcome) -> OutcomeClass {

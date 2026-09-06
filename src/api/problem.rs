@@ -13,19 +13,23 @@ pub(super) const NOT_FOUND: &str = "https://api.scherzo.dev/problems/not-found";
 pub(super) fn decode_type(
     response: &super::http_util::BufferedResponse,
 ) -> Result<String, &'static str> {
-    super::http_util::require_media_type(response.content_type.as_deref(), PROBLEM_MEDIA_TYPE)?;
-    decode(&response.body, response.status).map(|problem| problem.r#type)
+    decode_type_parts(
+        &response.body,
+        response.status,
+        response.content_type.as_deref(),
+    )
 }
 
 pub(super) fn require_type(
     response: &super::http_util::BufferedResponse,
     expected_type: &str,
 ) -> Result<(), &'static str> {
-    if decode_type(response)? == expected_type {
-        Ok(())
-    } else {
-        Err("the problem type is not valid for its HTTP status")
-    }
+    require_type_parts(
+        &response.body,
+        response.status,
+        response.content_type.as_deref(),
+        expected_type,
+    )
 }
 
 pub(super) fn decode(
@@ -38,4 +42,26 @@ pub(super) fn decode(
         return Err("the problem status does not match the HTTP status");
     }
     Ok(problem)
+}
+
+pub(super) fn decode_type_parts(
+    body: &[u8],
+    status: StatusCode,
+    content_type: Option<&str>,
+) -> Result<String, &'static str> {
+    super::http_util::require_media_type(content_type, PROBLEM_MEDIA_TYPE)?;
+    decode(body, status).map(|problem| problem.r#type)
+}
+
+pub(super) fn require_type_parts(
+    body: &[u8],
+    status: StatusCode,
+    content_type: Option<&str>,
+    expected_type: &str,
+) -> Result<(), &'static str> {
+    if decode_type_parts(body, status, content_type)? == expected_type {
+        Ok(())
+    } else {
+        Err("the problem type is not valid for its HTTP status")
+    }
 }

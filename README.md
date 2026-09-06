@@ -166,10 +166,10 @@ The current release supports:
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, linked sign-in identity management,
-  logout, account signup, organization discovery and profile management, one-page
-  member-directory reads, actor-bound GitHub App setup, installation and repository
-  discovery, complete project and repository configuration, and inputless Cloud run
-  creation and inspection;
+  logout, account signup and display-name management, organization discovery and profile
+  management, one-page member-directory reads, actor-bound GitHub App setup, installation
+  and repository discovery, complete project and repository configuration, and inputless
+  Cloud run creation and inspection;
 - runner and runner-pool administration plus prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
@@ -607,7 +607,7 @@ leaf command. This includes authentication and linked identity management, accou
 organization, GitHub connection, project, Cloud run, and runner administration commands;
 the option is not global.
 
-## Account signup
+## Account management
 
 OAuth login does not implicitly create a Scherzo Cloud account. When authentication
 status is `signup_required` and the deployment advertises signup, use
@@ -615,6 +615,26 @@ status is `signup_required` and the deployment advertises signup, use
 Add `--json` for a schema-version-1 structured result. The CLI authenticates the request
 with the existing human credential and retries an ambiguous transport failure once with
 the same opaque idempotency key.
+
+Set or clear the authenticated account's optional display name with exactly one of these
+options:
+
+```sh
+scherzo-cloud account update --display-name "Ada Lovelace"
+scherzo-cloud account update --clear-display-name
+```
+
+The deployment removes surrounding Unicode whitespace and accepts 1 through 200 Unicode
+scalar values without control characters. An equivalent normalized name and clearing an
+already absent name are successful no-ops. Successful human output says that the display
+name is `set` or `cleared`; `--json` reports the same stable `outcome` and the active
+`principal`. The principal omits `displayName` after a clear.
+
+Each invocation generates a fresh opaque idempotency key. After an ambiguous transport
+failure, the CLI retries once with the same key and exact merge patch. If the result still
+cannot be confirmed, check `scherzo-cloud auth status` before issuing another update.
+Structured failures report one of `invalid_display_name`, `unauthenticated`, `forbidden`,
+`idempotency_conflict`, `request_too_large`, `unsupported_media_type`, or `unreachable`.
 
 ## Organization management
 

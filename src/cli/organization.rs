@@ -5,13 +5,13 @@ mod output;
 mod show;
 mod update;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::api::{
     CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
-    HttpTransportPolicy, ListCurrentPrincipalMembershipsOutcome,
-    ListOrganizationMembershipsOutcome, OrganizationError, UpdateOrganizationOutcome,
+    ListCurrentPrincipalMembershipsOutcome, ListOrganizationMembershipsOutcome, OrganizationError,
+    UpdateOrganizationOutcome,
 };
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
@@ -56,9 +56,15 @@ impl LeafOptions {
         write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
-        O: HumanCredentialOutcome,
+        O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        let outcome = with_human_credential(deployment, self.http.transport_policy(), operation)?;
+        let outcome = super::execute_with_human_credential(
+            deployment,
+            self.http.transport_policy(),
+            "prepare organization networking",
+            "contact organization API at",
+            operation,
+        )?;
         write(deployment.fingerprint().api_url(), &outcome, self.json)
             .context("write organization result")
     }
@@ -70,7 +76,7 @@ impl LeafOptions {
         write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
-        O: HumanCredentialOutcome,
+        O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
         let idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate organization mutation request identity")?;
@@ -117,16 +123,12 @@ fn execute_leaf<T>(
     )
 }
 
-trait HumanCredentialOutcome: Sized {
-    fn unauthenticated() -> Self;
-    fn unreachable(category: crate::api::UnreachableCategory) -> Self;
-    fn is_unauthenticated(&self) -> bool;
-}
-
 macro_rules! impl_human_credential_outcome {
     ($($outcome:ty),+ $(,)?) => {
         $(
-            impl HumanCredentialOutcome for $outcome {
+            impl super::HumanCredentialOutcome for $outcome {
+                type Error = OrganizationError;
+
                 fn unauthenticated() -> Self {
                     Self::Common(CommonOrganizationFailure::Unauthenticated)
                 }
@@ -141,6 +143,10 @@ macro_rules! impl_human_credential_outcome {
                         Self::Common(CommonOrganizationFailure::Unauthenticated)
                     )
                 }
+
+                fn credential_rejected(error: &Self::Error) -> bool {
+                    error.credential_rejected()
+                }
             }
         )+
     };
@@ -153,40 +159,3 @@ impl_human_credential_outcome!(
     ListCurrentPrincipalMembershipsOutcome,
     ListOrganizationMembershipsOutcome,
 );
-
-fn with_human_credential<O>(
-    deployment: &Deployment,
-    transport_policy: HttpTransportPolicy,
-    mut operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
-) -> anyhow::Result<O>
-where
-    O: HumanCredentialOutcome,
-{
-    let client = HttpClient::new(transport_policy)
-        .map_err(|error| anyhow!(error))
-        .context("prepare organization networking")?;
-    super::execute_human_api_operation(
-        &client,
-        deployment,
-        |access_token| operation(&client, deployment.fingerprint().api_url(), access_token),
-        |result| {
-            result.as_ref().is_ok_and(O::is_unauthenticated)
-                || result
-                    .as_ref()
-                    .is_err_and(OrganizationError::credential_rejected)
-        },
-        super::HumanApiOutcomeAdapters {
-            unauthenticated: O::unauthenticated,
-            unreachable: O::unreachable,
-            operation_error: organization_api_error,
-        },
-        format!(
-            "contact organization API at {}",
-            deployment.fingerprint().api_url()
-        ),
-    )
-}
-
-fn organization_api_error(error: OrganizationError) -> anyhow::Error {
-    anyhow!(error)
-}

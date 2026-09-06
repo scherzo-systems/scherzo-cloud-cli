@@ -23,6 +23,8 @@ use std::time::Duration;
 
 #[path = "cli/account_signup.rs"]
 mod account_signup;
+#[path = "cli/account_update.rs"]
+mod account_update;
 mod api_test_support {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

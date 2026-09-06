@@ -9,6 +9,7 @@ mod human_principal;
 mod identities;
 mod organizations;
 mod problem;
+mod profile;
 mod projects;
 mod runners;
 mod runs;
@@ -71,6 +72,7 @@ pub(crate) use organizations::{
     UpdateOrganizationOutcome, create_organization, get_organization,
     list_current_principal_memberships, list_organization_memberships, update_organization,
 };
+pub(crate) use profile::{UpdateProfileError, UpdateProfileOutcome, update_current_principal};
 pub(crate) use projects::{
     CreateProjectInput, GitHubInstallation as ProjectGitHubInstallation,
     GitHubInstallationList as ProjectGitHubInstallationList,

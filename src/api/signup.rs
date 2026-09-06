@@ -18,7 +18,6 @@ use super::{UnreachableCategory, classify_reqwest_error};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ATTEMPTS: usize = 2;
 const JSON_MEDIA_TYPE: &str = "application/json";
-const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";
 const UNAUTHORIZED: &str = "https://api.scherzo.dev/problems/unauthorized";
 const SIGNUP_NOT_PERMITTED: &str = "https://api.scherzo.dev/problems/signup-not-permitted";
@@ -224,36 +223,39 @@ async fn decode_response(response: Response) -> Result<SignupOutcome, AttemptErr
 
     match status {
         StatusCode::CREATED => {
-            require_media_type(content_type.as_deref(), JSON_MEDIA_TYPE, false)?;
+            http_util::require_media_type(content_type.as_deref(), JSON_MEDIA_TYPE)
+                .map_err(|reason| AttemptError::Protocol(SignupError::protocol(reason, false)))?;
             human_principal::decode(&body)
                 .map(SignupOutcome::Authenticated)
                 .map_err(|reason| AttemptError::Protocol(SignupError::protocol(reason, false)))
         }
         StatusCode::UNAUTHORIZED => {
-            require_problem_type(
+            problem::require_type_parts(
                 &body,
                 StatusCode::UNAUTHORIZED,
                 content_type.as_deref(),
                 UNAUTHORIZED,
-                true,
-            )?;
+            )
+            .map_err(|reason| AttemptError::Protocol(SignupError::protocol(reason, true)))?;
             Ok(SignupOutcome::Unauthenticated)
         }
         StatusCode::FORBIDDEN => {
-            require_problem_type(
+            problem::require_type_parts(
                 &body,
                 StatusCode::FORBIDDEN,
                 content_type.as_deref(),
                 SIGNUP_NOT_PERMITTED,
-                false,
-            )?;
+            )
+            .map_err(|reason| AttemptError::Protocol(SignupError::protocol(reason, false)))?;
             Ok(SignupOutcome::SignupNotPermitted)
         }
         StatusCode::CONFLICT => {
-            require_media_type(content_type.as_deref(), PROBLEM_MEDIA_TYPE, false)?;
-            let problem = problem::decode(&body, StatusCode::CONFLICT)
-                .map_err(|reason| AttemptError::Protocol(SignupError::protocol(reason, false)))?;
-            match problem.r#type.as_str() {
+            let problem_type =
+                problem::decode_type_parts(&body, StatusCode::CONFLICT, content_type.as_deref())
+                    .map_err(|reason| {
+                        AttemptError::Protocol(SignupError::protocol(reason, false))
+                    })?;
+            match problem_type.as_str() {
                 PRINCIPAL_ALREADY_PROVISIONED => Ok(SignupOutcome::AlreadyProvisioned),
                 IDEMPOTENCY_CONFLICT => Ok(SignupOutcome::IdempotencyConflict),
                 _ => Err(AttemptError::Protocol(SignupError::protocol(
@@ -276,40 +278,5 @@ async fn decode_response(response: Response) -> Result<SignupOutcome, AttemptErr
             "the HTTP status is not valid for this operation",
             false,
         ))),
-    }
-}
-
-fn require_problem_type(
-    body: &[u8],
-    status: StatusCode,
-    content_type: Option<&str>,
-    expected_type: &'static str,
-    credential_rejected: bool,
-) -> Result<(), AttemptError> {
-    require_media_type(content_type, PROBLEM_MEDIA_TYPE, credential_rejected)?;
-    let problem = problem::decode(body, status).map_err(|reason| {
-        AttemptError::Protocol(SignupError::protocol(reason, credential_rejected))
-    })?;
-    if problem.r#type != expected_type {
-        return Err(AttemptError::Protocol(SignupError::protocol(
-            "the problem type is not valid for its HTTP status",
-            credential_rejected,
-        )));
-    }
-    Ok(())
-}
-
-fn require_media_type(
-    actual: Option<&str>,
-    expected: &'static str,
-    credential_rejected: bool,
-) -> Result<(), AttemptError> {
-    if actual == Some(expected) {
-        Ok(())
-    } else {
-        Err(AttemptError::Protocol(SignupError::protocol(
-            "the response Content-Type is not valid for its HTTP status",
-            credential_rejected,
-        )))
     }
 }
