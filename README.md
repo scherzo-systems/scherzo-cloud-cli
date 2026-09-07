@@ -167,18 +167,19 @@ The current release supports:
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, linked sign-in identity management,
   logout, account signup and display-name management, organization discovery and profile
-  management, one-page member-directory reads, actor-bound GitHub App setup, installation
-  and repository discovery, complete project and repository configuration, and inputless
-  Cloud run creation and inspection;
+  management, invitation issuance and lifecycle management, the current principal's
+  invitation inbox, one-page member-directory reads, actor-bound GitHub App setup,
+  installation and repository discovery, complete project and repository configuration,
+  and inputless Cloud run creation and inspection;
 - runner and runner-pool administration plus prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
 
 The Cloud management surface is not complete. The CLI can discover and manage accessible
-organizations, change member roles, remove members, leave organizations, connect GitHub App
-installations, discover authorized repositories, manage projects and runner pools, and create
-or inspect an inputless run for a ready project. It cannot yet invite members, stage run inputs,
-or guide the rest of Cloud onboarding.
+organizations, manage invitations and membership, connect GitHub App installations,
+discover authorized repositories, manage projects and runner pools, and create or inspect
+an inputless run for a ready project. It cannot yet stage run inputs or guide the rest of
+Cloud onboarding.
 
 ## Public API contract
 
@@ -724,6 +725,67 @@ because an earlier result was unconfirmed.
 These commands are a direct human management surface. Authentication status may carry a
 server-advertised `organization.create` action, but the CLI only transports that value;
 a trusted external guide owns action selection, explanation, and approval.
+
+## Organization invitations
+
+Invitation commands use the selected human OAuth credential. Active organization owners
+can issue invitations to either an active principal ID or an email address, inspect retained
+invitation history, and revoke an outstanding invitation:
+
+```sh
+# Issue to exactly one target kind.
+scherzo-cloud organization invitations issue acme-labs \
+  --principal prn_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud organization invitations issue acme-labs \
+  --email teammate@example.com
+
+# Read one owner-only page, including terminal history.
+scherzo-cloud organization invitations list acme-labs --limit 50
+
+# Revoke an outstanding invitation.
+scherzo-cloud organization invitations revoke acme-labs \
+  inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+```
+
+The current principal can list directly targeted outstanding invitations, preview an
+invitation, and accept or decline it:
+
+```sh
+scherzo-cloud invitation list --limit 50
+scherzo-cloud invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud invitation decline inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+```
+
+Email-targeted invitation links contain a bearer capability. Supply it only through a
+private regular file owned by the current Unix user, or through explicit standard input:
+
+```sh
+scherzo-cloud invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --capability-file ~/.config/scherzo/invitation.capability
+scherzo-cloud invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --capability-file - < ~/.config/scherzo/invitation.capability
+```
+
+Capability files must use mode `0600`, must not be symlinks, and must be owned by the
+invoking user. The capability's embedded
+invitation ID must match the command argument. The CLI sends the value only in the API
+request body, zeroizes the capability input buffer after use, and never includes it in
+normal human or JSON output. This does not guarantee erasure of copies made by the
+HTTP or TLS stack. Avoid command-line arguments, environment variables, shell history,
+logs, and issue reports for capability values.
+
+Preview, accept, and decline intentionally collapse expired, revoked, consumed,
+inaccessible, and wrong-capability cases into `invitation_unavailable`; they do not reveal
+which condition applied. Owner history retains `outstanding`, `accepted`, `declined`,
+`revoked`, and `expired` states. Each list reads one page, preserves `nextCursor`, and does
+not follow it automatically; limits accept 1 through 200.
+
+Issue, revoke, accept, and decline generate a fresh opaque idempotency key and retry one
+ambiguous transport failure with the same serialized request and key. They never retry a
+contracted HTTP response. `--json` emits schema-version-1 results. Authentication and
+failures use exit 3 when sign-in is required, exit 4 when the deployment is unreachable
+or rate limited, and exit 1 for other rejected or unavailable outcomes.
 
 ## GitHub connections
 

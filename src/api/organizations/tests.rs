@@ -1075,3 +1075,114 @@ fn explicit_server_failures_are_not_retried() {
     );
     server.finish_one();
 }
+
+#[test]
+fn issue_invitation_retries_an_ambiguous_transport_failure_with_the_same_request() {
+    let invitation_id = "inv_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let invitation = serde_json::json!({
+        "id": invitation_id,
+        "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "issuerPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "targetKind": "email",
+        "targetEmail": "teammate@example.com",
+        "state": "outstanding",
+        "issuedAt": "2026-09-07T03:00:00Z",
+        "deliveryState": "pending",
+        "expiresAt": "2026-09-14T03:00:00Z"
+    });
+    let success = response(
+        "201 Created",
+        Some(JSON_MEDIA_TYPE),
+        &[
+            ("Idempotency-Key", KEY),
+            ("Location", "/v1/invitations/inv_01k0z6r1w8f4jy2m7q9v3x5abc"),
+        ],
+        &serde_json::to_vec(&invitation).unwrap(),
+    );
+    let server = ScriptedHttpServer::respond_in_sequence(vec![Vec::new(), success]);
+
+    let outcome = issue_invitation(
+        &http_client(),
+        &server.api_url,
+        TOKEN,
+        "acme",
+        KEY,
+        InvitationTarget::Email("teammate@example.com"),
+    )
+    .expect("issue should succeed after one ambiguous failure");
+
+    assert!(matches!(outcome, IssueInvitationOutcome::Issued(_)));
+    let requests = server.finish();
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(header_value(&requests[0], "idempotency-key"), KEY);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
+        serde_json::json!({
+            "kind": "email",
+            "email": "teammate@example.com"
+        })
+    );
+}
+
+#[test]
+fn accept_invitation_replays_the_same_capability_body_after_an_interrupted_success() {
+    let capability = "inv_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let membership = serde_json::json!({
+        "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "role": "member",
+        "state": "active",
+        "createdAt": "2026-09-07T03:00:00Z",
+        "updatedAt": "2026-09-07T03:00:00Z"
+    });
+    let success = response(
+        "200 OK",
+        Some(JSON_MEDIA_TYPE),
+        &[("Idempotency-Key", KEY)],
+        &serde_json::to_vec(&membership).unwrap(),
+    );
+    let mut interrupted = success.clone();
+    interrupted.pop();
+    let server = ScriptedHttpServer::respond_in_sequence(vec![interrupted, success]);
+
+    let outcome = accept_invitation(
+        &http_client(),
+        &server.api_url,
+        TOKEN,
+        "inv_01k0z6r1w8f4jy2m7q9v3x5abc",
+        Some(capability),
+        KEY,
+    )
+    .expect("accept should succeed after one interrupted replayable response");
+
+    assert!(matches!(outcome, AcceptInvitationOutcome::Accepted(_)));
+    let requests = server.finish();
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
+        serde_json::json!({ "capability": capability })
+    );
+}
+
+#[test]
+fn invitation_unavailable_is_a_contracted_non_retryable_outcome() {
+    let server = ScriptedHttpServer::respond(problem_response(
+        "409 Conflict",
+        409,
+        INVITATION_UNAVAILABLE,
+        &[],
+    ));
+
+    let outcome = preview_invitation(
+        &http_client(),
+        &server.api_url,
+        TOKEN,
+        "inv_01k0z6r1w8f4jy2m7q9v3x5abc",
+        None,
+    )
+    .expect("unavailable invitation should decode");
+
+    assert_eq!(outcome, PreviewInvitationOutcome::Unavailable);
+    assert_eq!(server.finish().len(), 1);
+}

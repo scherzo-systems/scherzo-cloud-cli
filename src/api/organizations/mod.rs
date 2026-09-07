@@ -6,6 +6,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION};
 use reqwest::{Method, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
+use zeroize::Zeroizing;
 
 use super::bearer_authorization;
 use super::generated::models as generated_models;
@@ -19,7 +20,9 @@ use super::problem::{
 use super::{UnreachableCategory, classify_reqwest_error};
 
 pub(crate) use models::{
-    CurrentPrincipalMembership, CurrentPrincipalMembershipPage, MembershipRole, MembershipState,
+    AcceptedInvitationMembership, CurrentPrincipalMembership, CurrentPrincipalMembershipPage,
+    Invitation, InvitationDeliveryState, InvitationInboxEntry, InvitationInboxPage, InvitationPage,
+    InvitationPreview, InvitationState, InvitationTargetKind, MembershipRole, MembershipState,
     Organization, OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry,
     OrganizationMembershipHistoryPage, OrganizationMembershipPage, OrganizationState,
     PrincipalType,
@@ -38,6 +41,13 @@ const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency
 const MEMBERSHIP_TRANSITION_UNAVAILABLE: &str =
     "https://api.scherzo.dev/problems/membership-transition-unavailable";
 const HUMAN_OWNER_REQUIRED: &str = "https://api.scherzo.dev/problems/human-owner-required";
+const RECIPIENT_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/recipient-unavailable";
+const INVITATION_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/invitation-unavailable";
+const OUTSTANDING_INVITATION_LIMIT: &str =
+    "https://api.scherzo.dev/problems/outstanding-invitation-limit-reached";
+const MEMBERSHIP_LIMIT: &str = "https://api.scherzo.dev/problems/membership-limit-reached";
+const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
+const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupported-media-type";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CommonOrganizationFailure {
@@ -111,6 +121,61 @@ pub(crate) enum MembershipTerminationOutcome {
     NotFound,
     TransitionUnavailable,
     HumanOwnerRequired,
+    IdempotencyConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvitationTarget<'a> {
+    Principal(&'a str),
+    Email(&'a str),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum IssueInvitationOutcome {
+    Issued(Box<Invitation>),
+    Common(CommonOrganizationFailure),
+    NotFound,
+    RecipientUnavailable,
+    OutstandingLimitReached,
+    RateLimited { retry_after: u64 },
+    IdempotencyConflict,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ListOrganizationInvitationsOutcome {
+    Listed(InvitationPage),
+    Common(CommonOrganizationFailure),
+    NotFound,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ListInvitationInboxOutcome {
+    Listed(InvitationInboxPage),
+    Common(CommonOrganizationFailure),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum PreviewInvitationOutcome {
+    Previewed(InvitationPreview),
+    Common(CommonOrganizationFailure),
+    Unavailable,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AcceptInvitationOutcome {
+    Accepted(AcceptedInvitationMembership),
+    Common(CommonOrganizationFailure),
+    Unavailable,
+    MembershipLimitReached,
+    IdempotencyConflict,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum InvitationTerminationOutcome {
+    Completed,
+    Common(CommonOrganizationFailure),
+    NotFound,
+    Unavailable,
     IdempotencyConflict,
 }
 
@@ -197,6 +262,13 @@ enum Operation {
     UpdateMembership,
     EndMembership,
     Leave,
+    IssueInvitation,
+    ListOrganizationInvitations,
+    RevokeInvitation,
+    ListInvitationInbox,
+    PreviewInvitation,
+    AcceptInvitation,
+    DeclineInvitation,
 }
 
 impl Operation {
@@ -211,20 +283,43 @@ impl Operation {
             Self::UpdateMembership => "membership-update",
             Self::EndMembership => "membership-removal",
             Self::Leave => "leave",
+            Self::IssueInvitation => "invitation issue",
+            Self::ListOrganizationInvitations => "organization-invitation list",
+            Self::RevokeInvitation => "invitation revocation",
+            Self::ListInvitationInbox => "invitation inbox list",
+            Self::PreviewInvitation => "invitation preview",
+            Self::AcceptInvitation => "invitation acceptance",
+            Self::DeclineInvitation => "invitation decline",
         }
     }
 
     fn can_retry_interrupted_response(self, status: StatusCode) -> bool {
         matches!(
             (self, status),
-            (Self::Create, StatusCode::CREATED)
-                | (Self::Update | Self::UpdateMembership, StatusCode::OK)
-                | (Self::EndMembership | Self::Leave, StatusCode::NO_CONTENT)
+            (Self::Create | Self::IssueInvitation, StatusCode::CREATED)
+                | (
+                    Self::Update | Self::UpdateMembership | Self::AcceptInvitation,
+                    StatusCode::OK
+                )
+                | (
+                    Self::EndMembership
+                        | Self::Leave
+                        | Self::RevokeInvitation
+                        | Self::DeclineInvitation,
+                    StatusCode::NO_CONTENT
+                )
         )
     }
 
     fn success_has_json_body(self) -> bool {
-        matches!(self, Self::Create | Self::Update | Self::UpdateMembership)
+        matches!(
+            self,
+            Self::Create
+                | Self::Update
+                | Self::UpdateMembership
+                | Self::IssueInvitation
+                | Self::AcceptInvitation
+        )
     }
 }
 
@@ -235,7 +330,7 @@ struct RequestSpec {
     authorization: HeaderValue,
     idempotency_key: Option<HeaderValue>,
     content_type: Option<&'static str>,
-    body: Option<Vec<u8>>,
+    body: Option<Zeroizing<Vec<u8>>>,
     max_attempts: usize,
 }
 
@@ -380,7 +475,7 @@ pub(crate) fn list_current_principal_memberships(
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ListCurrentPrincipalMembershipsOutcome, OrganizationError> {
-    let spec = membership_list_request_spec(
+    let spec = list_request_spec(
         client,
         Operation::ListCurrentMemberships,
         api_url,
@@ -408,7 +503,7 @@ pub(crate) fn list_organization_memberships(
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ListOrganizationMembershipsOutcome, OrganizationError> {
-    let spec = membership_list_request_spec(
+    let spec = list_request_spec(
         client,
         Operation::ListMemberships,
         api_url,
@@ -434,7 +529,7 @@ pub(crate) fn list_organization_membership_history(
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ListOrganizationMembershipHistoryOutcome, OrganizationError> {
-    let spec = membership_list_request_spec(
+    let spec = list_request_spec(
         client,
         Operation::ListMembershipHistory,
         api_url,
@@ -546,6 +641,302 @@ pub(crate) fn leave_organization(
     )
 }
 
+pub(crate) fn issue_invitation(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    idempotency_key: &str,
+    target: InvitationTarget<'_>,
+) -> Result<IssueInvitationOutcome, OrganizationError> {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "kind", rename_all = "lowercase")]
+    enum TargetRequest<'a> {
+        Principal {
+            #[serde(rename = "principalId")]
+            principal_id: &'a str,
+        },
+        Email {
+            email: &'a str,
+        },
+    }
+
+    let request = match target {
+        InvitationTarget::Principal(principal_id) => TargetRequest::Principal { principal_id },
+        InvitationTarget::Email(email) => TargetRequest::Email { email },
+    };
+    let body = serialize_request(Operation::IssueInvitation, &request)?;
+    let spec = request_spec(
+        client,
+        Operation::IssueInvitation,
+        Method::POST,
+        api_url,
+        &["v1", "organizations", organization_ref, "invitations"],
+        access_token,
+        Some(idempotency_key),
+        Some(JSON_MEDIA_TYPE),
+        Some(body),
+        MUTATION_ATTEMPTS,
+    )?;
+    execute_invitation_spec(
+        client,
+        &spec,
+        |response| decode_issue_invitation_response(response, idempotency_key),
+        |category| IssueInvitationOutcome::Common(CommonOrganizationFailure::Unreachable(category)),
+    )
+}
+
+pub(crate) fn list_organization_invitations(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    limit: Option<u16>,
+    cursor: Option<&str>,
+) -> Result<ListOrganizationInvitationsOutcome, OrganizationError> {
+    let spec = list_request_spec(
+        client,
+        Operation::ListOrganizationInvitations,
+        api_url,
+        &["v1", "organizations", organization_ref, "invitations"],
+        access_token,
+        limit,
+        cursor,
+    )?;
+    execute_invitation_spec(
+        client,
+        &spec,
+        decode_organization_invitation_list_response,
+        |category| {
+            ListOrganizationInvitationsOutcome::Common(CommonOrganizationFailure::Unreachable(
+                category,
+            ))
+        },
+    )
+}
+
+pub(crate) fn revoke_invitation(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    invitation_id: &str,
+    idempotency_key: &str,
+) -> Result<InvitationTerminationOutcome, OrganizationError> {
+    let spec = request_spec(
+        client,
+        Operation::RevokeInvitation,
+        Method::DELETE,
+        api_url,
+        &[
+            "v1",
+            "organizations",
+            organization_ref,
+            "invitations",
+            invitation_id,
+        ],
+        access_token,
+        Some(idempotency_key),
+        None,
+        None,
+        MUTATION_ATTEMPTS,
+    )?;
+    execute_invitation_spec(
+        client,
+        &spec,
+        |response| {
+            decode_invitation_termination_response(
+                Operation::RevokeInvitation,
+                response,
+                idempotency_key,
+            )
+        },
+        |category| {
+            InvitationTerminationOutcome::Common(CommonOrganizationFailure::Unreachable(category))
+        },
+    )
+}
+
+pub(crate) fn list_invitation_inbox(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    limit: Option<u16>,
+    cursor: Option<&str>,
+) -> Result<ListInvitationInboxOutcome, OrganizationError> {
+    let spec = list_request_spec(
+        client,
+        Operation::ListInvitationInbox,
+        api_url,
+        &["v1", "me", "invitations"],
+        access_token,
+        limit,
+        cursor,
+    )?;
+    execute_invitation_spec(
+        client,
+        &spec,
+        decode_invitation_inbox_response,
+        |category| {
+            ListInvitationInboxOutcome::Common(CommonOrganizationFailure::Unreachable(category))
+        },
+    )
+}
+
+pub(crate) fn preview_invitation(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    invitation_id: &str,
+    capability: Option<&str>,
+) -> Result<PreviewInvitationOutcome, OrganizationError> {
+    let body = invitation_capability_body(Operation::PreviewInvitation, capability)?;
+    let spec = invitation_action_spec(
+        client,
+        api_url,
+        invitation_id,
+        access_token,
+        InvitationAction::Preview,
+        body,
+    )?;
+    execute_invitation_spec(
+        client,
+        &spec,
+        decode_invitation_preview_response,
+        |category| {
+            PreviewInvitationOutcome::Common(CommonOrganizationFailure::Unreachable(category))
+        },
+    )
+}
+
+pub(crate) fn accept_invitation(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    invitation_id: &str,
+    capability: Option<&str>,
+    idempotency_key: &str,
+) -> Result<AcceptInvitationOutcome, OrganizationError> {
+    let body = invitation_capability_body(Operation::AcceptInvitation, capability)?;
+    let spec = invitation_action_spec(
+        client,
+        api_url,
+        invitation_id,
+        access_token,
+        InvitationAction::Accept { idempotency_key },
+        body,
+    )?;
+    execute_invitation_spec(
+        client,
+        &spec,
+        |response| decode_accept_invitation_response(response, idempotency_key),
+        |category| {
+            AcceptInvitationOutcome::Common(CommonOrganizationFailure::Unreachable(category))
+        },
+    )
+}
+
+pub(crate) fn decline_invitation(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    invitation_id: &str,
+    capability: Option<&str>,
+    idempotency_key: &str,
+) -> Result<InvitationTerminationOutcome, OrganizationError> {
+    let body = invitation_capability_body(Operation::DeclineInvitation, capability)?;
+    let spec = invitation_action_spec(
+        client,
+        api_url,
+        invitation_id,
+        access_token,
+        InvitationAction::Decline { idempotency_key },
+        body,
+    )?;
+    execute_invitation_spec(
+        client,
+        &spec,
+        |response| {
+            decode_invitation_termination_response(
+                Operation::DeclineInvitation,
+                response,
+                idempotency_key,
+            )
+        },
+        |category| {
+            InvitationTerminationOutcome::Common(CommonOrganizationFailure::Unreachable(category))
+        },
+    )
+}
+
+enum InvitationAction<'a> {
+    Preview,
+    Accept { idempotency_key: &'a str },
+    Decline { idempotency_key: &'a str },
+}
+
+fn invitation_action_spec(
+    client: &HttpClient,
+    api_url: &str,
+    invitation_id: &str,
+    access_token: &str,
+    action: InvitationAction<'_>,
+    body: Zeroizing<Vec<u8>>,
+) -> Result<RequestSpec, OrganizationError> {
+    let (operation, action_path, idempotency_key, max_attempts) = match action {
+        InvitationAction::Preview => (Operation::PreviewInvitation, "preview", None, READ_ATTEMPTS),
+        InvitationAction::Accept { idempotency_key } => (
+            Operation::AcceptInvitation,
+            "accept",
+            Some(idempotency_key),
+            MUTATION_ATTEMPTS,
+        ),
+        InvitationAction::Decline { idempotency_key } => (
+            Operation::DeclineInvitation,
+            "decline",
+            Some(idempotency_key),
+            MUTATION_ATTEMPTS,
+        ),
+    };
+    request_spec(
+        client,
+        operation,
+        Method::POST,
+        api_url,
+        &["v1", "invitations", invitation_id, action_path],
+        access_token,
+        idempotency_key,
+        Some(JSON_MEDIA_TYPE),
+        Some(body),
+        max_attempts,
+    )
+}
+
+fn execute_invitation_spec<O>(
+    client: &HttpClient,
+    spec: &RequestSpec,
+    decode: impl FnOnce(ReceivedResponse) -> Result<O, OrganizationError>,
+    unreachable: impl FnOnce(UnreachableCategory) -> O,
+) -> Result<O, OrganizationError> {
+    match execute_request(client, spec, REQUEST_TIMEOUT)? {
+        RequestExecution::Response(response) => decode(response),
+        RequestExecution::Unreachable(category) => Ok(unreachable(category)),
+    }
+}
+
+fn invitation_capability_body(
+    operation: Operation,
+    capability: Option<&str>,
+) -> Result<Zeroizing<Vec<u8>>, OrganizationError> {
+    #[derive(serde::Serialize)]
+    struct CapabilityRequest<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capability: Option<&'a str>,
+    }
+
+    serialize_request(operation, &CapabilityRequest { capability })
+}
+
 fn execute_membership_termination(
     client: &HttpClient,
     api_url: &str,
@@ -584,7 +975,7 @@ fn merge_patch_request_spec(
     path: &[&str],
     access_token: &str,
     idempotency_key: &str,
-    body: Vec<u8>,
+    body: Zeroizing<Vec<u8>>,
 ) -> Result<RequestSpec, OrganizationError> {
     request_spec(
         client,
@@ -600,7 +991,7 @@ fn merge_patch_request_spec(
     )
 }
 
-fn membership_list_request_spec(
+fn list_request_spec(
     client: &HttpClient,
     operation: Operation,
     api_url: &str,
@@ -638,7 +1029,7 @@ fn request_spec(
     access_token: &str,
     idempotency_key: Option<&str>,
     content_type: Option<&'static str>,
-    body: Option<Vec<u8>>,
+    body: Option<Zeroizing<Vec<u8>>>,
     max_attempts: usize,
 ) -> Result<RequestSpec, OrganizationError> {
     let endpoint = client.endpoint(api_url, path).map_err(|error| {
@@ -667,7 +1058,7 @@ fn request_spec_for_endpoint(
     access_token: &str,
     idempotency_key: Option<&str>,
     content_type: Option<&'static str>,
-    body: Option<Vec<u8>>,
+    body: Option<Zeroizing<Vec<u8>>>,
     max_attempts: usize,
 ) -> Result<RequestSpec, OrganizationError> {
     let authorization = bearer_authorization(access_token).map_err(|_| {
@@ -695,8 +1086,9 @@ fn request_spec_for_endpoint(
 fn serialize_request(
     operation: Operation,
     request: &impl serde::Serialize,
-) -> Result<Vec<u8>, OrganizationError> {
+) -> Result<Zeroizing<Vec<u8>>, OrganizationError> {
     serde_json::to_vec(request)
+        .map(Zeroizing::new)
         .map_err(|_| OrganizationError::local(operation, OrganizationErrorKind::SerializeRequest))
 }
 
@@ -822,15 +1214,17 @@ fn require_replayable_success_headers(
         }
     }
 
-    if matches!(spec.operation, Operation::Create)
-        && response
-            .headers()
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .is_none()
+    if matches!(
+        spec.operation,
+        Operation::Create | Operation::IssueInvitation
+    ) && response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .is_none()
     {
         return Err(OrganizationError::protocol(
-            Operation::Create,
+            spec.operation,
             "the successful response has a missing or mismatched Location header",
             false,
         ));
@@ -857,7 +1251,7 @@ async fn send_request(
         request = request.header(CONTENT_TYPE, content_type);
     }
     if let Some(body) = &spec.body {
-        request = request.body(body.clone());
+        request = request.body(body.as_slice().to_vec());
     }
 
     request.send().await.map_err(|error| {
@@ -881,6 +1275,429 @@ async fn receive_response(
         OrganizationError::protocol(operation, reason, rejected)
     })
     .await
+}
+
+fn decode_issue_invitation_response(
+    response: ReceivedResponse,
+    expected_idempotency_key: &str,
+) -> Result<IssueInvitationOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::CREATED => {
+            require_response_idempotency_key(
+                Operation::IssueInvitation,
+                &response,
+                expected_idempotency_key,
+            )?;
+            let invitation = decode_invitation(Operation::IssueInvitation, &response)?;
+            require_invitation_location(&response, &invitation.id)?;
+            Ok(IssueInvitationOutcome::Issued(Box::new(invitation)))
+        }
+        StatusCode::NOT_FOUND => {
+            require_problem(Operation::IssueInvitation, &response, NOT_FOUND, false)?;
+            Ok(IssueInvitationOutcome::NotFound)
+        }
+        StatusCode::CONFLICT => {
+            let problem_type = decode_problem_type(Operation::IssueInvitation, &response, false)?;
+            match problem_type.as_str() {
+                RECIPIENT_UNAVAILABLE => Ok(IssueInvitationOutcome::RecipientUnavailable),
+                OUTSTANDING_INVITATION_LIMIT => Ok(IssueInvitationOutcome::OutstandingLimitReached),
+                IDEMPOTENCY_CONFLICT => Ok(IssueInvitationOutcome::IdempotencyConflict),
+                _ => Err(OrganizationError::protocol(
+                    Operation::IssueInvitation,
+                    "a 409 response has an unrecognized problem type",
+                    false,
+                )),
+            }
+        }
+        StatusCode::TOO_MANY_REQUESTS => {
+            require_problem(Operation::IssueInvitation, &response, RATE_LIMITED, false)?;
+            parse_retry_after(Operation::IssueInvitation, &response)
+                .map(|retry_after| IssueInvitationOutcome::RateLimited { retry_after })
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            require_problem(
+                Operation::IssueInvitation,
+                &response,
+                REQUEST_BODY_TOO_LARGE,
+                false,
+            )?;
+            Ok(IssueInvitationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            require_problem(
+                Operation::IssueInvitation,
+                &response,
+                UNSUPPORTED_MEDIA_TYPE,
+                false,
+            )?;
+            Ok(IssueInvitationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        _ => decode_common_list_failure(Operation::IssueInvitation, &response)
+            .map(IssueInvitationOutcome::Common),
+    }
+}
+
+fn decode_organization_invitation_list_response(
+    response: ReceivedResponse,
+) -> Result<ListOrganizationInvitationsOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::OK => decode_invitation_page(Operation::ListOrganizationInvitations, &response)
+            .map(ListOrganizationInvitationsOutcome::Listed),
+        StatusCode::NOT_FOUND => {
+            require_problem(
+                Operation::ListOrganizationInvitations,
+                &response,
+                NOT_FOUND,
+                false,
+            )?;
+            Ok(ListOrganizationInvitationsOutcome::NotFound)
+        }
+        _ => decode_common_list_failure(Operation::ListOrganizationInvitations, &response)
+            .map(ListOrganizationInvitationsOutcome::Common),
+    }
+}
+
+fn decode_invitation_inbox_response(
+    response: ReceivedResponse,
+) -> Result<ListInvitationInboxOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::OK => decode_invitation_inbox_page(Operation::ListInvitationInbox, &response)
+            .map(ListInvitationInboxOutcome::Listed),
+        _ => decode_common_list_failure(Operation::ListInvitationInbox, &response)
+            .map(ListInvitationInboxOutcome::Common),
+    }
+}
+
+fn decode_invitation_preview_response(
+    response: ReceivedResponse,
+) -> Result<PreviewInvitationOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::OK => decode_invitation_preview(Operation::PreviewInvitation, &response)
+            .map(PreviewInvitationOutcome::Previewed),
+        StatusCode::CONFLICT => {
+            require_problem(
+                Operation::PreviewInvitation,
+                &response,
+                INVITATION_UNAVAILABLE,
+                false,
+            )?;
+            Ok(PreviewInvitationOutcome::Unavailable)
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            require_problem(
+                Operation::PreviewInvitation,
+                &response,
+                REQUEST_BODY_TOO_LARGE,
+                false,
+            )?;
+            Ok(PreviewInvitationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            require_problem(
+                Operation::PreviewInvitation,
+                &response,
+                UNSUPPORTED_MEDIA_TYPE,
+                false,
+            )?;
+            Ok(PreviewInvitationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        _ => decode_common_list_failure(Operation::PreviewInvitation, &response)
+            .map(PreviewInvitationOutcome::Common),
+    }
+}
+
+fn decode_accept_invitation_response(
+    response: ReceivedResponse,
+    expected_idempotency_key: &str,
+) -> Result<AcceptInvitationOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::OK => {
+            require_response_idempotency_key(
+                Operation::AcceptInvitation,
+                &response,
+                expected_idempotency_key,
+            )?;
+            decode_accepted_invitation_membership(Operation::AcceptInvitation, &response)
+                .map(AcceptInvitationOutcome::Accepted)
+        }
+        StatusCode::CONFLICT => {
+            let problem_type = decode_problem_type(Operation::AcceptInvitation, &response, false)?;
+            match problem_type.as_str() {
+                INVITATION_UNAVAILABLE => Ok(AcceptInvitationOutcome::Unavailable),
+                MEMBERSHIP_LIMIT => Ok(AcceptInvitationOutcome::MembershipLimitReached),
+                IDEMPOTENCY_CONFLICT => Ok(AcceptInvitationOutcome::IdempotencyConflict),
+                _ => Err(OrganizationError::protocol(
+                    Operation::AcceptInvitation,
+                    "a 409 response has an unrecognized problem type",
+                    false,
+                )),
+            }
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            require_problem(
+                Operation::AcceptInvitation,
+                &response,
+                REQUEST_BODY_TOO_LARGE,
+                false,
+            )?;
+            Ok(AcceptInvitationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            require_problem(
+                Operation::AcceptInvitation,
+                &response,
+                UNSUPPORTED_MEDIA_TYPE,
+                false,
+            )?;
+            Ok(AcceptInvitationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        _ => decode_common_list_failure(Operation::AcceptInvitation, &response)
+            .map(AcceptInvitationOutcome::Common),
+    }
+}
+
+fn decode_invitation_termination_response(
+    operation: Operation,
+    response: ReceivedResponse,
+    expected_idempotency_key: &str,
+) -> Result<InvitationTerminationOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::NO_CONTENT => {
+            require_response_idempotency_key(operation, &response, expected_idempotency_key)?;
+            if response.content_type.is_some() || !response.body.is_empty() {
+                return Err(OrganizationError::protocol(
+                    operation,
+                    "the successful response contains an unexpected representation",
+                    false,
+                ));
+            }
+            Ok(InvitationTerminationOutcome::Completed)
+        }
+        StatusCode::NOT_FOUND if matches!(operation, Operation::RevokeInvitation) => {
+            require_problem(operation, &response, NOT_FOUND, false)?;
+            Ok(InvitationTerminationOutcome::NotFound)
+        }
+        StatusCode::CONFLICT => {
+            let problem_type = decode_problem_type(operation, &response, false)?;
+            match problem_type.as_str() {
+                INVITATION_UNAVAILABLE => Ok(InvitationTerminationOutcome::Unavailable),
+                IDEMPOTENCY_CONFLICT => Ok(InvitationTerminationOutcome::IdempotencyConflict),
+                _ => Err(OrganizationError::protocol(
+                    operation,
+                    "a 409 response has an unrecognized problem type",
+                    false,
+                )),
+            }
+        }
+        StatusCode::PAYLOAD_TOO_LARGE if matches!(operation, Operation::DeclineInvitation) => {
+            require_problem(operation, &response, REQUEST_BODY_TOO_LARGE, false)?;
+            Ok(InvitationTerminationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        StatusCode::UNSUPPORTED_MEDIA_TYPE if matches!(operation, Operation::DeclineInvitation) => {
+            require_problem(operation, &response, UNSUPPORTED_MEDIA_TYPE, false)?;
+            Ok(InvitationTerminationOutcome::Common(
+                CommonOrganizationFailure::InvalidInput,
+            ))
+        }
+        _ => decode_common_list_failure(operation, &response)
+            .map(InvitationTerminationOutcome::Common),
+    }
+}
+
+fn decode_invitation_page(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<InvitationPage, OrganizationError> {
+    let value = decode_json_value(
+        operation,
+        response,
+        "the organization-invitation-list response body is invalid",
+    )?;
+    reject_null_invitation_page_optionals(operation, &value)?;
+    let generated: generated_models::InvitationList = decode_json_model(
+        operation,
+        value,
+        "the organization-invitation-list response body is invalid",
+    )?;
+    InvitationPage::try_from(generated)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, false))
+}
+
+fn decode_invitation_inbox_page(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<InvitationInboxPage, OrganizationError> {
+    let value = decode_json_value(
+        operation,
+        response,
+        "the invitation-inbox-list response body is invalid",
+    )?;
+    if value
+        .get("nextCursor")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        return Err(OrganizationError::protocol(
+            operation,
+            "the invitation inbox response contains an explicit null optional field",
+            false,
+        ));
+    }
+    let generated: generated_models::InvitationInboxList = decode_json_model(
+        operation,
+        value,
+        "the invitation-inbox-list response body is invalid",
+    )?;
+    InvitationInboxPage::try_from(generated)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, false))
+}
+
+fn decode_invitation(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<Invitation, OrganizationError> {
+    let value = decode_json_value(
+        operation,
+        response,
+        "the invitation response body is invalid",
+    )?;
+    reject_null_invitation_optionals(operation, &value)?;
+    let generated: generated_models::Invitation =
+        decode_json_model(operation, value, "the invitation response body is invalid")?;
+    Invitation::try_from(generated)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, false))
+}
+
+fn decode_invitation_preview(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<InvitationPreview, OrganizationError> {
+    let value = decode_json_value(
+        operation,
+        response,
+        "the invitation preview response body is invalid",
+    )?;
+    let generated: generated_models::InvitationPreview = decode_json_model(
+        operation,
+        value,
+        "the invitation preview response body is invalid",
+    )?;
+    InvitationPreview::try_from(generated)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, false))
+}
+
+fn decode_accepted_invitation_membership(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<AcceptedInvitationMembership, OrganizationError> {
+    let value = decode_json_value(
+        operation,
+        response,
+        "the invitation-acceptance response body is invalid",
+    )?;
+    let generated: generated_models::AcceptedInvitationMembership = decode_json_model(
+        operation,
+        value,
+        "the invitation-acceptance response body is invalid",
+    )?;
+    AcceptedInvitationMembership::try_from(generated)
+        .map_err(|reason| OrganizationError::protocol(operation, reason, false))
+}
+
+fn reject_null_invitation_page_optionals(
+    operation: Operation,
+    value: &serde_json::Value,
+) -> Result<(), OrganizationError> {
+    if value
+        .get("nextCursor")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        return Err(OrganizationError::protocol(
+            operation,
+            "the invitation list response contains an explicit null optional field",
+            false,
+        ));
+    }
+    if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
+        for item in items {
+            reject_null_invitation_optionals(operation, item)?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_null_invitation_optionals(
+    operation: Operation,
+    value: &serde_json::Value,
+) -> Result<(), OrganizationError> {
+    let has_null_optional = [
+        "targetPrincipalId",
+        "targetEmail",
+        "terminalAt",
+        "replacedInvitationId",
+        "replacementInvitationId",
+        "deliveryState",
+    ]
+    .into_iter()
+    .any(|field| value.get(field).is_some_and(serde_json::Value::is_null));
+    if has_null_optional {
+        Err(OrganizationError::protocol(
+            operation,
+            "the invitation response contains an explicit null optional field",
+            false,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_invitation_location(
+    response: &ReceivedResponse,
+    invitation_id: &str,
+) -> Result<(), OrganizationError> {
+    let expected = format!("/v1/invitations/{invitation_id}");
+    if http_util::header_matches(response.location.as_ref(), &expected) {
+        Ok(())
+    } else {
+        Err(OrganizationError::protocol(
+            Operation::IssueInvitation,
+            "the successful response has a missing or mismatched Location header",
+            false,
+        ))
+    }
+}
+
+fn parse_retry_after(
+    operation: Operation,
+    response: &ReceivedResponse,
+) -> Result<u64, OrganizationError> {
+    response
+        .retry_after
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            OrganizationError::protocol(
+                operation,
+                "a 429 response has an invalid Retry-After header",
+                false,
+            )
+        })
 }
 
 fn decode_create_response(

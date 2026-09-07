@@ -55,15 +55,21 @@ pub(crate) use identities::{
     OidcIdentity, RemoveIdentityOutcome, link_identity, list_identities, remove_identity,
 };
 pub(crate) use organizations::{
-    CommonOrganizationFailure, CreateOrganizationOutcome, CurrentPrincipalMembership,
-    GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
-    ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome, MembershipRole,
-    MembershipState, MembershipTerminationOutcome, Organization, OrganizationError,
+    AcceptInvitationOutcome, AcceptedInvitationMembership, CommonOrganizationFailure,
+    CreateOrganizationOutcome, CurrentPrincipalMembership, GetOrganizationOutcome, Invitation,
+    InvitationDeliveryState, InvitationInboxEntry, InvitationPreview, InvitationState,
+    InvitationTarget, InvitationTargetKind, InvitationTerminationOutcome, IssueInvitationOutcome,
+    ListCurrentPrincipalMembershipsOutcome, ListInvitationInboxOutcome,
+    ListOrganizationInvitationsOutcome, ListOrganizationMembershipHistoryOutcome,
+    ListOrganizationMembershipsOutcome, MembershipRole, MembershipState,
+    MembershipTerminationOutcome, Organization, OrganizationError,
     OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry, OrganizationState,
-    PrincipalType, UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
-    create_organization, end_organization_membership, get_organization, leave_organization,
-    list_current_principal_memberships, list_organization_membership_history,
-    list_organization_memberships, update_organization, update_organization_membership_role,
+    PreviewInvitationOutcome, PrincipalType, UpdateOrganizationMembershipOutcome,
+    UpdateOrganizationOutcome, accept_invitation, create_organization, decline_invitation,
+    end_organization_membership, get_organization, issue_invitation, leave_organization,
+    list_current_principal_memberships, list_invitation_inbox, list_organization_invitations,
+    list_organization_membership_history, list_organization_memberships, preview_invitation,
+    revoke_invitation, update_organization, update_organization_membership_role,
 };
 pub(crate) use profile::{UpdateProfileError, UpdateProfileOutcome, update_current_principal};
 pub(crate) use projects::{

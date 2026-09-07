@@ -9,6 +9,7 @@ Commands:
   artifact      Work with portable workflow artifacts
   auth          Manage your Scherzo Cloud sign-in
   github        Manage GitHub connections
+  invitation    Manage Scherzo Cloud invitations
   organization  Manage Scherzo Cloud organizations
   project       Manage Scherzo Cloud projects
   run           Work with Scherzo Cloud runs

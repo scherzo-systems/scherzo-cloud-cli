@@ -44,6 +44,8 @@ mod codex_installation;
 mod github;
 #[path = "cli/identities.rs"]
 mod identities;
+#[path = "cli/invitation.rs"]
+mod invitation;
 #[path = "cli/organization.rs"]
 mod organization;
 #[path = "cli/pi_installation.rs"]

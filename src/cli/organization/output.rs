@@ -6,12 +6,14 @@ use serde::Serialize;
 use crate::api::{
     CommonOrganizationFailure, CreateOrganizationOutcome, CurrentPrincipalMembership,
     GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
-    ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome, MembershipRole,
-    MembershipState, MembershipTerminationOutcome, Organization,
-    OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry, OrganizationState,
-    PrincipalType, UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
+    ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome,
+    MembershipTerminationOutcome, Organization, OrganizationMembershipDirectoryEntry,
+    OrganizationMembershipHistoryEntry, OrganizationState, PrincipalType,
+    UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
+
+use super::super::{membership_role, membership_state, write_page_footer};
 
 pub(super) fn write_create(
     deployment: &str,
@@ -580,19 +582,8 @@ fn write_current_memberships_human(
         }
         write_membership_times(&mut stdout, item)?;
     }
-    write_membership_page_footer(&mut stdout, deployment, next_cursor)?;
+    write_page_footer(&mut stdout, deployment, next_cursor)?;
     Ok(())
-}
-
-fn write_membership_page_footer(
-    output: &mut impl Write,
-    deployment: &str,
-    next_cursor: Option<&str>,
-) -> io::Result<()> {
-    if let Some(next_cursor) = next_cursor {
-        writeln!(output, "next cursor: {next_cursor}")?;
-    }
-    writeln!(output, "deployment: {deployment}")
 }
 
 trait MembershipTimes {
@@ -694,7 +685,7 @@ fn write_membership_history_human(
         writeln!(stdout, "organization: {}", item.organization_id)?;
         write_membership_times(&mut stdout, item)?;
     }
-    write_membership_page_footer(&mut stdout, deployment, next_cursor)?;
+    write_page_footer(&mut stdout, deployment, next_cursor)?;
     Ok(())
 }
 
@@ -793,21 +784,6 @@ const fn principal_type(principal_type: PrincipalType) -> &'static str {
     match principal_type {
         PrincipalType::Human => "human",
         PrincipalType::Service => "service",
-    }
-}
-
-const fn membership_role(role: MembershipRole) -> &'static str {
-    match role {
-        MembershipRole::Owner => "owner",
-        MembershipRole::Member => "member",
-    }
-}
-
-const fn membership_state(state: MembershipState) -> &'static str {
-    match state {
-        MembershipState::Active => "active",
-        MembershipState::Suspended => "suspended",
-        MembershipState::Ended => "ended",
     }
 }
 

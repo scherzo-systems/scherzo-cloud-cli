@@ -98,6 +98,106 @@ pub(crate) struct OrganizationMembershipHistoryPage {
     pub(crate) next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Invitation {
+    pub(crate) id: String,
+    pub(crate) organization_id: String,
+    pub(crate) issuer_principal_id: String,
+    pub(crate) target_kind: InvitationTargetKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target_principal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target_email: Option<String>,
+    pub(crate) state: InvitationState,
+    pub(crate) issued_at: String,
+    pub(crate) expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) replaced_invitation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) replacement_invitation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery_state: Option<InvitationDeliveryState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvitationTargetKind {
+    Principal,
+    Email,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvitationState {
+    Outstanding,
+    Accepted,
+    Declined,
+    Revoked,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvitationDeliveryState {
+    Pending,
+    Leased,
+    Sent,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InvitationPage {
+    pub(crate) items: Vec<Invitation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InvitationInboxEntry {
+    pub(crate) id: String,
+    pub(crate) organization_id: String,
+    pub(crate) organization_display_name: String,
+    pub(crate) organization_slug: String,
+    pub(crate) issuer_principal_id: String,
+    pub(crate) expires_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InvitationInboxPage {
+    pub(crate) items: Vec<InvitationInboxEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InvitationPreview {
+    pub(crate) id: String,
+    pub(crate) organization_id: String,
+    pub(crate) organization_display_name: String,
+    pub(crate) organization_slug: String,
+    pub(crate) target_kind: InvitationTargetKind,
+    pub(crate) expires_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AcceptedInvitationMembership {
+    pub(crate) id: String,
+    pub(crate) organization_id: String,
+    pub(crate) principal_id: String,
+    pub(crate) role: MembershipRole,
+    pub(crate) state: MembershipState,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PrincipalType {
@@ -146,6 +246,215 @@ impl TryFrom<models::Organization> for Organization {
             },
             display_name: value.display_name,
             slug: value.slug,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        })
+    }
+}
+
+impl TryFrom<models::InvitationList> for InvitationPage {
+    type Error = &'static str;
+
+    fn try_from(value: models::InvitationList) -> Result<Self, Self::Error> {
+        let (items, next_cursor) = convert_page(
+            value.items,
+            value.next_cursor,
+            "the organization invitation cursor is empty",
+        )?;
+        Ok(Self { items, next_cursor })
+    }
+}
+
+impl TryFrom<models::Invitation> for Invitation {
+    type Error = &'static str;
+
+    fn try_from(value: models::Invitation) -> Result<Self, Self::Error> {
+        if !crate::public_id::valid_typed_id(&value.id, "inv_") {
+            return Err("the invitation ID is invalid");
+        }
+        if !crate::public_id::valid_typed_id(&value.organization_id, "org_") {
+            return Err("the invitation organization ID is invalid");
+        }
+        if !crate::public_id::valid_typed_id(&value.issuer_principal_id, "prn_") {
+            return Err("the invitation issuer principal ID is invalid");
+        }
+        parse_timestamp(&value.issued_at, "the invitation issue time is invalid")?;
+        parse_timestamp(
+            &value.expires_at,
+            "the invitation expiration time is invalid",
+        )?;
+        if let Some(terminal_at) = value.terminal_at.as_deref() {
+            parse_timestamp(terminal_at, "the invitation terminal time is invalid")?;
+        }
+        for related_id in [
+            value.replaced_invitation_id.as_deref(),
+            value.replacement_invitation_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !crate::public_id::valid_typed_id(related_id, "inv_") {
+                return Err("an invitation replacement ID is invalid");
+            }
+        }
+
+        let target_kind = match value.target_kind {
+            models::invitation::TargetKind::Principal => InvitationTargetKind::Principal,
+            models::invitation::TargetKind::Email => InvitationTargetKind::Email,
+        };
+        let state = match value.state {
+            models::invitation::State::Outstanding => InvitationState::Outstanding,
+            models::invitation::State::Accepted => InvitationState::Accepted,
+            models::invitation::State::Declined => InvitationState::Declined,
+            models::invitation::State::Revoked => InvitationState::Revoked,
+            models::invitation::State::Expired => InvitationState::Expired,
+        };
+        let target_is_valid = match (state, target_kind) {
+            (InvitationState::Outstanding, InvitationTargetKind::Principal) => {
+                value
+                    .target_principal_id
+                    .as_deref()
+                    .is_some_and(|id| crate::public_id::valid_typed_id(id, "prn_"))
+                    && value.target_email.is_none()
+            }
+            (InvitationState::Outstanding, InvitationTargetKind::Email) => {
+                value
+                    .target_email
+                    .as_deref()
+                    .is_some_and(|email| valid_bounded_text(email, 3, 320))
+                    && value.target_principal_id.is_none()
+            }
+            (_, _) => value.target_principal_id.is_none() && value.target_email.is_none(),
+        };
+        if !target_is_valid
+            || target_kind == InvitationTargetKind::Principal && value.delivery_state.is_some()
+        {
+            return Err("the invitation target projection is invalid");
+        }
+
+        Ok(Self {
+            id: value.id,
+            organization_id: value.organization_id,
+            issuer_principal_id: value.issuer_principal_id,
+            target_kind,
+            target_principal_id: value.target_principal_id,
+            target_email: value.target_email,
+            state,
+            issued_at: value.issued_at,
+            expires_at: value.expires_at,
+            terminal_at: value.terminal_at,
+            replaced_invitation_id: value.replaced_invitation_id,
+            replacement_invitation_id: value.replacement_invitation_id,
+            delivery_state: value.delivery_state.map(|state| match state {
+                models::invitation::DeliveryState::Pending => InvitationDeliveryState::Pending,
+                models::invitation::DeliveryState::Leased => InvitationDeliveryState::Leased,
+                models::invitation::DeliveryState::Sent => InvitationDeliveryState::Sent,
+                models::invitation::DeliveryState::Failed => InvitationDeliveryState::Failed,
+            }),
+        })
+    }
+}
+
+impl TryFrom<models::InvitationInboxList> for InvitationInboxPage {
+    type Error = &'static str;
+
+    fn try_from(value: models::InvitationInboxList) -> Result<Self, Self::Error> {
+        let (items, next_cursor) = convert_page(
+            value.items,
+            value.next_cursor,
+            "the invitation inbox cursor is empty",
+        )?;
+        Ok(Self { items, next_cursor })
+    }
+}
+
+impl TryFrom<models::InvitationInboxEntry> for InvitationInboxEntry {
+    type Error = &'static str;
+
+    fn try_from(value: models::InvitationInboxEntry) -> Result<Self, Self::Error> {
+        if !crate::public_id::valid_typed_id(&value.id, "inv_")
+            || !crate::public_id::valid_typed_id(&value.organization_id, "org_")
+            || !crate::public_id::valid_typed_id(&value.issuer_principal_id, "prn_")
+            || !valid_bounded_text(&value.organization_display_name, 1, 200)
+            || !crate::public_id::valid_url_safe_name(&value.organization_slug)
+        {
+            return Err("the invitation inbox entry is invalid");
+        }
+        parse_timestamp(
+            &value.expires_at,
+            "the invitation inbox expiration time is invalid",
+        )?;
+        Ok(Self {
+            id: value.id,
+            organization_id: value.organization_id,
+            organization_display_name: value.organization_display_name,
+            organization_slug: value.organization_slug,
+            issuer_principal_id: value.issuer_principal_id,
+            expires_at: value.expires_at,
+        })
+    }
+}
+
+impl TryFrom<models::InvitationPreview> for InvitationPreview {
+    type Error = &'static str;
+
+    fn try_from(value: models::InvitationPreview) -> Result<Self, Self::Error> {
+        if !crate::public_id::valid_typed_id(&value.id, "inv_")
+            || !crate::public_id::valid_typed_id(&value.organization_id, "org_")
+            || !valid_bounded_text(&value.organization_display_name, 1, 200)
+            || !crate::public_id::valid_url_safe_name(&value.organization_slug)
+        {
+            return Err("the invitation preview is invalid");
+        }
+        parse_timestamp(
+            &value.expires_at,
+            "the invitation preview expiration time is invalid",
+        )?;
+        Ok(Self {
+            id: value.id,
+            organization_id: value.organization_id,
+            organization_display_name: value.organization_display_name,
+            organization_slug: value.organization_slug,
+            target_kind: match value.target_kind {
+                models::invitation_preview::TargetKind::Principal => {
+                    InvitationTargetKind::Principal
+                }
+                models::invitation_preview::TargetKind::Email => InvitationTargetKind::Email,
+            },
+            expires_at: value.expires_at,
+        })
+    }
+}
+
+impl TryFrom<models::AcceptedInvitationMembership> for AcceptedInvitationMembership {
+    type Error = &'static str;
+
+    fn try_from(value: models::AcceptedInvitationMembership) -> Result<Self, Self::Error> {
+        if !crate::public_id::valid_typed_id(&value.id, "mem_")
+            || !crate::public_id::valid_typed_id(&value.organization_id, "org_")
+            || !crate::public_id::valid_typed_id(&value.principal_id, "prn_")
+        {
+            return Err("the accepted invitation membership is invalid");
+        }
+        parse_timestamp(
+            &value.created_at,
+            "the accepted membership creation time is invalid",
+        )?;
+        parse_timestamp(
+            &value.updated_at,
+            "the accepted membership update time is invalid",
+        )?;
+        Ok(Self {
+            id: value.id,
+            organization_id: value.organization_id,
+            principal_id: value.principal_id,
+            role: match value.role {
+                models::accepted_invitation_membership::Role::Owner => MembershipRole::Owner,
+                models::accepted_invitation_membership::Role::Member => MembershipRole::Member,
+            },
+            state: match value.state {
+                models::accepted_invitation_membership::State::Active => MembershipState::Active,
+            },
             created_at: value.created_at,
             updated_at: value.updated_at,
         })

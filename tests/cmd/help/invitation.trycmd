@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud invitation --help
+Manage Scherzo Cloud invitations
+
+Usage: scherzo-cloud invitation [COMMAND]
+
+Commands:
+  list     List your invitation inbox
+  preview  Preview an invitation
+  accept   Accept an invitation
+  decline  Decline an invitation
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

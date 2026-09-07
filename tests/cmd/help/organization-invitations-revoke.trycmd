@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud organization invitations revoke --help
+Revoke an organization invitation
+
+Usage: scherzo-cloud organization invitations revoke [OPTIONS] --yes <ORGANIZATION> <INVITATION>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <INVITATION>    Exact invitation ID
+
+Options:
+      --yes                  Confirm invitation revocation
+      --json                 Print the invitation result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+```

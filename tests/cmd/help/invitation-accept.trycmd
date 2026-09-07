@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud invitation accept --help
+Accept an invitation
+
+Usage: scherzo-cloud invitation accept [OPTIONS] <INVITATION>
+
+Arguments:
+  <INVITATION>  Exact invitation ID
+
+Options:
+      --capability-file <PATH|->  Read an email invitation capability from a protected file or explicit stdin
+      --json                      Print the invitation result as JSON
+      --allow-insecure-http       Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                      Print help
+
+```

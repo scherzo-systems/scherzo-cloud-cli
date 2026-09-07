@@ -10,7 +10,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::api::{
-    CommonOrganizationFailure, CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
+    CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
     ListCurrentPrincipalMembershipsOutcome, ListOrganizationMembershipHistoryOutcome,
     ListOrganizationMembershipsOutcome, MembershipTerminationOutcome, OrganizationError,
     UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
@@ -35,6 +35,8 @@ enum OrganizationCommand {
     Leave(leave::Command),
     #[command(about = list::ABOUT)]
     List(list::Command),
+    #[command(about = "Manage organization invitations")]
+    Invitations(super::invitation::OrganizationCommand),
     #[command(about = show::ABOUT)]
     Show(show::Command),
     #[command(about = update::ABOUT)]
@@ -107,6 +109,7 @@ impl Command {
             Some(OrganizationCommand::List(command)) => {
                 execute_leaf(command, list::Command::execute)
             }
+            Some(OrganizationCommand::Invitations(command)) => command.execute(),
             Some(OrganizationCommand::Show(command)) => {
                 execute_leaf(command, show::Command::execute)
             }
@@ -130,36 +133,7 @@ fn execute_leaf<T>(
     )
 }
 
-macro_rules! impl_human_credential_outcome {
-    ($($outcome:ty),+ $(,)?) => {
-        $(
-            impl super::HumanCredentialOutcome for $outcome {
-                type Error = OrganizationError;
-
-                fn unauthenticated() -> Self {
-                    Self::Common(CommonOrganizationFailure::Unauthenticated)
-                }
-
-                fn unreachable(category: crate::api::UnreachableCategory) -> Self {
-                    Self::Common(CommonOrganizationFailure::Unreachable(category))
-                }
-
-                fn is_unauthenticated(&self) -> bool {
-                    matches!(
-                        self,
-                        Self::Common(CommonOrganizationFailure::Unauthenticated)
-                    )
-                }
-
-                fn credential_rejected(error: &Self::Error) -> bool {
-                    error.credential_rejected()
-                }
-            }
-        )+
-    };
-}
-
-impl_human_credential_outcome!(
+super::impl_organization_human_credential_outcome!(
     CreateOrganizationOutcome,
     GetOrganizationOutcome,
     UpdateOrganizationOutcome,

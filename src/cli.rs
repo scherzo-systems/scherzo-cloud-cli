@@ -1,7 +1,38 @@
+macro_rules! impl_organization_human_credential_outcome {
+    ($($outcome:ty),+ $(,)?) => {
+        $(
+            impl super::HumanCredentialOutcome for $outcome {
+                type Error = crate::api::OrganizationError;
+
+                fn unauthenticated() -> Self {
+                    Self::Common(crate::api::CommonOrganizationFailure::Unauthenticated)
+                }
+
+                fn unreachable(category: crate::api::UnreachableCategory) -> Self {
+                    Self::Common(crate::api::CommonOrganizationFailure::Unreachable(category))
+                }
+
+                fn is_unauthenticated(&self) -> bool {
+                    matches!(
+                        self,
+                        Self::Common(crate::api::CommonOrganizationFailure::Unauthenticated)
+                    )
+                }
+
+                fn credential_rejected(error: &Self::Error) -> bool {
+                    error.credential_rejected()
+                }
+            }
+        )+
+    };
+}
+pub(super) use impl_organization_human_credential_outcome;
+
 mod account;
 mod artifact;
 mod auth;
 mod github;
+mod invitation;
 mod organization;
 mod principal;
 mod project;
@@ -22,7 +53,9 @@ use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
-use crate::api::{HttpClient, HttpTransportPolicy, UnreachableCategory};
+use crate::api::{
+    HttpClient, HttpTransportPolicy, MembershipRole, MembershipState, UnreachableCategory,
+};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
@@ -150,6 +183,8 @@ enum Command {
     Auth(auth::Command),
     #[command(about = github::ABOUT)]
     Github(github::Command),
+    #[command(about = invitation::ABOUT)]
+    Invitation(invitation::Command),
     #[command(about = organization::ABOUT)]
     Organization(organization::Command),
     #[command(about = project::ABOUT)]
@@ -180,6 +215,7 @@ impl Cli {
             Some(Command::Artifact(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
             Some(Command::Github(command)) => command.execute(),
+            Some(Command::Invitation(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Project(command)) => command.execute(),
             Some(Command::Run(command)) => command.execute(),
@@ -278,6 +314,46 @@ fn write_cloud_list_json(
         items,
         next_cursor,
     })
+}
+
+fn write_cloud_failure_json(
+    deployment: &str,
+    outcome: &'static str,
+    category: Option<&'static str>,
+    retry_after: Option<u64>,
+) -> io::Result<()> {
+    write_pretty_json(&ApiFailureResult::with_retry_after(
+        deployment,
+        outcome,
+        category,
+        retry_after,
+    ))
+}
+
+fn write_page_footer(
+    output: &mut impl Write,
+    deployment: &str,
+    next_cursor: Option<&str>,
+) -> io::Result<()> {
+    if let Some(next_cursor) = next_cursor {
+        writeln!(output, "next cursor: {next_cursor}")?;
+    }
+    writeln!(output, "deployment: {deployment}")
+}
+
+const fn membership_role(role: MembershipRole) -> &'static str {
+    match role {
+        MembershipRole::Owner => "owner",
+        MembershipRole::Member => "member",
+    }
+}
+
+const fn membership_state(state: MembershipState) -> &'static str {
+    match state {
+        MembershipState::Active => "active",
+        MembershipState::Suspended => "suspended",
+        MembershipState::Ended => "ended",
+    }
 }
 
 struct ProcessSignals {
@@ -734,8 +810,17 @@ mod tests {
             "github setup",
             "github setup begin",
             "github setup complete",
+            "invitation",
+            "invitation accept",
+            "invitation decline",
+            "invitation list",
+            "invitation preview",
             "organization",
             "organization create",
+            "organization invitations",
+            "organization invitations issue",
+            "organization invitations list",
+            "organization invitations revoke",
             "organization leave",
             "organization list",
             "organization members",
