@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/test-public-api-boundary" >&2
+  exit 2
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+boundary_check=$script_dir/check-public-api-boundary
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/scherzo-public-api-boundary-test.XXXXXX")
+trap 'rm -rf "$test_root"' EXIT
+
+clean_root=$test_root/clean
+mkdir -p "$clean_root/models"
+printf 'pub struct Organization;\n' >"$clean_root/models/organization.rs"
+if ! "$boundary_check" "$clean_root" >/dev/null; then
+  fail "Public API boundary check rejected a customer-only generated tree."
+fi
+
+expect_rejection() {
+  local case_name=$1
+  local relative_path=$2
+  local source=$3
+  local generated_root=$test_root/$case_name
+  local fixture_path=$generated_root/$relative_path
+
+  mkdir -p "$(dirname "$fixture_path")"
+  printf '%s\n' "$source" >"$fixture_path"
+  if "$boundary_check" "$generated_root" >/dev/null 2>&1; then
+    fail "Public API boundary check accepted the $case_name fixture."
+  fi
+}
+
+expect_rejection \
+  operator-route \
+  apis/organizations_api.rs \
+  'const PATH: &str = "/v1/operator/organizations";'
+expect_rejection \
+  operator-operation-binding \
+  apis/organizations_api.rs \
+  'pub fn create_organization_as_operator() {}'
+expect_rejection \
+  operator-operation-error \
+  apis/organizations_api.rs \
+  'pub struct CreateOrganizationAsOperatorError;'
+expect_rejection \
+  operator-model-module \
+  models/operator_organization.rs \
+  'pub struct Organization;'
+
+printf 'Public API boundary regression checks passed.\n'

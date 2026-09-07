@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: scripts/check-public-api-boundary [GENERATED_DIRECTORY]" >&2
+}
+
+if [[ $# -gt 1 ]]; then
+  usage
+  exit 2
+fi
+
+public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+generated_root=${1:-$public_root/src/api/generated}
+if [[ $generated_root != /* ]]; then
+  generated_root=$PWD/$generated_root
+fi
+
+python3 - "$generated_root" <<'PY'
+from pathlib import Path
+import sys
+
+generated_root = Path(sys.argv[1])
+if not generated_root.is_dir():
+    print(
+        f"Generated public API source directory is missing: {generated_root}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+rust_sources = sorted(generated_root.rglob("*.rs"))
+if not rust_sources:
+    print(
+        f"Generated public API source contains no Rust files: {generated_root}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+operator_term = "operator"
+forbidden_markers = {
+    f"/v1/{operator_term}": "operator route",
+    f"_as_{operator_term}": "operator operation binding",
+    f"As{operator_term.title()}": "operator operation error type",
+}
+violations = []
+for path in rust_sources:
+    relative_path = path.relative_to(generated_root)
+    if relative_path.parts[0] == "models" and relative_path.name.startswith(
+        f"{operator_term}_"
+    ):
+        violations.append((relative_path, "operator-only model module"))
+
+    text = path.read_text(encoding="utf-8")
+    for marker, description in forbidden_markers.items():
+        if marker in text:
+            violations.append((relative_path, description))
+
+if violations:
+    print(
+        "Generated public API source contains private operator bindings:",
+        file=sys.stderr,
+    )
+    ordered_violations = sorted(
+        set(violations), key=lambda item: (str(item[0]), item[1])
+    )
+    for path, description in ordered_violations:
+        print(f"  {path}: {description}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+printf 'Generated public API boundary checks passed.\n'

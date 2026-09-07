@@ -39,6 +39,7 @@ required_files=(
   scripts/check-lint-policy
   scripts/check-msrv
   scripts/check-pi-json-v1-extension
+  scripts/check-public-api-boundary
   scripts/check-structure
   scripts/strict-devenv
   scripts/test-strict-devenv
@@ -52,6 +53,7 @@ required_files=(
   scripts/test-release-impact
   scripts/test-release-package
   scripts/test-release-path-classifier
+  scripts/test-public-api-boundary
   scripts/verify-release-candidate
   scripts/verify-release-package
   scripts/verify-release-package-isolated
@@ -168,6 +170,7 @@ python3 "$public_root/scripts/test-release-candidate"
 "$public_root/scripts/test-release-impact"
 python3 "$public_root/scripts/test-release-package"
 "$public_root/scripts/test-release-path-classifier"
+"$public_root/scripts/test-public-api-boundary"
 "$public_root/scripts/check-release"
 
 for readme_contract in \

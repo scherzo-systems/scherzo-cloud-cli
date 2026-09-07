@@ -147,6 +147,7 @@ export TMPDIR=$tmp_alias
 
 "$public_root/scripts/test-strict-devenv"
 "$public_root/scripts/check-structure"
+"$public_root/scripts/check-public-api-boundary"
 "$public_root/scripts/check-help-output-style"
 "$public_root/scripts/check-pi-json-v1-extension"
 

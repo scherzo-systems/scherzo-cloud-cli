@@ -170,7 +170,9 @@ case "$PI_FIXTURE_MODE" in
     printf '%s\n' '{"type":"agent_settled"}'
     ;;
   transcript)
-    cat "$PI_FIXTURE_PHASE_TRANSCRIPT"
+    while IFS= read -r event; do
+      printf '%s\n' "$event"
+    done < "$PI_FIXTURE_PHASE_TRANSCRIPT"
     ;;
   *)
     exit 73
@@ -2428,7 +2430,8 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
         };
         let (task, _started, terminal) = start_invocation(fixture.invocation, diagnostics.clone());
 
-        read_signal(fixture.descendant_ready).await;
+        read_signal(fixture.descendant_ready.clone()).await;
+        read_signal(fixture.result_settlement_ready).await;
         read_signal(fixture.ready).await;
         let process = process_id(&fs::read(fixture.process).unwrap());
         let descendant = process_id(&fs::read(fixture.descendant).unwrap());
@@ -2453,6 +2456,16 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
 
         deadline_release.send(true).unwrap();
         deadline_task.await.unwrap();
+        read_signal(fixture.descendant_ready).await;
+        assert!(
+            !process_group_is_quiescent(process),
+            "the unreaped descendant must keep the process group observable"
+        );
+        assert!(
+            !task.is_finished(),
+            "cancellation must not become terminal while the process group still exists"
+        );
+        write_signal(fixture.result_settlement_release).await;
         assert_user_cancellation(task, terminal).await;
         let diagnostic = diagnostics.get("agent-step").unwrap();
         assert_eq!(diagnostic.standard_error().bytes(), b"phase diagnostic\n");
@@ -2523,8 +2536,8 @@ fn phase_cancellation_process_fixture() {
 #[ignore = "launched as the stubborn Pi cancellation process fixture"]
 fn stubborn_process_fixture() {
     let interrupted = begin_pi_process_fixture();
-    let _descendant = spawn_process_fixture(
-        "execution::workflow::pi_json_v1::adapter_tests::stubborn_descendant_process_fixture",
+    let _reaper = spawn_process_fixture(
+        "execution::workflow::pi_json_v1::adapter_tests::stubborn_descendant_reaper_process_fixture",
     );
     let _diagnostic = signal_pi_process_fixture_ready();
 
@@ -2568,12 +2581,22 @@ fn detached_standard_output_holder_process() {
 #[test]
 #[ignore = "launched as an out-of-group reaper by the process-group regression"]
 fn in_group_descendant_reaper_process() {
+    run_descendant_reaper_process(
+        "execution::workflow::pi_json_v1::adapter_tests::in_group_descendant_process",
+    );
+}
+
+#[test]
+#[ignore = "launched as an out-of-group reaper by the cancellation regression"]
+fn stubborn_descendant_reaper_process_fixture() {
+    run_descendant_reaper_process(
+        "execution::workflow::pi_json_v1::adapter_tests::stubborn_descendant_process_fixture",
+    );
+}
+
+fn run_descendant_reaper_process(descendant_test: &str) {
     let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "execution::workflow::pi_json_v1::adapter_tests::in_group_descendant_process",
-            "--ignored",
-        ])
+        .args(["--exact", descendant_test, "--ignored"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
