@@ -21,4 +21,7 @@ Options:
   -h, --help     Print help
   -V, --version  Print version
 
+Documentation:
+  Public API contract: https://docs.scherzo.dev/openapi/public-api.yaml
+
 ```

@@ -89,11 +89,15 @@ impl From<anyhow::Error> for CommandFailure {
     }
 }
 
+const AFTER_HELP: &str =
+    "Documentation:\n  Public API contract: https://docs.scherzo.dev/openapi/public-api.yaml";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "scherzo-cloud",
     about = "Scherzo Cloud CLI",
-    version = crate::build_info::VERSION
+    version = crate::build_info::VERSION,
+    after_help = AFTER_HELP
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]

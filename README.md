@@ -180,6 +180,19 @@ installations, discover authorized repositories, manage projects and runner pool
 or inspect an inputless run for a ready project. It cannot yet invite members, stage run inputs,
 or guide the rest of Cloud onboarding.
 
+## Public API contract
+
+Download the customer OpenAPI contract from its stable public URL:
+
+<https://docs.scherzo.dev/openapi/public-api.yaml>
+
+The hosted file describes the API deployed at `https://api.scherzo.dev`. A particular CLI
+build remains self-contained: it uses the generated Rust client committed under
+`src/api/generated/` and does not fetch the hosted contract at build time or run time. Each
+generated source header records the OpenAPI Generator version and SHA-256 digest of the
+canonical contract used for that client, so its provenance identifies the contract used by
+that CLI build even when the deployed API contract has since changed.
+
 ## Local workflow validation
 
 Use `scherzo-cloud workflow validate` to resolve a checked-out Workflow V1 bundle

@@ -297,7 +297,10 @@ executable will be committed here.
 A normal public build consumes the committed client beneath `src/api/generated` and
 does not require the contract source files or generator. Each generated Rust file
 identifies OpenAPI Generator 7.22.0 and the canonical contract digest. Monorepo tooling
-regenerates the client and checks it for drift before the public source is mirrored.
+regenerates the client and checks it for drift before the public source is mirrored. The
+hosted contract at <https://docs.scherzo.dev/openapi/public-api.yaml> describes the
+deployed API; the digest in a CLI build's generated source identifies the exact contract
+used to generate that build.
 
 The generated module remains private to the handwritten API boundary so generated DTOs
 do not become command or workflow domain types. Generation overlays the public contract's

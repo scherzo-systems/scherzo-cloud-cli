@@ -175,9 +175,10 @@ for readme_contract in \
   'scherzo-cloud workflow schema > workflow-v1.schema.json' \
   'https://docs.scherzo.dev/agent/workflow-authoring.md' \
   'https://docs.scherzo.dev/reference/workflow-v1.md' \
-  'https://docs.scherzo.dev/schemas/workflow-v1.schema.json'; do
+  'https://docs.scherzo.dev/schemas/workflow-v1.schema.json' \
+  'https://docs.scherzo.dev/openapi/public-api.yaml'; do
   if ! grep --fixed-strings --quiet -- "$readme_contract" "$public_root/README.md"; then
-    echo "The public README is missing Workflow V1 guidance: $readme_contract" >&2
+    echo "The public README is missing required guidance: $readme_contract" >&2
     exit 1
   fi
 done
