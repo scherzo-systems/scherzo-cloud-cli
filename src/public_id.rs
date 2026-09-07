@@ -18,8 +18,12 @@ pub(crate) fn valid_organization_ref(value: &str) -> bool {
 }
 
 pub(crate) fn valid_url_safe_name(value: &str) -> bool {
+    valid_lowercase_hyphenated(value, 63)
+}
+
+pub(crate) fn valid_lowercase_hyphenated(value: &str, maximum_bytes: usize) -> bool {
     let bytes = value.as_bytes();
-    (1..=63).contains(&bytes.len())
+    (1..=maximum_bytes).contains(&bytes.len())
         && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
         && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
         && bytes

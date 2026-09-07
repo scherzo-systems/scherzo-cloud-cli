@@ -349,10 +349,10 @@ rendered help come from the same structure. Bare command groups may print their 
 help, but only an explicit leaf command may start long-running behavior.
 
 Organization parsing and credential policy live in `src/cli/organization.rs`; its
-`create.rs`, `show.rs`, `update.rs`, `leave.rs`, and `members.rs` children own leaf
-arguments and API calls. `output.rs` exhaustively maps route-specific outcomes to human
-text, schema-version-1 JSON, and process status. The command modules never expose generated
-DTOs or map raw HTTP statuses independently.
+`audit.rs`, `create.rs`, `show.rs`, `update.rs`, `leave.rs`, and `members.rs` children own
+leaf arguments and API calls. `output.rs` exhaustively maps route-specific outcomes to
+human text, schema-version-1 JSON, and process status. The command modules never expose
+generated DTOs or map raw HTTP statuses independently.
 
 `release.toml` schema 2 is a static public policy contract: initial version `0.1.0`,
 development version `0.0.0-dev`, and minor impact for breaking changes before `1.0`.

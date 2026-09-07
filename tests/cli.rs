@@ -48,6 +48,8 @@ mod identities;
 mod invitation;
 #[path = "cli/organization.rs"]
 mod organization;
+#[path = "cli/organization_audit.rs"]
+mod organization_audit;
 #[path = "cli/pi_installation.rs"]
 mod pi_installation;
 #[path = "cli/project.rs"]

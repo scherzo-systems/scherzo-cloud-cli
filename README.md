@@ -166,9 +166,9 @@ The current release supports:
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, linked sign-in identity management,
-  logout, account signup and display-name management, organization discovery and profile
-  management, invitation issuance and lifecycle management, the current principal's
-  invitation inbox, one-page member-directory reads, actor-bound GitHub App setup,
+  logout, account signup and display-name management, organization discovery, profile
+  management and owner audit history, invitation issuance and lifecycle management, the
+  current principal's invitation inbox, one-page member-directory reads, actor-bound GitHub App setup,
   installation and repository discovery, complete project and repository configuration,
   and inputless Cloud run creation and inspection;
 - runner and runner-pool administration plus prerequisite diagnostics; and
@@ -683,6 +683,11 @@ scherzo-cloud organization members list acme-labs \
 # Read one owner-only page containing active, suspended, and ended memberships.
 scherzo-cloud organization members history acme-labs --limit 50
 
+# Read one owner-only page of privacy-safe audit records.
+scherzo-cloud organization audit list acme-labs \
+  --limit 50 \
+  --cursor opaque-continuation
+
 # Change another member's organization role.
 scherzo-cloud organization members update acme-labs \
   mem_01k0z6r1w8f4jy2m7q9v3x5abc \
@@ -709,6 +714,15 @@ page, preserve `nextCursor`, and do not follow it automatically. Their `--limit`
 accept 1 through 200. Active-member listing remains available to effective members;
 membership history and member changes require an active owner. History preserves
 lifecycle fields while leaving an inactive principal's omitted display name absent.
+
+Audit listing also returns exactly one oldest-first page and preserves `nextCursor`, but
+its `--limit` accepts 1 through 100. Only an active organization owner can use it. Human
+output identifies each available record's actor, action, target, occurrence time, change
+count, and retention snapshot. A record whose details cannot be projected remains in
+place with `details: unavailable`, its occurrence and retention metadata, and the
+redacted warning reason; the CLI does not infer actor, action, target, or hidden subject
+details. `--json` emits the same closed records, `detailsStatus`, retention snapshots,
+optional warnings, and cursor in a schema-version-1 `listed` result.
 
 Role update accepts only `owner` or `member`. It does not expose membership suspension
 or reactivation. Member removal and self-leave are terminal and require `--yes`. The

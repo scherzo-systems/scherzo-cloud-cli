@@ -4,10 +4,12 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::api::{
-    CommonOrganizationFailure, CreateOrganizationOutcome, CurrentPrincipalMembership,
-    GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
+    AuditActor, AuditProjectionWarning, AuditProjectionWarningReason, CommonOrganizationFailure,
+    CreateOrganizationOutcome, CurrentPrincipalMembership, GetOrganizationOutcome,
+    ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
     ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome,
-    MembershipTerminationOutcome, Organization, OrganizationMembershipDirectoryEntry,
+    MembershipTerminationOutcome, Organization, OrganizationAuditRecord,
+    OrganizationAuditSubjectKind, OrganizationMembershipDirectoryEntry,
     OrganizationMembershipHistoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
 };
@@ -215,6 +217,46 @@ pub(super) fn write_members_history(
     }
 }
 
+pub(super) fn write_audit_list(
+    deployment: &str,
+    outcome: &ListOrganizationAuditRecordsOutcome,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    match outcome {
+        ListOrganizationAuditRecordsOutcome::Listed(page) => {
+            if json {
+                write_json(&AuditListResult {
+                    schema_version: 1,
+                    deployment,
+                    outcome: "listed",
+                    items: &page.items,
+                    next_cursor: page.next_cursor.as_deref(),
+                    warnings: page.warnings.as_deref(),
+                })?;
+            } else {
+                write_audit_records_human(
+                    deployment,
+                    &page.items,
+                    page.next_cursor.as_deref(),
+                    page.warnings.as_deref(),
+                )?;
+            }
+            Ok(ExitCode::Success)
+        }
+        ListOrganizationAuditRecordsOutcome::Common(common) => {
+            write_audit_common_failure(deployment, common, json)
+        }
+        ListOrganizationAuditRecordsOutcome::NotFound => write_organization_operation_failure(
+            deployment,
+            "not_found",
+            None,
+            "error: organization audit records not found or unavailable\n\nCheck the organization reference and your access, then try again.",
+            OutcomeClass::GeneralFailure,
+            json,
+        ),
+    }
+}
+
 pub(super) fn write_members_update(
     deployment: &str,
     outcome: &UpdateOrganizationMembershipOutcome,
@@ -292,6 +334,149 @@ pub(super) fn write_leave(
     )
 }
 
+fn write_audit_records_human(
+    deployment: &str,
+    items: &[OrganizationAuditRecord],
+    next_cursor: Option<&str>,
+    warnings: Option<&[AuditProjectionWarning]>,
+) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "✓ Organization audit records listed.\n")?;
+    for item in items {
+        match item {
+            OrganizationAuditRecord::DetailsAvailable {
+                id,
+                occurred_at,
+                retention,
+                actor,
+                delegating_principal_id,
+                action,
+                subject,
+                changes,
+            } => {
+                writeln!(stdout, "record: {id}")?;
+                writeln!(stdout, "time: {occurred_at}")?;
+                writeln!(stdout, "details: available")?;
+                write_audit_actor(&mut stdout, actor)?;
+                if let Some(principal_id) = delegating_principal_id {
+                    writeln!(stdout, "delegating principal: {principal_id}")?;
+                }
+                writeln!(stdout, "action: {action}")?;
+                writeln!(
+                    stdout,
+                    "target: {} {}",
+                    audit_subject_kind(subject.kind),
+                    subject.id
+                )?;
+                writeln!(stdout, "changes: {}", changes.len())?;
+                writeln!(
+                    stdout,
+                    "retention: {} · retain until: {}\n",
+                    retention.identifier, retention.retain_until
+                )?;
+            }
+            OrganizationAuditRecord::DetailsUnavailable {
+                id,
+                occurred_at,
+                retention,
+            } => {
+                writeln!(stdout, "record: {id}")?;
+                writeln!(stdout, "time: {occurred_at}")?;
+                writeln!(stdout, "details: unavailable")?;
+                writeln!(
+                    stdout,
+                    "retention: {} · retain until: {}\n",
+                    retention.identifier, retention.retain_until
+                )?;
+            }
+        }
+    }
+    if let Some(warnings) = warnings {
+        for warning in warnings {
+            writeln!(
+                stdout,
+                "warning: {} · reason: {}",
+                warning.record_id,
+                audit_warning_reason(warning.reason)
+            )?;
+        }
+        if !warnings.is_empty() {
+            writeln!(stdout)?;
+        }
+    }
+    write_page_footer(&mut stdout, deployment, next_cursor)?;
+    Ok(())
+}
+
+fn write_audit_actor(output: &mut impl Write, actor: &AuditActor) -> io::Result<()> {
+    match actor {
+        AuditActor::Principal { principal_id } => {
+            writeln!(output, "actor: principal {principal_id}")
+        }
+        AuditActor::Runner { runner_id } => writeln!(output, "actor: runner {runner_id}"),
+        AuditActor::System => writeln!(output, "actor: system"),
+    }
+}
+
+const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str {
+    match kind {
+        OrganizationAuditSubjectKind::Organization => "organization",
+        OrganizationAuditSubjectKind::ArtifactSet => "artifact_set",
+        OrganizationAuditSubjectKind::RunInputSet => "run_input_set",
+        OrganizationAuditSubjectKind::Membership => "membership",
+        OrganizationAuditSubjectKind::Invitation => "invitation",
+        OrganizationAuditSubjectKind::RunnerPool => "runner_pool",
+        OrganizationAuditSubjectKind::RunnerRegistration => "runner_registration",
+        OrganizationAuditSubjectKind::RunnerActivation => "runner_activation",
+        OrganizationAuditSubjectKind::RunnerCredential => "runner_credential",
+        OrganizationAuditSubjectKind::GithubInstallation => "github_installation",
+        OrganizationAuditSubjectKind::Project => "project",
+        OrganizationAuditSubjectKind::RepositoryConnection => "repository_connection",
+        OrganizationAuditSubjectKind::Assignment => "assignment",
+    }
+}
+
+const fn audit_warning_reason(reason: AuditProjectionWarningReason) -> &'static str {
+    match reason {
+        AuditProjectionWarningReason::UnknownAction => "unknown_action",
+        AuditProjectionWarningReason::MalformedRecord => "malformed_record",
+    }
+}
+
+struct CommonFailurePresentation {
+    unauthenticated: &'static str,
+    forbidden: &'static str,
+    invalid_input_subject: &'static str,
+    invalid_input_remedy: &'static str,
+}
+
+const AUDIT_FAILURE_PRESENTATION: CommonFailurePresentation = CommonFailurePresentation {
+    unauthenticated: "error: organization audit records require sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+    forbidden: "error: organization audit records unavailable for this account\n\nUse an active organization owner account.",
+    invalid_input_subject: "organization audit request",
+    invalid_input_remedy: "Check the organization reference, limit, and cursor, then try again.",
+};
+
+const MEMBERSHIP_FAILURE_PRESENTATION: CommonFailurePresentation = CommonFailurePresentation {
+    unauthenticated: "error: organization membership management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+    forbidden: "error: organization membership operation not permitted\n\nUse an active organization owner account.",
+    invalid_input_subject: "organization membership input",
+    invalid_input_remedy: "Check the organization reference, membership ID, and cursor, then try again.",
+};
+
+fn write_audit_common_failure(
+    deployment: &str,
+    failure: &CommonOrganizationFailure,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    write_common_organization_operation_failure(
+        deployment,
+        failure,
+        &AUDIT_FAILURE_PRESENTATION,
+        json,
+    )
+}
+
 fn write_membership_termination(
     deployment: &str,
     organization: &str,
@@ -343,35 +528,50 @@ fn write_membership_common_failure(
     failure: &CommonOrganizationFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
+    write_common_organization_operation_failure(
+        deployment,
+        failure,
+        &MEMBERSHIP_FAILURE_PRESENTATION,
+        json,
+    )
+}
+
+fn write_common_organization_operation_failure(
+    deployment: &str,
+    failure: &CommonOrganizationFailure,
+    presentation: &CommonFailurePresentation,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
     let (outcome, category, message, class) = match failure {
         CommonOrganizationFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: organization membership management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            presentation.unauthenticated.to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         CommonOrganizationFailure::Forbidden => (
             "forbidden",
             None,
-            "error: organization membership operation not permitted\n\nUse an active organization owner account.".to_owned(),
+            presentation.forbidden.to_owned(),
             OutcomeClass::Forbidden,
         ),
         CommonOrganizationFailure::InvalidInput => (
             "invalid_input",
             None,
             format!(
-                "error: organization membership input rejected by {deployment}\n\nCheck the organization reference, membership ID, and cursor, then try again."
+                "error: {} rejected by {deployment}\n\n{}",
+                presentation.invalid_input_subject, presentation.invalid_input_remedy
             ),
             OutcomeClass::GeneralFailure,
         ),
         CommonOrganizationFailure::Unreachable(category) => {
-            membership_unreachable(deployment, *category)
+            organization_operation_unreachable(deployment, *category)
         }
     };
-    write_membership_failure(deployment, outcome, category, &message, class, json)
+    write_organization_operation_failure(deployment, outcome, category, &message, class, json)
 }
 
-fn membership_unreachable(
+fn organization_operation_unreachable(
     deployment: &str,
     category: crate::api::UnreachableCategory,
 ) -> (&'static str, Option<&'static str>, String, OutcomeClass) {
@@ -387,7 +587,7 @@ fn membership_unreachable(
 }
 
 fn write_membership_not_found(deployment: &str, json: bool) -> anyhow::Result<ExitCode> {
-    write_membership_failure(
+    write_organization_operation_failure(
         deployment,
         "not_found",
         None,
@@ -423,7 +623,7 @@ fn write_membership_conflict(
             "error: organization membership request identity conflicted with another request\n\nRun the command again to use a new request identity.",
         ),
     };
-    write_membership_failure(
+    write_organization_operation_failure(
         deployment,
         outcome,
         None,
@@ -433,7 +633,7 @@ fn write_membership_conflict(
     )
 }
 
-fn write_membership_failure(
+fn write_organization_operation_failure(
     deployment: &str,
     outcome: &'static str,
     category: Option<&'static str>,
@@ -716,7 +916,7 @@ fn write_current_membership_failure(
             OutcomeClass::GeneralFailure,
         ),
         CommonOrganizationFailure::Unreachable(category) => {
-            membership_unreachable(deployment, *category)
+            organization_operation_unreachable(deployment, *category)
         }
     };
     if json {
@@ -785,6 +985,19 @@ const fn principal_type(principal_type: PrincipalType) -> &'static str {
         PrincipalType::Human => "human",
         PrincipalType::Service => "service",
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditListResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    items: &'a [OrganizationAuditRecord],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warnings: Option<&'a [AuditProjectionWarning]>,
 }
 
 #[derive(Serialize)]

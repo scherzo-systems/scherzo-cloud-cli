@@ -1,3 +1,4 @@
+mod audit;
 mod create;
 mod leave;
 mod list;
@@ -11,9 +12,10 @@ use clap::{Args, Subcommand};
 
 use crate::api::{
     CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
-    ListCurrentPrincipalMembershipsOutcome, ListOrganizationMembershipHistoryOutcome,
-    ListOrganizationMembershipsOutcome, MembershipTerminationOutcome, OrganizationError,
-    UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
+    ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
+    ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome,
+    MembershipTerminationOutcome, OrganizationError, UpdateOrganizationMembershipOutcome,
+    UpdateOrganizationOutcome,
 };
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
@@ -29,6 +31,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum OrganizationCommand {
+    #[command(about = audit::ABOUT)]
+    Audit(audit::Command),
     #[command(about = create::ABOUT)]
     Create(create::Command),
     #[command(about = leave::ABOUT)]
@@ -100,6 +104,7 @@ impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
             None => super::print_help(&[NAME]),
+            Some(OrganizationCommand::Audit(command)) => command.execute(),
             Some(OrganizationCommand::Create(command)) => {
                 execute_leaf(command, create::Command::execute)
             }
@@ -138,6 +143,7 @@ super::impl_organization_human_credential_outcome!(
     GetOrganizationOutcome,
     UpdateOrganizationOutcome,
     ListCurrentPrincipalMembershipsOutcome,
+    ListOrganizationAuditRecordsOutcome,
     ListOrganizationMembershipHistoryOutcome,
     ListOrganizationMembershipsOutcome,
     MembershipTerminationOutcome,

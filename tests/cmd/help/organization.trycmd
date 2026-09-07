@@ -5,6 +5,7 @@ Manage Scherzo Cloud organizations
 Usage: scherzo-cloud organization [COMMAND]
 
 Commands:
+  audit        Work with organization audit records
   create       Create a Scherzo Cloud organization
   leave        Leave a Scherzo Cloud organization
   list         List your Scherzo Cloud organization memberships

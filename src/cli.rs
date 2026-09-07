@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use clap::{Args, CommandFactory, Parser, Subcommand, builder::NonEmptyStringValueParser};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::api::{
@@ -79,6 +79,29 @@ impl FromStr for OrganizationRef {
 }
 
 impl Deref for OrganizationRef {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContinuationCursor(String);
+
+impl FromStr for ContinuationCursor {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() {
+            Err("must be a nonempty opaque cursor".to_owned())
+        } else {
+            Ok(Self(value.to_owned()))
+        }
+    }
+}
+
+impl Deref for ContinuationCursor {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -165,12 +188,8 @@ struct PaginationArgs {
     )]
     limit: Option<u16>,
 
-    #[arg(
-        long,
-        value_parser = NonEmptyStringValueParser::new(),
-        help = "Opaque continuation cursor"
-    )]
-    cursor: Option<String>,
+    #[arg(long, help = "Opaque continuation cursor")]
+    cursor: Option<ContinuationCursor>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -816,6 +835,8 @@ mod tests {
             "invitation list",
             "invitation preview",
             "organization",
+            "organization audit",
+            "organization audit list",
             "organization create",
             "organization invitations",
             "organization invitations issue",

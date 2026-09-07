@@ -2,7 +2,7 @@ use super::*;
 
 const TOKEN: &str = "unique-organization-command-token-sentinel";
 
-fn prepared_organization(
+pub(super) fn prepared_organization(
     responses: Vec<Vec<u8>>,
     access_token: &str,
 ) -> (
@@ -29,7 +29,7 @@ fn prepared_organization(
     )
 }
 
-fn prepared_organization_refresh(
+pub(super) fn prepared_organization_refresh(
     mut responses: Vec<Vec<u8>>,
     access_token: &str,
 ) -> (
@@ -199,7 +199,7 @@ fn current_membership_items() -> serde_json::Value {
     ])
 }
 
-fn organization_problem(status_text: &str, status: u16, problem_type: &str) -> Vec<u8> {
+pub(super) fn organization_problem(status_text: &str, status: u16, problem_type: &str) -> Vec<u8> {
     problem_http_response(
         status_text,
         serde_json::json!({

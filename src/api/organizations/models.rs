@@ -100,6 +100,114 @@ pub(crate) struct OrganizationMembershipHistoryPage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct OrganizationAuditRecordPage {
+    pub(crate) items: Vec<OrganizationAuditRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) warnings: Option<Vec<AuditProjectionWarning>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "detailsStatus")]
+pub(crate) enum OrganizationAuditRecord {
+    #[serde(rename = "details_available")]
+    DetailsAvailable {
+        id: String,
+        #[serde(rename = "occurredAt")]
+        occurred_at: String,
+        retention: AuditRetentionSnapshot,
+        actor: AuditActor,
+        #[serde(
+            rename = "delegatingPrincipalId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        delegating_principal_id: Option<String>,
+        action: String,
+        subject: OrganizationAuditSubject,
+        changes: Vec<OrganizationAuditChange>,
+    },
+    #[serde(rename = "details_unavailable")]
+    DetailsUnavailable {
+        id: String,
+        #[serde(rename = "occurredAt")]
+        occurred_at: String,
+        retention: AuditRetentionSnapshot,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuditRetentionSnapshot {
+    pub(crate) identifier: String,
+    pub(crate) retain_until: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum AuditActor {
+    Principal {
+        #[serde(rename = "principalId")]
+        principal_id: String,
+    },
+    Runner {
+        #[serde(rename = "runnerId")]
+        runner_id: String,
+    },
+    System,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrganizationAuditSubject {
+    pub(crate) kind: OrganizationAuditSubjectKind,
+    pub(crate) id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OrganizationAuditSubjectKind {
+    Organization,
+    ArtifactSet,
+    RunInputSet,
+    Membership,
+    Invitation,
+    RunnerPool,
+    RunnerRegistration,
+    RunnerActivation,
+    RunnerCredential,
+    GithubInstallation,
+    Project,
+    RepositoryConnection,
+    Assignment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrganizationAuditChange {
+    pub(crate) field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) after: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuditProjectionWarning {
+    pub(crate) record_id: String,
+    pub(crate) reason: AuditProjectionWarningReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AuditProjectionWarningReason {
+    UnknownAction,
+    MalformedRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Invitation {
     pub(crate) id: String,
     pub(crate) organization_id: String,
@@ -696,6 +804,223 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
             terminal_at: value.terminal_at,
         })
     }
+}
+
+impl TryFrom<models::OrganizationAuditRecordList> for OrganizationAuditRecordPage {
+    type Error = &'static str;
+
+    fn try_from(value: models::OrganizationAuditRecordList) -> Result<Self, Self::Error> {
+        if value.next_cursor.as_deref() == Some("") {
+            return Err("the organization audit record cursor is empty");
+        }
+        let items = value
+            .items
+            .into_iter()
+            .map(OrganizationAuditRecord::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let warnings = value
+            .warnings
+            .map(|warnings| {
+                warnings
+                    .into_iter()
+                    .map(AuditProjectionWarning::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        Ok(Self {
+            items,
+            next_cursor: value.next_cursor,
+            warnings,
+        })
+    }
+}
+
+impl TryFrom<models::OrganizationAuditRecord> for OrganizationAuditRecord {
+    type Error = &'static str;
+
+    fn try_from(value: models::OrganizationAuditRecord) -> Result<Self, Self::Error> {
+        match value {
+            models::OrganizationAuditRecord::DetailsAvailable(details) => {
+                let details = *details;
+                validate_audit_record_metadata(&details.id, &details.occurred_at)?;
+                let retention = AuditRetentionSnapshot::try_from(*details.retention)?;
+                let actor = AuditActor::try_from(*details.actor)?;
+                if details
+                    .delegating_principal_id
+                    .as_deref()
+                    .is_some_and(|id| !crate::public_id::valid_typed_id(id, "prn_"))
+                {
+                    return Err("the organization audit delegating principal ID is invalid");
+                }
+                if details.changes.is_empty() {
+                    return Err("the organization audit record has no changes");
+                }
+                let changes = details
+                    .changes
+                    .into_iter()
+                    .map(OrganizationAuditChange::from)
+                    .collect();
+                Ok(Self::DetailsAvailable {
+                    id: details.id,
+                    occurred_at: details.occurred_at,
+                    retention,
+                    actor,
+                    delegating_principal_id: details.delegating_principal_id,
+                    action: details.action.to_string(),
+                    subject: OrganizationAuditSubject::try_from(*details.subject)?,
+                    changes,
+                })
+            }
+            models::OrganizationAuditRecord::DetailsUnavailable(details) => {
+                let details = *details;
+                validate_audit_record_metadata(&details.id, &details.occurred_at)?;
+                Ok(Self::DetailsUnavailable {
+                    id: details.id,
+                    occurred_at: details.occurred_at,
+                    retention: AuditRetentionSnapshot::try_from(*details.retention)?,
+                })
+            }
+        }
+    }
+}
+
+impl TryFrom<models::AuditRetentionSnapshot> for AuditRetentionSnapshot {
+    type Error = &'static str;
+
+    fn try_from(value: models::AuditRetentionSnapshot) -> Result<Self, Self::Error> {
+        if !valid_audit_retention_identifier(&value.identifier) {
+            return Err("the organization audit retention identifier is invalid");
+        }
+        parse_timestamp(
+            &value.retain_until,
+            "the organization audit retention time is invalid",
+        )?;
+        Ok(Self {
+            identifier: value.identifier,
+            retain_until: value.retain_until,
+        })
+    }
+}
+
+impl TryFrom<models::AuditActor> for AuditActor {
+    type Error = &'static str;
+
+    fn try_from(value: models::AuditActor) -> Result<Self, Self::Error> {
+        match (value.kind, value.principal_id, value.runner_id) {
+            (models::audit_actor::Kind::Principal, Some(principal_id), None)
+                if crate::public_id::valid_typed_id(&principal_id, "prn_") =>
+            {
+                Ok(Self::Principal { principal_id })
+            }
+            (models::audit_actor::Kind::Runner, None, Some(runner_id))
+                if crate::public_id::valid_typed_id(&runner_id, "rnr_") =>
+            {
+                Ok(Self::Runner { runner_id })
+            }
+            (models::audit_actor::Kind::System, None, None) => Ok(Self::System),
+            _ => Err("the organization audit actor is invalid"),
+        }
+    }
+}
+
+impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
+    type Error = &'static str;
+
+    fn try_from(value: models::OrganizationAuditSubject) -> Result<Self, Self::Error> {
+        use models::organization_audit_subject::Kind;
+
+        let (kind, prefix) = match value.kind {
+            Kind::Organization => (OrganizationAuditSubjectKind::Organization, "org_"),
+            Kind::ArtifactSet => (OrganizationAuditSubjectKind::ArtifactSet, "ats_"),
+            Kind::RunInputSet => (OrganizationAuditSubjectKind::RunInputSet, "ris_"),
+            Kind::Membership => (OrganizationAuditSubjectKind::Membership, "mem_"),
+            Kind::Invitation => (OrganizationAuditSubjectKind::Invitation, "inv_"),
+            Kind::RunnerPool => (OrganizationAuditSubjectKind::RunnerPool, "rpl_"),
+            Kind::RunnerRegistration => (OrganizationAuditSubjectKind::RunnerRegistration, "rnr_"),
+            Kind::RunnerActivation => (OrganizationAuditSubjectKind::RunnerActivation, "rna_"),
+            Kind::RunnerCredential => (OrganizationAuditSubjectKind::RunnerCredential, "rrc_"),
+            Kind::GithubInstallation => (OrganizationAuditSubjectKind::GithubInstallation, "ghi_"),
+            Kind::Project => (OrganizationAuditSubjectKind::Project, "prj_"),
+            Kind::RepositoryConnection => {
+                (OrganizationAuditSubjectKind::RepositoryConnection, "rpc_")
+            }
+            Kind::Assignment => (OrganizationAuditSubjectKind::Assignment, "asn_"),
+        };
+        if !crate::public_id::valid_typed_id(&value.id, prefix) {
+            return Err("the organization audit subject is invalid");
+        }
+        Ok(Self { kind, id: value.id })
+    }
+}
+
+impl From<models::OrganizationAuditChange> for OrganizationAuditChange {
+    fn from(value: models::OrganizationAuditChange) -> Self {
+        use models::organization_audit_change::Field;
+
+        let field = match value.field {
+            Field::DisplayName => "display_name",
+            Field::Name => "name",
+            Field::Role => "role",
+            Field::Slug => "slug",
+            Field::State => "state",
+            Field::Mode => "mode",
+            Field::RunnerPoolId => "runner_pool_id",
+            Field::RepositoryConnectionId => "repository_connection_id",
+            Field::DefaultBranch => "default_branch",
+            Field::RetireAt => "retire_at",
+            Field::Reason => "reason",
+            Field::RunId => "run_id",
+            Field::ArtifactSetId => "artifact_set_id",
+            Field::MemberCount => "member_count",
+            Field::AuthorizedSizeBytes => "authorized_size_bytes",
+            Field::CapabilityExpiresAt => "capability_expires_at",
+            Field::ProjectId => "project_id",
+            Field::PromptPresent => "prompt_present",
+            Field::AttachmentCount => "attachment_count",
+            Field::AggregateSizeBytes => "aggregate_size_bytes",
+        };
+        Self {
+            field: field.to_owned(),
+            before: value.before,
+            after: value.after,
+        }
+    }
+}
+
+impl TryFrom<models::AuditProjectionWarning> for AuditProjectionWarning {
+    type Error = &'static str;
+
+    fn try_from(value: models::AuditProjectionWarning) -> Result<Self, Self::Error> {
+        if !crate::public_id::valid_typed_id(&value.record_id, "aud_") {
+            return Err("the organization audit warning record ID is invalid");
+        }
+        Ok(Self {
+            record_id: value.record_id,
+            reason: match value.reason {
+                models::audit_projection_warning::Reason::UnknownAction => {
+                    AuditProjectionWarningReason::UnknownAction
+                }
+                models::audit_projection_warning::Reason::MalformedRecord => {
+                    AuditProjectionWarningReason::MalformedRecord
+                }
+            },
+        })
+    }
+}
+
+fn validate_audit_record_metadata(id: &str, occurred_at: &str) -> Result<(), &'static str> {
+    if !crate::public_id::valid_typed_id(id, "aud_") {
+        return Err("the organization audit record ID is invalid");
+    }
+    parse_timestamp(
+        occurred_at,
+        "the organization audit occurrence time is invalid",
+    )?;
+    Ok(())
+}
+
+fn valid_audit_retention_identifier(value: &str) -> bool {
+    crate::public_id::valid_lowercase_hyphenated(value, 64)
 }
 
 fn convert_page<T, U>(

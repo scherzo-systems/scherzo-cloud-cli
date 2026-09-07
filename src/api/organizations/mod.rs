@@ -20,12 +20,14 @@ use super::problem::{
 use super::{UnreachableCategory, classify_reqwest_error};
 
 pub(crate) use models::{
-    AcceptedInvitationMembership, CurrentPrincipalMembership, CurrentPrincipalMembershipPage,
-    Invitation, InvitationDeliveryState, InvitationInboxEntry, InvitationInboxPage, InvitationPage,
+    AcceptedInvitationMembership, AuditActor, AuditProjectionWarning, AuditProjectionWarningReason,
+    CurrentPrincipalMembership, CurrentPrincipalMembershipPage, Invitation,
+    InvitationDeliveryState, InvitationInboxEntry, InvitationInboxPage, InvitationPage,
     InvitationPreview, InvitationState, InvitationTargetKind, MembershipRole, MembershipState,
-    Organization, OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry,
-    OrganizationMembershipHistoryPage, OrganizationMembershipPage, OrganizationState,
-    PrincipalType,
+    Organization, OrganizationAuditRecord, OrganizationAuditRecordPage,
+    OrganizationAuditSubjectKind, OrganizationMembershipDirectoryEntry,
+    OrganizationMembershipHistoryEntry, OrganizationMembershipHistoryPage,
+    OrganizationMembershipPage, OrganizationState, PrincipalType,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -100,6 +102,13 @@ pub(crate) enum ListOrganizationMembershipsOutcome {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ListOrganizationMembershipHistoryOutcome {
     Listed(OrganizationMembershipHistoryPage),
+    Common(CommonOrganizationFailure),
+    NotFound,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ListOrganizationAuditRecordsOutcome {
+    Listed(OrganizationAuditRecordPage),
     Common(CommonOrganizationFailure),
     NotFound,
 }
@@ -259,6 +268,7 @@ enum Operation {
     ListCurrentMemberships,
     ListMemberships,
     ListMembershipHistory,
+    ListAuditRecords,
     UpdateMembership,
     EndMembership,
     Leave,
@@ -280,6 +290,7 @@ impl Operation {
             Self::ListCurrentMemberships => "current-membership-list",
             Self::ListMemberships => "membership-list",
             Self::ListMembershipHistory => "membership-history-list",
+            Self::ListAuditRecords => "audit-record-list",
             Self::UpdateMembership => "membership-update",
             Self::EndMembership => "membership-removal",
             Self::Leave => "leave",
@@ -552,6 +563,32 @@ pub(crate) fn list_organization_membership_history(
                 CommonOrganizationFailure::Unreachable(category),
             ))
         }
+    }
+}
+
+pub(crate) fn list_organization_audit_records(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    organization_ref: &str,
+    limit: Option<u16>,
+    cursor: Option<&str>,
+) -> Result<ListOrganizationAuditRecordsOutcome, OrganizationError> {
+    let spec = list_request_spec(
+        client,
+        Operation::ListAuditRecords,
+        api_url,
+        &["v1", "organizations", organization_ref, "audit-records"],
+        access_token,
+        limit,
+        cursor,
+    )?;
+
+    match execute_request(client, &spec, REQUEST_TIMEOUT)? {
+        RequestExecution::Response(response) => decode_audit_record_list_response(response),
+        RequestExecution::Unreachable(category) => Ok(ListOrganizationAuditRecordsOutcome::Common(
+            CommonOrganizationFailure::Unreachable(category),
+        )),
     }
 }
 
@@ -2030,6 +2067,75 @@ fn decode_membership_history_response(
         _ => decode_common_list_failure(Operation::ListMembershipHistory, &response)
             .map(ListOrganizationMembershipHistoryOutcome::Common),
     }
+}
+
+fn decode_audit_record_list_response(
+    response: ReceivedResponse,
+) -> Result<ListOrganizationAuditRecordsOutcome, OrganizationError> {
+    match response.status {
+        StatusCode::OK => {
+            let value = decode_json_value(
+                Operation::ListAuditRecords,
+                &response,
+                "the audit-record-list response body is invalid",
+            )?;
+            reject_null_audit_record_optionals(&value)?;
+            let generated: generated_models::OrganizationAuditRecordList = decode_json_model(
+                Operation::ListAuditRecords,
+                value,
+                "the audit-record-list response body is invalid",
+            )?;
+            OrganizationAuditRecordPage::try_from(generated)
+                .map(ListOrganizationAuditRecordsOutcome::Listed)
+                .map_err(|reason| {
+                    OrganizationError::protocol(Operation::ListAuditRecords, reason, false)
+                })
+        }
+        StatusCode::NOT_FOUND => {
+            require_problem(Operation::ListAuditRecords, &response, NOT_FOUND, false)?;
+            Ok(ListOrganizationAuditRecordsOutcome::NotFound)
+        }
+        _ => decode_common_list_failure(Operation::ListAuditRecords, &response)
+            .map(ListOrganizationAuditRecordsOutcome::Common),
+    }
+}
+
+fn reject_null_audit_record_optionals(value: &serde_json::Value) -> Result<(), OrganizationError> {
+    let page_has_null = ["nextCursor", "warnings"]
+        .into_iter()
+        .any(|field| value.get(field).is_some_and(serde_json::Value::is_null));
+    let item_has_null = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("delegatingPrincipalId")
+                    .is_some_and(serde_json::Value::is_null)
+                    || item.get("actor").is_some_and(|actor| {
+                        ["principalId", "runnerId"]
+                            .into_iter()
+                            .any(|field| actor.get(field).is_some_and(serde_json::Value::is_null))
+                    })
+                    || item
+                        .get("changes")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|changes| {
+                            changes.iter().any(|change| {
+                                ["before", "after"].into_iter().any(|field| {
+                                    change.get(field).is_some_and(serde_json::Value::is_null)
+                                })
+                            })
+                        })
+            })
+        });
+    if page_has_null || item_has_null {
+        return Err(OrganizationError::protocol(
+            Operation::ListAuditRecords,
+            "the audit-record-list response contains an explicit null optional field",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn decode_update_membership_response(
