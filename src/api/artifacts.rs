@@ -202,7 +202,27 @@ impl ArtifactSource for ArtifactApi {
                 let wire: WireInventory = serde_json::from_slice(&response.body).map_err(|_| {
                     ArtifactApiError::protocol("the inventory body is invalid", false)
                 })?;
-                ArtifactInventoryPage::try_from(wire)
+                let page = ArtifactInventoryPage::try_from(wire)?;
+                let incomplete_initial_page = cursor.is_none()
+                    && page.next_cursor.is_none()
+                    && page.members.len() < page.member_count;
+                let unusable_continuation = page.next_cursor.is_some()
+                    && (page.members.is_empty()
+                        || page.members.len() == page.member_count
+                        || page.next_cursor.as_deref() == cursor);
+                let oversized_page = page.members.len() > usize::from(limit);
+                let ignored_cursor = cursor.is_some() && page.members.len() == page.member_count;
+                if incomplete_initial_page
+                    || unusable_continuation
+                    || oversized_page
+                    || ignored_cursor
+                {
+                    return Err(ArtifactApiError::protocol(
+                        "the inventory pagination is inconsistent",
+                        false,
+                    ));
+                }
+                Ok(page)
             }
             status => Err(classify_api_failure(status, &response)),
         }
@@ -441,7 +461,7 @@ fn require_success_headers(response: &ReceivedResponse) -> Result<(), ArtifactAp
 fn classify_api_failure(status: StatusCode, response: &ReceivedResponse) -> ArtifactApiError {
     let credential_rejected = status == StatusCode::UNAUTHORIZED;
     if response.content_type.as_deref() != Some(PROBLEM_MEDIA_TYPE)
-        || serde_json::from_slice::<serde_json::Value>(&response.body).is_err()
+        || super::problem::decode(&response.body, status).is_err()
     {
         return ArtifactApiError::protocol(
             "the error response is not valid problem details",
@@ -522,6 +542,13 @@ impl TryFrom<WireMember> for ArtifactMember {
     type Error = ArtifactApiError;
 
     fn try_from(member: WireMember) -> Result<Self, Self::Error> {
+        let media_type_length = member.media_type.chars().count();
+        if !valid_inventory_member_path(&member.path) || !(3..=128).contains(&media_type_length) {
+            return Err(ArtifactApiError::protocol(
+                "a member descriptor is invalid",
+                false,
+            ));
+        }
         Ok(Self {
             path: member.path,
             media_type: member.media_type,
@@ -536,10 +563,15 @@ impl TryFrom<WireInventory> for ArtifactInventoryPage {
     type Error = ArtifactApiError;
 
     fn try_from(page: WireInventory) -> Result<Self, Self::Error> {
-        if page.member_count == 0
+        if !crate::public_id::valid_typed_id(&page.artifact_set_id, "ats_")
+            || page.member_count == 0
             || page.member_count > 4097
             || page.members.len() > 200
-            || page.next_cursor.as_ref().is_some_and(String::is_empty)
+            || page.members.len() > page.member_count
+            || page.next_cursor.as_ref().is_some_and(|cursor| {
+                let length = cursor.chars().count();
+                !(1..=2048).contains(&length)
+            })
         {
             return Err(ArtifactApiError::protocol(
                 "the inventory bounds are invalid",
@@ -554,22 +586,44 @@ impl TryFrom<WireInventory> for ArtifactInventoryPage {
                 false,
             ));
         }
+        let total_size_bytes = u64::try_from(page.total_size_bytes).map_err(|_| {
+            ArtifactApiError::protocol("the inventory byte total is invalid", false)
+        })?;
+        let members = page
+            .members
+            .into_iter()
+            .map(ArtifactMember::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        if members
+            .windows(2)
+            .any(|members| members[0].path >= members[1].path)
+            || members
+                .iter()
+                .try_fold(0_u64, |total, member| total.checked_add(member.size_bytes))
+                .is_none_or(|page_size| page_size > total_size_bytes)
+        {
+            return Err(ArtifactApiError::protocol(
+                "the inventory members are inconsistent",
+                false,
+            ));
+        }
         Ok(Self {
             artifact_set_id: page.artifact_set_id,
             sealed_at: page.sealed_at,
             expires_at: page.expires_at,
             member_count: page.member_count,
-            total_size_bytes: u64::try_from(page.total_size_bytes).map_err(|_| {
-                ArtifactApiError::protocol("the inventory byte total is invalid", false)
-            })?,
-            members: page
-                .members
-                .into_iter()
-                .map(ArtifactMember::try_from)
-                .collect::<Result<_, _>>()?,
+            total_size_bytes,
+            members,
             next_cursor: page.next_cursor,
         })
     }
+}
+
+fn valid_inventory_member_path(path: &str) -> bool {
+    path == "result.json"
+        || path.strip_prefix("exports/").is_some_and(|ordinal| {
+            ordinal.len() == 4 && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 impl TryFrom<WireCapabilities> for ArtifactCapabilities {

@@ -267,6 +267,39 @@ execute command or agent steps, check harness or model availability, read human 
 runner credentials, or contact Scherzo Cloud. A zero exit status means only that the
 local definition resolved successfully.
 
+## Remote artifact metadata and download
+
+List one page of a run's sealed Artifact Set without downloading it:
+
+```sh
+scherzo-cloud artifact list acme-research run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --limit 50
+```
+
+The result includes whole-set identity, seal and retention times, total member and byte
+counts, and each member's portable path, media type, size, and SHA-256 digest. Members
+are in portable-path order. `--limit` accepts 1 through 200, and `--cursor` continues
+from the opaque `next cursor` value; the limit may change between pages. Add `--json`
+for a schema-version-1 result with `outcome: "listed"` and the page under `artifactSet`.
+
+Listing calls only the metadata inventory operation. It does not request exact download
+capabilities, read artifact bytes, or create output files. A missing run and an
+unattached, deleted, or not-yet-sealed Artifact Set are deliberately indistinguishable
+and produce `outcome: "unavailable"`; an elapsed retention window produces
+`outcome: "expired"`. Both states return a nonzero status, as do authorization,
+network, invalid-cursor, and invalid-response outcomes.
+
+Download and verify the complete set only when its bytes are needed:
+
+```sh
+scherzo-cloud artifact download acme-research \
+  run_01k0z6r1w8f4jy2m7q9v3x5abc --output ./downloaded-attempt-result
+```
+
+Download continues through every inventory page, requests fresh exact capabilities in
+bounded batches, verifies each member and the complete portable set, and atomically
+creates the requested output directory only after complete validation.
+
 ## Portable artifact validation
 
 Validate one copied or downloaded Artifact Set V1 directory without its original run,

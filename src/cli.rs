@@ -811,6 +811,7 @@ mod tests {
             "account update",
             "artifact",
             "artifact download",
+            "artifact list",
             "artifact validate",
             "auth",
             "auth identities",

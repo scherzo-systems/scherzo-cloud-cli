@@ -1,90 +1,57 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, anyhow};
 use clap::Args;
 
-use super::assembly::{ArtifactAssemblyError, assemble_artifact_set};
-use crate::api::{ArtifactApi, ArtifactApiError, HttpClient};
+use super::assembly::{ArtifactAssemblyError, AssembledArtifact, assemble_artifact_set};
+use crate::api::{ArtifactApi, ArtifactApiError};
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
-
 pub(super) const ABOUT: &str = "Download and verify a run's Artifact Set";
 
+pub(super) type Command = super::RemoteArtifactCommand<Operation>;
+
 #[derive(Debug, Args)]
-pub(super) struct Command {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: crate::cli::OrganizationRef,
-
-    #[arg(
-        value_name = "RUN",
-        help = "Run identifier containing the Artifact Set"
-    )]
-    run_id: String,
-
+pub(super) struct Operation {
     #[arg(
         long,
         value_name = "PATH",
         help = "Directory to create for the complete Artifact Set (must not already exist)"
     )]
     output: PathBuf,
-
-    // Artifact download owns a filesystem commit in addition to Cloud access, so its
-    // command shape and networking context remain separate from read-only auth status.
-    // jscpd:ignore-start
-    #[command(flatten)]
-    http: super::super::HttpOptions,
 }
 
-impl Command {
-    pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
-        let transport_policy = self.http.transport_policy();
-        let session_client = HttpClient::new(transport_policy)
-            .map_err(|error| anyhow!(error))
-            .context("prepare Artifact Set networking")?;
-        // jscpd:ignore-end
-        let result = session::execute_required(
-            &session_client,
-            deployment,
-            |access_token| {
-                let mut api = ArtifactApi::new(
-                    deployment.fingerprint().api_url(),
-                    access_token.expose(),
-                    transport_policy,
-                )?;
-                assemble_artifact_set(&mut api, &self.organization, &self.run_id, &self.output)
-            },
-            |result| {
-                result.as_ref().is_err_and(|error| {
-                    matches!(
-                        error,
-                        ArtifactAssemblyError::Api(error) if error.credential_rejected()
-                    )
-                })
-            },
-        );
-        let result = match result {
-            Ok(RequiredOperation::Unauthenticated) => Err(ArtifactAssemblyError::Api(
-                ArtifactApiError::Unauthenticated,
-            )),
-            Ok(RequiredOperation::Completed(result)) => result,
-            Err(error) => match error.unreachable_category() {
-                Some(category) => Err(ArtifactAssemblyError::Api(ArtifactApiError::Unreachable(
-                    category,
-                ))),
-                None => {
-                    return Err(anyhow!(error)
-                        .context("acquire human session for Artifact Set download")
-                        .into());
-                }
-            },
-        };
-        write_result(deployment.fingerprint().api_url(), result).map_err(Into::into)
+impl super::RemoteArtifactOperation for Operation {
+    type Output = AssembledArtifact;
+    type Error = ArtifactAssemblyError;
+
+    const SESSION_CONTEXT: &'static str = "acquire human session for Artifact Set download";
+
+    fn request(
+        &self,
+        api: &mut ArtifactApi,
+        run: &super::RunArtifactReference,
+    ) -> Result<Self::Output, Self::Error> {
+        assemble_artifact_set(api, &run.organization, &run.run_id, &self.output)
+    }
+
+    fn credential_rejected(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            ArtifactAssemblyError::Api(error) if error.credential_rejected()
+        )
+    }
+
+    fn write_result(
+        &self,
+        deployment: &str,
+        _run: &super::RunArtifactReference,
+        result: Result<Self::Output, Self::Error>,
+    ) -> anyhow::Result<ExitCode> {
+        write_download_result(deployment, result)
     }
 }
 
-fn write_result(
+fn write_download_result(
     deployment: &str,
     result: Result<super::assembly::AssembledArtifact, ArtifactAssemblyError>,
 ) -> anyhow::Result<ExitCode> {

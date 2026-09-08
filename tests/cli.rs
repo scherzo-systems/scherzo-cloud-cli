@@ -14,6 +14,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -32,6 +33,8 @@ mod api_test_support {
     ));
 }
 use api_test_support::read_request;
+#[path = "cli/artifact_remote.rs"]
+mod artifact_remote;
 #[path = "cli/artifact_validate.rs"]
 mod artifact_validate;
 #[path = "cli/auth_login.rs"]
@@ -193,6 +196,18 @@ fn run(args: &[&str]) -> Output {
 }
 
 fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
+    run_with_env_from(args, environment, None)
+}
+
+fn run_with_env_in(args: &[&str], environment: &[(&str, &str)], current_dir: &Path) -> Output {
+    run_with_env_from(args, environment, Some(current_dir))
+}
+
+fn run_with_env_from(
+    args: &[&str],
+    environment: &[(&str, &str)],
+    current_dir: Option<&Path>,
+) -> Output {
     let credential_directory =
         tempfile::tempdir().expect("temporary credential directory should be created");
     fs::set_permissions(credential_directory.path(), Permissions::from_mode(0o700))
@@ -218,6 +233,9 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
     }
     for (name, value) in environment {
         command.env(name, value);
+    }
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
     }
 
     command.output().expect("scherzo-cloud should run")
