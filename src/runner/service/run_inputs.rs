@@ -432,6 +432,34 @@ pub(super) fn materialize(
     cancellation: &CaptureCancellation,
     private_root: &Path,
 ) -> Result<ResolvedImports, RunInputFailure> {
+    materialize_with_clock(
+        broker,
+        MaterializationIdentity {
+            assignment_id,
+            execution_spec_id,
+        },
+        projection,
+        deadline,
+        cancellation,
+        private_root,
+        crate::timing::utc_now,
+    )
+}
+
+struct MaterializationIdentity<'a> {
+    assignment_id: &'a str,
+    execution_spec_id: &'a str,
+}
+
+fn materialize_with_clock(
+    broker: Option<&dyn RunInputBroker>,
+    identity: MaterializationIdentity<'_>,
+    projection: Option<&RunInputProjectionV1>,
+    deadline: PreparationDeadline,
+    cancellation: &CaptureCancellation,
+    private_root: &Path,
+    mut utc_now: impl FnMut() -> OffsetDateTime,
+) -> Result<ResolvedImports, RunInputFailure> {
     let Some(projection) = projection else {
         return Ok(ResolvedImports::default());
     };
@@ -439,7 +467,12 @@ pub(super) fn materialize(
     let broker = broker.ok_or(RunInputFailure::ServiceUnavailable)?;
     ensure_materialization_current(cancellation, deadline)?;
     let envelope = broker
-        .manifest(assignment_id, execution_spec_id, cancellation, deadline)
+        .manifest(
+            identity.assignment_id,
+            identity.execution_spec_id,
+            cancellation,
+            deadline,
+        )
         .map_err(manifest_broker_failure)?;
     let manifest = validate_manifest_envelope(&envelope, projection)?;
 
@@ -451,35 +484,48 @@ pub(super) fn materialize(
         .map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
     let logical_members = logical_members(&manifest)?;
     let mut completed = Vec::with_capacity(logical_members.len());
-    for member in &logical_members {
-        ensure_materialization_current(cancellation, deadline)?;
-        let capabilities = broker
-            .capabilities(
-                assignment_id,
-                execution_spec_id,
-                std::slice::from_ref(&member.member_id),
-                cancellation,
-                deadline,
-            )
-            .map_err(capability_broker_failure)?;
-        validate_capabilities(
-            &capabilities,
-            projection,
-            std::slice::from_ref(member),
-            deadline,
-        )?;
-        let capability = capabilities
-            .members
-            .first()
-            .ok_or(RunInputFailure::ManifestMismatch)?;
-        completed.push(download_member(
-            broker,
-            staging.path(),
-            member,
-            capability,
-            cancellation,
-            deadline,
-        )?);
+    for batch in logical_members.chunks(MAXIMUM_CAPABILITY_MEMBERS) {
+        let mut first_undownloaded = 0;
+        while first_undownloaded < batch.len() {
+            ensure_materialization_current(cancellation, deadline)?;
+            let requested = &batch[first_undownloaded..];
+            let member_ids = requested
+                .iter()
+                .map(|member| member.member_id.clone())
+                .collect::<Vec<_>>();
+            let capabilities = broker
+                .capabilities(
+                    identity.assignment_id,
+                    identity.execution_spec_id,
+                    &member_ids,
+                    cancellation,
+                    deadline,
+                )
+                .map_err(capability_broker_failure)?;
+            let capability_expires_at =
+                validate_capabilities(&capabilities, projection, requested, deadline, utc_now())?;
+            let response_start = first_undownloaded;
+            for (member, capability) in requested.iter().zip(&capabilities.members) {
+                ensure_materialization_current(cancellation, deadline)?;
+                if utc_now() >= capability_expires_at {
+                    if first_undownloaded == response_start {
+                        return Err(RunInputFailure::ServiceUnavailable);
+                    }
+                    break;
+                }
+                let completed_member = download_member(
+                    broker,
+                    staging.path(),
+                    member,
+                    capability,
+                    cancellation,
+                    deadline,
+                )?;
+                ensure_materialization_current(cancellation, deadline)?;
+                completed.push(completed_member);
+                first_undownloaded += 1;
+            }
+        }
     }
     let imports = construct_imports(&manifest, &completed)?;
     let _retained_staging: PathBuf = staging.keep();
@@ -630,17 +676,17 @@ fn validate_capabilities(
     projection: &RunInputProjectionV1,
     requested: &[LogicalMember],
     deadline: PreparationDeadline,
-) -> Result<(), RunInputFailure> {
+    utc_now: OffsetDateTime,
+) -> Result<OffsetDateTime, RunInputFailure> {
     let expires_at = OffsetDateTime::parse(&envelope.capability_expires_at, &Rfc3339)
         .ok()
         .filter(|value| {
             envelope.capability_expires_at.ends_with('Z')
                 && value.offset() == UtcOffset::UTC
-                && *value > crate::timing::utc_now()
+                && *value > utc_now
                 && deadline.contains_expiry(*value)
         })
         .ok_or(RunInputFailure::ManifestMismatch)?;
-    let _ = expires_at;
     if envelope.schema_version != 1
         || envelope.input_set_id != projection.input_set_id
         || envelope.members.len() != requested.len()
@@ -657,7 +703,7 @@ fn validate_capabilities(
             return Err(RunInputFailure::ManifestMismatch);
         }
     }
-    Ok(())
+    Ok(expires_at)
 }
 
 fn download_member(
@@ -974,17 +1020,37 @@ fn hex_digit(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use super::*;
     use crate::runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    enum CapabilityMutation {
+        #[default]
+        None,
+        Missing,
+        Duplicate,
+        Extra,
+        WrongMetadata,
+        WrongSet,
+        Expired,
+    }
 
     struct FixtureBroker {
         manifest: ManifestEnvelope,
         bodies: Mutex<VecDeque<Vec<u8>>>,
         manifest_calls: Mutex<usize>,
         capability_calls: Mutex<Vec<Vec<String>>>,
-        download_calls: Mutex<usize>,
+        download_calls: Mutex<Vec<String>>,
+        capability_mutation: CapabilityMutation,
+        capability_failure: Option<BrokerFailure>,
+        capability_expirations: Mutex<VecDeque<String>>,
+        expire_after_download: Option<Arc<AtomicBool>>,
+        cancel_after_download: Option<usize>,
     }
 
     impl RunInputBroker for FixtureBroker {
@@ -1007,38 +1073,85 @@ mod tests {
             _cancellation: &CaptureCancellation,
             deadline: PreparationDeadline,
         ) -> Result<CapabilityEnvelope, BrokerFailure> {
-            self.capability_calls.lock().unwrap().push(members.to_vec());
+            let issuance = {
+                let mut calls = self.capability_calls.lock().unwrap();
+                calls.push(members.to_vec());
+                calls.len()
+            };
+            if let Some(failure) = self.capability_failure {
+                return Err(failure);
+            }
             let logical = logical_members(&self.manifest.manifest)
                 .unwrap()
                 .into_iter()
                 .filter(|member| members.contains(&member.member_id))
                 .collect::<Vec<_>>();
-            Ok(CapabilityEnvelope {
+            let mut envelope = CapabilityEnvelope {
                 schema_version: 1,
                 input_set_id: self.manifest.input_set_id.clone(),
-                capability_expires_at: deadline.expires_at.format(&Rfc3339).unwrap(),
+                capability_expires_at: self
+                    .capability_expirations
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| deadline.expires_at.format(&Rfc3339).unwrap()),
                 members: logical
                     .into_iter()
                     .map(|member| CapabilityMember {
+                        url: fixture_member_url(&member.member_id, issuance),
                         member_id: member.member_id,
                         media_type: member.media_type,
                         size_bytes: member.size_bytes,
                         sha256: member.sha256,
-                        url: "https://objects.example.test/exact?private=sentinel".to_owned(),
                     })
                     .collect(),
-            })
+            };
+            match self.capability_mutation {
+                CapabilityMutation::None => {}
+                CapabilityMutation::Missing => {
+                    envelope.members.pop();
+                }
+                CapabilityMutation::Duplicate => {
+                    if let Some(first) = envelope.members.first().cloned()
+                        && let Some(last) = envelope.members.last_mut()
+                    {
+                        *last = first;
+                    }
+                }
+                CapabilityMutation::Extra => {
+                    if let Some(last) = envelope.members.last().cloned() {
+                        envelope.members.push(last);
+                    }
+                }
+                CapabilityMutation::WrongMetadata => {
+                    if let Some(last) = envelope.members.last_mut() {
+                        last.size_bytes = last.size_bytes.saturating_add(1);
+                    }
+                }
+                CapabilityMutation::WrongSet => {
+                    envelope.input_set_id = "ris_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned();
+                }
+                CapabilityMutation::Expired => {
+                    envelope.capability_expires_at =
+                        OffsetDateTime::UNIX_EPOCH.format(&Rfc3339).unwrap();
+                }
+            }
+            Ok(envelope)
         }
 
         fn download(
             &self,
-            _url: &str,
+            url: &str,
             _expected_size: u64,
-            _cancellation: &CaptureCancellation,
+            cancellation: &CaptureCancellation,
             _deadline: PreparationDeadline,
             consume: &mut dyn FnMut(&[u8]) -> Result<(), BrokerFailure>,
         ) -> Result<(), BrokerFailure> {
-            *self.download_calls.lock().unwrap() += 1;
+            let download_number = {
+                let mut calls = self.download_calls.lock().unwrap();
+                calls.push(url.to_owned());
+                calls.len()
+            };
             let body = self
                 .bodies
                 .lock()
@@ -1047,6 +1160,12 @@ mod tests {
                 .ok_or(BrokerFailure::ContentUnavailable)?;
             for chunk in body.chunks(2) {
                 consume(chunk)?;
+            }
+            if let Some(expired) = &self.expire_after_download {
+                expired.store(true, Ordering::SeqCst);
+            }
+            if self.cancel_after_download == Some(download_number) {
+                cancellation.cancel();
             }
             Ok(())
         }
@@ -1093,10 +1212,63 @@ mod tests {
                 bodies: Mutex::new(bodies.into()),
                 manifest_calls: Mutex::new(0),
                 capability_calls: Mutex::new(Vec::new()),
-                download_calls: Mutex::new(0),
+                download_calls: Mutex::new(Vec::new()),
+                capability_mutation: CapabilityMutation::None,
+                capability_failure: None,
+                capability_expirations: Mutex::new(VecDeque::new()),
+                expire_after_download: None,
+                cancel_after_download: None,
             },
             projection,
         )
+    }
+
+    fn fixture_member_url(member_id: &str, issuance: usize) -> String {
+        format!("https://objects.example.test/{member_id}?issuance={issuance}")
+    }
+
+    fn attachment_body(index: usize) -> Vec<u8> {
+        format!("attachment-{index:06}").into_bytes()
+    }
+
+    fn manifest_with_member_count(member_count: usize) -> (ManifestV1, Vec<Vec<u8>>) {
+        assert!((1..=MAXIMUM_ATTACHMENTS + 1).contains(&member_count));
+        let prompt = b"prompt".to_vec();
+        let mut bodies = Vec::with_capacity(member_count);
+        bodies.push(prompt.clone());
+        let mut attachments = Vec::with_capacity(member_count - 1);
+        for index in 0..member_count - 1 {
+            let body = attachment_body(index);
+            attachments.push(AttachmentMember {
+                index,
+                display_name: None,
+                media_type: "application/octet-stream".to_owned(),
+                size_bytes: u64::try_from(body.len()).unwrap(),
+                sha256: lowercase_hex_bytes(digest(&SHA256, &body).as_ref()),
+            });
+            bodies.push(body);
+        }
+        (
+            ManifestV1 {
+                schema_version: 1,
+                prompt: Some(PromptMember {
+                    size_bytes: u64::try_from(prompt.len()).unwrap(),
+                    sha256: lowercase_hex_bytes(digest(&SHA256, &prompt).as_ref()),
+                }),
+                attachments,
+            },
+            bodies,
+        )
+    }
+
+    fn expected_member_ids(member_count: usize) -> Vec<String> {
+        std::iter::once("prompt".to_owned())
+            .chain((0..member_count - 1).map(|index| format!("attachments/{index:06}")))
+            .collect()
+    }
+
+    fn assert_private_root_empty(private_root: &Path) {
+        assert!(fs::read_dir(private_root).unwrap().next().is_none());
     }
 
     fn materialize_projection(
@@ -1183,7 +1355,7 @@ mod tests {
             Some("reverse-upload-two")
         );
         assert_eq!(*broker.manifest_calls.lock().unwrap(), 1);
-        assert_eq!(*broker.download_calls.lock().unwrap(), 3);
+        assert_eq!(broker.download_calls.lock().unwrap().len(), 3);
 
         let staging = fs::read_dir(private.path())
             .unwrap()
@@ -1232,7 +1404,7 @@ mod tests {
             Err(RunInputFailure::ManifestMismatch)
         );
         assert!(broker.capability_calls.lock().unwrap().is_empty());
-        assert_eq!(*broker.download_calls.lock().unwrap(), 0);
+        assert!(broker.download_calls.lock().unwrap().is_empty());
 
         let empty = materialize(
             Some(&broker),
@@ -1249,39 +1421,182 @@ mod tests {
     }
 
     #[test]
-    fn materialization_refreshes_authority_per_member_and_closes_content_failures() {
-        let empty_digest = lowercase_hex_bytes(digest(&SHA256, &[]).as_ref());
-        let attachments = (0..101)
-            .map(|index| AttachmentMember {
-                index,
-                display_name: None,
-                media_type: "application/octet-stream".to_owned(),
-                size_bytes: 0,
-                sha256: empty_digest.clone(),
-            })
-            .collect::<Vec<_>>();
-        let (broker, projection) = broker_for(
-            ManifestV1 {
-                schema_version: 1,
-                prompt: None,
-                attachments,
-            },
-            vec![Vec::new(); 101],
-        );
-        let private = tempfile::tempdir().unwrap();
-        let imports = materialize_projection(&broker, &projection, private.path()).unwrap();
-        assert_eq!(imports.attachments().len(), 101);
-        assert_eq!(
-            broker
-                .capability_calls
-                .lock()
-                .unwrap()
-                .iter()
-                .map(Vec::len)
-                .collect::<Vec<_>>(),
-            vec![1; 101]
-        );
+    fn materialization_batches_exact_members_at_boundaries_and_preserves_values() {
+        for member_count in [99, 100, 101, MAXIMUM_ATTACHMENTS + 1] {
+            let (manifest, bodies) = manifest_with_member_count(member_count);
+            let (broker, projection) = broker_for(manifest, bodies);
+            let private = tempfile::tempdir().unwrap();
 
+            let imports = materialize_projection(&broker, &projection, private.path()).unwrap();
+
+            assert_eq!(imports.prompt(), Some("prompt"));
+            assert_eq!(imports.attachments().len(), member_count - 1);
+            for (index, attachment) in imports.attachments().iter().enumerate() {
+                assert_eq!(attachment.bytes(), attachment_body(index));
+            }
+            let expected_ids = expected_member_ids(member_count);
+            let expected_batches = expected_ids
+                .chunks(MAXIMUM_CAPABILITY_MEMBERS)
+                .map(<[String]>::to_vec)
+                .collect::<Vec<_>>();
+            assert_eq!(*broker.capability_calls.lock().unwrap(), expected_batches);
+            assert_eq!(
+                *broker.download_calls.lock().unwrap(),
+                expected_ids
+                    .chunks(MAXIMUM_CAPABILITY_MEMBERS)
+                    .enumerate()
+                    .flat_map(|(batch_index, batch)| {
+                        batch.iter().map(move |member_id| {
+                            fixture_member_url(member_id, batch_index.saturating_add(1))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn expired_batch_suffix_is_reissued_before_later_downloads() {
+        let start = OffsetDateTime::parse("2099-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let first_expiry = start + time::Duration::minutes(5);
+        let second_expiry = start + time::Duration::minutes(10);
+        let expired = Arc::new(AtomicBool::new(false));
+        let (manifest, bodies) = manifest_with_member_count(3);
+        let (mut broker, projection) = broker_for(manifest, bodies);
+        broker.capability_expirations = Mutex::new(VecDeque::from([
+            first_expiry.format(&Rfc3339).unwrap(),
+            second_expiry.format(&Rfc3339).unwrap(),
+        ]));
+        broker.expire_after_download = Some(Arc::clone(&expired));
+        let private = tempfile::tempdir().unwrap();
+
+        let imports = materialize_with_clock(
+            Some(&broker),
+            MaterializationIdentity {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                execution_spec_id: "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+            },
+            Some(&projection),
+            deadline(),
+            &CaptureCancellation::default(),
+            private.path(),
+            || {
+                if expired.load(Ordering::SeqCst) {
+                    first_expiry
+                } else {
+                    start
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(imports.prompt(), Some("prompt"));
+        assert_eq!(imports.attachments().len(), 2);
+        assert_eq!(
+            *broker.capability_calls.lock().unwrap(),
+            vec![expected_member_ids(3), expected_member_ids(3)[1..].to_vec()]
+        );
+        assert_eq!(
+            *broker.download_calls.lock().unwrap(),
+            vec![
+                fixture_member_url("prompt", 1),
+                fixture_member_url("attachments/000000", 2),
+                fixture_member_url("attachments/000001", 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_batch_entries_prevent_every_download_in_the_batch() {
+        for mutation in [
+            CapabilityMutation::Missing,
+            CapabilityMutation::Duplicate,
+            CapabilityMutation::Extra,
+            CapabilityMutation::WrongMetadata,
+            CapabilityMutation::WrongSet,
+            CapabilityMutation::Expired,
+        ] {
+            let (manifest, bodies) = manifest_with_member_count(2);
+            let (mut broker, projection) = broker_for(manifest, bodies);
+            broker.capability_mutation = mutation;
+            let private = tempfile::tempdir().unwrap();
+
+            assert_eq!(
+                materialize_projection(&broker, &projection, private.path()),
+                Err(RunInputFailure::ManifestMismatch),
+                "{mutation:?}"
+            );
+            assert_eq!(
+                *broker.capability_calls.lock().unwrap(),
+                vec![expected_member_ids(2)],
+                "{mutation:?}"
+            );
+            assert!(
+                broker.download_calls.lock().unwrap().is_empty(),
+                "{mutation:?}"
+            );
+            assert_private_root_empty(private.path());
+        }
+    }
+
+    #[test]
+    fn cancellation_fencing_and_deadline_stop_acquisition_and_remove_staging() {
+        let (manifest, bodies) = manifest_with_member_count(101);
+        let (mut broker, projection) = broker_for(manifest, bodies);
+        broker.cancel_after_download = Some(1);
+        let private = tempfile::tempdir().unwrap();
+        let cancellation = CaptureCancellation::default();
+        assert_eq!(
+            materialize(
+                Some(&broker),
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+                Some(&projection),
+                deadline(),
+                &cancellation,
+                private.path(),
+            ),
+            Err(RunInputFailure::AssignmentFenced)
+        );
+        assert_eq!(broker.capability_calls.lock().unwrap().len(), 1);
+        assert_eq!(broker.download_calls.lock().unwrap().len(), 1);
+        assert_private_root_empty(private.path());
+
+        let (manifest, bodies) = manifest_with_member_count(1);
+        let (mut broker, projection) = broker_for(manifest, bodies);
+        broker.capability_failure = Some(BrokerFailure::Fenced);
+        let private = tempfile::tempdir().unwrap();
+        assert_eq!(
+            materialize_projection(&broker, &projection, private.path()),
+            Err(RunInputFailure::AssignmentFenced)
+        );
+        assert_eq!(broker.capability_calls.lock().unwrap().len(), 1);
+        assert!(broker.download_calls.lock().unwrap().is_empty());
+        assert_private_root_empty(private.path());
+
+        let (manifest, bodies) = manifest_with_member_count(1);
+        let (broker, projection) = broker_for(manifest, bodies);
+        let private = tempfile::tempdir().unwrap();
+        assert_eq!(
+            materialize(
+                Some(&broker),
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+                Some(&projection),
+                PreparationDeadline::elapsed_for_test(),
+                &CaptureCancellation::default(),
+                private.path(),
+            ),
+            Err(RunInputFailure::AssignmentFenced)
+        );
+        assert_eq!(*broker.manifest_calls.lock().unwrap(), 0);
+        assert!(broker.capability_calls.lock().unwrap().is_empty());
+        assert!(broker.download_calls.lock().unwrap().is_empty());
+        assert_private_root_empty(private.path());
+    }
+
+    #[test]
+    fn content_failures_are_classified_and_remove_staging() {
         assert_eq!(
             classify_provider_status(StatusCode::FORBIDDEN),
             BrokerFailure::Unavailable
@@ -1316,7 +1631,7 @@ mod tests {
                 materialize_projection(&broker, &projection, private.path()),
                 Err(expected)
             );
-            assert!(fs::read_dir(private.path()).unwrap().next().is_none());
+            assert_private_root_empty(private.path());
         }
     }
 
