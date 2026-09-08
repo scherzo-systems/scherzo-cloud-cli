@@ -18,15 +18,15 @@ fn audit_page(next_cursor: Option<&str>) -> serde_json::Value {
                     "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"
                 },
                 "delegatingPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd",
-                "action": "project.repository_bound",
+                "action": "publication.branch_confirmed",
                 "subject": {
-                    "kind": "project",
-                    "id": "prj_01k0z6r1w8f4jy2m7q9v3x5abc"
+                    "kind": "publication",
+                    "id": "pub_01k0z6r1w8f4jy2m7q9v3x5abc"
                 },
                 "changes": [
                     {
-                        "field": "repository_connection_id",
-                        "after": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
+                        "field": "head_oid",
+                        "after": "0123456789abcdef0123456789abcdef01234567"
                     }
                 ],
                 "future": { "omittedFromStableOutput": true }
@@ -103,15 +103,15 @@ fn organization_audit_list_preserves_one_privacy_safe_page_as_stable_json() {
                         "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"
                     },
                     "delegatingPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd",
-                    "action": "project.repository_bound",
+                    "action": "publication.branch_confirmed",
                     "subject": {
-                        "kind": "project",
-                        "id": "prj_01k0z6r1w8f4jy2m7q9v3x5abc"
+                        "kind": "publication",
+                        "id": "pub_01k0z6r1w8f4jy2m7q9v3x5abc"
                     },
                     "changes": [
                         {
-                            "field": "repository_connection_id",
-                            "after": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc"
+                            "field": "head_oid",
+                            "after": "0123456789abcdef0123456789abcdef01234567"
                         }
                     ]
                 },
@@ -171,8 +171,8 @@ fn human_audit_list_identifies_available_details_without_inventing_unavailable_d
     for expected in [
         "time: 2026-09-05T12:00:00Z",
         "actor: principal prn_01k0z6r1w8f4jy2m7q9v3x5abc",
-        "action: project.repository_bound",
-        "target: project prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "action: publication.branch_confirmed",
+        "target: publication pub_01k0z6r1w8f4jy2m7q9v3x5abc",
         "retention: identity-tenancy-production-730d-v1 · retain until: 2028-09-04T12:00:00Z",
         "warning: aud_01k0z6r1w8f4jy2m7q9v3x5abd · reason: unknown_action",
     ] {
