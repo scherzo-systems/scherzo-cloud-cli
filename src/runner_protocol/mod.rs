@@ -2258,10 +2258,26 @@ mod tests {
 
     #[test]
     fn canonical_maximal_recovery_frame_has_published_exact_size() {
-        const PUBLISHED_SIZE: usize = 11_464_578;
-        const PUBLISHED_SETTLING_SIZE: usize = 1_964;
+        let fixture: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/maximal-recovery-frame-size.json"
+        )))
+        .unwrap();
+        let fixture_size = |field| usize::try_from(fixture[field].as_u64().unwrap()).unwrap();
+        assert_eq!(
+            fixture_size("maximumOrdinaryFrameBytes"),
+            MAXIMUM_ORDINARY_FRAME_BYTES
+        );
+        assert_eq!(
+            fixture_size("maximumConditionTransitionFrameBytes"),
+            MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES
+        );
+        assert_eq!(
+            fixture_size("maximumTerminalFrameBytes"),
+            MAXIMUM_TERMINAL_FRAME_BYTES
+        );
         let encoded = encode_runner_frame(&maximal_recovery_terminal_frame()).unwrap();
-        assert_eq!(encoded.len(), PUBLISHED_SIZE);
+        assert_eq!(encoded.len(), fixture_size("maximalRecoveryFrameBytes"));
         assert!(encoded.len() < MAXIMUM_TERMINAL_FRAME_BYTES);
 
         let settling = RunnerFrame::ExecutionTransition {
@@ -2304,7 +2320,7 @@ mod tests {
             }),
         };
         let settling = encode_runner_frame(&settling).unwrap();
-        assert_eq!(settling.len(), PUBLISHED_SETTLING_SIZE);
+        assert_eq!(settling.len(), fixture_size("maximalSettlingFrameBytes"));
         assert!(settling.len() <= MAXIMUM_ORDINARY_FRAME_BYTES);
 
         let mut one_byte_over = encoded;

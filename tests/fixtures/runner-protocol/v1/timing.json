@@ -1,0 +1,6 @@
+{
+  "pingIntervalSeconds": 10,
+  "pongTimeoutSeconds": 30,
+  "presenceLeaseSeconds": 50,
+  "finalAcknowledgementGraceSeconds": 10
+}

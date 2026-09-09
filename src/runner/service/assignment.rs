@@ -3532,6 +3532,27 @@ mod tests {
         "runner::service::assignment::tests::failing_command_fixture_process";
     // SCHERZO_* variables are intentionally removed from admitted command environments.
     const COMMAND_FIXTURE_SOCKET: &str = "WORKFLOW_ASSIGNMENT_COMMAND_FIXTURE_SOCKET";
+
+    #[test]
+    fn final_acknowledgement_grace_matches_runner_timing_contract() {
+        let fixture: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/timing.json"
+        )))
+        .unwrap();
+        let duration = |field| Duration::from_secs(fixture[field].as_u64().unwrap());
+        let ping = duration("pingIntervalSeconds");
+        let pong = duration("pongTimeoutSeconds");
+        let presence = duration("presenceLeaseSeconds");
+
+        assert_eq!(
+            FINAL_ACKNOWLEDGEMENT_GRACE,
+            duration("finalAcknowledgementGraceSeconds")
+        );
+        assert_eq!(FINAL_ACKNOWLEDGEMENT_GRACE, ping);
+        assert_eq!(presence, pong + 2 * ping);
+    }
+
     const SUCCESSFUL_PI: &str = r#"#!/bin/sh
 set -eu
 printf '%s\0' "$*" >> "${0%/*}/pi.calls"
@@ -6915,6 +6936,16 @@ steps:
 
     #[tokio::test]
     async fn runner_reservation_consumes_carried_capacity_without_node_arithmetic() {
+        let frame_fixture: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/maximal-recovery-frame-size.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            frame_fixture["runnerTerminalCapacityBytes"].as_u64(),
+            Some(RUNNER_TERMINAL_FRAME_BYTES)
+        );
+
         let outbox = ObservationOutbox::new();
         for _ in 0..32 {
             outbox

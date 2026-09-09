@@ -1,0 +1,8 @@
+{
+  "maximumOrdinaryFrameBytes": 262144,
+  "maximumConditionTransitionFrameBytes": 268435456,
+  "maximumTerminalFrameBytes": 536870912,
+  "runnerTerminalCapacityBytes": 67108864,
+  "maximalRecoveryFrameBytes": 11464578,
+  "maximalSettlingFrameBytes": 1964
+}
