@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, Stdio};
@@ -10,8 +10,8 @@ use rustix::process::Pid;
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationSource, ExecutionContext, ResolvedImports, admit_workflow,
-    default_execution_policy_limits,
+    CancellationPolicy, CancellationSource, CaptureLimits, ExecutionContext, ExecutionPolicyLimits,
+    InputLimits, ResolvedImports, admit_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::{
     CaptureBoundary, CaptureBoundaryObserver, CarrierBudgetClass,
@@ -84,6 +84,23 @@ fn admitted_capture<const N: usize>(
     crate::execution::workflow::admission::AdmittedWorkflow,
     ArtifactStaging,
 ) {
+    admitted_capture_with_limits(
+        root,
+        repository,
+        additional_environment,
+        default_execution_policy_limits(1),
+    )
+}
+
+fn admitted_capture_with_limits<const N: usize>(
+    root: &Path,
+    repository: &Path,
+    additional_environment: [(&str, &OsStr); N],
+    limits: ExecutionPolicyLimits,
+) -> (
+    crate::execution::workflow::admission::AdmittedWorkflow,
+    ArtifactStaging,
+) {
     let source = root.join(format!("workflow-{N}"));
     let staging = root.join(format!("staging-{N}"));
     fs::create_dir(&source).unwrap();
@@ -98,7 +115,7 @@ fn admitted_capture<const N: usize>(
         ResolvedImports::default(),
         ExecutionContext::new(
             repository.to_owned(),
-            default_execution_policy_limits(1),
+            limits,
             EnvironmentSnapshot::new(environment),
             CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
         ),
@@ -157,6 +174,31 @@ fn git_parent(arguments: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn git_succeeds(repository: &Path, arguments: &[&str]) -> bool {
+    fixture_git_command()
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+fn deterministic_payload(length: usize) -> Vec<u8> {
+    let mut state = 0x6d2b_79f5_u32;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        })
+        .collect()
 }
 
 fn create_fifo(path: &Path) {
@@ -453,31 +495,249 @@ fn non_descendant_head_is_rejected_without_a_carrier_reservation() {
 }
 
 #[test]
-fn merge_topology_is_carried_from_the_exact_run_baseline() {
-    let fixture = GitFixture::new();
-    let initial_branch = git(&fixture.repository, &["branch", "--show-current"])
+fn merge_forked_before_baseline_excludes_prerequisite_history_and_imports_independently() {
+    const CARRIER_LIMIT: u64 = 32 * 1024;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = temporary.path().join("repository");
+    init_repository(&repository);
+    fs::write(
+        repository.join("historical.bin"),
+        deterministic_payload(256 * 1024),
+    )
+    .unwrap();
+    git(&repository, &["add", "historical.bin"]);
+    git(&repository, &["commit", "--quiet", "-m", "history"]);
+    let historical_blob = git_oid(&repository, "HEAD:historical.bin");
+    let main_branch = git(&repository, &["branch", "--show-current"])
         .trim()
         .to_owned();
-    git(&fixture.repository, &["switch", "--quiet", "-c", "side"]);
-    fixture.commit_file("side.txt", b"side\n", "side");
-    git(&fixture.repository, &["switch", "--quiet", &initial_branch]);
-    fixture.commit_file("main.txt", b"main\n", "main");
+    git(&repository, &["branch", "side"]);
+
+    fs::remove_file(repository.join("historical.bin")).unwrap();
+    fs::write(repository.join("baseline.txt"), b"baseline\n").unwrap();
+    git(&repository, &["add", "--all"]);
+    git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    let baseline = git_oid(&repository, "HEAD");
+    let baseline_repository = temporary.path().join("baseline.git");
+    git_parent(&[
+        "clone",
+        "--quiet",
+        "--bare",
+        repository.to_str().unwrap(),
+        baseline_repository.to_str().unwrap(),
+    ]);
+
+    let limits = ExecutionPolicyLimits::new(
+        1,
+        CaptureLimits::new(16, 1024 * 1024, 1024 * 1024).with_git_carrier_limits(
+            1,
+            CARRIER_LIMIT,
+            CARRIER_LIMIT,
+        ),
+        InputLimits::new(16, 1024, 16 * 1024, 16 * 1024),
+        1024 * 1024,
+    );
+    let (admitted, artifacts) =
+        admitted_capture_with_limits(temporary.path(), &repository, [], limits);
+    let capture =
+        GitCaptureContext::admit(admitted.execution(), &CaptureCancellation::default()).unwrap();
+    let fixture = GitFixture {
+        _temporary: temporary,
+        repository,
+        artifacts,
+        capture,
+    };
+
+    git(&fixture.repository, &["switch", "--quiet", "side"]);
+    fixture.commit_file("side.txt", b"side\n", "side change");
+    let side = git_oid(&fixture.repository, "HEAD");
+    git(&fixture.repository, &["switch", "--quiet", &main_branch]);
+    fixture.commit_file("main.txt", b"main\n", "main change");
+    let main = git_oid(&fixture.repository, "HEAD");
     git(
         &fixture.repository,
         &["merge", "--quiet", "--no-ff", "side", "-m", "merge"],
     );
-    let merge = git_oid(&fixture.repository, "HEAD");
+    let head = git_oid(&fixture.repository, "HEAD");
+    let tree = git_oid(&fixture.repository, "HEAD^{tree}");
+    assert!(!git_succeeds(
+        &baseline_repository,
+        &["cat-file", "-e", &head]
+    ));
+
+    let exclusion = format!("^{baseline}");
+    let required = git(
+        &fixture.repository,
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            &head,
+            &exclusion,
+        ],
+    );
+    let required = parse_object_list(required.as_bytes())
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut old_shallow = tempfile::NamedTempFile::new().unwrap();
+    writeln!(old_shallow, "{baseline}").unwrap();
+    old_shallow.flush().unwrap();
+    let expanded = fixture_git_command()
+        .arg("-C")
+        .arg(&fixture.repository)
+        .args([
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            &head,
+            &exclusion,
+        ])
+        .env("GIT_SHALLOW_FILE", old_shallow.path())
+        .output()
+        .unwrap();
+    assert!(
+        expanded.status.success(),
+        "baseline-shallow reproduction failed: {}",
+        String::from_utf8_lossy(&expanded.stderr)
+    );
+    let expanded = parse_object_list(&expanded.stdout)
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(!required.contains(historical_blob.as_str()));
+    assert!(expanded.contains(historical_blob.as_str()));
+    assert!(expanded.len() > required.len());
 
     let candidates = fixture.capture().unwrap();
+    let branch = candidates.outputs()["changes"].as_git_branch().unwrap();
+    assert_eq!(branch.metadata().base_oid(), baseline);
+    assert_eq!(branch.metadata().head_oid(), head);
+    assert_eq!(branch.metadata().tree_oid(), tree);
+    let carrier = branch.carrier().unwrap();
+    assert!(carrier.size() <= CARRIER_LIMIT);
+    let bytes = read_carrier(&fixture.artifacts, &candidates);
+    let header = bundle_header(&baseline, &head);
+    assert_eq!(&bytes[..header.len()], header);
+    let pack_count = usize::try_from(u32::from_be_bytes(
+        bytes[header.len() + 8..header.len() + 12]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(pack_count, required.len());
+
+    let bundle_path = fixture._temporary.path().join("carrier.bundle");
+    fs::write(&bundle_path, bytes).unwrap();
+    git(
+        &baseline_repository,
+        &[
+            "fetch",
+            "--quiet",
+            bundle_path.to_str().unwrap(),
+            "refs/scherzo/head:refs/heads/imported",
+        ],
+    );
+    assert_eq!(git_oid(&baseline_repository, "refs/heads/imported"), head);
     assert_eq!(
+        git_oid(&baseline_repository, "refs/heads/imported^{tree}"),
+        tree
+    );
+    assert!(git_succeeds(
+        &baseline_repository,
+        &["merge-base", "--is-ancestor", &side, "refs/heads/imported"]
+    ));
+    assert!(git_succeeds(
+        &baseline_repository,
+        &["merge-base", "--is-ancestor", &main, "refs/heads/imported"]
+    ));
+    assert_eq!(
+        git(
+            &baseline_repository,
+            &["show", "refs/heads/imported:baseline.txt"]
+        ),
+        "baseline\n"
+    );
+    assert_eq!(
+        git(
+            &baseline_repository,
+            &["show", "refs/heads/imported:side.txt"]
+        ),
+        "side\n"
+    );
+    assert_eq!(
+        git(
+            &baseline_repository,
+            &["show", "refs/heads/imported:main.txt"]
+        ),
+        "main\n"
+    );
+    assert!(!git_succeeds(
+        &baseline_repository,
+        &["cat-file", "-e", "refs/heads/imported:historical.bin"]
+    ));
+    assert!(git_succeeds(
+        &baseline_repository,
+        &["fsck", "--connectivity-only", "refs/heads/imported"]
+    ));
+}
+
+#[test]
+fn bitmap_capture_matches_preflight_when_head_restores_a_historical_blob() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = temporary.path().join("repository");
+    init_repository(&repository);
+    fs::write(repository.join("restored.txt"), b"historical\n").unwrap();
+    git(&repository, &["add", "restored.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "history"]);
+    let historical_blob = git_oid(&repository, "HEAD:restored.txt");
+    fs::remove_file(repository.join("restored.txt")).unwrap();
+    git(&repository, &["add", "--all"]);
+    git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    let fixture = GitFixture::from_prepared(temporary, repository);
+
+    fixture.commit_file(
+        "restored.txt",
+        b"historical\n",
+        "restore historical content",
+    );
+    git(
+        &fixture.repository,
+        &["repack", "--quiet", "-a", "-d", "-b"],
+    );
+    assert!(
+        fs::read_dir(fixture.repository.join(".git/objects/pack"))
+            .unwrap()
+            .any(|entry| entry.unwrap().path().extension() == Some(OsStr::new("bitmap")))
+    );
+    let head = git_oid(&fixture.repository, "HEAD");
+    let exclusion = format!("^{}", fixture.capture.baseline_oid());
+    let required = git(
+        &fixture.repository,
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            &head,
+            &exclusion,
+        ],
+    );
+    assert!(
+        parse_object_list(required.as_bytes())
+            .unwrap()
+            .contains(&historical_blob.as_str())
+    );
+
+    let candidates = fixture.capture().unwrap();
+
+    assert!(
         candidates.outputs()["changes"]
             .as_git_branch()
             .unwrap()
-            .metadata()
-            .head_oid(),
-        merge
+            .carrier()
+            .is_some()
     );
-    assert!(!read_carrier(&fixture.artifacts, &candidates).is_empty());
 }
 
 #[test]
@@ -533,6 +793,50 @@ fn capture_rejects_a_clean_submodule_added_after_admission() {
     );
     assert_eq!(fixture.artifacts.git_reservation_usage(), (0, 0));
     assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
+}
+
+#[test]
+fn nonshallow_capture_does_not_require_a_missing_baseline_parent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = temporary.path().join("repository");
+    init_repository(&repository);
+    fs::write(repository.join("historical.txt"), b"historical\n").unwrap();
+    git(&repository, &["add", "historical.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "history"]);
+    let historical_commit = git_oid(&repository, "HEAD");
+    fs::remove_file(repository.join("historical.txt")).unwrap();
+    fs::write(repository.join("baseline.txt"), b"baseline\n").unwrap();
+    git(&repository, &["add", "--all"]);
+    git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    let historical_object = repository
+        .join(".git/objects")
+        .join(&historical_commit[..2])
+        .join(&historical_commit[2..]);
+    fs::remove_file(historical_object).unwrap();
+    assert_eq!(
+        git(&repository, &["rev-parse", "--is-shallow-repository"]),
+        "false\n"
+    );
+    assert!(!git_succeeds(
+        &repository,
+        &["--no-lazy-fetch", "cat-file", "-e", &historical_commit]
+    ));
+    let fixture = GitFixture::from_prepared(temporary, repository);
+    fixture.commit_file("new.txt", b"new\n", "new");
+
+    let candidates = fixture.capture().unwrap();
+
+    assert!(
+        candidates.outputs()["changes"]
+            .as_git_branch()
+            .unwrap()
+            .carrier()
+            .is_some()
+    );
+    assert!(!git_succeeds(
+        &fixture.repository,
+        &["--no-lazy-fetch", "cat-file", "-e", &historical_commit]
+    ));
 }
 
 #[test]
@@ -662,6 +966,63 @@ fn finish_promisor<const N: usize>(
 
 fn promisor_fixture() -> PromisorFixture {
     finish_promisor(prepare_promisor(), [])
+}
+
+#[test]
+fn promisor_capture_does_not_hydrate_missing_prebaseline_only_objects() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("promisor-source");
+    init_repository(&source);
+    git(&source, &["config", "uploadpack.allowFilter", "true"]);
+    fs::write(
+        source.join("historical.bin"),
+        deterministic_payload(64 * 1024),
+    )
+    .unwrap();
+    git(&source, &["add", "historical.bin"]);
+    git(&source, &["commit", "--quiet", "-m", "historical blob"]);
+    let historical_blob = git_oid(&source, "HEAD:historical.bin");
+    fs::remove_file(source.join("historical.bin")).unwrap();
+    fs::write(source.join("baseline.txt"), b"baseline\n").unwrap();
+    git(&source, &["add", "--all"]);
+    git(&source, &["commit", "--quiet", "-m", "baseline"]);
+
+    let repository = temporary.path().join("partial");
+    git_parent(&[
+        "clone",
+        "--quiet",
+        "--filter=blob:none",
+        "--no-checkout",
+        &format!("file://{}", source.display()),
+        repository.to_str().unwrap(),
+    ]);
+    git(&repository, &["checkout", "--quiet", "HEAD"]);
+    git(&repository, &["config", "user.name", "Scherzo Test"]);
+    git(
+        &repository,
+        &["config", "user.email", "test@example.invalid"],
+    );
+    assert!(!git_succeeds(
+        &repository,
+        &["--no-lazy-fetch", "cat-file", "-e", &historical_blob]
+    ));
+    let fixture = GitFixture::from_prepared(temporary, repository);
+    fs::rename(&source, source.with_extension("unavailable")).unwrap();
+    fixture.commit_file("new.txt", b"new\n", "new");
+
+    let candidates = fixture.capture().unwrap();
+
+    assert!(
+        candidates.outputs()["changes"]
+            .as_git_branch()
+            .unwrap()
+            .carrier()
+            .is_some()
+    );
+    assert!(!git_succeeds(
+        &fixture.repository,
+        &["--no-lazy-fetch", "cat-file", "-e", &historical_blob]
+    ));
 }
 
 #[test]
@@ -1036,7 +1397,7 @@ fn capture_timeout_names_git_command_and_limit() {
     let wrapper = temporary.path().join("git-with-timeout");
     fs::write(
         &wrapper,
-        "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects --stdout --revs --no-sparse --window=0 --depth=0 \"*) IFS= read -r unexpected < \"$BLOCKER\"; exit 75 ;;
+        "#!/bin/sh\ncase \" $* \" in\n  *\" pack-objects --stdout --revs --no-sparse --no-use-bitmap-index --window=0 --depth=0 \"*) IFS= read -r unexpected < \"$BLOCKER\"; exit 75 ;;
 esac\nexec \"$REAL_GIT\" \"$@\"\n",
     )
     .unwrap();
@@ -1068,7 +1429,7 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
     };
     assert_eq!(
         timeout.command.as_ref(),
-        "git pack-objects --stdout --revs --no-sparse --window=0 --depth=0"
+        "git pack-objects --stdout --revs --no-sparse --no-use-bitmap-index --window=0 --depth=0"
     );
     assert_eq!(timeout.limit, Duration::from_secs(1));
     assert_eq!(artifacts.git_reservation_usage(), (0, 0));

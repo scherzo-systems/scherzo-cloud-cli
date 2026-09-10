@@ -426,12 +426,17 @@ impl GitCaptureContext {
             .ok_or(GitCaptureFailure::BundleProfileInvalid)?;
 
         let initial = self.observe(cancellation)?;
-        // Treating the admitted baseline as the sole shallow boundary keeps revision traversal
-        // independent of history before it while exposing missing post-baseline objects to Git's
-        // ordinary promisor hydration instead of silently accepting another shallow cutoff.
-        let shallow = self.baseline_shallow_file()?;
-        self.require_ancestor(&initial.head_oid, shallow.path(), cancellation)?;
+        // Proving descent never requires history before the admitted baseline. Keep that proof
+        // independent of the boundary selected for incremental object traversal.
+        let ancestry_shallow = self.baseline_shallow_file()?;
+        self.require_ancestor(&initial.head_oid, ancestry_shallow.path(), cancellation)?;
         let changed = initial.head_oid != self.baseline_oid;
+        let capture_shallow = if changed {
+            Some(self.capture_shallow_file(cancellation)?)
+        } else {
+            None
+        };
+        let shallow = capture_shallow.as_ref().unwrap_or(&ancestry_shallow);
         let object_count = if changed {
             self.require_capture_objects(&initial.head_oid, shallow.path(), cancellation)?
         } else {
@@ -889,6 +894,68 @@ impl GitCaptureContext {
         Ok(shallow)
     }
 
+    fn capture_shallow_file(
+        &self,
+        cancellation: &CaptureCancellation,
+    ) -> Result<tempfile::NamedTempFile, GitCaptureFailure> {
+        let mut shallow = tempfile::NamedTempFile::new()
+            .map_err(|_| GitCaptureFailure::TemporaryStorageUnavailable)?;
+        shallow
+            .flush()
+            .map_err(|_| GitCaptureFailure::TemporaryStorageUnavailable)?;
+
+        // A normal exclusion walk needs available baseline commit ancestry to mark old side
+        // history uninteresting. Probe commits only, without fetching or requiring pre-baseline
+        // trees and blobs; repository-wide shallow metadata is not evidence that this particular
+        // ancestry is unavailable. Fall back to the baseline boundary only when the probe finds a
+        // missing commit.
+        let history = self
+            .run_source(
+                &["rev-list", "--count", "--missing=print", &self.baseline_oid],
+                ProcessInput::None,
+                MAXIMUM_SMALL_OUTPUT_BYTES,
+                cancellation,
+                true,
+                Some(shallow.path()),
+            )
+            .map_err(|failure| {
+                capture_process_failure(failure, GitCaptureFailure::RequiredObjectsUnavailable)
+            })?;
+        if !history.status.success() || history.stdout.truncated {
+            return Err(GitCaptureFailure::RequiredObjectsUnavailable);
+        }
+        let mut count_seen = false;
+        let mut missing = false;
+        for line in terminated_lines(&history.stdout.bytes)
+            .ok_or(GitCaptureFailure::RequiredObjectsUnavailable)?
+        {
+            if let Some(oid) = line.strip_prefix(b"?") {
+                if !std::str::from_utf8(oid).is_ok_and(|oid| is_lowercase_hex(oid, 40)) {
+                    return Err(GitCaptureFailure::RequiredObjectsUnavailable);
+                }
+                missing = true;
+            } else if !count_seen
+                && std::str::from_utf8(line)
+                    .ok()
+                    .and_then(|count| count.parse::<u64>().ok())
+                    .is_some()
+            {
+                count_seen = true;
+            } else {
+                return Err(GitCaptureFailure::RequiredObjectsUnavailable);
+            }
+        }
+        if !count_seen {
+            return Err(GitCaptureFailure::RequiredObjectsUnavailable);
+        }
+        if missing {
+            writeln!(shallow, "{}", self.baseline_oid)
+                .and_then(|()| shallow.flush())
+                .map_err(|_| GitCaptureFailure::TemporaryStorageUnavailable)?;
+        }
+        Ok(shallow)
+    }
+
     fn read_git_metadata(
         &self,
         cancellation: &CaptureCancellation,
@@ -1130,6 +1197,9 @@ impl GitCaptureContext {
             // Git's default sparse object walk may add redundant objects for direct tree copies.
             // Keep the pack aligned with the fully walked object set checked before generation.
             OsString::from("--no-sparse"),
+            // Match the ordinary revision walk used by preflight even when the source has a
+            // reachability bitmap that can omit redundant, historically reachable objects.
+            OsString::from("--no-use-bitmap-index"),
             OsString::from("--window=0"),
             OsString::from("--depth=0"),
         ];
