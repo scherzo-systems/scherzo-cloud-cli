@@ -1098,6 +1098,7 @@ fn valid_unavailable_entry(entry: &Value) -> bool {
                 "source_failed"
                     | "source_blocked"
                     | "source_input_unavailable"
+                    | "source_skipped"
                     | "source_not_run"
                     | "source_trigger_not_selected"
                     | "source_cancelled"

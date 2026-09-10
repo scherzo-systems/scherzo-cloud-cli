@@ -4505,6 +4505,7 @@ fn durable_finalizer_valid(finalizer: &DurableFinalizerV1) -> bool {
             AttemptStepStateV1::Succeeded
                 | AttemptStepStateV1::Failed
                 | AttemptStepStateV1::Blocked
+                | AttemptStepStateV1::Skipped
                 | AttemptStepStateV1::NotRun
                 | AttemptStepStateV1::Cancelled
         )
@@ -4527,6 +4528,7 @@ fn attempt_step_detail_valid(
         ) => true,
         (_, AttemptStepStateV1::Failed, Some(NodeDetail::Failed(_))) => true,
         (_, AttemptStepStateV1::Blocked, Some(NodeDetail::Blocked(_))) => true,
+        (_, AttemptStepStateV1::Skipped, Some(NodeDetail::Skipped(_))) => true,
         (AttemptNodeRoleV1::Step, AttemptStepStateV1::NotRun, Some(NodeDetail::NotRun(detail))) => {
             detail.code == NonExecutionCode::FailureStop
         }

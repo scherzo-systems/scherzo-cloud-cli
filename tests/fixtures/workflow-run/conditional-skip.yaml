@@ -1,0 +1,59 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf false > needed.txt"]
+    outputs:
+      needed:
+        kind: text
+        from: path
+        path: needed.txt
+  resolve:
+    kind: cmd
+    condition:
+      equals:
+        - ref: outputs.prepare.needed
+        - value: "true"
+    command:
+      argv: ["/bin/sh", "-c", "exit 42"]
+  check:
+    kind: cmd
+    condition:
+      disposition:
+        node: resolve
+        is: succeeded
+    command:
+      argv: ["/bin/sh", "-c", "exit 43"]
+    outputs:
+      resolution:
+        kind: text
+        from: path
+        path: resolution.txt
+finalizers:
+  publish:
+    kind: cmd
+    condition:
+      disposition:
+        node: check
+        is: succeeded
+    command:
+      argv: ["/bin/sh", "-c", "exit 44"]
+    outputs:
+      publication:
+        kind: text
+        from: path
+        path: publication.txt
+  observe:
+    kind: cmd
+    condition:
+      disposition:
+        node: publish
+        is: skipped
+    command:
+      argv: ["/bin/sh", "-c", "printf observed > observed.txt"]
+exports:
+  resolution:
+    ref: outputs.check.resolution
+  publication:
+    ref: outputs.publish.publication

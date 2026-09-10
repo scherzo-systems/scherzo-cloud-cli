@@ -160,6 +160,9 @@ pub(crate) fn summary_disposition_matches(
         (StepState::Blocked { detail: left }, StepState::Blocked { detail: right }) => {
             left == right
         }
+        (StepState::Skipped { detail: left }, StepState::Skipped { detail: right }) => {
+            left == right
+        }
         (StepState::NotRun { detail: left }, StepState::NotRun { detail: right }) => left == right,
         (StepState::Cancelled { detail: left }, StepState::Cancelled { detail: right }) => {
             left == right

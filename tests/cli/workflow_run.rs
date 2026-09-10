@@ -899,6 +899,85 @@ fn command_only_run_remains_harness_independent() {
 }
 
 #[test]
+fn conditional_skips_persist_for_steps_and_finalizers() {
+    let bundle = RunBundle::new(include_str!(
+        "../fixtures/workflow-run/conditional-skip.yaml"
+    ));
+    let destination = bundle.result("conditional-skips");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let output = run(&args);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = result_json(&destination);
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["result"], result);
+    assert_eq!(result["steps"][0]["state"], "succeeded");
+    for node in [
+        &result["steps"][1],
+        &result["steps"][2],
+        &result["finalization"]["finalizers"][0],
+    ] {
+        assert_eq!(node["state"], "skipped");
+        assert_eq!(node["detail"]["code"], "condition_false");
+    }
+    assert_eq!(
+        result["finalization"]["finalizers"][1]["state"],
+        "succeeded"
+    );
+    for export in ["resolution", "publication"] {
+        assert_eq!(
+            result["exports"][export],
+            serde_json::json!({
+                "state": "unavailable", "reason": "source_skipped"
+            })
+        );
+    }
+    assert_eq!(
+        fs::read(bundle.execution_root().join("observed.txt")).unwrap(),
+        b"observed"
+    );
+
+    let status = run(&[
+        "workflow".to_owned(),
+        "status".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let attempt = &status["state"]["attempts"][0];
+    assert_eq!(attempt["state"], "succeeded");
+    assert_eq!(attempt["progress"]["steps"][1]["state"], "skipped");
+    assert_eq!(attempt["progress"]["steps"][2]["state"], "skipped");
+    assert_eq!(attempt["finalization"]["complete"], true);
+    assert_eq!(attempt["finalization"]["finalizers"][0]["state"], "skipped");
+    assert_eq!(status["retry"]["eligible"], false);
+
+    let validation = run(&[
+        "artifact".to_owned(),
+        "validate".to_owned(),
+        "--json".to_owned(),
+        attempt_result(&destination).to_string_lossy().into_owned(),
+    ]);
+    assert!(
+        validation.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&validation.stdout),
+        String::from_utf8_lossy(&validation.stderr)
+    );
+}
+
+#[test]
 fn advisory_failure_keeps_truthful_state_and_returns_success() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
