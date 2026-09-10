@@ -7,6 +7,7 @@ Usage: scherzo-cloud organization [COMMAND]
 Commands:
   audit        Work with organization audit records
   create       Create a Scherzo Cloud organization
+  deletion     Manage an organization deletion schedule
   leave        Leave a Scherzo Cloud organization
   list         List your Scherzo Cloud organization memberships
   invitations  Manage organization invitations

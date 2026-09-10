@@ -148,6 +148,28 @@ pub(crate) fn execute_required_with_binding<T, E>(
     })
 }
 
+pub(crate) fn remove_bound_credential(
+    deployment: &Deployment,
+    binding: &SessionBinding,
+) -> Result<LocalCredentialState, SessionError> {
+    let store = CredentialStore::from_environment().map_err(SessionError::CredentialStore)?;
+    let _authority = store
+        .refresh_authority(deployment.fingerprint())
+        .map_err(SessionError::CredentialStore)?;
+    let removed = store
+        .remove_if_credential_matches_under_authority(
+            deployment.fingerprint(),
+            binding.credential.access_token(),
+            binding.credential.refresh_token(),
+        )
+        .map_err(SessionError::CredentialStore)?;
+    Ok(if removed {
+        LocalCredentialState::Removed
+    } else {
+        LocalCredentialState::Retained
+    })
+}
+
 pub(crate) fn execute_bound_required<T, E>(
     client: &HttpClient,
     deployment: &Deployment,

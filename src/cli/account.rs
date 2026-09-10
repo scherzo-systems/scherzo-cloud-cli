@@ -43,6 +43,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum AccountCommand {
+    #[command(about = super::deletion::account_about())]
+    Deletion(super::deletion::AccountCommand),
     #[command(about = signup::ABOUT)]
     Signup(SignupCommand),
     #[command(about = update::ABOUT)]
@@ -154,19 +156,22 @@ fn execute_update(
 // jscpd:ignore-start
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
-        super::execute_deployment_command(
-            self.command,
-            &[NAME],
-            "configure Scherzo Cloud account",
-            |command, deployment| match command {
-                AccountCommand::Signup(command) => {
-                    execute_signup(command, deployment).map_err(Into::into)
-                }
-                AccountCommand::Update(command) => {
-                    execute_update(command, deployment).map_err(Into::into)
-                }
-            },
-        )
+        match self.command {
+            None => super::print_help(&[NAME]),
+            Some(AccountCommand::Deletion(command)) => command.execute(),
+            Some(AccountCommand::Signup(command)) => super::execute_deployment_leaf(
+                command,
+                &[NAME],
+                "configure Scherzo Cloud account",
+                execute_signup,
+            ),
+            Some(AccountCommand::Update(command)) => super::execute_deployment_leaf(
+                command,
+                &[NAME],
+                "configure Scherzo Cloud account",
+                execute_update,
+            ),
+        }
     }
 }
 // jscpd:ignore-end

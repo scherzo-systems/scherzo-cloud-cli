@@ -7,6 +7,7 @@ mod http_client;
 pub(crate) mod http_util;
 mod human_principal;
 mod identities;
+mod lifecycle;
 mod organizations;
 mod problem;
 mod profile;
@@ -53,6 +54,12 @@ pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use identities::{
     CommonIdentityFailure, IdentityApiError, LinkIdentityOutcome, ListIdentitiesOutcome,
     OidcIdentity, RemoveIdentityOutcome, link_identity, list_identities, remove_identity,
+};
+pub(crate) use lifecycle::{
+    CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, LifecycleApiError,
+    LifecycleResourceKind, LifecycleState, LifecycleTransition, RequestDeletionOutcome,
+    cancel_current_principal_deletion, cancel_organization_deletion,
+    request_current_principal_deletion, request_organization_deletion,
 };
 pub(crate) use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,

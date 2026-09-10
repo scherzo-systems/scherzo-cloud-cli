@@ -166,8 +166,9 @@ The current release supports:
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, linked sign-in identity management,
-  logout, account signup and display-name management, organization discovery, profile
-  management and owner audit history, invitation issuance and lifecycle management, the
+  logout, account signup, display-name management, account and organization deletion
+  scheduling, organization discovery, profile management and owner audit history,
+  invitation issuance and lifecycle management, the
   current principal's invitation inbox, one-page member-directory reads, actor-bound GitHub App setup,
   installation and repository discovery, complete project and repository configuration,
   and inputless Cloud run creation and inspection;
@@ -684,11 +685,53 @@ cannot be confirmed, check `scherzo-cloud auth status` before issuing another up
 Structured failures report one of `invalid_display_name`, `unauthenticated`, `forbidden`,
 `idempotency_conflict`, `request_too_large`, `unsupported_media_type`, or `unreachable`.
 
+Schedule deletion of the authenticated human account only after reviewing the 30-day
+window and confirming explicitly:
+
+```sh
+scherzo-cloud account deletion request --yes
+```
+
+A successful request reports the principal ID, `deletion_pending` state, request time,
+deadline, and update time. It conditionally removes the exact local human credential
+that authorized the request; it never removes a credential that another process replaced
+while the request was in progress. The result reports `localCredential` as `removed` or
+`changed`; a local cleanup error reports `removal_unconfirmed`, returns nonzero after
+showing the confirmed schedule, and directs the user to local sign-out. An unconfirmed
+API request retains the local credential and must not be repeated
+until the lifecycle state has been confirmed with the deployment operator.
+
+Cancel before the deadline with a fresh browser proof from the same still-linked identity:
+
+```sh
+scherzo-cloud account deletion cancel
+```
+
+Cancellation does not use or require the stored local session. It requests a fresh
+browser/device access token without `offline_access`, sends that token only as the API
+bearer, and never stores it or a refresh token. A successful cancellation reports the
+returned active lifecycle transition while leaving the credential store unchanged; run
+`scherzo-cloud auth login` afterward to establish a renewable local session. This
+separation is intentional: an old stored credential, a refreshed background session, or
+a different linked identity does not replace the API's distinct, later, same-identity
+proof requirement.
+
+`account deletion request --json` emits one schema-version-1 result. Cancellation emits
+newline-delimited schema-version-1 `activation_required` and terminal `result` events
+because browser authorization is part of the command. A repeated request or cancellation
+with a new request identity reports `transition_unavailable` when the lifecycle is
+already in the requested state or the transition is otherwise unavailable. Scheduling
+also reports `human_owner_required` when deleting the account would leave an organization
+without an effective human owner. Browser proof rejection reports
+`reauthentication_required`; no outcome weakens the linked-identity or issuance-time
+checks.
+
 ## Organization management
 
-Organization commands use only the selected human OAuth credential. They do not start a
-login or signup flow and never read runner credentials. Organization references must be
-an exact `org_` ID or lowercase URL-safe slug. The CLI rejects invalid references locally
+Organization commands use only human OAuth authority and never read runner credentials.
+Except for deletion cancellation's explicit fresh proof flow below, they use the selected
+local credential and do not start login or signup. Organization references must be an
+exact `org_` ID or lowercase URL-safe slug. The CLI rejects invalid references locally
 and passes accepted references to the deployment without normalization.
 
 ```sh
@@ -707,6 +750,12 @@ scherzo-cloud organization show acme-research
 scherzo-cloud organization update acme-research \
   --display-name "Acme Labs" \
   --slug acme-labs
+
+# Schedule deletion for 30 days as a current active human owner.
+scherzo-cloud organization deletion request acme-labs --yes
+
+# Cancel before the deadline with a fresh browser proof.
+scherzo-cloud organization deletion cancel acme-labs
 
 # Read one active member-directory page. Both pagination options are optional.
 scherzo-cloud organization members list acme-labs \
@@ -747,6 +796,23 @@ page, preserve `nextCursor`, and do not follow it automatically. Their `--limit`
 accept 1 through 200. Active-member listing remains available to effective members;
 membership history and member changes require an active owner. History preserves
 lifecycle fields while leaving an inactive principal's omitted display name absent.
+
+Organization deletion request and cancellation require a current active human owner.
+Cancellation additionally requires the same linked identity that scheduled deletion to
+present a different browser-issued bearer with a strictly later issuer time. As with
+account cancellation, the CLI obtains that proof through a fresh browser/device flow
+without `offline_access`, sends it only as the cancellation bearer, and does not persist
+it. Organization lifecycle commands never replace or remove the account's local human
+credential. A successful request reports the 30-day `deletion_pending` schedule; a
+successful cancellation reports the returned `active` or `suspended` transition.
+
+Request uses one schema-version-1 result with `--json`; cancellation uses
+newline-delimited `activation_required` and terminal `result` events. Owner denial stays
+`forbidden` on request and is deliberately included in `reauthentication_required` on
+cancellation so the CLI does not disclose whether a private target, actor, or proof would
+otherwise qualify. Missing and inaccessible organization targets remain
+indistinguishable. `transition_unavailable` handles a schedule or cancellation that is
+already in the requested state or otherwise unavailable.
 
 Audit listing also returns exactly one oldest-first page and preserves `nextCursor`, but
 its `--limit` accepts 1 through 100. Only an active organization owner can use it. Human

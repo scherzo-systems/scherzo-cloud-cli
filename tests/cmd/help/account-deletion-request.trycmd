@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud account deletion request --help
+Request account deletion
+
+Usage: scherzo-cloud account deletion request [OPTIONS] --yes
+
+Options:
+      --yes                  Confirm the 30-day deletion schedule
+      --json                 Print the deletion result as JSON
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                 Print help
+
+Account access:
+  A confirmed request removes this deployment's local human credential.
+  Cancellation requires a fresh browser proof from the same linked identity before the deadline.
+
+```

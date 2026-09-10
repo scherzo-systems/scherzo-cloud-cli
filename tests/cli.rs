@@ -22,6 +22,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[path = "cli/account_deletion.rs"]
+mod account_deletion;
 #[path = "cli/account_signup.rs"]
 mod account_signup;
 #[path = "cli/account_update.rs"]
@@ -53,6 +55,8 @@ mod invitation;
 mod organization;
 #[path = "cli/organization_audit.rs"]
 mod organization_audit;
+#[path = "cli/organization_deletion.rs"]
+mod organization_deletion;
 #[path = "cli/pi_installation.rs"]
 mod pi_installation;
 #[path = "cli/project.rs"]

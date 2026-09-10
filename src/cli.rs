@@ -31,6 +31,7 @@ pub(super) use impl_organization_human_credential_outcome;
 mod account;
 mod artifact;
 mod auth;
+mod deletion;
 mod github;
 mod invitation;
 mod organization;
@@ -807,6 +808,9 @@ mod tests {
         let actual = customer_command_paths();
         let expected = [
             "account",
+            "account deletion",
+            "account deletion cancel",
+            "account deletion request",
             "account signup",
             "account update",
             "artifact",
@@ -839,6 +843,9 @@ mod tests {
             "organization audit",
             "organization audit list",
             "organization create",
+            "organization deletion",
+            "organization deletion cancel",
+            "organization deletion request",
             "organization invitations",
             "organization invitations issue",
             "organization invitations list",

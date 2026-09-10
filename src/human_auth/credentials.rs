@@ -163,6 +163,18 @@ impl CredentialStore {
         })
     }
 
+    pub(crate) fn remove_if_credential_matches_under_authority(
+        &self,
+        deployment: &DeploymentFingerprint,
+        access_token: &(impl TokenSource + ?Sized),
+        refresh_token: &(impl TokenSource + ?Sized),
+    ) -> Result<bool, CredentialError> {
+        self.remove_matching(deployment, |credential| {
+            credential.access_token.expose() == access_token.expose()
+                && credential.refresh_token.expose() == refresh_token.expose()
+        })
+    }
+
     pub(crate) fn remove_if_refresh_token_matches_under_authority(
         &self,
         deployment: &DeploymentFingerprint,

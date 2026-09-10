@@ -35,6 +35,8 @@ enum OrganizationCommand {
     Audit(audit::Command),
     #[command(about = create::ABOUT)]
     Create(create::Command),
+    #[command(about = super::deletion::organization_about())]
+    Deletion(super::deletion::OrganizationCommand),
     #[command(about = leave::ABOUT)]
     Leave(leave::Command),
     #[command(about = list::ABOUT)]
@@ -108,6 +110,7 @@ impl Command {
             Some(OrganizationCommand::Create(command)) => {
                 execute_leaf(command, create::Command::execute)
             }
+            Some(OrganizationCommand::Deletion(command)) => command.execute(),
             Some(OrganizationCommand::Leave(command)) => {
                 execute_leaf(command, leave::Command::execute)
             }
