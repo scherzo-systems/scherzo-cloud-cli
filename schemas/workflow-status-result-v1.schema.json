@@ -1666,8 +1666,44 @@
                 "verification",
                 "rename"
               ]
+            },
+            "resultInvariant": {
+              "enum": [
+                "attempt_metadata",
+                "workflow_metadata",
+                "execution_metadata",
+                "result_structure",
+                "step_metadata",
+                "finalization_metadata",
+                "outcome_metadata",
+                "export_metadata",
+                "export_sources",
+                "export_values",
+                "git_branch",
+                "diagnostic_stream",
+                "recovery",
+                "failure",
+                "retained_path",
+                "timing"
+              ]
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "resultInvariant"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "phase": {
+                    "const": "serialization"
+                  }
+                }
+              }
+            }
+          ]
         }
       ]
     },

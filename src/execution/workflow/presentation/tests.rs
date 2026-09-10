@@ -256,6 +256,7 @@ impl Fixture {
             content_digest: self.digest.clone(),
             execution_root: self.execution_root.clone(),
             maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
+            maximum_retained_bytes_per_stream: super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
             cloud_capacity: None,
             timing: WorkflowRunTiming {
                 started_at,

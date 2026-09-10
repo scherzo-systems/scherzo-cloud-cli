@@ -184,6 +184,7 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
         content_digest: fixture.content_digest.clone(),
         execution_root: fixture.execution_root.clone(),
         maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
+        maximum_retained_bytes_per_stream: super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
         cloud_capacity: None,
         timing: WorkflowRunTiming {
             started_at: timestamp_fixture("2026-08-02T12:01:44Z"),
@@ -678,6 +679,7 @@ fn conflicting_values_for_one_captured_identity_are_rejected() {
         failure.kind(),
         LocalPublicationFailureKind::InvalidRunResult
     );
+    assert_eq!(failure.invariant(), Some(RunResultInvariant::ExportValues));
     assert!(!destination.exists());
 }
 

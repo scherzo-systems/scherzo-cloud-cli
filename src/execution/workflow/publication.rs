@@ -118,6 +118,7 @@ pub(crate) struct WorkflowRunResult {
     pub(crate) content_digest: WorkflowContentDigest,
     pub(crate) execution_root: PathBuf,
     pub(crate) maximum_parallel_steps: NonZeroUsize,
+    pub(crate) maximum_retained_bytes_per_stream: u64,
     pub(crate) cloud_capacity: Option<CloudExecutionCapacityV1>,
     pub(crate) timing: WorkflowRunTiming,
     pub(crate) outcome: RunOutcome,
@@ -194,11 +195,56 @@ pub(crate) enum LocalPublicationFailureKind {
     AtomicPublicationUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunResultInvariant {
+    AttemptMetadata,
+    WorkflowMetadata,
+    ExecutionMetadata,
+    ResultStructure,
+    StepMetadata,
+    FinalizationMetadata,
+    OutcomeMetadata,
+    ExportMetadata,
+    ExportSources,
+    ExportValues,
+    GitBranch,
+    DiagnosticStream,
+    Recovery,
+    Failure,
+    RetainedPath,
+    Timing,
+}
+
+impl RunResultInvariant {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AttemptMetadata => "attempt_metadata",
+            Self::WorkflowMetadata => "workflow_metadata",
+            Self::ExecutionMetadata => "execution_metadata",
+            Self::ResultStructure => "result_structure",
+            Self::StepMetadata => "step_metadata",
+            Self::FinalizationMetadata => "finalization_metadata",
+            Self::OutcomeMetadata => "outcome_metadata",
+            Self::ExportMetadata => "export_metadata",
+            Self::ExportSources => "export_sources",
+            Self::ExportValues => "export_values",
+            Self::GitBranch => "git_branch",
+            Self::DiagnosticStream => "diagnostic_stream",
+            Self::Recovery => "recovery",
+            Self::Failure => "failure",
+            Self::RetainedPath => "retained_path",
+            Self::Timing => "timing",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalPublicationError {
     phase: LocalPublicationPhase,
     kind: LocalPublicationFailureKind,
     export: Option<String>,
+    invariant: Option<RunResultInvariant>,
 }
 
 impl LocalPublicationError {
@@ -214,11 +260,16 @@ impl LocalPublicationError {
         self.export.as_deref()
     }
 
+    pub(crate) fn invariant(&self) -> Option<RunResultInvariant> {
+        self.invariant
+    }
+
     fn new(phase: LocalPublicationPhase, kind: LocalPublicationFailureKind) -> Self {
         Self {
             phase,
             kind,
             export: None,
+            invariant: None,
         }
     }
 
@@ -231,6 +282,16 @@ impl LocalPublicationError {
             phase,
             kind,
             export: Some(export.to_owned()),
+            invariant: None,
+        }
+    }
+
+    fn invalid(invariant: RunResultInvariant) -> Self {
+        Self {
+            phase: LocalPublicationPhase::Serialization,
+            kind: LocalPublicationFailureKind::InvalidRunResult,
+            export: None,
+            invariant: Some(invariant),
         }
     }
 }
@@ -244,6 +305,9 @@ impl fmt::Display for LocalPublicationError {
         )?;
         if let Some(export) = &self.export {
             write!(formatter, " for export {export:?}")?;
+        }
+        if let Some(invariant) = self.invariant {
+            write!(formatter, " ({})", invariant.as_str())?;
         }
         Ok(())
     }
@@ -1256,18 +1320,12 @@ pub(crate) fn prepare_cloud_workflow_result(
     object_format: String,
     commit_oid: String,
 ) -> Result<PreparedCloudWorkflowResult, LocalPublicationError> {
-    if !run.exports.keys().eq(run.export_sources.keys()) {
-        return Err(invalid_run_result());
-    }
+    validate_export_source_set(run)?;
     let mut exports = BTreeMap::new();
     let mut carriers = Vec::new();
     let mut sources = BTreeMap::<(String, String), SourcePublication>::new();
     for (index, (name, export)) in run.exports.iter().enumerate() {
-        let ordinal = index.checked_add(1).ok_or_else(invalid_run_result)?;
-        let source = run
-            .export_sources
-            .get(name)
-            .ok_or_else(invalid_run_result)?;
+        let (ordinal, source) = checked_export_source(run, index, name)?;
         let identity = (source.node.id.clone(), source.output.clone());
         let metadata = match export {
             ExportValue::Unavailable { reason } => {
@@ -1275,7 +1333,7 @@ pub(crate) fn prepare_cloud_workflow_result(
             }
             ExportValue::Available { output } => {
                 if !captured_type_matches(source.value_type, output) {
-                    return Err(invalid_run_result());
+                    return Err(invalid_run_result(RunResultInvariant::ExportValues));
                 }
                 match existing_available_export(&sources, &identity, source, output)? {
                     Some(metadata) => metadata,
@@ -1311,7 +1369,7 @@ pub(crate) fn prepare_cloud_workflow_result(
 }
 
 fn encode_result_json(result: &WorkflowResultV1) -> Result<Vec<u8>, LocalPublicationError> {
-    result_metadata::validate(result).map_err(|_| invalid_run_result())?;
+    result_metadata::validate_with_invariant(result).map_err(invalid_run_result)?;
     let mut bytes = serde_json::to_vec_pretty(result).map_err(|_| {
         LocalPublicationError::new(
             LocalPublicationPhase::Serialization,
@@ -1379,7 +1437,7 @@ fn cloud_available_export(
                 },
             });
             if (branch_metadata.base_oid() != branch_metadata.head_oid()) != carrier.is_some() {
-                return Err(invalid_run_result());
+                return Err(invalid_run_result(RunResultInvariant::GitBranch));
             }
             let body = branch
                 .carrier()
@@ -1415,7 +1473,7 @@ fn cloud_available_export(
                     carrier.digest.value.clone(),
                 ),
                 ExportV1::GitBranch { carrier: None, .. } | ExportV1::Unavailable { .. } => {
-                    return Err(invalid_run_result());
+                    return Err(invalid_run_result(RunResultInvariant::GitBranch));
                 }
             };
             Some(CloudResultCarrier {
@@ -1483,28 +1541,16 @@ fn publish_prepared_with_observer(
         None,
     )?;
 
-    if !run.exports.keys().eq(run.export_sources.keys()) {
-        return Err(invalid_run_result());
-    }
+    validate_export_source_set(run)?;
     let mut exports = BTreeMap::new();
     let mut sources = BTreeMap::<(String, String), SourcePublication>::new();
     for (index, (name, export)) in run.exports.iter().enumerate() {
-        let ordinal = index.checked_add(1).ok_or_else(|| {
-            LocalPublicationError::for_export(
-                LocalPublicationPhase::Serialization,
-                LocalPublicationFailureKind::InvalidRunResult,
-                name,
-            )
-        })?;
-        let source = run
-            .export_sources
-            .get(name)
-            .ok_or_else(invalid_run_result)?;
+        let (ordinal, source) = checked_export_source(run, index, name)?;
         let identity = (source.node.id.clone(), source.output.clone());
         let metadata = match export {
             ExportValue::Available { output } => {
                 if !captured_type_matches(source.value_type, output) {
-                    return Err(invalid_run_result());
+                    return Err(invalid_run_result(RunResultInvariant::ExportValues));
                 }
                 match existing_available_export(&sources, &identity, source, output)? {
                     Some(metadata) => metadata,
@@ -1632,6 +1678,29 @@ fn insert_available_source(
     );
 }
 
+fn validate_export_source_set(run: &WorkflowRunResult) -> Result<(), LocalPublicationError> {
+    if run.exports.keys().eq(run.export_sources.keys()) {
+        Ok(())
+    } else {
+        Err(invalid_run_result(RunResultInvariant::ExportSources))
+    }
+}
+
+fn checked_export_source<'a>(
+    run: &'a WorkflowRunResult,
+    index: usize,
+    name: &str,
+) -> Result<(usize, &'a ResolvedOutputSource), LocalPublicationError> {
+    let ordinal = index
+        .checked_add(1)
+        .ok_or_else(|| invalid_run_result(RunResultInvariant::ExportSources))?;
+    let source = run
+        .export_sources
+        .get(name)
+        .ok_or_else(|| invalid_run_result(RunResultInvariant::ExportSources))?;
+    Ok((ordinal, source))
+}
+
 fn existing_available_export(
     sources: &BTreeMap<(String, String), SourcePublication>,
     identity: &(String, String),
@@ -1647,10 +1716,10 @@ fn existing_available_export(
         metadata,
     } = publication
     else {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::ExportValues));
     };
     if owner_source != source || owner_output != output {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::ExportValues));
     }
     Ok(Some(metadata.as_ref().clone()))
 }
@@ -1675,7 +1744,7 @@ fn unavailable_export(
             source: owner_source,
             reason: owner_reason,
         }) if owner_source == source && *owner_reason == reason => {}
-        Some(_) => return Err(invalid_run_result()),
+        Some(_) => return Err(invalid_run_result(RunResultInvariant::ExportValues)),
     }
     Ok(ExportV1::Unavailable {
         reason: export_unavailable_reason(reason),
@@ -1827,7 +1896,7 @@ fn write_git_branch_export(
     let metadata = branch.metadata();
     let has_delta = metadata.base_oid() != metadata.head_oid();
     if has_delta != branch.carrier().is_some() {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::GitBranch));
     }
     let carrier = match branch.carrier() {
         None => None,
@@ -1980,7 +2049,7 @@ fn build_result_with_provenance(
     let finalization = run.finalization.as_ref().map(finalization_v1).transpose()?;
 
     if run.attempt_number == 0 {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::AttemptMetadata));
     }
     Ok(WorkflowResultV1 {
         schema_version: 1,
@@ -2003,7 +2072,7 @@ fn build_result_with_provenance(
         },
         command_output_policy: CommandOutputPolicyV1 {
             encoding: "base64".to_owned(),
-            maximum_retained_bytes_per_stream: super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
+            maximum_retained_bytes_per_stream: run.maximum_retained_bytes_per_stream,
         },
         outcome,
         primary_issue,
@@ -2026,7 +2095,7 @@ fn finalization_v1(
         .iter()
         .any(|finalizer| finalizer.role != WorkflowNodeRoleV1::Finalizer)
     {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::FinalizationMetadata));
     }
     let issues = finalizers
         .iter()
@@ -2101,7 +2170,9 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         | StepState::Running
         | StepState::CapturingOutputs
         | StepState::Recovering { .. }
-        | StepState::Cancelling { .. } => return Err(invalid_run_result()),
+        | StepState::Cancelling { .. } => {
+            return Err(invalid_run_result(RunResultInvariant::StepMetadata));
+        }
     };
     let command_output = step
         .command_output
@@ -2110,7 +2181,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         .transpose()?;
 
     if step.kind == WorkflowRunStepKind::Agent && command_output.is_some() {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::StepMetadata));
     }
 
     Ok(WorkflowStepV1 {
@@ -2144,9 +2215,10 @@ pub(crate) fn command_output_v1(
 fn diagnostic_stream_v1(
     stream: &CapturedDiagnosticStream,
 ) -> Result<DiagnosticStreamV1, LocalPublicationError> {
-    let retained_bytes = u64::try_from(stream.bytes().len()).map_err(|_| invalid_run_result())?;
+    let retained_bytes = u64::try_from(stream.bytes().len())
+        .map_err(|_| invalid_run_result(RunResultInvariant::DiagnosticStream))?;
     if retained_bytes > super::MAXIMUM_RETAINED_BYTES_PER_STREAM {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::DiagnosticStream));
     }
     let discarded_bytes = stream
         .truncation()
@@ -2171,13 +2243,13 @@ pub(crate) fn step_recovery_summary_v1(
         return if recovery.terminal_disposition.is_none() {
             Ok(None)
         } else {
-            Err(invalid_run_result())
+            Err(invalid_run_result(RunResultInvariant::Recovery))
         };
     }
     let rounds = recovery_round_summaries_v1(recovery, true)?;
     let termination = match recovery
         .terminal_disposition
-        .ok_or_else(invalid_run_result)?
+        .ok_or_else(|| invalid_run_result(RunResultInvariant::Recovery))?
     {
         RecoveryTerminalDisposition::Recovered { execution_number } => {
             RecoveryTerminationV1::Recovered {
@@ -2205,7 +2277,7 @@ pub(crate) fn step_recovery_summary_v1(
                     } if *retained_phase == phase => Some(cause),
                     _ => None,
                 })
-                .ok_or_else(invalid_run_result)?;
+                .ok_or_else(|| invalid_run_result(RunResultInvariant::Recovery))?;
             RecoveryTerminationV1::HandlerFailed {
                 round: round.get(),
                 handler_failure: recovery_handler_failure_v1(phase, failure)?,
@@ -2277,7 +2349,7 @@ pub(crate) fn recovery_round_summaries_v1(
                             return Ok(None);
                         }
                         RecoveryHandlerOutcome::Starting | RecoveryHandlerOutcome::Running => {
-                            return Err(invalid_run_result());
+                            return Err(invalid_run_result(RunResultInvariant::Recovery));
                         }
                     };
                     Ok(Some(RecoveryHandlerSummaryV1 {
@@ -2319,7 +2391,7 @@ fn recovery_handler_failure_v1(
     cause: &StepFailureCause,
 ) -> Result<RecoveryHandlerFailureV1, LocalPublicationError> {
     let StepFailureCause::RecoveryHandler(cause) = cause else {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::Recovery));
     };
     let (code, exit_code, decision_rejection) = match cause {
         super::recovery::RecoveryHandlerFailure::ContextUnavailable => {
@@ -2439,7 +2511,7 @@ pub(super) fn failure_v1(
             FailurePhaseV1::OutputCapture,
             output_capture_failure_cause(cause),
         ),
-        _ => return Err(invalid_run_result()),
+        _ => return Err(invalid_run_result(RunResultInvariant::Failure)),
     };
     Ok(FailureV1 { phase, cause })
 }
@@ -2683,26 +2755,23 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
 
 fn retained_path(path: &Path) -> Result<String, LocalPublicationError> {
     if !path.is_absolute() {
-        return Err(invalid_run_result());
+        return Err(invalid_run_result(RunResultInvariant::RetainedPath));
     }
     path.to_str()
         .map(str::to_owned)
-        .ok_or_else(invalid_run_result)
+        .ok_or_else(|| invalid_run_result(RunResultInvariant::RetainedPath))
 }
 
 fn timestamp(value: OffsetDateTime) -> Result<String, LocalPublicationError> {
-    utc_timestamp(value).map_err(|_| invalid_run_result())
+    utc_timestamp(value).map_err(|_| invalid_run_result(RunResultInvariant::Timing))
 }
 
 fn duration_milliseconds(duration: Duration) -> Result<u64, LocalPublicationError> {
-    u64::try_from(duration.as_millis()).map_err(|_| invalid_run_result())
+    u64::try_from(duration.as_millis()).map_err(|_| invalid_run_result(RunResultInvariant::Timing))
 }
 
-fn invalid_run_result() -> LocalPublicationError {
-    LocalPublicationError::new(
-        LocalPublicationPhase::Serialization,
-        LocalPublicationFailureKind::InvalidRunResult,
-    )
+fn invalid_run_result(invariant: RunResultInvariant) -> LocalPublicationError {
+    LocalPublicationError::invalid(invariant)
 }
 
 fn workflow_node_role(role: WorkflowNodeRole) -> WorkflowNodeRoleV1 {

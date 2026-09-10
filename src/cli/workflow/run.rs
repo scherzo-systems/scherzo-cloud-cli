@@ -607,9 +607,10 @@ pub(super) async fn execute_owned_attempt(
     }
     let state_publication = match &publication {
         Ok(_) => owned_run.record_result_published(),
-        Err(error) => {
-            owned_run.record_result_publication_failed(publication_failure_phase(error.phase()))
-        }
+        Err(error) => owned_run.record_result_publication_failed(
+            publication_failure_phase(error.phase()),
+            error.invariant(),
+        ),
     };
     host.complete_publication(&publication);
     host.begin_cleanup();
@@ -1620,6 +1621,11 @@ fn build_run_result(
         content_digest: execution.content_digest,
         execution_root: admitted.execution().root().to_owned(),
         maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
+        maximum_retained_bytes_per_stream: admitted
+            .execution()
+            .limits()
+            .maximum_step_log_bytes()
+            .get(),
         cloud_capacity: None,
         timing: run_timing,
         outcome: execution.outcome,

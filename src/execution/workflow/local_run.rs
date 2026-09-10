@@ -42,7 +42,8 @@ use super::process_group::{
     terminate_authenticated_process_group,
 };
 use super::publication::{
-    CancellationReasonV1, FinalizationTriggerV1, cancellation_reason, finalization_trigger,
+    CancellationReasonV1, FinalizationTriggerV1, RunResultInvariant, cancellation_reason,
+    finalization_trigger,
 };
 use super::resolution::{ResolvedWorkflow, resolve_retained};
 use super::runtime::{
@@ -616,6 +617,8 @@ pub(super) enum AttemptResultV1 {
     },
     PublicationFailed {
         phase: PublicationFailurePhaseV1,
+        #[serde(rename = "resultInvariant", skip_serializing_if = "Option::is_none")]
+        result_invariant: Option<RunResultInvariant>,
     },
 }
 
@@ -1036,6 +1039,7 @@ impl LocalAttemptOwner {
     pub(crate) fn record_result_publication_failed(
         &self,
         phase: PublicationFailurePhaseV1,
+        invariant: Option<RunResultInvariant>,
     ) -> Result<(), LocalRunDirectoryError> {
         self.state.update(|state| {
             let attempt_number = state.current_attempt_number;
@@ -1043,7 +1047,10 @@ impl LocalAttemptOwner {
             if !attempt.state.is_terminal() {
                 return Err(LocalRunDirectoryError::StateConflict);
             }
-            attempt.result = AttemptResultV1::PublicationFailed { phase };
+            attempt.result = AttemptResultV1::PublicationFailed {
+                phase,
+                result_invariant: invariant,
+            };
             append_diagnostic(
                 state,
                 attempt_number,
@@ -3881,7 +3888,7 @@ fn status_result(result: &AttemptResultV1) -> LocalStatusResult {
         AttemptResultV1::Published { relative_directory } => LocalStatusResult::Published {
             relative_directory: relative_directory.clone(),
         },
-        AttemptResultV1::PublicationFailed { phase } => LocalStatusResult::PublicationFailed {
+        AttemptResultV1::PublicationFailed { phase, .. } => LocalStatusResult::PublicationFailed {
             phase: publication_failure_phase_name(*phase),
         },
     }
@@ -4552,9 +4559,15 @@ fn validate_attempt_result(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirec
             AttemptStateV1::Succeeded | AttemptStateV1::WorkflowFailed | AttemptStateV1::Cancelled,
             AttemptResultV1::NotPublished {
                 reason: ResultAbsentReasonV1::PublicationPending,
-            }
-            | AttemptResultV1::PublicationFailed { .. },
+            },
         ) => true,
+        (
+            AttemptStateV1::Succeeded | AttemptStateV1::WorkflowFailed | AttemptStateV1::Cancelled,
+            AttemptResultV1::PublicationFailed {
+                phase,
+                result_invariant,
+            },
+        ) => result_invariant.is_none() || *phase == PublicationFailurePhaseV1::Serialization,
         (
             AttemptStateV1::Interrupted,
             AttemptResultV1::NotPublished {

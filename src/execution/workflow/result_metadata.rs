@@ -17,8 +17,9 @@ use super::evidence::{
 use super::publication::{
     CancellationReasonV1, DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1,
     FinalizationTriggerV1, RecoveryHandlerFailureCodeV1, RecoveryHandlerOutcomeV1,
-    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryTerminationV1, WorkflowNodeRoleV1,
-    WorkflowOutcomeV1, WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryTerminationV1, RunResultInvariant,
+    WorkflowNodeRoleV1, WorkflowOutcomeV1, WorkflowProvenanceV1, WorkflowResultV1,
+    WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_identifier, is_lowercase_hex,
@@ -122,47 +123,65 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataErr
 }
 
 pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
-    let origin_profile_valid =
-        match &result.workflow.provenance {
-            WorkflowProvenanceV1::Local { source_root } => {
-                is_canonical_absolute_path(source_root)
-                    && result
-                        .execution
-                        .execution_root
-                        .as_deref()
-                        .is_some_and(is_canonical_absolute_path)
-                    && result.execution.capacity.is_none()
-            }
-            WorkflowProvenanceV1::Cloud {
-                project_id,
-                repository_connection_id,
-                object_format,
-                commit_oid,
-            } => {
-                valid_typed_id(project_id, "prj_")
-                    && valid_typed_id(repository_connection_id, "rpc_")
-                    && object_format == "sha1"
-                    && is_lowercase_hex(commit_oid, 40)
-                    && result.execution.execution_root.is_none()
-                    && result.execution.capacity.as_ref().is_some_and(|capacity| {
-                        valid_cloud_capacity(capacity, &result.workflow.digest)
-                    })
-            }
-        };
-    if result.schema_version != 1
-        || result.attempt_number == 0
-        || !origin_profile_valid
+    validate_with_invariant(result).map_err(|_| ResultMetadataError)
+}
+
+pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), RunResultInvariant> {
+    if result.schema_version != 1 {
+        return Err(RunResultInvariant::ResultStructure);
+    }
+    if result.attempt_number == 0 {
+        return Err(RunResultInvariant::AttemptMetadata);
+    }
+    let (provenance_valid, execution_origin_valid) = match &result.workflow.provenance {
+        WorkflowProvenanceV1::Local { source_root } => (
+            is_canonical_absolute_path(source_root),
+            result
+                .execution
+                .execution_root
+                .as_deref()
+                .is_some_and(is_canonical_absolute_path)
+                && result.execution.capacity.is_none(),
+        ),
+        WorkflowProvenanceV1::Cloud {
+            project_id,
+            repository_connection_id,
+            object_format,
+            commit_oid,
+        } => (
+            valid_typed_id(project_id, "prj_")
+                && valid_typed_id(repository_connection_id, "rpc_")
+                && object_format == "sha1"
+                && is_lowercase_hex(commit_oid, 40),
+            result.execution.execution_root.is_none()
+                && result.execution.capacity.as_ref().is_some_and(|capacity| {
+                    valid_cloud_capacity(capacity, &result.workflow.digest)
+                }),
+        ),
+    };
+    if !provenance_valid
         || !is_canonical_relative_path(&result.workflow.path)
         || result.workflow.digest.algorithm != SHA256_ALGORITHM
         || !is_lowercase_hex(&result.workflow.digest.value, 64)
+    {
+        return Err(RunResultInvariant::WorkflowMetadata);
+    }
+    if !execution_origin_valid
         || !(1..=MAXIMUM_PARALLEL_STEPS).contains(&result.execution.maximum_parallel_steps)
         || parse_canonical_utc_timestamp(&result.execution.started_at).is_none()
         || parse_canonical_utc_timestamp(&result.execution.finished_at).is_none()
-        || result.command_output_policy.encoding != BASE64_ENCODING
-        || result
-            .command_output_policy
-            .maximum_retained_bytes_per_stream
-            != super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+    {
+        return Err(RunResultInvariant::ExecutionMetadata);
+    }
+    let maximum_stream_bytes = result
+        .command_output_policy
+        .maximum_retained_bytes_per_stream;
+    if result.command_output_policy.encoding != BASE64_ENCODING
+        || maximum_stream_bytes == 0
+        || maximum_stream_bytes > super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+        || result.execution.capacity.as_ref().is_some_and(|capacity| {
+            maximum_stream_bytes > capacity.maximum_retained_bytes_per_invocation
+        })
         || result.steps.is_empty()
         || result
             .finalization
@@ -176,32 +195,30 @@ pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataEr
             > MAXIMUM_STEPS
         || result.exports.len() > MAXIMUM_EXPORTS
     {
-        return Err(ResultMetadataError);
+        return Err(RunResultInvariant::ResultStructure);
     }
 
-    let total_nodes = result.steps.len()
-        + result
-            .finalization
-            .as_ref()
-            .map_or(0, |finalization| finalization.finalizers.len());
     let mut ids = BTreeSet::new();
     validate_steps(
         &result.steps,
         WorkflowNodeRoleV1::Step,
-        total_nodes,
+        maximum_stream_bytes,
         &mut ids,
-    )?;
+    )
+    .map_err(|_| RunResultInvariant::StepMetadata)?;
     if let Some(finalization) = &result.finalization {
         validate_steps(
             &finalization.finalizers,
             WorkflowNodeRoleV1::Finalizer,
-            total_nodes,
+            maximum_stream_bytes,
             &mut ids,
-        )?;
-        validate_finalization(finalization)?;
+        )
+        .map_err(|_| RunResultInvariant::FinalizationMetadata)?;
+        validate_finalization(finalization)
+            .map_err(|_| RunResultInvariant::FinalizationMetadata)?;
     }
-    validate_outcome(result)?;
-    validate_exports(&result.exports)
+    validate_outcome(result).map_err(|_| RunResultInvariant::OutcomeMetadata)?;
+    validate_exports(&result.exports).map_err(|_| RunResultInvariant::ExportMetadata)
 }
 
 fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
@@ -495,10 +512,9 @@ fn cancellation_detail(reason: CancellationReasonV1) -> CancellationDetail {
 fn validate_steps(
     steps: &[WorkflowStepV1],
     expected_role: WorkflowNodeRoleV1,
-    total_nodes: usize,
+    maximum_stream_bytes: u64,
     ids: &mut BTreeSet<String>,
 ) -> Result<(), ResultMetadataError> {
-    let maximum_stream_bytes = super::maximum_retained_bytes_per_stream(total_nodes);
     for step in steps {
         if !is_identifier(&step.id)
             || !ids.insert(step.id.clone())
@@ -586,12 +602,15 @@ fn validate_steps(
         {
             return Err(ResultMetadataError);
         }
-        validate_step_recovery(step)?;
+        validate_step_recovery(step, maximum_stream_bytes)?;
     }
     Ok(())
 }
 
-fn validate_step_recovery(step: &WorkflowStepV1) -> Result<(), ResultMetadataError> {
+fn validate_step_recovery(
+    step: &WorkflowStepV1,
+    maximum_stream_bytes: u64,
+) -> Result<(), ResultMetadataError> {
     let Some(recovery) = &step.recovery else {
         return step
             .invocations
@@ -647,7 +666,7 @@ fn validate_step_recovery(step: &WorkflowStepV1) -> Result<(), ResultMetadataErr
         }
         for diagnostic in &invocation.diagnostics {
             if !is_canonical_relative_path(&diagnostic.reference)
-                || !valid_stream(&diagnostic.stream, super::MAXIMUM_RETAINED_BYTES_PER_STREAM)
+                || !valid_stream(&diagnostic.stream, maximum_stream_bytes)
             {
                 return Err(ResultMetadataError);
             }

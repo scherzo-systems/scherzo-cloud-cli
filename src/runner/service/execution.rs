@@ -1076,6 +1076,13 @@ impl ExecutionJob {
                 .execution()
                 .limits()
                 .maximum_parallel_steps(),
+            maximum_retained_bytes_per_stream: self
+                .accepted
+                .admitted
+                .execution()
+                .limits()
+                .maximum_step_log_bytes()
+                .get(),
             cloud_capacity: Some(cloud_execution_capacity(&self.accepted.admitted)),
             timing: WorkflowRunTiming {
                 started_at: started_at.utc,

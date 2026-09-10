@@ -136,6 +136,25 @@ fn encode(value: &Value) -> Vec<u8> {
 }
 
 #[test]
+fn invalid_result_metadata_reports_a_closed_field_category() {
+    let valid: WorkflowResultV1 = serde_json::from_value(result_fixture()).unwrap();
+
+    let mut invalid_execution = valid.clone();
+    invalid_execution.execution.execution_root = Some("relative".to_owned());
+    assert_eq!(
+        validate_with_invariant(&invalid_execution),
+        Err(RunResultInvariant::ExecutionMetadata)
+    );
+
+    let mut invalid_step = valid;
+    invalid_step.steps[0].id.clear();
+    assert_eq!(
+        validate_with_invariant(&invalid_step),
+        Err(RunResultInvariant::StepMetadata)
+    );
+}
+
+#[test]
 fn finalization_metadata_rejects_role_issue_and_force_mismatches() {
     let valid = finalized_result_fixture();
     assert!(decode(&encode(&valid)).is_ok());
@@ -287,9 +306,8 @@ fn accepts_stream_at_shared_retention_cap_and_rejects_larger_claim() {
 }
 
 #[test]
-fn partitions_the_durable_stream_budget_across_maximum_step_count() {
-    let step_count = 256;
-    let maximum = super::super::maximum_retained_bytes_per_stream(step_count);
+fn accepts_stream_truncated_at_the_declared_admitted_limit() {
+    let maximum = 1_024_u64;
     let retained = vec![b'x'; usize::try_from(maximum).unwrap()];
     let stream = json!({
         "encoding": "base64",
@@ -300,50 +318,30 @@ fn partitions_the_durable_stream_budget_across_maximum_step_count() {
         "fullyDrained": true
     });
     let mut result = result_fixture();
-    let command = json!({
-        "id": "step0",
-        "role": "step",
-        "kind": "cmd",
-        "failurePolicy": "required",
-        "state": "succeeded",
-        "startedAt": "2026-08-02T12:01:44Z",
-        "durationMilliseconds": 1000,
-        "commandOutput": {
-            "stdout": stream,
-            "stderr": {
-                "encoding": "base64",
-                "data": "",
-                "retainedBytes": 0,
-                "discardedBytes": 0,
-                "truncated": false,
-                "fullyDrained": true
-            }
+    result["commandOutputPolicy"]["maximumRetainedBytesPerStream"] = json!(maximum);
+    result["steps"][0]["kind"] = json!("cmd");
+    result["steps"][0]["commandOutput"] = json!({
+        "stdout": stream,
+        "stderr": {
+            "encoding": "base64",
+            "data": "",
+            "retainedBytes": 0,
+            "discardedBytes": 0,
+            "truncated": false,
+            "fullyDrained": true
         }
     });
-    let agents = (1..step_count).map(|index| {
-        json!({
-            "id": format!("step{index}"),
-            "role": "step",
-            "kind": "agent",
-            "failurePolicy": "required",
-            "state": "succeeded",
-            "startedAt": "2026-08-02T12:01:44Z",
-            "durationMilliseconds": 1000
-        })
-    });
-    result["steps"] = Value::Array(std::iter::once(command).chain(agents).collect());
 
     assert!(decode(&encode(&result)).is_ok());
 
-    let oversized = vec![b'x'; usize::try_from(maximum + 1).unwrap()];
-    result["steps"][0]["commandOutput"]["stdout"] = json!({
-        "encoding": "base64",
-        "data": BASE64_STANDARD.encode(oversized),
-        "retainedBytes": maximum + 1,
-        "discardedBytes": 0,
-        "truncated": false,
-        "fullyDrained": true
-    });
+    let mut underfilled = result.clone();
+    underfilled["steps"][0]["commandOutput"]["stdout"]["data"] =
+        json!(BASE64_STANDARD.encode(&retained[..retained.len() - 1]));
+    underfilled["steps"][0]["commandOutput"]["stdout"]["retainedBytes"] = json!(maximum - 1);
+    assert_eq!(decode(&encode(&underfilled)), Err(ResultMetadataError));
+
+    result["commandOutputPolicy"]["maximumRetainedBytesPerStream"] =
+        json!(super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM + 1);
     assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
 }
 

@@ -1712,7 +1712,9 @@
               "const": "base64"
             },
             "maximumRetainedBytesPerStream": {
-              "const": 4194304
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4194304
             }
           }
         },

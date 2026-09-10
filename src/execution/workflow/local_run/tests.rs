@@ -35,6 +35,10 @@ impl AdmittedFixture {
     }
 
     fn from_source(source: &str) -> Self {
+        Self::from_source_with_maximum_step_log_bytes(source, 1024)
+    }
+
+    fn from_source_with_maximum_step_log_bytes(source: &str, maximum_step_log_bytes: u64) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -59,7 +63,7 @@ impl AdmittedFixture {
                     2,
                     CaptureLimits::new(16, 1024, 4096),
                     InputLimits::new(16, 1024, 4096, 4096),
-                    1024,
+                    maximum_step_log_bytes,
                 ),
                 EnvironmentSnapshot::default(),
                 CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
@@ -1419,11 +1423,59 @@ fn archived_attempt_reports_each_nonpublished_disposition_without_fallback() {
         ArchivedAttemptIneligibilityReason::Unpublished,
     );
 
-    run.record_result_publication_failed(PublicationFailurePhaseV1::Serialization)
+    run.record_result_publication_failed(PublicationFailurePhaseV1::Serialization, None)
         .unwrap();
     assert_archive_ineligible(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
         ArchivedAttemptIneligibilityReason::PublicationFailed,
+    );
+}
+
+#[test]
+fn publication_failure_persists_only_the_closed_result_invariant() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("publication-invariant");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+
+    run.record_result_publication_failed(
+        PublicationFailurePhaseV1::Serialization,
+        Some(RunResultInvariant::ExportValues),
+    )
+    .unwrap();
+
+    let state = read_state(run.root_handle()).unwrap();
+    assert!(matches!(
+        &state.attempts[0].result,
+        AttemptResultV1::PublicationFailed {
+            phase: PublicationFailurePhaseV1::Serialization,
+            result_invariant: Some(RunResultInvariant::ExportValues),
+        }
+    ));
+    let status = read_local_run_status(&run_path).unwrap();
+    assert_eq!(
+        status.state["attempts"][0]["result"],
+        serde_json::json!({
+            "status": "publication_failed",
+            "phase": "serialization",
+            "resultInvariant": "export_values"
+        })
+    );
+
+    let diagnostic = state.diagnostics.last().unwrap();
+    assert_eq!(diagnostic.code, DiagnosticCodeV1::ResultPublicationFailure);
+    assert_eq!(diagnostic.step_id, None);
+    assert_eq!(diagnostic.action_id, None);
+    assert_eq!(diagnostic.guard_id, None);
+
+    let mut inconsistent = state;
+    inconsistent.attempts[0].result = AttemptResultV1::PublicationFailed {
+        phase: PublicationFailurePhaseV1::Rename,
+        result_invariant: Some(RunResultInvariant::ExportValues),
+    };
+    assert_eq!(
+        decode_state(&encode_json(&inconsistent).unwrap()),
+        Err(LocalRunDirectoryError::StateInvalid)
     );
 }
 
@@ -1545,13 +1597,17 @@ fn archived_attempt_loads_cancelled_commands_that_never_started() {
 
 #[test]
 fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
+    let maximum_retained_bytes_per_stream = 131_072_u64;
     let mut source = String::from("schemaVersion: 1\nsteps:\n");
     for index in 0..256 {
         source.push_str(&format!(
             "  step{index}:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
         ));
     }
-    let fixture = AdmittedFixture::from_source(&source);
+    let fixture = AdmittedFixture::from_source_with_maximum_step_log_bytes(
+        &source,
+        maximum_retained_bytes_per_stream,
+    );
     let run_path = fixture.run_path("archive-large-result");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
     settle_as_succeeded(&run);
@@ -1561,8 +1617,11 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
     let run_document = read_run(run.root_handle()).unwrap();
     let stream = serde_json::json!({
         "encoding": "base64",
-        "data": BASE64_STANDARD.encode(vec![b'x'; 131_072]),
-        "retainedBytes": 131_072,
+        "data": BASE64_STANDARD.encode(vec![
+            b'x';
+            usize::try_from(maximum_retained_bytes_per_stream).unwrap()
+        ]),
+        "retainedBytes": maximum_retained_bytes_per_stream,
         "discardedBytes": 0,
         "truncated": false,
         "fullyDrained": true
@@ -1610,7 +1669,12 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
         },
         "commandOutputPolicy": {
             "encoding": "base64",
-            "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
+            "maximumRetainedBytesPerStream": fixture
+                .admitted
+                .execution()
+                .limits()
+                .maximum_step_log_bytes()
+                .get()
         },
         "outcome": "succeeded",
         "steps": steps,

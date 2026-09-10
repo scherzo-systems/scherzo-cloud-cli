@@ -1,0 +1,77 @@
+schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf '{\"status\":\"ready\"}\n' > report.json"]
+    outputs:
+      report:
+        kind: file
+        from: path
+        path: report.json
+        mediaType: application/json
+  validateAndReview:
+    kind: cmd
+    dependsOn: [produce]
+    recovery:
+      retries: 10
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"retry target","reason":"target remains invalid"}' > "$SCHERZO_RECOVERY_RESULT"
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          count=0
+          if test -f attempts; then
+            count=$(cat attempts)
+          fi
+          count=$((count + 1))
+          printf '%s' "$count" > attempts
+          if test "$count" -eq 11; then
+            head -c 3145728 /dev/zero
+          fi
+          exit 75
+    outputs:
+      review:
+        kind: file
+        from: path
+        path: review.json
+        mediaType: application/json
+  package:
+    kind: cmd
+    dependsOn: [validateAndReview]
+    command:
+      argv: ["/bin/sh", "-c", "printf packaged > package.txt"]
+    outputs:
+      package:
+        kind: file
+        from: path
+        path: package.txt
+        mediaType: text/plain
+finalizers:
+  cleanup:
+    kind: cmd
+    failurePolicy: advisory
+    when: [failed]
+    command:
+      argv: ["/bin/sh", "-c", "printf cleanup-complete > cleanup.txt"]
+  successReport:
+    kind: cmd
+    failurePolicy: advisory
+    when: [succeeded]
+    command:
+      argv: ["/bin/true"]
+exports:
+  availableReport:
+    ref: outputs.produce.report
+  failedReview:
+    ref: outputs.validateAndReview.review
+  blockedPackage:
+    ref: outputs.package.package

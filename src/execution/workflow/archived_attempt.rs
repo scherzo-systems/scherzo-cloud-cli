@@ -632,7 +632,10 @@ fn validate_and_project_result(
         || result
             .command_output_policy
             .maximum_retained_bytes_per_stream
-            != super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+            > workflow
+                .capacity
+                .requirements
+                .maximum_retained_bytes_per_invocation
         || !is_canonical_relative_path(&result.workflow.path)
         || !is_canonical_absolute_path(source_root)
         || !is_canonical_absolute_path(execution_root)
@@ -730,7 +733,9 @@ fn project_steps(
     {
         return Err(());
     }
-    let maximum_stream_bytes = super::maximum_retained_bytes_per_stream(result.steps.len());
+    let maximum_stream_bytes = result
+        .command_output_policy
+        .maximum_retained_bytes_per_stream;
     result
         .steps
         .iter()
@@ -808,8 +813,9 @@ fn project_finalization(
         }
         _ => return Err(()),
     };
-    let maximum_stream_bytes =
-        super::maximum_retained_bytes_per_stream(result.steps.len() + wire.finalizers.len());
+    let maximum_stream_bytes = result
+        .command_output_policy
+        .maximum_retained_bytes_per_stream;
     let finalizers = wire
         .finalizers
         .iter()

@@ -2704,6 +2704,11 @@ mod tests {
                 content_digest: admitted.workflow().content_digest.clone(),
                 execution_root: admitted.execution().root().to_owned(),
                 maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
+                maximum_retained_bytes_per_stream: admitted
+                    .execution()
+                    .limits()
+                    .maximum_step_log_bytes()
+                    .get(),
                 cloud_capacity: Some(crate::runner::service::execution::cloud_execution_capacity(
                     &admitted,
                 )),

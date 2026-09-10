@@ -268,6 +268,51 @@ fn status_schema_rejects_active_ownership_with_eligible_retry() {
 }
 
 #[test]
+fn status_schema_bounds_result_publication_invariants() {
+    let (_bundle, run_directory) = completed_run("status-schema-result-invariant");
+    let (output, mut value) = status_json(&run_directory);
+    assert!(output.status.success());
+    value["state"]["attempts"][0]["result"] = serde_json::json!({
+        "status": "publication_failed",
+        "phase": "serialization",
+        "resultInvariant": "export_values"
+    });
+    value["state"]["diagnostics"] = serde_json::json!([{
+        "sequence": 1,
+        "attemptNumber": 1,
+        "code": "result_publication_failure"
+    }]);
+    assert!(status_schema().is_valid(&value));
+
+    value["state"]["attempts"][0]["result"]["phase"] = serde_json::json!("rename");
+    assert!(!status_schema().is_valid(&value));
+    value["state"]["attempts"][0]["result"]["phase"] = serde_json::json!("serialization");
+    value["state"]["attempts"][0]["result"]["resultInvariant"] =
+        serde_json::json!("export_values:secret");
+    assert!(!status_schema().is_valid(&value));
+
+    let mut interrupted: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/workflow-status/v1/valid/settled-interrupted.json"
+    )))
+    .unwrap();
+    interrupted["state"]["attempts"][0]["result"]["resultInvariant"] =
+        serde_json::json!("export_values");
+    assert!(!status_schema().is_valid(&interrupted));
+    interrupted["state"]["attempts"][0]["result"] = serde_json::json!({
+        "status": "not_published",
+        "reason": "interrupted"
+    });
+    interrupted["state"]["diagnostics"] = serde_json::json!([{
+        "sequence": 1,
+        "attemptNumber": 1,
+        "code": "result_publication_failure",
+        "resultInvariant": "export_values"
+    }]);
+    assert!(!status_schema().is_valid(&interrupted));
+}
+
+#[test]
 fn closed_status_schema_accepts_positive_and_rejects_negative_fixtures() {
     let validator = status_schema();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workflow-status/v1");

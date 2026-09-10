@@ -38,7 +38,7 @@ use super::workflow_run::{
     wait_for_process_poll,
 };
 
-fn workflow_view_schema() -> jsonschema::Validator {
+pub(super) fn workflow_view_schema() -> jsonschema::Validator {
     let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/schemas/workflow-view-result-v1.schema.json"

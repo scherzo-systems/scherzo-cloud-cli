@@ -22,6 +22,7 @@ use super::claude_code_installation::{
 };
 use super::codex_installation::CodexFixture;
 use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
+use super::workflow_view::workflow_view_schema;
 use super::{
     CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES, poll_until,
 };
@@ -1080,6 +1081,129 @@ fn finalization_runs_after_ordinary_failure_and_is_durable_before_publication() 
         "failed"
     );
     assert_eq!(status["retry"]["eligible"], true);
+}
+
+#[test]
+fn settled_failed_run_is_published_with_recovery_finalization_and_truthful_exports() {
+    let bundle = RunBundle::new(include_str!(
+        "../fixtures/workflow-run/settled-failure-publication.yaml"
+    ));
+    let destination = bundle.result("settled-failure-publication");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = run(&args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &terminal["result"];
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["primaryIssue"]["node"]["id"], "validateAndReview");
+    assert_eq!(result["primaryIssue"]["node"]["role"], "step");
+    assert_eq!(result["steps"][0]["id"], "produce");
+    assert_eq!(result["steps"][0]["state"], "succeeded");
+    assert_eq!(result["steps"][1]["id"], "validateAndReview");
+    assert_eq!(result["steps"][1]["state"], "failed");
+    assert_eq!(
+        result["steps"][1]["recovery"]["termination"],
+        serde_json::json!({"kind": "exhausted", "executionNumber": 11})
+    );
+    let invocations = result["steps"][1]["invocations"].as_array().unwrap();
+    assert_eq!(invocations.len(), 21);
+    let admitted_retention = (64_u64 * 1024 * 1024) / 25;
+    assert_eq!(
+        result["commandOutputPolicy"]["maximumRetainedBytesPerStream"],
+        admitted_retention
+    );
+    let command_stdout = &result["steps"][1]["commandOutput"]["stdout"];
+    assert_eq!(command_stdout["retainedBytes"], admitted_retention);
+    assert_eq!(
+        command_stdout["discardedBytes"],
+        3_u64 * 1024 * 1024 - admitted_retention
+    );
+    assert_eq!(command_stdout["truncated"], true);
+    let terminal_invocation = invocations.last().unwrap();
+    assert_eq!(terminal_invocation["role"], "target");
+    assert_eq!(terminal_invocation["targetExecution"], 11);
+    let invocation_stdout = terminal_invocation["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["kind"] == "command_stdout")
+        .unwrap();
+    assert_eq!(invocation_stdout["stream"], *command_stdout);
+    assert_eq!(result["steps"][2]["id"], "package");
+    assert_eq!(result["steps"][2]["state"], "blocked");
+    assert_eq!(result["finalization"]["trigger"], "failed");
+    assert_eq!(result["finalization"]["finalizers"][0]["id"], "cleanup");
+    assert_eq!(
+        result["finalization"]["finalizers"][0]["failurePolicy"],
+        "advisory"
+    );
+    assert_eq!(
+        result["finalization"]["finalizers"][0]["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        result["finalization"]["finalizers"][1]["id"],
+        "successReport"
+    );
+    assert_eq!(result["finalization"]["finalizers"][1]["state"], "not_run");
+    assert_eq!(result["exports"]["availableReport"]["state"], "available");
+    assert_eq!(
+        result["exports"]["failedReview"],
+        serde_json::json!({"state": "unavailable", "reason": "source_failed"})
+    );
+    assert_eq!(
+        result["exports"]["blockedPackage"],
+        serde_json::json!({"state": "unavailable", "reason": "source_blocked"})
+    );
+    assert_eq!(result_json(&destination), *result);
+    assert_eq!(
+        fs::read(bundle.execution_root().join("cleanup.txt")).unwrap(),
+        b"cleanup-complete"
+    );
+
+    let status = isolated_command(&[
+        "workflow".to_owned(),
+        "status".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["state"]["attempts"][0]["state"], "workflow_failed");
+    assert_eq!(
+        status["state"]["attempts"][0]["result"]["status"],
+        "published"
+    );
+    assert_eq!(status["retry"], serde_json::json!({"eligible": true}));
+
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(
+        view.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&view.stdout),
+        String::from_utf8_lossy(&view.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&view));
+    assert_eq!(view["result"], *result);
 }
 
 #[test]
