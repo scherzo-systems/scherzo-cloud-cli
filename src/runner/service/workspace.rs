@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,8 +10,11 @@ use std::time::Duration;
 
 use fs4::{FileExt, TryLockError};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, fstat, openat, statat};
+use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use super::workflow_git::WorkflowGitAuthority;
+use crate::execution::owned_tree::{self, RemovalError};
 
 const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
 const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
@@ -87,7 +91,7 @@ pub(super) enum AssignmentRootCreationError {
 }
 
 pub(super) trait TreeRemover: Send + Sync {
-    fn remove_tree(&self, path: &Path) -> io::Result<()>;
+    fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()>;
 }
 
 pub(super) trait CleanupSleeper: Send + Sync {
@@ -101,9 +105,34 @@ pub(super) trait WorkRootHook: Send + Sync {
 struct SystemTreeRemover;
 
 impl TreeRemover for SystemTreeRemover {
-    fn remove_tree(&self, path: &Path) -> io::Result<()> {
-        fs::remove_dir_all(path)
+    fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
+        match tree.validate(false) {
+            Ok(TreePresence::Present) => {}
+            Ok(TreePresence::Missing) => return Err(io::ErrorKind::NotFound.into()),
+            Err(()) => return Err(safety_removal_error()),
+        }
+        let link = tree.link().ok_or_else(safety_removal_error)?;
+        owned_tree::remove_open_tree_at(
+            link.parent.as_ref(),
+            link.identity.as_ref(),
+            link.directory.as_ref(),
+        )
+        .map_err(|error| match error {
+            RemovalError::Filesystem(error) => filesystem_removal_error(error),
+            RemovalError::Replaced => safety_removal_error(),
+        })
     }
+}
+
+fn filesystem_removal_error(error: Errno) -> io::Error {
+    io::Error::from_raw_os_error(error.raw_os_error())
+}
+
+fn safety_removal_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "owned tree changed during removal",
+    )
 }
 
 struct InterruptibleSleeper;
@@ -255,7 +284,7 @@ impl CleanupEngine {
             if self.cancellation.is_cancelled() {
                 return CleanupResult::Preempted;
             }
-            let removal = self.remover.remove_tree(&tree.path);
+            let removal = self.remover.remove_tree(tree);
             marker_may_be_missing = true;
             match removal {
                 Ok(()) => match tree.validate(true) {
@@ -266,7 +295,16 @@ impl CleanupEngine {
                     }
                 },
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return CleanupResult::Released;
+                    match tree.validate(true) {
+                        Ok(TreePresence::Missing) => return CleanupResult::Released,
+                        Ok(TreePresence::Present) => {}
+                        Err(()) => {
+                            return CleanupResult::Quarantined(CleanupFailure::Safety);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    return CleanupResult::Quarantined(CleanupFailure::Safety);
                 }
                 Err(_) => {}
             }
@@ -282,82 +320,189 @@ impl CleanupEngine {
 
 #[derive(Clone)]
 struct MarkerProof {
-    path: PathBuf,
+    parent: Arc<OwnedFd>,
     contents: &'static [u8],
     device: u64,
     inode: u64,
 }
 
 impl MarkerProof {
-    fn capture(path: PathBuf, contents: &'static [u8]) -> Result<Self, ()> {
-        let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
+    fn capture(parent: Arc<OwnedFd>, contents: &'static [u8]) -> Result<Self, ()> {
+        let metadata = statat(
+            parent.as_ref(),
+            OWNERSHIP_MARKER_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| ())?;
         let proof = Self {
-            path,
+            parent,
             contents,
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
         };
         verify_marker(&proof)?;
         Ok(proof)
     }
+
+    fn is_missing(&self) -> bool {
+        matches!(
+            statat(
+                self.parent.as_ref(),
+                OWNERSHIP_MARKER_NAME,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ),
+            Err(Errno::NOENT)
+        )
+    }
 }
 
 #[derive(Clone)]
-struct OwnedTree {
-    path: PathBuf,
-    parent_device: u64,
-    parent_inode: u64,
+struct DirectoryLink {
+    parent: Arc<OwnedFd>,
+    identity: Arc<str>,
+    directory: Arc<OwnedFd>,
     device: u64,
     inode: u64,
+}
+
+impl DirectoryLink {
+    fn capture(parent: Arc<OwnedFd>, identity: Arc<str>) -> Result<Self, ()> {
+        let observed = statat(
+            parent.as_ref(),
+            identity.as_ref(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| ())?;
+        let directory = Arc::new(
+            owned_tree::open_directory_at(parent.as_ref(), identity.as_ref()).map_err(|_| ())?,
+        );
+        let opened = fstat(directory.as_ref()).map_err(|_| ())?;
+        let named = statat(
+            parent.as_ref(),
+            identity.as_ref(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| ())?;
+        if !safe_owned_directory_stat(&observed)
+            || !safe_owned_directory_stat(&opened)
+            || !safe_owned_directory_stat(&named)
+            || opened.st_dev != observed.st_dev
+            || opened.st_ino != observed.st_ino
+            || opened.st_dev != named.st_dev
+            || opened.st_ino != named.st_ino
+        {
+            return Err(());
+        }
+        Ok(Self {
+            parent,
+            identity,
+            directory,
+            device: opened.st_dev,
+            inode: opened.st_ino,
+        })
+    }
+
+    fn validate(&self) -> Result<TreePresence, ()> {
+        let opened = fstat(self.directory.as_ref()).map_err(|_| ())?;
+        if !safe_owned_directory_stat(&opened)
+            || opened.st_dev != self.device
+            || opened.st_ino != self.inode
+        {
+            return Err(());
+        }
+        let named = match statat(
+            self.parent.as_ref(),
+            self.identity.as_ref(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(metadata) => metadata,
+            Err(Errno::NOENT) => return Ok(TreePresence::Missing),
+            Err(_) => return Err(()),
+        };
+        if !safe_owned_directory_stat(&named)
+            || named.st_dev != self.device
+            || named.st_ino != self.inode
+        {
+            return Err(());
+        }
+        Ok(TreePresence::Present)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct OwnedTree {
+    path: PathBuf,
+    lineage: Vec<DirectoryLink>,
     marker: Option<MarkerProof>,
 }
 
+#[derive(Clone, Copy)]
 enum TreePresence {
     Missing,
     Present,
 }
 
 impl OwnedTree {
-    fn capture(parent: &Path, path: PathBuf, marker: Option<MarkerProof>) -> Result<Self, ()> {
-        let parent_metadata = safe_directory(parent)?;
-        let metadata = safe_directory(&path)?;
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn capture_root(parent: &File, path: PathBuf) -> Result<Self, ()> {
+        let parent = Arc::new(fcntl_dupfd_cloexec(parent, 0).map_err(|_| ())?);
+        Self::capture_with_parent(Vec::new(), parent, path)
+    }
+
+    fn capture_child(parent: &Self, path: PathBuf) -> Result<Self, ()> {
+        if path.parent() != Some(parent.path()) {
+            return Err(());
+        }
+        let directory = Arc::clone(&parent.link().ok_or(())?.directory);
+        Self::capture_with_parent(parent.lineage.clone(), directory, path)
+    }
+
+    fn capture_with_parent(
+        mut lineage: Vec<DirectoryLink>,
+        parent: Arc<OwnedFd>,
+        path: PathBuf,
+    ) -> Result<Self, ()> {
+        let identity = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(Arc::<str>::from)
+            .ok_or(())?;
+        lineage.push(DirectoryLink::capture(parent, identity)?);
         Ok(Self {
             path,
-            parent_device: parent_metadata.dev(),
-            parent_inode: parent_metadata.ino(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            marker,
+            lineage,
+            marker: None,
         })
     }
 
+    fn link(&self) -> Option<&DirectoryLink> {
+        self.lineage.last()
+    }
+
+    fn directory(&self) -> Result<&Arc<OwnedFd>, ()> {
+        self.link().map(|link| &link.directory).ok_or(())
+    }
+
+    fn install_marker(&mut self, marker: MarkerProof) {
+        self.marker = Some(marker);
+    }
+
     fn validate(&self, marker_may_be_missing: bool) -> Result<TreePresence, ()> {
-        let parent = self.path.parent().ok_or(())?;
-        let parent_metadata = safe_directory(parent)?;
-        if parent_metadata.dev() != self.parent_device || parent_metadata.ino() != self.parent_inode
-        {
-            return Err(());
-        }
-        let metadata = match fs::symlink_metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(TreePresence::Missing);
+        let last = self.lineage.len().checked_sub(1).ok_or(())?;
+        for (index, link) in self.lineage.iter().enumerate() {
+            match link.validate()? {
+                TreePresence::Present => {}
+                TreePresence::Missing if index == last => return Ok(TreePresence::Missing),
+                TreePresence::Missing => return Err(()),
             }
-            Err(_) => return Err(()),
-        };
-        if !safe_owned_directory(&metadata)
-            || metadata.dev() != self.device
-            || metadata.ino() != self.inode
-        {
-            return Err(());
         }
         if let Some(marker) = &self.marker {
             match verify_marker(marker) {
                 Ok(()) => {}
-                Err(())
-                    if marker_may_be_missing
-                        && fs::symlink_metadata(&marker.path)
-                            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+                Err(()) if marker_may_be_missing && marker.is_missing() => {}
                 Err(()) => return Err(()),
             }
         }
@@ -376,28 +521,50 @@ fn safe_owned_directory(metadata: &Metadata) -> bool {
         && metadata.mode() & 0o7777 == PRIVATE_DIRECTORY_MODE
 }
 
+fn safe_owned_directory_stat(metadata: &Stat) -> bool {
+    FileType::from_raw_mode(metadata.st_mode) == FileType::Directory
+        && metadata.st_uid == rustix::process::geteuid().as_raw()
+        && metadata.st_mode & 0o7777 == PRIVATE_DIRECTORY_MODE
+}
+
 fn verify_marker(marker: &MarkerProof) -> Result<(), ()> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(NOFOLLOW_FLAG)
-        .open(&marker.path)
-        .map_err(|_| ())?;
-    let metadata = file.metadata().map_err(|_| ())?;
-    let path_metadata = fs::symlink_metadata(&marker.path).map_err(|_| ())?;
-    if !safe_private_file(&metadata)
-        || path_metadata.dev() != metadata.dev()
-        || path_metadata.ino() != metadata.ino()
-        || metadata.dev() != marker.device
-        || metadata.ino() != marker.inode
+    let descriptor = openat(
+        marker.parent.as_ref(),
+        OWNERSHIP_MARKER_NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ())?;
+    let metadata = fstat(&descriptor).map_err(|_| ())?;
+    let named = statat(
+        marker.parent.as_ref(),
+        OWNERSHIP_MARKER_NAME,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|_| ())?;
+    if !safe_private_file_stat(&metadata)
+        || !safe_private_file_stat(&named)
+        || named.st_dev != metadata.st_dev
+        || named.st_ino != metadata.st_ino
+        || metadata.st_dev != marker.device
+        || metadata.st_ino != marker.inode
     {
         return Err(());
     }
+    let mut file = File::from(descriptor);
     let mut contents = Vec::with_capacity(marker.contents.len());
     std::io::Read::by_ref(&mut file)
         .take(u64::try_from(marker.contents.len()).map_err(|_| ())? + 1)
         .read_to_end(&mut contents)
         .map_err(|_| ())?;
     (contents == marker.contents).then_some(()).ok_or(())
+}
+
+fn safe_private_file_stat(metadata: &Stat) -> bool {
+    FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile
+        && metadata.st_uid == rustix::process::geteuid().as_raw()
+        && metadata.st_mode & 0o7777 == PRIVATE_FILE_MODE
+        && metadata.st_nlink == 1
 }
 
 fn safe_private_file(metadata: &Metadata) -> bool {
@@ -481,10 +648,17 @@ impl WorkRootLease {
                 continue;
             }
             let path = work_root.join(name);
-            let marker = MarkerProof::capture(path.join(OWNERSHIP_MARKER_NAME), BOOT_MARKER)
+            let mut tree = OwnedTree::capture_root(&authority.shared.directory_lock, path.clone())
                 .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?;
-            let tree = OwnedTree::capture(work_root, path, Some(marker))
-                .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?;
+            let marker = MarkerProof::capture(
+                Arc::clone(
+                    tree.directory()
+                        .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?,
+                ),
+                BOOT_MARKER,
+            )
+            .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?;
+            tree.install_marker(marker);
             match engine.remove(&tree) {
                 CleanupResult::Released => {}
                 CleanupResult::Quarantined(CleanupFailure::Safety) => {
@@ -504,10 +678,11 @@ impl WorkRootLease {
             .map_err(|()| WorkRootError::UnsafeWorkRoot)?;
         let boot_path = work_root.join(boot_id);
         create_private_directory(&boot_path).map_err(|_| WorkRootError::CreateBootRoot)?;
-        let marker =
-            create_marker(&boot_path, BOOT_MARKER).map_err(|_| WorkRootError::CreateBootRoot)?;
-        let boot_tree = OwnedTree::capture(work_root, boot_path, Some(marker))
+        let mut boot_tree = OwnedTree::capture_root(&authority.shared.directory_lock, boot_path)
             .map_err(|_| WorkRootError::CreateBootRoot)?;
+        let marker =
+            create_marker(&boot_tree, BOOT_MARKER).map_err(|_| WorkRootError::CreateBootRoot)?;
+        boot_tree.install_marker(marker);
         Ok(Arc::new(Self {
             boot_tree,
             engine,
@@ -526,14 +701,12 @@ impl WorkRootLease {
         let assignment_path = self.boot_tree.path.join(assignment_id);
         create_private_directory(&assignment_path)
             .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
-        let assignment_marker = create_marker(&assignment_path, ASSIGNMENT_MARKER)
+        let mut assignment_tree =
+            OwnedTree::capture_child(&self.boot_tree, assignment_path.clone())
+                .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
+        let assignment_marker = create_marker(&assignment_tree, ASSIGNMENT_MARKER)
             .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
-        let assignment_tree = OwnedTree::capture(
-            &self.boot_tree.path,
-            assignment_path.clone(),
-            Some(assignment_marker.clone()),
-        )
-        .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
+        assignment_tree.install_marker(assignment_marker.clone());
         let private_path = assignment_path.join("private");
         let workspace_path = assignment_path.join("workspace");
         if create_private_directory(&private_path).is_err()
@@ -546,18 +719,20 @@ impl WorkRootLease {
                 }
             });
         }
-        let workspace_tree =
-            match OwnedTree::capture(&assignment_path, workspace_path, Some(assignment_marker)) {
-                Ok(tree) => tree,
-                Err(()) => {
-                    return Err(match self.engine.remove(&assignment_tree) {
-                        CleanupResult::Released => AssignmentRootCreationError::Unavailable,
-                        CleanupResult::Quarantined(_) | CleanupResult::Preempted => {
-                            AssignmentRootCreationError::CleanupFailed
-                        }
-                    });
-                }
-            };
+        let workspace_tree = match OwnedTree::capture_child(&assignment_tree, workspace_path) {
+            Ok(mut tree) => {
+                tree.install_marker(assignment_marker);
+                tree
+            }
+            Err(()) => {
+                return Err(match self.engine.remove(&assignment_tree) {
+                    CleanupResult::Released => AssignmentRootCreationError::Unavailable,
+                    CleanupResult::Quarantined(_) | CleanupResult::Preempted => {
+                        AssignmentRootCreationError::CleanupFailed
+                    }
+                });
+            }
+        };
         Ok(AssignmentRoot {
             assignment_tree,
             execution: workspace_tree.path.clone(),
@@ -674,22 +849,23 @@ fn create_private_directory(path: &Path) -> Result<(), ()> {
     safe_owned_directory(&metadata).then_some(()).ok_or(())
 }
 
-fn create_marker(parent: &Path, contents: &'static [u8]) -> Result<MarkerProof, ()> {
-    let path = parent.join(OWNERSHIP_MARKER_NAME);
-    let mut marker = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
-        .custom_flags(NOFOLLOW_FLAG)
-        .open(&path)
-        .map_err(|_| ())?;
+fn create_marker(parent: &OwnedTree, contents: &'static [u8]) -> Result<MarkerProof, ()> {
+    let directory = Arc::clone(parent.directory()?);
+    let descriptor = openat(
+        directory.as_ref(),
+        OWNERSHIP_MARKER_NAME,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| ())?;
+    let mut marker = File::from(descriptor);
     marker
         .set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))
         .and_then(|()| marker.write_all(contents))
         .and_then(|()| marker.sync_all())
         .map_err(|_| ())?;
     set_close_on_exec(&marker)?;
-    MarkerProof::capture(path, contents)
+    MarkerProof::capture(directory, contents)
 }
 
 #[derive(Clone)]
@@ -1017,7 +1193,8 @@ mod tests {
     }
 
     impl TreeRemover for ScriptedRemover {
-        fn remove_tree(&self, path: &Path) -> io::Result<()> {
+        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
+            let path = tree.path();
             self.calls.fetch_add(1, Ordering::Relaxed);
             match self
                 .outcomes
@@ -1083,6 +1260,35 @@ mod tests {
         }
     }
 
+    struct SubstitutingRemover {
+        displaced: PathBuf,
+        outside: PathBuf,
+        calls: AtomicUsize,
+    }
+
+    impl TreeRemover for SubstitutingRemover {
+        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                fs::rename(tree.path(), &self.displaced)?;
+                symlink(&self.outside, tree.path())?;
+            }
+            SystemTreeRemover.remove_tree(tree)
+        }
+    }
+
+    struct AncestorSubstitutingRemover {
+        ancestor: PathBuf,
+        displaced: PathBuf,
+    }
+
+    impl TreeRemover for AncestorSubstitutingRemover {
+        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
+            fs::rename(&self.ancestor, &self.displaced)?;
+            symlink(&self.displaced, &self.ancestor)?;
+            SystemTreeRemover.remove_tree(tree)
+        }
+    }
+
     #[derive(Default)]
     struct CountingHook(AtomicUsize);
 
@@ -1104,6 +1310,36 @@ mod tests {
         hook: Arc<dyn WorkRootHook>,
     ) -> WorkspaceFilesystem {
         WorkspaceFilesystem::injected(remover, sleeper, hook)
+    }
+
+    fn owner_with_remover(root: &Path, remover: Arc<dyn TreeRemover>) -> Arc<WorkRootLease> {
+        WorkRootLease::acquire_with(
+            root,
+            BOOT_A,
+            filesystem(
+                remover,
+                Arc::new(RecordingSleeper::default()),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn assignment_with_retained_file(owner: &WorkRootLease) -> AssignmentRoot {
+        let assignment = owner.create_assignment(ASSIGNMENT).unwrap();
+        fs::write(assignment.workspace.path().join("owned"), b"retained").unwrap();
+        assignment
+    }
+
+    fn release_workspace(assignment: &AssignmentRoot) -> CleanupResult {
+        assignment
+            .workspace
+            .release_pending(ProcessQuiescence::Proven)
+            .wait()
     }
 
     fn spawn_ready_helper_child() -> Child {
@@ -1325,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_removal_not_found_recovers_but_exhaustion_quarantines_enclosing_root() {
+    fn partial_removal_and_spurious_not_found_retry_but_exhaustion_quarantines() {
         let recovered_root = private_work_root();
         let recovered_remover =
             ScriptedRemover::new([RemovalOutcome::Partial, RemovalOutcome::NotFound]);
@@ -1352,12 +1588,9 @@ mod tests {
         );
         assert_eq!(
             *recovered_sleeper.delays.lock().unwrap(),
-            vec![REMOVAL_DELAYS[0]]
+            vec![REMOVAL_DELAYS[0], REMOVAL_DELAYS[1]]
         );
-        assert!(
-            workspace_path.exists(),
-            "injected NotFound leaves its fixture path"
-        );
+        assert!(!workspace_path.exists());
 
         let failed_root = private_work_root();
         let failed_remover = ScriptedRemover::new([RemovalOutcome::Error; 6]);
@@ -1413,19 +1646,110 @@ mod tests {
     }
 
     #[test]
+    fn assignment_release_removes_nested_read_only_inputs_without_following_links() {
+        let root = private_work_root();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"outside remains").unwrap();
+        fs::set_permissions(&sentinel, Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&outside, Permissions::from_mode(0o500)).unwrap();
+        let sentinel_mode = mode(&sentinel);
+        let outside_mode = mode(&outside);
+
+        let owner = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
+        let assignment = owner.create_assignment(ASSIGNMENT).unwrap();
+        let assignment_path = assignment.execution.parent().unwrap().to_owned();
+        fs::write(assignment.execution.join("ordinary"), b"writable sibling").unwrap();
+        let workflow = assignment.execution.join(
+            "delivery-rounds/0001/run/.private/workflow-fixture/.inputs-fixture/view-fixture",
+        );
+        let values = workflow.join("values");
+        fs::create_dir_all(&values).unwrap();
+        fs::write(values.join("result"), b"immutable input").unwrap();
+        symlink(&sentinel, workflow.join("outside-link")).unwrap();
+        fs::set_permissions(values.join("result"), Permissions::from_mode(0o400)).unwrap();
+        for directory in [
+            values.as_path(),
+            workflow.as_path(),
+            workflow.parent().unwrap(),
+            workflow.parent().unwrap().parent().unwrap(),
+        ] {
+            fs::set_permissions(directory, Permissions::from_mode(0o500)).unwrap();
+        }
+
+        assert_eq!(
+            assignment.release_pending(ProcessQuiescence::Proven).wait(),
+            CleanupResult::Released
+        );
+        assert!(!assignment_path.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside remains");
+        assert_eq!(mode(&sentinel), sentinel_mode);
+        assert_eq!(mode(&outside), outside_mode);
+
+        fs::set_permissions(&outside, Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn concurrent_root_substitution_fails_closed_without_mutating_the_outside_tree() {
+        let root = private_work_root();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"operator content").unwrap();
+        fs::set_permissions(&sentinel, Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&outside, Permissions::from_mode(0o500)).unwrap();
+        let displaced = root.path().join("displaced-workspace");
+        let remover = Arc::new(SubstitutingRemover {
+            displaced: displaced.clone(),
+            outside: outside.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let owner = owner_with_remover(root.path(), remover.clone());
+        let assignment = assignment_with_retained_file(&owner);
+
+        assert_eq!(
+            release_workspace(&assignment),
+            CleanupResult::Quarantined(CleanupFailure::Safety)
+        );
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fs::read(displaced.join("owned")).unwrap(), b"retained");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"operator content");
+        assert_eq!(mode(&sentinel), 0o400);
+        assert_eq!(mode(&outside), 0o500);
+
+        fs::set_permissions(&outside, Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn concurrent_ancestor_substitution_invalidates_workspace_authority() {
+        let root = private_work_root();
+        let boot = root.path().join(BOOT_A);
+        let displaced = root.path().join("displaced-boot");
+        let owner = owner_with_remover(
+            root.path(),
+            Arc::new(AncestorSubstitutingRemover {
+                ancestor: boot,
+                displaced: displaced.clone(),
+            }),
+        );
+        let assignment = assignment_with_retained_file(&owner);
+
+        assert_eq!(
+            release_workspace(&assignment),
+            CleanupResult::Quarantined(CleanupFailure::Safety)
+        );
+        assert_eq!(
+            fs::read(displaced.join(ASSIGNMENT).join("workspace").join("owned")).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[test]
     fn safety_and_quiescence_failures_make_no_destructive_call() {
         let root = private_work_root();
         let remover = ScriptedRemover::new([]);
-        let owner = WorkRootLease::acquire_with(
-            root.path(),
-            BOOT_A,
-            filesystem(
-                remover.clone(),
-                Arc::new(RecordingSleeper::default()),
-                Arc::new(NoopWorkRootHook),
-            ),
-        )
-        .unwrap();
+        let owner = owner_with_remover(root.path(), remover.clone());
         let assignment = owner.create_assignment(ASSIGNMENT).unwrap();
         let path = assignment.workspace.path();
         assert_eq!(
@@ -1440,16 +1764,7 @@ mod tests {
 
         let unsafe_root = private_work_root();
         let unsafe_remover = ScriptedRemover::new([]);
-        let unsafe_owner = WorkRootLease::acquire_with(
-            unsafe_root.path(),
-            BOOT_A,
-            filesystem(
-                unsafe_remover.clone(),
-                Arc::new(RecordingSleeper::default()),
-                Arc::new(NoopWorkRootHook),
-            ),
-        )
-        .unwrap();
+        let unsafe_owner = owner_with_remover(unsafe_root.path(), unsafe_remover.clone());
         let unsafe_assignment = unsafe_owner.create_assignment(ASSIGNMENT).unwrap();
         let workspace = unsafe_assignment.workspace.path();
         fs::remove_dir(&workspace).unwrap();

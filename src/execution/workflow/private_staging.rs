@@ -7,10 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, fchmod, fstat, mkdirat, open, openat, statat, unlinkat,
-};
+use rustix::fs::{AtFlags, Dir, Mode, OFlags, fchmod, fstat, mkdirat, open, openat, unlinkat};
 use rustix::io::Errno;
+
+use crate::execution::owned_tree::RemovalError;
+pub(super) use crate::execution::owned_tree::{remove_open_tree_at, remove_tree_at};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum StagingLifecycle {
@@ -78,32 +79,6 @@ pub(super) fn create_staging_root(
     Err(())
 }
 
-pub(super) fn remove_tree_at(parent: &OwnedFd, identity: &str) -> Result<(), Errno> {
-    let directory = match openat(parent, identity, directory_open_flags(), Mode::empty()) {
-        Ok(directory) => directory,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(failure) => return Err(failure),
-    };
-    remove_open_tree_at(parent, identity, &directory)
-}
-
-pub(super) fn remove_open_tree_at(
-    parent: &OwnedFd,
-    identity: &str,
-    directory: &OwnedFd,
-) -> Result<(), Errno> {
-    remove_directory_contents(directory)?;
-    let opened = fstat(directory)?;
-    let named = statat(parent, identity, AtFlags::SYMLINK_NOFOLLOW)?;
-    if opened.st_dev != named.st_dev
-        || opened.st_ino != named.st_ino
-        || FileType::from_raw_mode(named.st_mode) != FileType::Directory
-    {
-        return Err(Errno::IO);
-    }
-    unlinkat(parent, identity, AtFlags::REMOVEDIR)
-}
-
 pub(super) fn same_file(left: &OwnedFd, right: &OwnedFd) -> Result<bool, Errno> {
     let left = fstat(left)?;
     let right = fstat(right)?;
@@ -126,32 +101,8 @@ pub(super) fn remove_staging_root(
     parent: &OwnedFd,
     identity: &str,
     root: &OwnedFd,
-) -> Result<(), Errno> {
+) -> Result<(), RemovalError> {
     remove_open_tree_at(parent, identity, root)
-}
-
-fn remove_directory_contents(directory: &OwnedFd) -> Result<(), Errno> {
-    fchmod(directory, Mode::RWXU)?;
-    let entries = Dir::read_from(directory)?
-        .filter_map(|entry| match entry {
-            Ok(entry) if !matches!(entry.file_name().to_bytes(), b"." | b"..") => {
-                Some(Ok(entry.file_name().to_owned()))
-            }
-            Ok(_) => None,
-            Err(failure) => Some(Err(failure)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for name in entries {
-        let metadata = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
-            let child = openat(directory, &name, directory_open_flags(), Mode::empty())?;
-            remove_directory_contents(&child)?;
-            unlinkat(directory, &name, AtFlags::REMOVEDIR)?;
-        } else {
-            unlinkat(directory, &name, AtFlags::empty())?;
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn create_payload_file(path: &Path) -> io::Result<File> {

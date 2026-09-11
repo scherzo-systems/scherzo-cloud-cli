@@ -1392,7 +1392,7 @@ mod tests {
         with_watchdog,
     };
     use super::workspace::{
-        CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkRootLease,
+        CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkRootLease,
         WorkspaceFilesystem,
     };
     use super::{
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     impl TreeRemover for FailingBootRemover {
-        fn remove_tree(&self, _path: &Path) -> io::Result<()> {
+        fn remove_tree(&self, _tree: &OwnedTree) -> io::Result<()> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(io::Error::other("injected boot cleanup failure"))
         }

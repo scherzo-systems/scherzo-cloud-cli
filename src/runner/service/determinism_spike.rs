@@ -1,5 +1,4 @@
 use std::io;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +24,7 @@ use super::test_support::{
     with_watchdog,
 };
 use super::workspace::{
-    CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkRootLease,
+    CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkRootLease,
     WorkspaceFilesystem,
 };
 use super::{
@@ -79,7 +78,7 @@ async fn reconnect_backoff_reset_and_cancellation_have_a_deterministic_transcrip
 struct FailingTreeRemover;
 
 impl TreeRemover for FailingTreeRemover {
-    fn remove_tree(&self, _path: &Path) -> io::Result<()> {
+    fn remove_tree(&self, _tree: &OwnedTree) -> io::Result<()> {
         Err(io::Error::other("injected cleanup failure"))
     }
 }
@@ -148,7 +147,7 @@ struct GatedFirstRemoval {
 }
 
 impl TreeRemover for GatedFirstRemoval {
-    fn remove_tree(&self, path: &Path) -> io::Result<()> {
+    fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
         if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
             let _ = self.started.send(());
             self.release
@@ -157,7 +156,7 @@ impl TreeRemover for GatedFirstRemoval {
                 .recv()
                 .map_err(|_| io::Error::other("cleanup gate closed"))?;
         }
-        std::fs::remove_dir_all(path)
+        std::fs::remove_dir_all(tree.path())
     }
 }
 

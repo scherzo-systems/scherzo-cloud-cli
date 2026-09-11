@@ -3515,7 +3515,8 @@ mod tests {
         controlled_sleeper, fixture_lease_clock, with_watchdog,
     };
     use crate::runner::service::workspace::{
-        CleanupCancellation, CleanupSleeper, TreeRemover, WorkRootHook, WorkspaceFilesystem,
+        CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook,
+        WorkspaceFilesystem,
     };
     use crate::runner_protocol::{
         ArtifactRegistrationOutcome, ArtifactRegistrationResponse,
@@ -3530,6 +3531,7 @@ mod tests {
         "runner::service::assignment::tests::command_fixture_process";
     const FAILING_COMMAND_FIXTURE_TEST_NAME: &str =
         "runner::service::assignment::tests::failing_command_fixture_process";
+    const NESTED_WORKFLOW_FIXTURE_TEST_NAME: &str = "cli::tests::nested_workflow_fixture_process";
     // SCHERZO_* variables are intentionally removed from admitted command environments.
     const COMMAND_FIXTURE_SOCKET: &str = "WORKFLOW_ASSIGNMENT_COMMAND_FIXTURE_SOCKET";
 
@@ -3823,10 +3825,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     impl TreeRemover for CleanupRemover {
-        fn remove_tree(&self, path: &Path) -> io::Result<()> {
+        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.outcomes.lock().unwrap().pop_front().unwrap_or(true) {
-                fs::remove_dir_all(path)
+                fs::remove_dir_all(tree.path())
             } else {
                 Err(io::Error::other("injected cleanup failure"))
             }
@@ -5049,6 +5051,74 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         ));
         assert!(!workspace.exists());
         assert!(private.exists());
+    }
+
+    #[tokio::test]
+    async fn nested_workflow_result_survives_read_only_input_cleanup_and_assignment_release() {
+        let nested_arguments = serde_json::to_string(&command_fixture_arguments_for(
+            NESTED_WORKFLOW_FIXTURE_TEST_NAME,
+        ))
+        .unwrap();
+        let workflow = format!(
+            "schemaVersion: 1\nsteps:\n  nested:\n    kind: cmd\n    command:\n      argv: {nested_arguments}\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: delivery-rounds/0001/nested-result.txt\n        mediaType: text/plain\nexports:\n  nestedResult:\n    ref: outputs.nested.result\n"
+        );
+        let (_temporary, mut manager) = manager_fixture(&workflow);
+        let source = source_fixture_path(&manager);
+        fs::write(
+            source.join("nested.yaml"),
+            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"printf 'nested portable result' > nested.txt\"]\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: nested.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      payload:\n        ref: outputs.produce.result\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"mkdir -p ../run/.private/workflow-retained/.inputs-retained; cp -a \\\"$SCHERZO_STEP_INPUTS\\\" ../run/.private/workflow-retained/.inputs-retained/view-retained\"]\nexports:\n  portable:\n    ref: outputs.produce.result\n",
+        )
+        .unwrap();
+        run_fixture_git(&source, &["add", "nested.yaml"]);
+        run_fixture_git(&source, &["commit", "--quiet", "-m", "nested fixture"]);
+        let offered = offer("bg");
+        let assignment_path = manager.work_root.boot_path().join(&offered.assignment_id);
+        offer_then_prepare(&mut manager, &offered).await;
+        spawn_execution(&mut manager, &offered);
+
+        let pending = with_watchdog(wait_for_carrier_registration(&mut manager))
+            .await
+            .expect("nested result carrier registration was not reached");
+        let expected = b"nested portable result";
+        let expected_sha256 = ring::digest::digest(&ring::digest::SHA256, expected)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(pending.iter().any(|entry| matches!(
+            &entry.observation,
+            AssignmentObservation::Artifact {
+                request: ArtifactRequest::RegisterCarrier {
+                    portable_owner_path,
+                    media_type,
+                    size_bytes,
+                    sha256,
+                    ..
+                },
+                ..
+            } if portable_owner_path == "exports/0001"
+                && media_type == "text/plain"
+                && *size_bytes == u64::try_from(expected.len()).unwrap()
+                && sha256 == &expected_sha256
+        )));
+        assert!(!assignment_path.join("workspace").exists());
+        assert!(fail_pending_artifact_registrations(&mut manager, &pending));
+
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("nested workflow terminal report was not selected");
+        assert_succeeded(&reports);
+        let terminal_id = manager
+            .pending_observations(&BTreeSet::new(), 100)
+            .into_iter()
+            .find(|entry| entry.observation.is_terminal())
+            .unwrap()
+            .id;
+        manager.acknowledge_observation(terminal_id);
+        settle_cleanup(&mut manager).await;
+        assert!(!manager.cleanup_failed);
+        assert!(manager.slot.is_none());
+        assert!(!assignment_path.exists());
     }
 
     #[tokio::test]

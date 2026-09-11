@@ -706,14 +706,80 @@ fn print_help(command_path: &[&str]) -> CommandResult {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
 
     use clap::CommandFactory;
+    use serde_json::Value;
 
-    use super::{Cli, unreachable_outcome_class};
+    use super::{Cli, parse, unreachable_outcome_class};
     use crate::api::UnreachableCategory;
-    use crate::exit_code::OutcomeClass;
+    use crate::exit_code::{ExitCode, OutcomeClass};
+
+    #[test]
+    #[ignore = "launched only as the nested assignment workflow fixture"]
+    fn nested_workflow_fixture_process() {
+        let workspace = std::env::current_dir().unwrap();
+        let round = workspace.join("delivery-rounds/0001");
+        let execution = round.join("workspace");
+        let run = round.join("run");
+        fs::create_dir_all(&execution).unwrap();
+        let arguments = vec![
+            OsString::from("scherzo-cloud"),
+            OsString::from("workflow"),
+            OsString::from("run"),
+            OsString::from("--source-root"),
+            workspace.clone().into_os_string(),
+            OsString::from("--execution-root"),
+            execution.into_os_string(),
+            OsString::from("--run-dir"),
+            run.clone().into_os_string(),
+            OsString::from("--json"),
+            OsString::from("--color"),
+            OsString::from("never"),
+            workspace.join("nested.yaml").into_os_string(),
+        ];
+        let outcome = match parse(arguments).unwrap().execute() {
+            Ok(outcome) => outcome,
+            Err(failure) => panic!("nested workflow fixture failed: {}", failure.error()),
+        };
+        assert_eq!(outcome, ExitCode::Success);
+
+        let result_root = run.join("attempts/000001/result");
+        let result: Value =
+            serde_json::from_slice(&fs::read(result_root.join("result.json")).unwrap()).unwrap();
+        assert_eq!(result["outcome"], "succeeded");
+        let export = result["exports"]["portable"]["path"].as_str().unwrap();
+        let bytes = fs::read(result_root.join(export)).unwrap();
+        assert_eq!(bytes, b"nested portable result");
+        fs::write(round.join("nested-result.txt"), bytes).unwrap();
+
+        let retained =
+            run.join(".private/workflow-retained/.inputs-retained/view-retained/values/payload");
+        assert_eq!(
+            fs::symlink_metadata(&retained)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o400
+        );
+        for directory in [
+            retained.parent().unwrap(),
+            retained.parent().unwrap().parent().unwrap(),
+        ] {
+            assert_eq!(
+                fs::symlink_metadata(directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o500
+            );
+        }
+    }
 
     fn collect_command_paths(command: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
         assert!(

@@ -1,6 +1,7 @@
 pub(crate) mod claude_code;
 pub(crate) mod codex;
 mod harness_installation;
+pub(crate) mod owned_tree;
 pub(crate) mod pi;
 pub(crate) mod workflow;
 
