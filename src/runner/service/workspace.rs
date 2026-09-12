@@ -12,7 +12,7 @@ use base64::Engine as _;
 use fs4::{FileExt, TryLockError};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, fstat, openat, renameat_with, statat,
+    AtFlags, Dev, FileType, Mode, OFlags, RenameFlags, Stat, fstat, openat, renameat_with, statat,
 };
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
@@ -49,6 +49,22 @@ const NOFOLLOW_FLAG: i32 = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
 )]
 const DIRECTORY_NOFOLLOW_FLAGS: i32 =
     (rustix::fs::OFlags::DIRECTORY.bits() | rustix::fs::OFlags::NOFOLLOW.bits()) as i32;
+
+#[cfg(target_vendor = "apple")]
+fn normalized_device(device: Dev) -> u64 {
+    // Darwin exposes dev_t as signed while MetadataExt::dev uses u64.
+    // Preserve the signed value's bits without a lint-suppressed integer cast.
+    u64::from_ne_bytes(i64::from(device).to_ne_bytes())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[allow(
+    clippy::useless_conversion,
+    reason = "dev_t width varies across Unix targets; widening is a no-op on Linux"
+)]
+fn normalized_device(device: Dev) -> u64 {
+    u64::from(device)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CleanupResult {
@@ -225,10 +241,11 @@ struct MetadataCleanupIdentityStore;
 impl CleanupIdentityStore for MetadataCleanupIdentityStore {
     fn read(&self, directory: &OwnedFd) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
         let metadata = fstat(directory).map_err(|_| ())?;
+        let device = normalized_device(metadata.st_dev);
         let mut identity = [0_u8; CLEANUP_IDENTITY_BYTES];
-        identity[..8].copy_from_slice(&metadata.st_dev.to_le_bytes());
+        identity[..8].copy_from_slice(&device.to_le_bytes());
         identity[8..16].copy_from_slice(&metadata.st_ino.to_le_bytes());
-        identity[16..24].copy_from_slice(&(!metadata.st_dev).to_le_bytes());
+        identity[16..24].copy_from_slice(&(!device).to_le_bytes());
         identity[24..].copy_from_slice(&(!metadata.st_ino).to_le_bytes());
         Ok(Some(identity))
     }
@@ -414,7 +431,7 @@ impl CleanupAuthorityRecord {
         }
         Ok(Self {
             relative_path,
-            parent_device: parent.st_dev,
+            parent_device: normalized_device(parent.st_dev),
             parent_inode: parent.st_ino,
             device: link.device,
             inode: link.inode,
@@ -784,7 +801,7 @@ impl MarkerProof {
         let proof = Self {
             parent,
             contents,
-            device: metadata.st_dev,
+            device: normalized_device(metadata.st_dev),
             inode: metadata.st_ino,
         };
         verify_marker(&proof)?;
@@ -850,7 +867,7 @@ impl DirectoryLink {
             parent,
             identity,
             directory: Some(directory),
-            device: opened.st_dev,
+            device: normalized_device(opened.st_dev),
             inode: opened.st_ino,
         })
     }
@@ -907,7 +924,7 @@ impl DirectoryLink {
         };
         let opened = fstat(directory.as_ref()).map_err(|_| ())?;
         if !safe_owned_directory_stat(&opened)
-            || opened.st_dev != self.device
+            || normalized_device(opened.st_dev) != self.device
             || opened.st_ino != self.inode
         {
             return Err(());
@@ -922,7 +939,7 @@ impl DirectoryLink {
             Err(_) => return Err(()),
         };
         if !safe_owned_directory_stat(&named)
-            || named.st_dev != self.device
+            || normalized_device(named.st_dev) != self.device
             || named.st_ino != self.inode
         {
             return Err(());
@@ -1009,7 +1026,7 @@ impl OwnedTree {
         };
         let link = tree.link().ok_or(())?;
         let parent_metadata = fstat(link.parent.as_ref()).map_err(|_| ())?;
-        if parent_metadata.st_dev != record.parent_device
+        if normalized_device(parent_metadata.st_dev) != record.parent_device
             || parent_metadata.st_ino != record.parent_inode
         {
             return Err(());
@@ -1182,10 +1199,14 @@ fn safe_owned_directory(metadata: &Metadata) -> bool {
         && metadata.mode() & 0o7777 == PRIVATE_DIRECTORY_MODE
 }
 
+#[allow(
+    clippy::useless_conversion,
+    reason = "st_mode is u16 on macOS and u32 on Linux"
+)]
 fn safe_owned_directory_stat(metadata: &Stat) -> bool {
     FileType::from_raw_mode(metadata.st_mode) == FileType::Directory
         && metadata.st_uid == rustix::process::geteuid().as_raw()
-        && metadata.st_mode & 0o7777 == PRIVATE_DIRECTORY_MODE
+        && u32::from(metadata.st_mode) & 0o7777 == PRIVATE_DIRECTORY_MODE
 }
 
 fn verify_marker(marker: &MarkerProof) -> Result<(), ()> {
@@ -1207,7 +1228,7 @@ fn verify_marker(marker: &MarkerProof) -> Result<(), ()> {
         || !safe_private_file_stat(&named)
         || named.st_dev != metadata.st_dev
         || named.st_ino != metadata.st_ino
-        || metadata.st_dev != marker.device
+        || normalized_device(metadata.st_dev) != marker.device
         || metadata.st_ino != marker.inode
     {
         return Err(());
@@ -1251,10 +1272,14 @@ fn verify_private_contents(
     (contents == expected).then_some(()).ok_or(())
 }
 
+#[allow(
+    clippy::useless_conversion,
+    reason = "st_mode is u16 on macOS and u32 on Linux"
+)]
 fn safe_private_file_stat(metadata: &Stat) -> bool {
     FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile
         && metadata.st_uid == rustix::process::geteuid().as_raw()
-        && metadata.st_mode & 0o7777 == PRIVATE_FILE_MODE
+        && u32::from(metadata.st_mode) & 0o7777 == PRIVATE_FILE_MODE
         && metadata.st_nlink == 1
 }
 
