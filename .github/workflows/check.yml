@@ -32,8 +32,10 @@ jobs:
         uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: devenv
+      # Devenv 2.3 embeds the Nix readOnlyMode lifetime fix (cachix/devenv#3064).
+      # Updating only the globally installed Nix does not fix its embedded evaluator.
       - name: Install devenv
-        run: nix profile add github:cachix/devenv/b8030c58deafc013fc51791377fe8fea4dadcb00
+        run: nix profile add github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2
       - name: Check public source
         run: ./scripts/check
 
