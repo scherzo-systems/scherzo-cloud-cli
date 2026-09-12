@@ -1565,6 +1565,8 @@ fn inherit_for_git_child(command: &mut Command, descriptor: libc::c_int) {
 
 #[cfg(test)]
 pub(super) mod test_support {
+    use std::sync::Mutex;
+
     use super::*;
 
     pub(in crate::runner::service) fn fixture_credential(
@@ -1640,6 +1642,69 @@ pub(super) mod test_support {
         Arc::new(FixtureSourceBroker {
             repository_url: None,
         })
+    }
+
+    struct GatedUnavailableSourceBroker {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SourceCredentialBroker for GatedUnavailableSourceBroker {
+        fn issue(
+            &self,
+            _assignment_id: &str,
+            cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            self.release
+                .lock()
+                .expect("source gate mutex poisoned")
+                .recv()
+                .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+            if cancellation.is_cancelled() {
+                Err(CredentialBrokerFailure::Fenced)
+            } else {
+                Err(CredentialBrokerFailure::Unavailable)
+            }
+        }
+
+        // This transport gate models source unavailability; runtime Git is deliberately inert.
+        // jscpd:ignore-start
+        fn commit_availability(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+
+        fn issue_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+
+        fn revoke_workflow_git(
+            &self,
+            _assignment_id: &str,
+            _token: &[u8],
+        ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+            Err(CredentialBrokerFailure::Unavailable)
+        }
+        // jscpd:ignore-end
+    }
+
+    pub(in crate::runner::service) fn gated_unavailable_source_broker() -> (
+        Arc<dyn SourceCredentialBroker>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        (
+            Arc::new(GatedUnavailableSourceBroker {
+                release: Mutex::new(released),
+            }),
+            release,
+        )
     }
 
     pub(in crate::runner::service) fn materialize(

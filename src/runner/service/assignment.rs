@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,123 @@ pub(super) struct AssignmentOffer {
     pub(super) project_id: String,
     pub(super) attempt_id: String,
     pub(super) execution_spec: ExecutionSpecV1RunnerProjection,
+}
+
+pub(super) trait AssignmentRootPreparer: Send + Sync {
+    fn prepare(&self, assignment_id: &str) -> Result<AssignmentRoot, AssignmentRootCreationError>;
+}
+
+impl AssignmentRootPreparer for WorkRootLease {
+    fn prepare(&self, assignment_id: &str) -> Result<AssignmentRoot, AssignmentRootCreationError> {
+        self.create_assignment(assignment_id)
+    }
+}
+
+const ROOT_PREPARATION_PENDING: u8 = 0;
+const ROOT_PREPARATION_DELIVERING: u8 = 1;
+const ROOT_PREPARATION_DETACHED: u8 = 2;
+
+struct AssignmentRootPreparationHandoff {
+    state: AtomicU8,
+}
+
+impl AssignmentRootPreparationHandoff {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(ROOT_PREPARATION_PENDING),
+        }
+    }
+
+    fn claim_delivery(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ROOT_PREPARATION_PENDING,
+                ROOT_PREPARATION_DELIVERING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn detach(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ROOT_PREPARATION_PENDING,
+                ROOT_PREPARATION_DETACHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+struct AssignmentRootPreparation {
+    assignment_id: String,
+    root_preparer: Arc<dyn AssignmentRootPreparer>,
+    handoff: Arc<AssignmentRootPreparationHandoff>,
+    event_sender: mpsc::UnboundedSender<ManagerEvent>,
+    wake: ObservationOutbox,
+}
+
+struct AssignmentRootPreparationWorker {
+    requests: Option<std::sync::mpsc::Sender<AssignmentRootPreparation>>,
+}
+
+impl AssignmentRootPreparationWorker {
+    fn new() -> Self {
+        let (requests, pending) = std::sync::mpsc::channel::<AssignmentRootPreparation>();
+        let worker = std::thread::Builder::new()
+            .name("runner-assignment-root-preparation".to_owned())
+            .spawn(move || {
+                while let Ok(request) = pending.recv() {
+                    prepare_assignment_root(request);
+                }
+            });
+        Self {
+            requests: worker.ok().map(|_| requests),
+        }
+    }
+
+    fn prepare(&self, request: AssignmentRootPreparation) -> Result<(), ()> {
+        self.requests
+            .as_ref()
+            .ok_or(())?
+            .send(request)
+            .map_err(|_| ())
+    }
+}
+
+fn prepare_assignment_root(request: AssignmentRootPreparation) {
+    let AssignmentRootPreparation {
+        assignment_id,
+        root_preparer,
+        handoff,
+        event_sender,
+        wake,
+    } = request;
+    let root = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        root_preparer.prepare(&assignment_id)
+    })) {
+        Ok(result) => result.map(Box::new),
+        Err(_) => Err(AssignmentRootCreationError::CleanupFailed),
+    };
+    if !handoff.claim_delivery() {
+        if let Ok(root) = root {
+            let _ = root.release_pending(ProcessQuiescence::Proven).wait();
+        }
+        wake.wake();
+        return;
+    }
+    let event = ManagerEvent::WorkspacePrepared {
+        assignment_id,
+        root,
+    };
+    if let Err(error) = event_sender.send(event)
+        && let ManagerEvent::WorkspacePrepared { root: Ok(root), .. } = error.0
+    {
+        let _ = root.release_pending(ProcessQuiescence::Proven).wait();
+    }
+    wake.wake();
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -957,6 +1075,7 @@ struct RunningAssignment {
 struct PreparingAssignment {
     offer: AssignmentOffer,
     cancellation: CaptureCancellation,
+    root_preparation: Option<Arc<AssignmentRootPreparationHandoff>>,
     root: Option<AssignmentRoot>,
     prepare_effect_id: Option<String>,
     preparation_event: Option<TelemetryEvent>,
@@ -1047,6 +1166,10 @@ enum LocalSlot {
 }
 
 pub(super) enum ManagerEvent {
+    WorkspacePrepared {
+        assignment_id: String,
+        root: Result<Box<AssignmentRoot>, AssignmentRootCreationError>,
+    },
     Prepared {
         offer: Box<AssignmentOffer>,
         prepare_effect_id: String,
@@ -1192,6 +1315,7 @@ impl AdmissionRuntime {
 
 pub(super) struct AssignmentDependencies {
     work_root: Arc<WorkRootLease>,
+    root_preparer: Arc<dyn AssignmentRootPreparer>,
     sleeper: Arc<dyn Sleeper>,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
@@ -1208,8 +1332,10 @@ impl AssignmentDependencies {
         recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
         guard_processes: bool,
     ) -> Self {
+        let root_preparer: Arc<dyn AssignmentRootPreparer> = work_root.clone();
         Self {
             work_root,
+            root_preparer,
             sleeper,
             source_broker,
             input_broker,
@@ -1257,7 +1383,16 @@ impl AssignmentDependencies {
 }
 
 pub(super) struct AssignmentManager {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the test fixture asserts work-root cleanup through this lease"
+        )
+    )]
     work_root: Arc<WorkRootLease>,
+    root_preparer: Arc<dyn AssignmentRootPreparer>,
+    root_preparation_worker: AssignmentRootPreparationWorker,
     pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
     claude_code_installation:
         Option<crate::execution::claude_code::ValidatedClaudeCodeInstallation>,
@@ -1293,6 +1428,7 @@ impl AssignmentManager {
     ) -> Self {
         let AssignmentDependencies {
             work_root,
+            root_preparer,
             sleeper,
             source_broker,
             input_broker,
@@ -1308,8 +1444,11 @@ impl AssignmentManager {
             Arc::clone(&sleeper),
             allow_insecure_artifact_uploads,
         );
+        let root_preparation_worker = AssignmentRootPreparationWorker::new();
         Self {
             work_root,
+            root_preparer,
+            root_preparation_worker,
             pi_installation: config.pi_installation().cloned(),
             claude_code_installation: config.claude_code_installation().cloned(),
             codex_installation: config.codex_installation().cloned(),
@@ -1452,30 +1591,32 @@ impl AssignmentManager {
             return self.retain_decision(offer, response);
         }
 
-        let Some(root) = self.prepare_offer_root(&offer)? else {
-            return Ok(());
-        };
-        let preparation = AssignmentObservation::Preparing {
-            effect_id: offer.effect_id.clone(),
-            assignment_id: offer.assignment_id.clone(),
-            offered_execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
-        };
-        if self.outbox.enqueue(preparation).is_err() {
-            self.begin_assignment_cleanup(
-                offer.assignment_id,
-                root,
-                ProcessQuiescence::Proven,
-                ReleaseAfter::Idle,
-            );
-            return Err(AssignmentManagerFailure::DecisionCapacity);
+        if let Err(decline) = self.validate_admission_prerequisites(&offer) {
+            let response = rejected(&offer, decline);
+            return self.retain_decision(offer, response);
         }
+
+        let assignment_id = offer.assignment_id.clone();
+        let root_preparation = Arc::new(AssignmentRootPreparationHandoff::new());
         self.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
             offer,
             cancellation: CaptureCancellation::default(),
-            root: Some(root),
+            root_preparation: Some(Arc::clone(&root_preparation)),
+            root: None,
             prepare_effect_id: None,
             preparation_event: None,
         })));
+        if self
+            .begin_workspace_preparation(assignment_id, root_preparation)
+            .is_err()
+        {
+            let Some(LocalSlot::Preparing(preparing)) = self.slot.take() else {
+                return Err(AssignmentManagerFailure::DecisionCapacity);
+            };
+            let offer = preparing.offer;
+            let response = rejected(&offer, environment_unavailable());
+            return self.retain_decision(offer, response);
+        }
         Ok(())
     }
 
@@ -1563,21 +1704,19 @@ impl AssignmentManager {
         self.begin_source_admission(offer, root, prepare.effect_id, deadline)
     }
 
-    fn prepare_offer_root(
-        &mut self,
-        offer: &AssignmentOffer,
-    ) -> Result<Option<AssignmentRoot>, AssignmentManagerFailure> {
-        if let Err(decline) = self.validate_admission_prerequisites(offer) {
-            self.retain_decision(offer.clone(), rejected(offer, decline))?;
-            return Ok(None);
-        }
-        match self.prepare_execution_root(&offer.assignment_id) {
-            Ok(root) => Ok(Some(root)),
-            Err(decline) => {
-                self.retain_decision(offer.clone(), rejected(offer, decline))?;
-                Ok(None)
-            }
-        }
+    fn begin_workspace_preparation(
+        &self,
+        assignment_id: String,
+        handoff: Arc<AssignmentRootPreparationHandoff>,
+    ) -> Result<(), ()> {
+        self.root_preparation_worker
+            .prepare(AssignmentRootPreparation {
+                assignment_id,
+                root_preparer: Arc::clone(&self.root_preparer),
+                handoff,
+                event_sender: self.event_sender.clone(),
+                wake: self.outbox.clone(),
+            })
     }
 
     fn finish_preparation_event(&mut self, outcome: TelemetryOutcome) {
@@ -1627,18 +1766,6 @@ impl AssignmentManager {
 
         let cancellation = CaptureCancellation::default();
         let sleeper = Arc::clone(&self.sleeper);
-        let preparation_fence =
-            match PreparationFence::arm(deadline, cancellation.clone(), Arc::clone(&sleeper)) {
-                Ok(fence) => fence,
-                Err(()) => {
-                    return self.reject_after_prepare_and_cleanup(
-                        offer,
-                        root,
-                        prepare_effect_id,
-                        environment_unavailable(),
-                    );
-                }
-            };
         let worker_cancellation = cancellation.clone();
         let worker_offer = offer.clone();
         let environment = self.environment.clone();
@@ -1646,118 +1773,106 @@ impl AssignmentManager {
         let runtime = self.admission_runtime();
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
-        let shared_root = Arc::new(Mutex::new(Some(root)));
-        let worker_root = Arc::clone(&shared_root);
-        let worker_prepare_effect_id = prepare_effect_id.clone();
-        let worker = std::thread::Builder::new()
-            .name("runner-assignment-preparation".to_owned())
-            .spawn(move || {
-                let _preparation_fence = preparation_fence;
-                let root = worker_root
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let Some(mut root) = root else {
-                    wake.wake();
-                    return;
-                };
-                let workspace_path = root.workspace.path();
-                let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let checkout = super::source::checkout(
-                        Arc::clone(&broker),
-                        &environment,
-                        &worker_offer.assignment_id,
-                        &source,
-                        &worker_cancellation,
-                        &workspace_path,
-                        &root.private,
-                    )
-                    .map_err(materialization_decline)?;
-                    runtime.progress(&worker_offer, 2, "input_download")?;
-                    let imports = super::run_inputs::materialize(
-                        input_broker.as_deref(),
-                        &worker_offer.assignment_id,
-                        &worker_offer.execution_spec.execution_spec_id,
-                        worker_offer.execution_spec.run_inputs.as_ref(),
-                        deadline,
-                        &worker_cancellation,
-                        &root.private,
-                    )
-                    .map_err(run_input_decline)?;
-                    runtime.progress(&worker_offer, 3, "workflow_admission")?;
-                    let materialized =
-                        super::source::resolve_checkout(checkout, &worker_cancellation)
-                            .map_err(materialization_decline)?;
-                    Ok::<_, AssignmentDecline>((materialized, imports))
-                }));
-                let admission = match preparation {
-                    Ok(Ok((materialized, imports))) => {
-                        root.execution = materialized.execution_root;
-                        let workflow_git = std::env::current_exe()
-                            .map_err(anyhow::Error::from)
-                            .and_then(|helper_executable| {
-                                WorkflowGitAuthority::install(WorkflowGitInstall {
-                                    broker: Arc::clone(&broker),
-                                    assignment_id: &worker_offer.assignment_id,
-                                    origin: materialized.origin,
-                                    workspace: &root.execution,
-                                    private_root: &root.private,
-                                    environment: &environment,
-                                    helper_executable: &helper_executable,
-                                    clock: Arc::clone(&sleeper),
-                                    recorder: runtime.recorder.clone(),
-                                    cancellation: &worker_cancellation,
-                                })
-                            });
-                        match workflow_git {
-                            Ok(workflow_git) => {
-                                root.install_workflow_git(workflow_git.clone());
-                                runtime.finish(
-                                    &worker_offer,
-                                    root,
-                                    materialized.workflow,
-                                    imports,
-                                    materialized.git_capture,
-                                    PreparationAuthority {
-                                        deadline,
-                                        cancellation: &worker_cancellation,
-                                        monotonic_now: sleeper.now(),
-                                    },
-                                )
-                            }
-                            Err(_) => Err(Box::new((root, environment_unavailable()))),
-                        }
-                    }
-                    Ok(Err(decline)) => Err(Box::new((root, decline))),
-                    Err(_) => Err(Box::new((root, environment_unavailable()))),
-                };
-                let _ = sender.send(ManagerEvent::Prepared {
-                    offer: Box::new(worker_offer),
-                    prepare_effect_id: worker_prepare_effect_id,
-                    deadline,
-                    admission: Box::new(admission),
-                });
-                wake.wake();
-            });
-        if worker.is_err() {
-            let root = shared_root
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(root) = root else {
-                self.cleanup_failed = true;
-                return Err(AssignmentManagerFailure::DecisionCapacity);
-            };
-            return self.reject_after_prepare_and_cleanup(
-                offer,
-                root,
-                prepare_effect_id,
-                environment_unavailable(),
-            );
-        }
         if let Some(LocalSlot::Preparing(preparing)) = &mut self.slot {
             preparing.cancellation = cancellation;
         }
+        tokio::task::spawn_blocking(move || {
+            let preparation_fence = match PreparationFence::arm(
+                deadline,
+                worker_cancellation.clone(),
+                Arc::clone(&sleeper),
+            ) {
+                Ok(fence) => fence,
+                Err(()) => {
+                    let _ = sender.send(ManagerEvent::Prepared {
+                        offer: Box::new(worker_offer),
+                        prepare_effect_id,
+                        deadline,
+                        admission: Box::new(Err(Box::new((root, environment_unavailable())))),
+                    });
+                    wake.wake();
+                    return;
+                }
+            };
+            let _preparation_fence = preparation_fence;
+            let mut root = root;
+            let workspace_path = root.workspace.path();
+            let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let checkout = super::source::checkout(
+                    Arc::clone(&broker),
+                    &environment,
+                    &worker_offer.assignment_id,
+                    &source,
+                    &worker_cancellation,
+                    &workspace_path,
+                    &root.private,
+                )
+                .map_err(materialization_decline)?;
+                runtime.progress(&worker_offer, 2, "input_download")?;
+                let imports = super::run_inputs::materialize(
+                    input_broker.as_deref(),
+                    &worker_offer.assignment_id,
+                    &worker_offer.execution_spec.execution_spec_id,
+                    worker_offer.execution_spec.run_inputs.as_ref(),
+                    deadline,
+                    &worker_cancellation,
+                    &root.private,
+                )
+                .map_err(run_input_decline)?;
+                runtime.progress(&worker_offer, 3, "workflow_admission")?;
+                let materialized = super::source::resolve_checkout(checkout, &worker_cancellation)
+                    .map_err(materialization_decline)?;
+                Ok::<_, AssignmentDecline>((materialized, imports))
+            }));
+            let admission = match preparation {
+                Ok(Ok((materialized, imports))) => {
+                    root.execution = materialized.execution_root;
+                    let workflow_git = std::env::current_exe()
+                        .map_err(anyhow::Error::from)
+                        .and_then(|helper_executable| {
+                            WorkflowGitAuthority::install(WorkflowGitInstall {
+                                broker: Arc::clone(&broker),
+                                assignment_id: &worker_offer.assignment_id,
+                                origin: materialized.origin,
+                                workspace: &root.execution,
+                                private_root: &root.private,
+                                environment: &environment,
+                                helper_executable: &helper_executable,
+                                clock: Arc::clone(&sleeper),
+                                recorder: runtime.recorder.clone(),
+                                cancellation: &worker_cancellation,
+                            })
+                        });
+                    match workflow_git {
+                        Ok(workflow_git) => {
+                            root.install_workflow_git(workflow_git.clone());
+                            runtime.finish(
+                                &worker_offer,
+                                root,
+                                materialized.workflow,
+                                imports,
+                                materialized.git_capture,
+                                PreparationAuthority {
+                                    deadline,
+                                    cancellation: &worker_cancellation,
+                                    monotonic_now: sleeper.now(),
+                                },
+                            )
+                        }
+                        Err(_) => Err(Box::new((root, environment_unavailable()))),
+                    }
+                }
+                Ok(Err(decline)) => Err(Box::new((root, decline))),
+                Err(_) => Err(Box::new((root, environment_unavailable()))),
+            };
+            let _ = sender.send(ManagerEvent::Prepared {
+                offer: Box::new(worker_offer),
+                prepare_effect_id,
+                deadline,
+                admission: Box::new(admission),
+            });
+            wake.wake();
+        });
         Ok(())
     }
 
@@ -1859,9 +1974,6 @@ impl AssignmentManager {
             .clone();
         let (authority_updates, authority_receiver) = tokio::sync::watch::channel(authority);
         let workflow_git = accepted.workflow_git.clone();
-        let workflow_git_activated = workflow_git
-            .activate(self.lease_clock.clone(), authority_receiver.clone())
-            .is_ok();
         self.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
             cancellation,
@@ -1881,7 +1993,6 @@ impl AssignmentManager {
                 lease_clock: self.lease_clock.clone(),
                 causal_lease,
                 updates: authority_receiver,
-                workflow_git_activated,
             },
         )))
     }
@@ -2202,7 +2313,15 @@ impl AssignmentManager {
         match slot {
             LocalSlot::Preparing(preparing) => {
                 preparing.cancellation.cancel();
-                self.slot = Some(LocalSlot::Preparing(preparing));
+                let detached_root_preparation = preparing.root.is_none()
+                    && preparing.prepare_effect_id.is_none()
+                    && preparing
+                        .root_preparation
+                        .as_ref()
+                        .is_some_and(|handoff| handoff.detach());
+                if !detached_root_preparation {
+                    self.slot = Some(LocalSlot::Preparing(preparing));
+                }
             }
             LocalSlot::Accepted(accepted) => {
                 let identity = accepted.identity.clone();
@@ -2210,7 +2329,7 @@ impl AssignmentManager {
                 self.finish_before_execution(identity, root, "graceful_shutdown")?;
             }
             LocalSlot::Running(running) => {
-                running.workflow_git.disable();
+                disable_workflow_git_off_thread(&running.workflow_git);
                 running.cancellation.request_cancellation(
                     crate::execution::workflow::admission::CancellationReason::RunnerShutdown,
                 );
@@ -2255,15 +2374,15 @@ impl AssignmentManager {
         quiescence: ProcessQuiescence,
         after: ReleaseAfter,
     ) {
-        let pending = root.release_pending(quiescence);
         self.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
             assignment_id: assignment_id.clone(),
             after,
         }));
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
-        tokio::spawn(async move {
-            let result = pending.wait_async().await;
+        // Run the synchronous release chain on the blocking pool, not the manager caller.
+        tokio::task::spawn_blocking(move || {
+            let result = root.release_pending(quiescence).wait();
             let _ = sender.send(ManagerEvent::CleanupFinished {
                 assignment_id,
                 result,
@@ -2401,6 +2520,72 @@ impl AssignmentManager {
         self.artifact_delivery.drain_uploads();
         while let Ok(event) = self.events.try_recv() {
             match event {
+                ManagerEvent::WorkspacePrepared {
+                    assignment_id,
+                    root,
+                } => {
+                    let root = root.map(|root| *root);
+                    let Some(LocalSlot::Preparing(mut preparing)) = self.slot.take() else {
+                        if let Ok(root) = root {
+                            release_unclaimed_assignment_root(root);
+                        }
+                        continue;
+                    };
+                    if preparing.offer.assignment_id != assignment_id {
+                        self.slot = Some(LocalSlot::Preparing(preparing));
+                        if let Ok(root) = root {
+                            release_unclaimed_assignment_root(root);
+                        }
+                        continue;
+                    }
+                    preparing.root_preparation = None;
+                    match root {
+                        Ok(root) if preparing.cancellation.is_cancelled() => {
+                            self.begin_assignment_cleanup(
+                                assignment_id,
+                                root,
+                                ProcessQuiescence::Proven,
+                                ReleaseAfter::Idle,
+                            );
+                        }
+                        Ok(root) => {
+                            let preparation = AssignmentObservation::Preparing {
+                                effect_id: preparing.offer.effect_id.clone(),
+                                assignment_id: assignment_id.clone(),
+                                offered_execution_spec_id: preparing
+                                    .offer
+                                    .execution_spec
+                                    .execution_spec_id
+                                    .clone(),
+                            };
+                            if self.outbox.enqueue(preparation).is_err() {
+                                self.begin_assignment_cleanup(
+                                    assignment_id,
+                                    root,
+                                    ProcessQuiescence::Proven,
+                                    ReleaseAfter::Idle,
+                                );
+                            } else {
+                                preparing.root = Some(root);
+                                self.slot = Some(LocalSlot::Preparing(preparing));
+                            }
+                        }
+                        Err(error) => {
+                            if error == AssignmentRootCreationError::CleanupFailed {
+                                self.cleanup_failed = true;
+                            }
+                            if !preparing.cancellation.is_cancelled() {
+                                let offer = preparing.offer;
+                                let response = rejected(&offer, environment_unavailable());
+                                if let Err(failure) = self.retain_decision(offer, response) {
+                                    self.lease_clock_failed |=
+                                        failure == AssignmentManagerFailure::LeaseClock;
+                                }
+                            }
+                            self.outbox.wake();
+                        }
+                    }
+                }
                 ManagerEvent::Prepared {
                     offer,
                     prepare_effect_id,
@@ -2854,21 +3039,6 @@ impl AssignmentManager {
         LeaseAuthority::derive(expected_sequence, basis, policy, cancellation_grace)
             .map_err(|_| GrantValidationFailure::Arithmetic)
     }
-
-    fn prepare_execution_root(
-        &mut self,
-        assignment_id: &str,
-    ) -> Result<AssignmentRoot, AssignmentDecline> {
-        match self.work_root.create_assignment(assignment_id) {
-            Ok(root) => Ok(root),
-            Err(AssignmentRootCreationError::Unavailable) => Err(environment_unavailable()),
-            Err(AssignmentRootCreationError::CleanupFailed) => {
-                self.cleanup_failed = true;
-                self.outbox.wake();
-                Err(environment_unavailable())
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2927,6 +3097,20 @@ pub(super) mod test_support {
             guard_processes,
         );
         AssignmentManager::new(config, lease_clock, dependencies)
+    }
+
+    pub(in crate::runner::service) fn install_root_preparer(
+        manager: &mut AssignmentManager,
+        root_preparer: Arc<dyn AssignmentRootPreparer>,
+    ) {
+        manager.root_preparer = root_preparer;
+    }
+
+    pub(in crate::runner::service) fn observation_retained(
+        manager: &AssignmentManager,
+        id: u64,
+    ) -> bool {
+        manager.outbox.contains(id)
     }
 
     pub(in crate::runner::service) fn artifact_delivery(
@@ -3156,13 +3340,20 @@ fn build_execution_context(
 }
 
 fn revoke_authority(running: &mut RunningAssignment) {
-    running.workflow_git.disable();
+    disable_workflow_git_off_thread(&running.workflow_git);
     running.authority_updates.send_modify(|authority| {
         authority.revoked = true;
     });
     running.cancellation.request_cancellation(
         crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired,
     );
+}
+
+fn disable_workflow_git_off_thread(workflow_git: &WorkflowGitAuthority) {
+    if workflow_git.fence_without_wake() {
+        let workflow_git = workflow_git.clone();
+        tokio::task::spawn_blocking(move || workflow_git.wake());
+    }
 }
 
 fn validate_lease_policy(policy: &ExecutionLeasePolicy) -> Result<(), WelcomePolicyFailure> {
@@ -3449,6 +3640,12 @@ fn admission_decline(failure: AdmissionFailure, cloud_git_capture: bool) -> Assi
     }
 }
 
+fn release_unclaimed_assignment_root(root: AssignmentRoot) {
+    tokio::task::spawn_blocking(move || {
+        let _ = root.release_pending(ProcessQuiescence::Proven).wait();
+    });
+}
+
 fn environment_unavailable() -> AssignmentDecline {
     AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable)
 }
@@ -3703,6 +3900,39 @@ printf '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_re
 printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"value","session_id":"%s"}\n' "$session"
 "#;
+
+    enum GatedRootPreparationOutcome {
+        Create(Arc<WorkRootLease>),
+        Unavailable,
+    }
+
+    struct GatedAssignmentRootPreparer {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        outcome: GatedRootPreparationOutcome,
+    }
+
+    impl AssignmentRootPreparer for GatedAssignmentRootPreparer {
+        fn prepare(
+            &self,
+            assignment_id: &str,
+        ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
+            let _ = self.started.send(());
+            self.release
+                .lock()
+                .expect("assignment root preparation gate mutex poisoned")
+                .recv()
+                .map_err(|_| AssignmentRootCreationError::Unavailable)?;
+            match &self.outcome {
+                GatedRootPreparationOutcome::Create(work_root) => {
+                    work_root.create_assignment(assignment_id)
+                }
+                GatedRootPreparationOutcome::Unavailable => {
+                    Err(AssignmentRootCreationError::Unavailable)
+                }
+            }
+        }
+    }
 
     struct BlockingSourceBroker {
         started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
@@ -3962,13 +4192,39 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    fn begin_preparation(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
-        let preparation_id = manager
+    fn has_offer_preparation(manager: &mut AssignmentManager) -> bool {
+        manager
             .pending_observations(&BTreeSet::new(), 10)
-            .into_iter()
-            .find(|pending| matches!(pending.observation, AssignmentObservation::Preparing { .. }))
-            .expect("offer preparation acknowledgement")
-            .id;
+            .iter()
+            .any(|pending| matches!(pending.observation, AssignmentObservation::Preparing { .. }))
+    }
+
+    async fn wait_for_offer_preparation(
+        manager: &mut AssignmentManager,
+    ) -> PendingAssignmentObservation {
+        with_watchdog(async {
+            let notification = manager.notification();
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                if let Some(preparation) = manager
+                    .pending_observations(&BTreeSet::new(), 10)
+                    .into_iter()
+                    .find(|pending| {
+                        matches!(pending.observation, AssignmentObservation::Preparing { .. })
+                    })
+                {
+                    return preparation;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("offer preparation acknowledgement timed out")
+    }
+
+    async fn begin_preparation(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
+        let preparation_id = wait_for_offer_preparation(manager).await.id;
         manager.acknowledge_observation(preparation_id);
         manager
             .handle_prepare(prepare_for(manager, offered))
@@ -3976,7 +4232,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     async fn prepare_current(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
-        begin_preparation(manager, offered);
+        begin_preparation(manager, offered).await;
         with_watchdog(wait_for_manager_state(manager, |manager| {
             manager.drain_events();
             !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
@@ -4978,6 +5234,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
             offer: offered.clone(),
             cancellation: CaptureCancellation::default(),
+            root_preparation: None,
             root: None,
             prepare_effect_id: Some("eff_01k0z6r1w8f4jy2m7q9v3x5acz".to_owned()),
             preparation_event: None,
@@ -5197,19 +5454,43 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[tokio::test]
-    async fn release_before_prepare_cleans_the_reserved_assignment_root() {
+    async fn release_during_root_preparation_cleans_the_late_root() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
+        let root_path = manager.work_root.boot_path().join(&offered.assignment_id);
+        let (started, mut root_preparation_started) = tokio::sync::mpsc::unbounded_channel();
+        let (release_root_preparation, released) = std::sync::mpsc::channel();
+        manager.root_preparer = Arc::new(GatedAssignmentRootPreparer {
+            started,
+            release: Mutex::new(released),
+            outcome: GatedRootPreparationOutcome::Create(Arc::clone(&manager.work_root)),
+        });
 
         manager.handle_offer(offered.clone()).unwrap();
-        assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
-
+        root_preparation_started
+            .recv()
+            .await
+            .expect("assignment root preparation did not start");
         release_current(&mut manager, &offered, "stale_or_invalid_acceptance");
 
-        assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
+        assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
+        assert!(!has_offer_preparation(&mut manager));
+
+        release_root_preparation
+            .send(())
+            .expect("release assignment root preparation");
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager.drain_events();
+            matches!(manager.slot, Some(LocalSlot::Releasing(_)))
+        }))
+        .await
+        .expect("late assignment root did not reach cleanup");
         settle_cleanup(&mut manager).await;
+
         assert!(manager.slot.is_none());
+        assert!(!root_path.exists());
+        assert!(!has_offer_preparation(&mut manager));
     }
 
     #[tokio::test]
@@ -5225,7 +5506,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.handle_offer(offered.clone()).unwrap();
         assert_eq!(source.calls(), 0);
         source.assert_not_started();
-        begin_preparation(&mut manager, &offered);
+        begin_preparation(&mut manager, &offered).await;
         source.wait_until_started();
         assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
         release_current(&mut manager, &offered, "offer_expired");
@@ -5262,7 +5543,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         align_offer_with_source_fixture(&manager, &mut offered);
 
         manager.handle_offer(offered.clone()).unwrap();
-        begin_preparation(&mut manager, &offered);
+        begin_preparation(&mut manager, &offered).await;
         source.wait_until_started();
         let (duration, deadline_release) = sleep_requests
             .recv()
@@ -5939,6 +6220,7 @@ steps:
         boundary_manager
             .handle_offer(boundary_offer.clone())
             .unwrap();
+        wait_for_offer_preparation(&mut boundary_manager).await;
         boundary.advance(Duration::from_secs(308));
         assert!(
             boundary_manager
@@ -7197,8 +7479,8 @@ steps:
         });
     }
 
-    #[test]
-    fn successor_fences_leave_room_for_more_than_256_completed_assignments() {
+    #[tokio::test]
+    async fn successor_fences_leave_room_for_more_than_256_completed_assignments() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let alphabet = b"0123456789abcdefghjkmnpqrstvwxyz";
@@ -7239,7 +7521,9 @@ steps:
             root: None,
         })));
 
-        assert_eq!(manager.handle_offer(offer("80")), Ok(()));
+        let successor = offer("80");
+        assert_eq!(manager.handle_offer(successor), Ok(()));
+        wait_for_offer_preparation(&mut manager).await;
     }
 
     #[tokio::test]
@@ -7280,9 +7564,61 @@ steps:
             root: None,
         })));
         manager.handle_offer(offer("bh")).unwrap();
+        wait_for_offer_preparation(&mut manager).await;
         assert_eq!(manager.outbox.lock().entries.len(), 2);
         assert_eq!(manager.pending_observations(&BTreeSet::new(), 100).len(), 1);
         manager.finish_transport();
         assert_eq!(manager.outbox.lock().entries.len(), 1);
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "wall time only bounds explicit root-worker and runtime-shutdown completion signals"
+    )]
+    #[test]
+    fn blocked_root_preparation_does_not_hold_tokio_runtime_shutdown() {
+        let (started, mut root_preparation_started) = tokio::sync::mpsc::unbounded_channel();
+        let (release_root_preparation, released) = std::sync::mpsc::channel();
+        let (begin_shutdown, shutdown_requested) = std::sync::mpsc::sync_channel(1);
+        let (finished, runtime_finished) = std::sync::mpsc::sync_channel(1);
+        let service = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build fixture Tokio runtime");
+            let guard = runtime.enter();
+            let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+            let (_temporary, mut manager) = manager_fixture(workflow);
+            manager.root_preparer = Arc::new(GatedAssignmentRootPreparer {
+                started,
+                release: Mutex::new(released),
+                outcome: GatedRootPreparationOutcome::Unavailable,
+            });
+            manager.handle_offer(offer("bg")).unwrap();
+            shutdown_requested
+                .recv()
+                .expect("runtime shutdown request missing");
+            manager.begin_shutdown().unwrap();
+            assert!(
+                manager.shutdown_complete(),
+                "blocked root preparation must detach from graceful shutdown"
+            );
+            drop(manager);
+            drop(guard);
+            drop(runtime);
+            let _ = finished.send(());
+        });
+
+        root_preparation_started
+            .blocking_recv()
+            .expect("assignment root preparation did not start");
+        begin_shutdown.send(()).expect("begin runtime shutdown");
+        runtime_finished
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Tokio runtime waited for blocked assignment root preparation");
+        release_root_preparation
+            .send(())
+            .expect("release assignment root preparation");
+        service.join().expect("runtime fixture thread panicked");
     }
 }

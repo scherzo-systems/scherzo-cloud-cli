@@ -3028,6 +3028,13 @@ mod tests {
                 .expect("send assignment offer");
             let effect_acknowledgement = effect_acknowledgement(&mut socket).await;
             assert_eq!(effect_acknowledgement["sequence"], 2);
+            let Some(Ok(Message::Text(preparing))) = socket.next().await else {
+                panic!("fixture did not receive assignment preparation acknowledgement");
+            };
+            let preparing: serde_json::Value =
+                serde_json::from_str(&preparing).expect("decode assignment preparation");
+            assert_eq!(preparing["type"], "assignment_preparing");
+            assert_eq!(preparing["sequence"], 3);
 
             failure_sent
                 .send(())

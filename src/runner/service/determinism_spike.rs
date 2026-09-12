@@ -9,19 +9,20 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use super::assignment::test_support::{cleanup_complete, manager as manager_fixture};
+use super::assignment::test_support::{cleanup_complete, manager_with_dependencies};
 use super::backoff::Backoff;
 use super::connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
     ConnectionProgress, FrameSource, OpeningHello, opening_hello, run_established,
 };
+use super::source::{SourceCredentialBroker, test_support::gated_unavailable_source_broker};
 use super::test_support::{
     ConfigFixture, ControlledShutdownTrigger, DeterminismTranscript, ScriptedConnection,
     ScriptedConnector, ScriptedInbound, ScriptedReader, ScriptedWriter, SleepRelease,
     assignment_offer, assignment_prepare, controlled_shutdown, controlled_sleeper_with_transcript,
     deterministic_frame_source, effect_observation_acknowledgement, fixture_lease_clock,
-    observation_acknowledgement, scripted_connector, scripted_duplex, sleep_request, welcome,
-    with_watchdog,
+    fixture_sleeper, observation_acknowledgement, scripted_connector, scripted_duplex,
+    sleep_request, welcome, with_watchdog,
 };
 use super::workspace::{
     CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkRootLease,
@@ -499,6 +500,12 @@ async fn run_assignment_scenario() -> Vec<String> {
                 .expect("assignment preparation progress message ID"),
             5,
         ));
+        let progress_acknowledgement_silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        fixture
+            .source_release
+            .send(())
+            .expect("release unavailable source response");
 
         let semantic = next_outbound(&mut fixture.outbound).await;
         let semantic = decode_text(&semantic, "semantic assignment response");
@@ -508,8 +515,6 @@ async fn run_assignment_scenario() -> Vec<String> {
             semantic["payload"]["decline"]["reason"],
             "source_service_unavailable"
         );
-        let semantic_silence_timer =
-            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
         fixture.inbound.send(effect_observation_acknowledgement(
             semantic["messageId"]
                 .as_str()
@@ -540,7 +545,7 @@ async fn run_assignment_scenario() -> Vec<String> {
         drop(prepare_effect_silence_timer);
         drop(prepare_acknowledgement_silence_timer);
         drop(progress_silence_timer);
-        drop(semantic_silence_timer);
+        drop(progress_acknowledgement_silence_timer);
         drop(final_silence_timer);
     };
 
@@ -689,6 +694,10 @@ async fn run_reconnect_scenario() -> Vec<String> {
             "rbt_00000000000000000000000001",
             2,
         );
+        let preparing = next_outbound(&mut second.outbound).await;
+        let preparing = decode_text(&preparing, "assignment preparation acknowledgement");
+        assert_eq!(preparing["type"], "assignment_preparing");
+        assert_eq!(preparing["sequence"], 3);
         let pending_effect_timer = sleep_request(&mut sleep_requests, Duration::from_secs(2)).await;
         second.inbound.send(gateway_close(
             CloseCode::Normal,
@@ -783,7 +792,7 @@ async fn run_reconnect_scenario() -> Vec<String> {
     let (service_result, ()) = tokio::join!(service, peer);
     service_result.expect("scripted cancellation should stop the runner cleanly");
     transcript.record("service.outcome:cancelled".to_owned());
-    let events = transcript.snapshot();
+    let mut events = transcript.snapshot();
     assert_eq!(
         requested_backoff_durations(&events),
         vec![1_000, 1_000, 2_000, 4_000, 1_000]
@@ -792,6 +801,18 @@ async fn run_reconnect_scenario() -> Vec<String> {
         released_backoff_durations(&events),
         vec![1_000, 1_000, 2_000, 4_000]
     );
+    // The blocking preparation worker may arm this independently of connection writes.
+    // Preserve the timer assertion without treating its scheduler-dependent position as protocol.
+    let preparation_deadline = "sleep.requested:895000ms";
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.as_str() == preparation_deadline)
+            .count(),
+        1,
+        "source preparation must retain its deadline fence"
+    );
+    events.retain(|event| event != preparation_deadline);
     events
 }
 
@@ -872,6 +893,7 @@ struct EstablishedRuntime {
     config: ConfigFixture,
     frame_source: Arc<dyn FrameSource>,
     sleeper: Arc<dyn Sleeper>,
+    source_broker: Arc<dyn SourceCredentialBroker>,
     opening: Vec<u8>,
 }
 
@@ -885,10 +907,14 @@ impl EstablishedRuntime {
         let (recorder, _capture) = test_recorder(BOOT_ID);
         let connection_event = recorder.start("runner.fixture_connection", []);
         let active_effect_event = ActiveEffectEvent::new();
-        let assignment_manager = Mutex::new(manager_fixture(
+        let assignment_manager = Mutex::new(manager_with_dependencies(
             &self.config,
             BOOT_ID.to_owned(),
             fixture_lease_clock(),
+            fixture_sleeper(),
+            None,
+            Some(Arc::clone(&self.source_broker)),
+            false,
         ));
         let result = run_established(
             ConnectionDependencies::new(
@@ -929,6 +955,7 @@ impl EstablishedRuntime {
 struct EstablishedFixture {
     runtime: EstablishedRuntime,
     sleep_requests: mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+    source_release: std::sync::mpsc::SyncSender<()>,
     inbound: ScriptedInbound,
     reader: ScriptedReader,
     writer: ScriptedWriter,
@@ -948,15 +975,18 @@ fn established_fixture(transcript: &DeterminismTranscript) -> EstablishedFixture
     )
     .expect("encode deterministic opening hello");
     let (sleeper, sleep_requests) = controlled_sleeper_with_transcript(transcript.clone());
+    let (source_broker, source_release) = gated_unavailable_source_broker();
     let (inbound, reader, writer, outbound) = scripted_duplex(transcript.clone());
     EstablishedFixture {
         runtime: EstablishedRuntime {
             config,
             frame_source,
             sleeper,
+            source_broker,
             opening,
         },
         sleep_requests,
+        source_release,
         inbound,
         reader,
         writer,

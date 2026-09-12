@@ -2664,20 +2664,20 @@ mod tests {
         ProtocolLog, RUNNER_PROTOCOL_EVENT_NAME, close_locally, close_outcome, opening_hello, run,
         run_established,
     };
-    use crate::execution::workflow::artifact::CaptureCancellation;
     use crate::runner::credential::test_credential;
     use crate::runner::service::artifact_delivery::{ArtifactDeliverySpec, ArtifactUploadBody};
     use crate::runner::service::assignment::{
-        AssignmentManager,
+        AssignmentManager, AssignmentRootPreparer,
         test_support::{
             artifact_delivery, enqueue_finalization_terminal, enqueue_lease_clock_failure_report,
-            enqueue_transitions, manager as manager_fixture, manager_with_dependencies,
+            enqueue_transitions, install_root_preparer, manager as manager_fixture,
+            manager_with_dependencies, observation_retained,
         },
     };
     use crate::runner::service::config::Config;
     use crate::runner::service::source::{
-        CommitAvailability, CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker,
-        WorkflowGitRevocation, test_support::unavailable_source_broker,
+        SourceCredentialBroker,
+        test_support::{gated_unavailable_source_broker, unavailable_source_broker},
     };
     use crate::runner::service::test_support::{
         ConfigFixture, DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
@@ -2687,6 +2687,7 @@ mod tests {
         observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
         sleep_request, welcome, with_watchdog,
     };
+    use crate::runner::service::workspace::{AssignmentRoot, AssignmentRootCreationError};
     use crate::runner::service::{Sequence, Sleeper};
     use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
     use crate::runner_protocol::{
@@ -2698,54 +2699,24 @@ mod tests {
 
     const OPENING_MESSAGE_ID: &str = "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc";
 
-    struct GatedUnavailableSourceBroker {
+    struct GatedFailingAssignmentRootPreparer {
+        started: mpsc::UnboundedSender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
-    impl SourceCredentialBroker for GatedUnavailableSourceBroker {
-        fn issue(
+    impl AssignmentRootPreparer for GatedFailingAssignmentRootPreparer {
+        fn prepare(
             &self,
             _assignment_id: &str,
-            cancellation: &CaptureCancellation,
-        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
+            let _ = self.started.send(());
             self.release
                 .lock()
-                .expect("source gate mutex poisoned")
+                .expect("workspace preparation gate mutex poisoned")
                 .recv()
-                .map_err(|_| CredentialBrokerFailure::Unavailable)?;
-            if cancellation.is_cancelled() {
-                Err(CredentialBrokerFailure::Fenced)
-            } else {
-                Err(CredentialBrokerFailure::Unavailable)
-            }
+                .map_err(|_| AssignmentRootCreationError::Unavailable)?;
+            Err(AssignmentRootCreationError::Unavailable)
         }
-
-        // This transport gate models source unavailability; runtime Git is deliberately inert.
-        // jscpd:ignore-start
-        fn commit_availability(
-            &self,
-            _assignment_id: &str,
-            _cancellation: &CaptureCancellation,
-        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
-            Err(CredentialBrokerFailure::Unavailable)
-        }
-
-        fn issue_workflow_git(
-            &self,
-            _assignment_id: &str,
-            _cancellation: &CaptureCancellation,
-        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
-            Err(CredentialBrokerFailure::Unavailable)
-        }
-
-        fn revoke_workflow_git(
-            &self,
-            _assignment_id: &str,
-            _token: &[u8],
-        ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
-            Err(CredentialBrokerFailure::Unavailable)
-        }
-        // jscpd:ignore-end
     }
 
     struct EstablishedTestContext {
@@ -2790,6 +2761,18 @@ mod tests {
                 sleep_requests: Some(sleep_requests),
                 opening,
             }
+        }
+
+        fn with_root_preparer(root_preparer: Arc<dyn AssignmentRootPreparer>) -> Self {
+            let mut context = Self::new();
+            install_root_preparer(
+                context
+                    .assignment_manager
+                    .get_mut()
+                    .expect("assignment manager mutex poisoned"),
+                root_preparer,
+            );
+            context
         }
 
         fn dependencies(&self) -> ConnectionDependencies<'_> {
@@ -3081,6 +3064,109 @@ mod tests {
             ]),
             BackpressuredWriter::new(BackpressurePoint::ReadyAfterFirstSend, blocked),
         )
+    }
+
+    #[tokio::test]
+    async fn slow_failing_workspace_does_not_block_acknowledgements_or_ping() {
+        let (workspace_started, mut workspace_start) = mpsc::unbounded_channel();
+        let (release_workspace, workspace_release) = std::sync::mpsc::channel();
+        let root_preparer = Arc::new(GatedFailingAssignmentRootPreparer {
+            started: workspace_started,
+            release: Mutex::new(workspace_release),
+        });
+        let context = EstablishedTestContext::with_root_preparer(root_preparer);
+        enqueue_transitions(&context.assignment_manager.lock().unwrap(), 1);
+
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            let opening = outbound.recv().await.expect("opening hello missing");
+            assert!(matches!(opening, Message::Text(_)));
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+
+            let transition = outbound.recv().await.expect("fixture transition missing");
+            let Message::Text(transition) = transition else {
+                panic!("fixture transition was not text");
+            };
+            let transition: serde_json::Value =
+                serde_json::from_str(&transition).expect("decode fixture transition");
+            assert_eq!(transition["type"], "execution_transition");
+            assert_eq!(transition["sequence"], 2);
+            inbound.send(assignment_offer());
+
+            let receipt = outbound.recv().await.expect("offer receipt missing");
+            let Message::Text(receipt) = receipt else {
+                panic!("offer receipt was not text");
+            };
+            let receipt: serde_json::Value =
+                serde_json::from_str(&receipt).expect("decode offer receipt");
+            assert_eq!(receipt["type"], "effect_acknowledged");
+            assert_eq!(receipt["sequence"], 3);
+            workspace_start
+                .recv()
+                .await
+                .expect("workspace preparation did not start");
+
+            inbound.send(observation_acknowledgement(
+                transition["messageId"]
+                    .as_str()
+                    .expect("transition message ID"),
+                2,
+            ));
+            inbound.send(observation_acknowledgement(
+                receipt["messageId"].as_str().expect("receipt message ID"),
+                3,
+            ));
+            inbound.send(Message::Ping(b"workspace-still-blocked".to_vec().into()));
+            let pong = outbound
+                .recv()
+                .await
+                .expect("workspace-blocked pong missing");
+            assert!(matches!(
+                pong,
+                Message::Pong(payload) if payload.as_ref() == b"workspace-still-blocked"
+            ));
+            assert!(
+                !observation_retained(&context.assignment_manager.lock().unwrap(), 1),
+                "the transition acknowledgement remained blocked behind workspace preparation"
+            );
+
+            release_workspace
+                .send(())
+                .expect("release workspace preparation");
+            let rejection = outbound.recv().await.expect("workspace rejection missing");
+            let Message::Text(rejection) = rejection else {
+                panic!("workspace rejection was not text");
+            };
+            let rejection: serde_json::Value =
+                serde_json::from_str(&rejection).expect("decode workspace rejection");
+            assert_eq!(rejection["type"], "assignment_rejected");
+            assert_eq!(
+                rejection["payload"]["effectId"],
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
+            );
+            assert_eq!(
+                rejection["payload"]["decline"]["reason"],
+                "execution_environment_unavailable"
+            );
+            inbound.send(observation_acknowledgement(
+                rejection["messageId"]
+                    .as_str()
+                    .expect("rejection message ID"),
+                4,
+            ));
+            inbound.send(Message::Close(None));
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("slow workspace transcript timed out");
+        let progress = result.expect("slow workspace transcript failed");
+        assert_eq!(progress.effects_received, 1);
+        assert_eq!(progress.effect_acknowledgements_confirmed, 1);
+        assert_eq!(next_sequence, 5);
     }
 
     #[tokio::test]
@@ -3960,10 +4046,7 @@ mod tests {
     #[tokio::test]
     async fn authenticates_and_completes_hello_and_ping_pong() {
         let (listener, endpoint) = fixture_listener().await;
-        let (release_source, source_release) = std::sync::mpsc::sync_channel(1);
-        let source_broker = Arc::new(GatedUnavailableSourceBroker {
-            release: Mutex::new(source_release),
-        });
+        let (source_broker, release_source) = gated_unavailable_source_broker();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept fixture connection");
             let mut socket = accept_hdr_async(stream, |request: &Request, mut response: Response| {
@@ -4019,6 +4102,20 @@ mod tests {
             let acknowledgement_message_id = offer_acknowledgement["messageId"]
                 .as_str()
                 .expect("effect acknowledgement message ID");
+            let Some(Ok(Message::Text(preparing))) = socket.next().await else {
+                panic!("fixture did not receive assignment preparation acknowledgement");
+            };
+            let preparing: serde_json::Value = serde_json::from_str(&preparing)
+                .expect("decode assignment preparation acknowledgement");
+            assert_eq!(preparing["type"], "assignment_preparing");
+            assert_eq!(
+                preparing["payload"]["effectId"],
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
+            );
+            assert_eq!(
+                preparing["payload"]["offeredExecutionSpecId"],
+                "xsp_01k0z6r1w8f4jy2m7q9v3x5abc"
+            );
             socket
                 .send(Message::Text(
                     json!({
@@ -4038,20 +4135,6 @@ mod tests {
                 ))
                 .await
                 .expect("send effect acknowledgement response");
-            let Some(Ok(Message::Text(preparing))) = socket.next().await else {
-                panic!("fixture did not receive assignment preparation acknowledgement");
-            };
-            let preparing: serde_json::Value = serde_json::from_str(&preparing)
-                .expect("decode assignment preparation acknowledgement");
-            assert_eq!(preparing["type"], "assignment_preparing");
-            assert_eq!(
-                preparing["payload"]["effectId"],
-                "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
-            );
-            assert_eq!(
-                preparing["payload"]["offeredExecutionSpecId"],
-                "xsp_01k0z6r1w8f4jy2m7q9v3x5abc"
-            );
             socket
                 .send(observation_acknowledgement(
                     preparing["messageId"]

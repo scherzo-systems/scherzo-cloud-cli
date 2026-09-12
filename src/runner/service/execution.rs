@@ -283,7 +283,6 @@ pub(super) struct ExecutionAuthority {
     pub(super) lease_clock: LeaseClock,
     pub(super) causal_lease: CausalLease,
     pub(super) updates: tokio::sync::watch::Receiver<LeaseAuthority>,
-    pub(super) workflow_git_activated: bool,
 }
 
 pub(super) struct ExecutionJob {
@@ -314,7 +313,7 @@ impl ExecutionJob {
             lease_clock: authority.lease_clock,
             causal_lease: authority.causal_lease,
             authority_updates: authority.updates,
-            workflow_git_activated: authority.workflow_git_activated,
+            workflow_git_activated: false,
             workspace_release_reported: AtomicBool::new(false),
         }
     }
@@ -360,7 +359,8 @@ impl ExecutionJob {
         });
     }
 
-    async fn run(self) {
+    async fn run(mut self) {
+        self.workflow_git_activated = self.activate_workflow_git().await;
         let assignment_id = self.accepted.assignment_id().to_owned();
         let attempt_id = self.accepted.attempt_id().to_owned();
         let run_id = self.accepted.run_id().to_owned();
@@ -389,6 +389,15 @@ impl ExecutionJob {
             quiescence,
         });
         self.outbox.wake();
+    }
+
+    async fn activate_workflow_git(&self) -> bool {
+        let workflow_git = self.accepted.workflow_git.clone();
+        let lease_clock = self.lease_clock.clone();
+        let authority = self.authority_updates.clone();
+        tokio::task::spawn_blocking(move || workflow_git.activate(lease_clock, authority).is_ok())
+            .await
+            .unwrap_or(false)
     }
 
     async fn release_workspace(
@@ -452,7 +461,9 @@ impl ExecutionJob {
             .cancellation()
             .source()
             .clone();
-        if !self.workflow_git_activated {
+        if !self.workflow_git_activated
+            && cancellation.cancellation_reason() != Some(CancellationReason::RunnerShutdown)
+        {
             return self
                 .abort_after_workspace_release(
                     assignment_id,

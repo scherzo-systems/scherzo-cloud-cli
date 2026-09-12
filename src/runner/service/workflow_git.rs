@@ -407,19 +407,29 @@ impl WorkflowGitAuthority {
     }
 
     pub(super) fn disable(&self) {
+        if self.fence_without_wake() {
+            self.wake();
+        }
+    }
+
+    pub(super) fn fence_without_wake(&self) -> bool {
         let mut state = self.lock();
-        if matches!(
+        if !matches!(
             state.lifecycle,
             AuthorityLifecycle::Installed | AuthorityLifecycle::Active
         ) {
-            if let Some(active) = &state.active {
-                active.issuance_cancellation.cancel();
-            }
-            state.lifecycle = AuthorityLifecycle::Disabled;
-            self.inner.stop.store(true, Ordering::Release);
-            drop(state);
-            wake_helper(&self.inner.socket_address);
+            return false;
         }
+        if let Some(active) = &state.active {
+            active.issuance_cancellation.cancel();
+        }
+        state.lifecycle = AuthorityLifecycle::Disabled;
+        self.inner.stop.store(true, Ordering::Release);
+        true
+    }
+
+    pub(super) fn wake(&self) {
+        wake_helper(&self.inner.socket_address);
     }
 
     pub(super) fn teardown(&self, quiescence: ProcessQuiescence) -> WorkflowGitTeardownReport {
