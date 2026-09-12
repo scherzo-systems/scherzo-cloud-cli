@@ -29,7 +29,7 @@ use super::workspace::{
 };
 use super::{
     Config, ConnectionLoopDependencies, Connector, ServiceError, Shutdown, Sleeper,
-    run_connection_loop, run_connection_loop_with_work_root,
+    run_connection_loop_with_work_root,
 };
 use crate::runner::credential::test_credential;
 use crate::runner::telemetry::test_recorder;
@@ -997,11 +997,18 @@ async fn run_deterministic_connection_loop(
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
     let config = deterministic_config();
-    run_connection_loop(
-        deterministic_connection_loop_dependencies(config.cloned_config(), sleeper),
+    let dependencies = deterministic_connection_loop_dependencies(config.cloned_config(), sleeper);
+    let work_root = WorkRootLease::acquire_for_test(
+        dependencies.config.assignment().work_root(),
+        &dependencies.boot_id,
+    )
+    .unwrap();
+    run_connection_loop_with_work_root(
+        dependencies,
         connector,
         Backoff::with_fixed_unit(1.0),
         shutdown,
+        work_root,
     )
     .await
 }

@@ -46,8 +46,24 @@ impl Command {
             claude_code_installation,
             codex_installation,
         );
-        crate::runner::service::run(config).context("serve enrolled runner assignments")?;
-        Ok(ExitCode::Success)
+        match crate::runner::service::run(config) {
+            Ok(()) => Ok(ExitCode::Success),
+            Err(error) => {
+                let exit_code = service_exit_code(&error);
+                Err(super::super::CommandFailure::with_exit_code(
+                    anyhow::Error::new(error).context("serve enrolled runner assignments"),
+                    exit_code,
+                ))
+            }
+        }
+    }
+}
+
+const fn service_exit_code(error: &crate::runner::service::ServiceError) -> ExitCode {
+    if error.requires_operator_recovery() {
+        ExitCode::RunnerRecoveryRequired
+    } else {
+        ExitCode::GeneralFailure
     }
 }
 
@@ -171,6 +187,22 @@ mod tests {
                 codex_available.then_some(&codex),
             );
         }
+    }
+
+    #[test]
+    fn recovery_required_service_failures_have_a_supervisor_stopping_exit_code() {
+        for error in [
+            crate::runner::service::ServiceError::WorkRootInUse,
+            crate::runner::service::ServiceError::WorkRootIsolation,
+            crate::runner::service::ServiceError::WorkRootRecovery,
+            crate::runner::service::ServiceError::WorkspaceCleanupFailed,
+        ] {
+            assert_eq!(service_exit_code(&error), ExitCode::RunnerRecoveryRequired);
+        }
+        assert_eq!(
+            service_exit_code(&crate::runner::service::ServiceError::BuildRuntime),
+            ExitCode::GeneralFailure
+        );
     }
 
     #[test]

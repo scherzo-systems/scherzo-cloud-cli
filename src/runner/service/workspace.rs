@@ -8,9 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use fs4::{FileExt, TryLockError};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, fstat, openat, statat};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, fstat, openat, renameat_with, statat,
+};
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use super::workflow_git::WorkflowGitAuthority;
@@ -18,10 +21,16 @@ use crate::execution::owned_tree::{self, RemovalError};
 
 const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
 const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
+const CLEANUP_AUTHORITY_NAME: &str = ".scherzo-runner-serve-cleanup-v1";
+const CLEANUP_AUTHORITY_STAGING_PREFIX: &str = ".scherzo-runner-serve-cleanup-staging-";
+const CLEANUP_AUTHORITY_HEADER: &str = "scherzo-runner-serve/cleanup-authority/v1";
+const CLEANUP_IDENTITY_ATTRIBUTE: &str = "user.scherzo.runner-cleanup-v1";
+const CLEANUP_IDENTITY_BYTES: usize = 32;
 const BOOT_MARKER: &[u8] = b"scherzo-runner-serve/boot-root/v1\n";
 const ASSIGNMENT_MARKER: &[u8] = b"scherzo-runner-serve/assignment-root/v1\n";
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const MAXIMUM_CLEANUP_AUTHORITY_BYTES: u64 = 512;
 const REMOVAL_DELAYS: [Duration; 5] = [
     Duration::from_millis(100),
     Duration::from_millis(250),
@@ -66,6 +75,7 @@ pub(super) enum WorkRootError {
     WorkRootInUse,
     UnsafeWorkRoot,
     AmbiguousOwnedRoot,
+    InvalidCleanupAuthority,
     StaleRootCleanupFailed,
     CreateBootRoot,
 }
@@ -76,9 +86,23 @@ impl fmt::Display for WorkRootError {
             Self::WorkRootInUse => "runner work root is already in use",
             Self::UnsafeWorkRoot => "runner work root ownership state is unsafe",
             Self::AmbiguousOwnedRoot => "runner work root contains ambiguous boot state",
+            Self::InvalidCleanupAuthority => "runner work root cleanup authority is invalid",
             Self::StaleRootCleanupFailed => "runner stale work-root cleanup failed",
             Self::CreateBootRoot => "runner boot root could not be created",
         })
+    }
+}
+
+impl WorkRootError {
+    pub(super) const fn error_type(self) -> &'static str {
+        match self {
+            Self::WorkRootInUse => "work_root_in_use",
+            Self::UnsafeWorkRoot => "unsafe_work_root",
+            Self::AmbiguousOwnedRoot => "ambiguous_owned_root",
+            Self::InvalidCleanupAuthority => "invalid_cleanup_authority",
+            Self::StaleRootCleanupFailed => "stale_root_cleanup_exhausted",
+            Self::CreateBootRoot => "boot_root_creation_failed",
+        }
     }
 }
 
@@ -106,16 +130,17 @@ struct SystemTreeRemover;
 
 impl TreeRemover for SystemTreeRemover {
     fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
-        match tree.validate(false) {
+        match tree.validate(true) {
             Ok(TreePresence::Present) => {}
             Ok(TreePresence::Missing) => return Err(io::ErrorKind::NotFound.into()),
             Err(()) => return Err(safety_removal_error()),
         }
         let link = tree.link().ok_or_else(safety_removal_error)?;
+        let directory = link.directory.as_ref().ok_or_else(safety_removal_error)?;
         owned_tree::remove_open_tree_at(
             link.parent.as_ref(),
             link.identity.as_ref(),
-            link.directory.as_ref(),
+            directory.as_ref(),
         )
         .map_err(|error| match error {
             RemovalError::Filesystem(error) => filesystem_removal_error(error),
@@ -149,11 +174,80 @@ impl WorkRootHook for NoopWorkRootHook {
     fn before_child_enumeration(&self) {}
 }
 
+trait CleanupIdentityStore: Send + Sync {
+    fn read(&self, directory: &OwnedFd) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()>;
+    fn create(
+        &self,
+        directory: &OwnedFd,
+        identity: &[u8; CLEANUP_IDENTITY_BYTES],
+    ) -> Result<(), ()>;
+}
+
+struct ExtendedAttributeCleanupIdentityStore;
+
+impl CleanupIdentityStore for ExtendedAttributeCleanupIdentityStore {
+    fn read(&self, directory: &OwnedFd) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
+        let mut buffer = [0_u8; CLEANUP_IDENTITY_BYTES + 1];
+        match rustix::fs::fgetxattr(directory, CLEANUP_IDENTITY_ATTRIBUTE, &mut buffer) {
+            Ok(length) if length == CLEANUP_IDENTITY_BYTES => {
+                let mut identity = [0_u8; CLEANUP_IDENTITY_BYTES];
+                identity.copy_from_slice(&buffer[..CLEANUP_IDENTITY_BYTES]);
+                Ok(Some(identity))
+            }
+            Ok(_) => Err(()),
+            Err(error) if missing_cleanup_identity(error) => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn create(
+        &self,
+        directory: &OwnedFd,
+        identity: &[u8; CLEANUP_IDENTITY_BYTES],
+    ) -> Result<(), ()> {
+        rustix::fs::fsetxattr(
+            directory,
+            CLEANUP_IDENTITY_ATTRIBUTE,
+            identity,
+            rustix::fs::XattrFlags::CREATE,
+        )
+        .map_err(|_| ())
+    }
+}
+
+// Unit tests exercise cleanup state transitions on filesystems such as the Nix
+// build sandbox that intentionally reject extended attributes. Device and inode
+// identity preserves replacement detection without weakening the system store.
+#[cfg(test)]
+struct MetadataCleanupIdentityStore;
+
+#[cfg(test)]
+impl CleanupIdentityStore for MetadataCleanupIdentityStore {
+    fn read(&self, directory: &OwnedFd) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
+        let metadata = fstat(directory).map_err(|_| ())?;
+        let mut identity = [0_u8; CLEANUP_IDENTITY_BYTES];
+        identity[..8].copy_from_slice(&metadata.st_dev.to_le_bytes());
+        identity[8..16].copy_from_slice(&metadata.st_ino.to_le_bytes());
+        identity[16..24].copy_from_slice(&(!metadata.st_dev).to_le_bytes());
+        identity[24..].copy_from_slice(&(!metadata.st_ino).to_le_bytes());
+        Ok(Some(identity))
+    }
+
+    fn create(
+        &self,
+        _directory: &OwnedFd,
+        _identity: &[u8; CLEANUP_IDENTITY_BYTES],
+    ) -> Result<(), ()> {
+        Err(())
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct WorkspaceFilesystem {
     remover: Arc<dyn TreeRemover>,
     sleeper: Arc<dyn CleanupSleeper>,
     hook: Arc<dyn WorkRootHook>,
+    cleanup_identity: Arc<dyn CleanupIdentityStore>,
 }
 
 impl WorkspaceFilesystem {
@@ -162,6 +256,17 @@ impl WorkspaceFilesystem {
             remover: Arc::new(SystemTreeRemover),
             sleeper: Arc::new(InterruptibleSleeper),
             hook: Arc::new(NoopWorkRootHook),
+            cleanup_identity: Arc::new(ExtendedAttributeCleanupIdentityStore),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn testing() -> Self {
+        Self {
+            remover: Arc::new(SystemTreeRemover),
+            sleeper: Arc::new(InterruptibleSleeper),
+            hook: Arc::new(NoopWorkRootHook),
+            cleanup_identity: Arc::new(MetadataCleanupIdentityStore),
         }
     }
 
@@ -171,10 +276,26 @@ impl WorkspaceFilesystem {
         sleeper: Arc<dyn CleanupSleeper>,
         hook: Arc<dyn WorkRootHook>,
     ) -> Self {
+        Self::injected_with_cleanup_identity(
+            remover,
+            sleeper,
+            hook,
+            Arc::new(MetadataCleanupIdentityStore),
+        )
+    }
+
+    #[cfg(test)]
+    fn injected_with_cleanup_identity(
+        remover: Arc<dyn TreeRemover>,
+        sleeper: Arc<dyn CleanupSleeper>,
+        hook: Arc<dyn WorkRootHook>,
+        cleanup_identity: Arc<dyn CleanupIdentityStore>,
+    ) -> Self {
         Self {
             remover,
             sleeper,
             hook,
+            cleanup_identity,
         }
     }
 }
@@ -244,6 +365,14 @@ impl WorkRootAuthority {
         }
         verify_lock_identity(&self.shared.lock_path, &self.shared.lock_file).map_err(|_| ())
     }
+
+    fn work_root(&self) -> &Path {
+        &self.shared.path
+    }
+
+    fn sync(&self) -> Result<(), ()> {
+        self.shared.directory_lock.sync_all().map_err(|_| ())
+    }
 }
 
 impl Drop for WorkRootAuthorityShared {
@@ -255,65 +384,383 @@ impl Drop for WorkRootAuthorityShared {
     }
 }
 
+struct CleanupAuthorityRecord {
+    relative_path: String,
+    parent_device: u64,
+    parent_inode: u64,
+    device: u64,
+    inode: u64,
+    marker_device: u64,
+    marker_inode: u64,
+    cleanup_identity: [u8; CLEANUP_IDENTITY_BYTES],
+}
+
+impl CleanupAuthorityRecord {
+    fn for_tree(
+        work_root: &Path,
+        tree: &OwnedTree,
+        cleanup_identity: [u8; CLEANUP_IDENTITY_BYTES],
+    ) -> Result<Self, ()> {
+        let relative_path = tree.path.strip_prefix(work_root).map_err(|_| ())?;
+        let relative_path = relative_path.to_str().ok_or(())?.to_owned();
+        let _ = CleanupTarget::parse(&relative_path)?;
+        let Some(MarkerState::Present(marker)) = tree.marker.as_ref() else {
+            return Err(());
+        };
+        let link = tree.link().ok_or(())?;
+        let parent = fstat(link.parent.as_ref()).map_err(|_| ())?;
+        if !safe_owned_directory_stat(&parent) {
+            return Err(());
+        }
+        Ok(Self {
+            relative_path,
+            parent_device: parent.st_dev,
+            parent_inode: parent.st_ino,
+            device: link.device,
+            inode: link.inode,
+            marker_device: marker.device,
+            marker_inode: marker.inode,
+            cleanup_identity,
+        })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "{CLEANUP_AUTHORITY_HEADER}\npath={}\nparent-device={}\nparent-inode={}\ndevice={}\ninode={}\nmarker-device={}\nmarker-inode={}\ncleanup-identity={}\n",
+            self.relative_path,
+            self.parent_device,
+            self.parent_inode,
+            self.device,
+            self.inode,
+            self.marker_device,
+            self.marker_inode,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.cleanup_identity),
+        )
+        .into_bytes()
+    }
+
+    fn decode(contents: &[u8]) -> Result<Self, ()> {
+        let contents = std::str::from_utf8(contents).map_err(|_| ())?;
+        let mut lines = contents.split('\n');
+        if lines.next() != Some(CLEANUP_AUTHORITY_HEADER) {
+            return Err(());
+        }
+        let relative_path = parse_authority_field(&mut lines, "path=")?.to_owned();
+        let _ = CleanupTarget::parse(&relative_path)?;
+        let parent_device = parse_authority_number(&mut lines, "parent-device=")?;
+        let parent_inode = parse_authority_number(&mut lines, "parent-inode=")?;
+        let device = parse_authority_number(&mut lines, "device=")?;
+        let inode = parse_authority_number(&mut lines, "inode=")?;
+        let marker_device = parse_authority_number(&mut lines, "marker-device=")?;
+        let marker_inode = parse_authority_number(&mut lines, "marker-inode=")?;
+        let cleanup_identity = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parse_authority_field(&mut lines, "cleanup-identity=")?)
+            .map_err(|_| ())?
+            .try_into()
+            .map_err(|_| ())?;
+        if lines.next() != Some("") || lines.next().is_some() {
+            return Err(());
+        }
+        Ok(Self {
+            relative_path,
+            parent_device,
+            parent_inode,
+            device,
+            inode,
+            marker_device,
+            marker_inode,
+            cleanup_identity,
+        })
+    }
+}
+
+fn parse_authority_field<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    prefix: &str,
+) -> Result<&'a str, ()> {
+    lines
+        .next()
+        .and_then(|line| line.strip_prefix(prefix))
+        .ok_or(())
+}
+
+fn parse_authority_number<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    prefix: &str,
+) -> Result<u64, ()> {
+    parse_authority_field(lines, prefix)?
+        .parse()
+        .map_err(|_| ())
+}
+
+struct CleanupTarget {
+    relative_path: PathBuf,
+    marker_contents: &'static [u8],
+    marker_in_parent: bool,
+}
+
+impl CleanupTarget {
+    fn parse(relative_path: &str) -> Result<Self, ()> {
+        let components = relative_path.split('/').collect::<Vec<_>>();
+        match components.as_slice() {
+            [boot] if valid_boot_id(boot) => Ok(Self {
+                relative_path: PathBuf::from(boot),
+                marker_contents: BOOT_MARKER,
+                marker_in_parent: false,
+            }),
+            [boot, assignment] if valid_boot_id(boot) && valid_assignment_id(assignment) => {
+                Ok(Self {
+                    relative_path: PathBuf::from(boot).join(assignment),
+                    marker_contents: ASSIGNMENT_MARKER,
+                    marker_in_parent: false,
+                })
+            }
+            [boot, assignment, "workspace"]
+                if valid_boot_id(boot) && valid_assignment_id(assignment) =>
+            {
+                Ok(Self {
+                    relative_path: PathBuf::from(boot).join(assignment).join("workspace"),
+                    marker_contents: ASSIGNMENT_MARKER,
+                    marker_in_parent: true,
+                })
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+fn valid_boot_id(value: &str) -> bool {
+    value
+        .parse::<crate::runner_protocol::generated::BootId>()
+        .is_ok()
+}
+
+fn valid_assignment_id(value: &str) -> bool {
+    value
+        .parse::<crate::runner_protocol::generated::AssignmentId>()
+        .is_ok()
+}
+
+struct CleanupAuthorityProof {
+    path: PathBuf,
+    contents: Vec<u8>,
+    device: u64,
+    inode: u64,
+    record: CleanupAuthorityRecord,
+}
+
+impl CleanupAuthorityProof {
+    fn create(
+        authority: &WorkRootAuthority,
+        tree: &OwnedTree,
+        cleanup_identity_store: &dyn CleanupIdentityStore,
+    ) -> Result<Self, ()> {
+        authority.validate()?;
+        let cleanup_identity = tree.prepare_cleanup_identity(cleanup_identity_store)?;
+        let record =
+            CleanupAuthorityRecord::for_tree(authority.work_root(), tree, cleanup_identity)?;
+        let contents = record.encode();
+        if u64::try_from(contents.len()).map_err(|_| ())? > MAXIMUM_CLEANUP_AUTHORITY_BYTES {
+            return Err(());
+        }
+        let (staging_name, staging_path, mut file) = create_cleanup_authority_staging(authority)?;
+        file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))
+            .and_then(|()| file.write_all(&contents))
+            .and_then(|()| file.sync_all())
+            .map_err(|_| ())?;
+        authority.validate()?;
+        verify_private_file_identity(&staging_path, &file)?;
+        renameat_with(
+            &authority.shared.directory_lock,
+            &staging_name,
+            &authority.shared.directory_lock,
+            CLEANUP_AUTHORITY_NAME,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|_| ())?;
+        authority.sync()?;
+        Self::capture(authority.work_root().join(CLEANUP_AUTHORITY_NAME))
+    }
+
+    fn load(authority: &WorkRootAuthority) -> Result<Option<Self>, ()> {
+        authority.validate()?;
+        let path = authority.work_root().join(CLEANUP_AUTHORITY_NAME);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Self::capture(path).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn capture(path: PathBuf) -> Result<Self, ()> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW_FLAG)
+            .open(&path)
+            .map_err(|_| ())?;
+        set_close_on_exec(&file)?;
+        let metadata = file.metadata().map_err(|_| ())?;
+        let path_metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
+        if !safe_private_file(&metadata)
+            || path_metadata.dev() != metadata.dev()
+            || path_metadata.ino() != metadata.ino()
+        {
+            return Err(());
+        }
+        let mut contents = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(MAXIMUM_CLEANUP_AUTHORITY_BYTES + 1)
+            .read_to_end(&mut contents)
+            .map_err(|_| ())?;
+        if u64::try_from(contents.len()).map_err(|_| ())? > MAXIMUM_CLEANUP_AUTHORITY_BYTES {
+            return Err(());
+        }
+        let record = CleanupAuthorityRecord::decode(&contents)?;
+        Ok(Self {
+            path,
+            contents,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            record,
+        })
+    }
+
+    fn validate(&self) -> Result<(), ()> {
+        verify_private_contents(&self.path, &self.contents, self.device, self.inode)
+    }
+
+    fn clear(self, authority: &WorkRootAuthority) -> Result<(), ()> {
+        authority.validate()?;
+        self.validate()?;
+        fs::remove_file(&self.path).map_err(|_| ())?;
+        authority.sync()
+    }
+}
+
+fn create_cleanup_authority_staging(
+    authority: &WorkRootAuthority,
+) -> Result<(String, PathBuf, File), ()> {
+    for _ in 0..8 {
+        let mut identity = [0_u8; 16];
+        getrandom::fill(&mut identity).map_err(|_| ())?;
+        let name = format!(
+            "{CLEANUP_AUTHORITY_STAGING_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identity)
+        );
+        let path = authority.work_root().join(&name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .custom_flags(NOFOLLOW_FLAG)
+            .open(&path)
+        {
+            Ok(file) => {
+                set_close_on_exec(&file)?;
+                return Ok((name, path, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(()),
+        }
+    }
+    Err(())
+}
+
+fn verify_private_file_identity(path: &Path, file: &File) -> Result<(), ()> {
+    let opened = file.metadata().map_err(|_| ())?;
+    let linked = fs::symlink_metadata(path).map_err(|_| ())?;
+    (safe_private_file(&opened)
+        && safe_private_file(&linked)
+        && opened.dev() == linked.dev()
+        && opened.ino() == linked.ino())
+    .then_some(())
+    .ok_or(())
+}
+
 #[derive(Clone)]
 struct CleanupEngine {
     remover: Arc<dyn TreeRemover>,
     sleeper: Arc<dyn CleanupSleeper>,
+    cleanup_identity: Arc<dyn CleanupIdentityStore>,
     cancellation: Arc<CleanupCancellation>,
     authority: WorkRootAuthority,
+    serialized: Arc<Mutex<()>>,
 }
 
 impl CleanupEngine {
     fn remove(&self, tree: &OwnedTree) -> CleanupResult {
+        let _serialized = self
+            .serialized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.cancellation.is_cancelled() {
             return CleanupResult::Preempted;
         }
-        let mut marker_may_be_missing = false;
+        let proof = match CleanupAuthorityProof::create(
+            &self.authority,
+            tree,
+            self.cleanup_identity.as_ref(),
+        ) {
+            Ok(proof) => proof,
+            Err(()) => return CleanupResult::Quarantined(CleanupFailure::Safety),
+        };
+        self.remove_with_proof(tree, proof)
+    }
+
+    fn resume(&self, tree: &OwnedTree, proof: CleanupAuthorityProof) -> CleanupResult {
+        let _serialized = self
+            .serialized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.remove_with_proof(tree, proof)
+    }
+
+    fn remove_with_proof(&self, tree: &OwnedTree, proof: CleanupAuthorityProof) -> CleanupResult {
         let mut delays = REMOVAL_DELAYS.into_iter();
+        let mut attempted = false;
         loop {
-            if self.authority.validate().is_err() {
+            if self.authority.validate().is_err() || proof.validate().is_err() {
                 return CleanupResult::Quarantined(CleanupFailure::Safety);
             }
-            match tree.validate(marker_may_be_missing) {
-                Ok(TreePresence::Missing) => return CleanupResult::Released,
+            match tree.validate_during_cleanup(
+                self.cleanup_identity.as_ref(),
+                &proof.record.cleanup_identity,
+            ) {
+                Ok(TreePresence::Missing) => return self.finish_removal(tree, proof),
                 Ok(TreePresence::Present) => {}
-                Err(()) => {
-                    return CleanupResult::Quarantined(CleanupFailure::Safety);
+                Err(()) => return CleanupResult::Quarantined(CleanupFailure::Safety),
+            }
+            if attempted {
+                let Some(delay) = delays.next() else {
+                    return CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted);
+                };
+                if !self.sleeper.sleep(delay, &self.cancellation) {
+                    return CleanupResult::Preempted;
                 }
+                attempted = false;
+                continue;
             }
             if self.cancellation.is_cancelled() {
                 return CleanupResult::Preempted;
             }
-            let removal = self.remover.remove_tree(tree);
-            marker_may_be_missing = true;
-            match removal {
-                Ok(()) => match tree.validate(true) {
-                    Ok(TreePresence::Missing) => return CleanupResult::Released,
-                    Ok(TreePresence::Present) => {}
-                    Err(()) => {
-                        return CleanupResult::Quarantined(CleanupFailure::Safety);
-                    }
-                },
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    match tree.validate(true) {
-                        Ok(TreePresence::Missing) => return CleanupResult::Released,
-                        Ok(TreePresence::Present) => {}
-                        Err(()) => {
-                            return CleanupResult::Quarantined(CleanupFailure::Safety);
-                        }
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                    return CleanupResult::Quarantined(CleanupFailure::Safety);
-                }
-                Err(_) => {}
+            if self
+                .remover
+                .remove_tree(tree)
+                .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
+            {
+                return CleanupResult::Quarantined(CleanupFailure::Safety);
             }
-            let Some(delay) = delays.next() else {
-                return CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted);
-            };
-            if !self.sleeper.sleep(delay, &self.cancellation) {
-                return CleanupResult::Preempted;
-            }
+            attempted = true;
+        }
+    }
+
+    fn finish_removal(&self, tree: &OwnedTree, proof: CleanupAuthorityProof) -> CleanupResult {
+        if tree.sync_parent().is_err() {
+            return CleanupResult::Quarantined(CleanupFailure::Safety);
+        }
+        match proof.clear(&self.authority) {
+            Ok(()) => CleanupResult::Released,
+            Err(()) => CleanupResult::Quarantined(CleanupFailure::Safety),
         }
     }
 }
@@ -357,10 +804,16 @@ impl MarkerProof {
 }
 
 #[derive(Clone)]
+enum MarkerState {
+    Present(MarkerProof),
+    Missing(Option<Arc<OwnedFd>>),
+}
+
+#[derive(Clone)]
 struct DirectoryLink {
     parent: Arc<OwnedFd>,
     identity: Arc<str>,
-    directory: Arc<OwnedFd>,
+    directory: Option<Arc<OwnedFd>>,
     device: u64,
     inode: u64,
 }
@@ -396,14 +849,63 @@ impl DirectoryLink {
         Ok(Self {
             parent,
             identity,
-            directory,
+            directory: Some(directory),
             device: opened.st_dev,
             inode: opened.st_ino,
         })
     }
 
+    fn recover(
+        parent: Arc<OwnedFd>,
+        identity: Arc<str>,
+        device: u64,
+        inode: u64,
+    ) -> Result<Self, ()> {
+        match statat(
+            parent.as_ref(),
+            identity.as_ref(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => {
+                let link = Self::capture(parent, identity)?;
+                if link.device != device || link.inode != inode {
+                    return Err(());
+                }
+                Ok(link)
+            }
+            Err(Errno::NOENT) => {
+                let parent_metadata = fstat(parent.as_ref()).map_err(|_| ())?;
+                if !safe_owned_directory_stat(&parent_metadata) {
+                    return Err(());
+                }
+                Ok(Self {
+                    parent,
+                    identity,
+                    directory: None,
+                    device,
+                    inode,
+                })
+            }
+            Err(_) => Err(()),
+        }
+    }
+
     fn validate(&self) -> Result<TreePresence, ()> {
-        let opened = fstat(self.directory.as_ref()).map_err(|_| ())?;
+        let parent = fstat(self.parent.as_ref()).map_err(|_| ())?;
+        if !safe_owned_directory_stat(&parent) {
+            return Err(());
+        }
+        let Some(directory) = &self.directory else {
+            return match statat(
+                self.parent.as_ref(),
+                self.identity.as_ref(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Err(Errno::NOENT) => Ok(TreePresence::Missing),
+                _ => Err(()),
+            };
+        };
+        let opened = fstat(directory.as_ref()).map_err(|_| ())?;
         if !safe_owned_directory_stat(&opened)
             || opened.st_dev != self.device
             || opened.st_ino != self.inode
@@ -433,7 +935,7 @@ impl DirectoryLink {
 pub(super) struct OwnedTree {
     path: PathBuf,
     lineage: Vec<DirectoryLink>,
-    marker: Option<MarkerProof>,
+    marker: Option<MarkerState>,
 }
 
 #[derive(Clone, Copy)]
@@ -456,7 +958,7 @@ impl OwnedTree {
         if path.parent() != Some(parent.path()) {
             return Err(());
         }
-        let directory = Arc::clone(&parent.link().ok_or(())?.directory);
+        let directory = Arc::clone(parent.link().ok_or(())?.directory.as_ref().ok_or(())?);
         Self::capture_with_parent(parent.lineage.clone(), directory, path)
     }
 
@@ -478,19 +980,133 @@ impl OwnedTree {
         })
     }
 
+    fn recover(
+        work_root_directory: &File,
+        work_root: &Path,
+        record: &CleanupAuthorityRecord,
+    ) -> Result<Self, ()> {
+        let target = CleanupTarget::parse(&record.relative_path)?;
+        let path = work_root.join(&target.relative_path);
+        let component_count = target.relative_path.iter().count();
+        let mut parent = Arc::new(fcntl_dupfd_cloexec(work_root_directory, 0).map_err(|_| ())?);
+        let mut lineage = Vec::with_capacity(component_count);
+        for (index, component) in target.relative_path.iter().enumerate() {
+            let identity = component.to_str().map(Arc::<str>::from).ok_or(())?;
+            let link = if index + 1 == component_count {
+                DirectoryLink::recover(Arc::clone(&parent), identity, record.device, record.inode)?
+            } else {
+                DirectoryLink::capture(Arc::clone(&parent), identity)?
+            };
+            if index + 1 < component_count {
+                parent = Arc::clone(link.directory.as_ref().ok_or(())?);
+            }
+            lineage.push(link);
+        }
+        let mut tree = Self {
+            path,
+            lineage,
+            marker: None,
+        };
+        let link = tree.link().ok_or(())?;
+        let parent_metadata = fstat(link.parent.as_ref()).map_err(|_| ())?;
+        if parent_metadata.st_dev != record.parent_device
+            || parent_metadata.st_ino != record.parent_inode
+        {
+            return Err(());
+        }
+        tree.marker = Some(match tree.validate_linked_directory()? {
+            TreePresence::Present => {
+                let marker_parent = if target.marker_in_parent {
+                    Arc::clone(&tree.link().ok_or(())?.parent)
+                } else {
+                    Arc::clone(tree.directory()?)
+                };
+                let marker = MarkerProof {
+                    parent: marker_parent,
+                    contents: target.marker_contents,
+                    device: record.marker_device,
+                    inode: record.marker_inode,
+                };
+                match verify_marker(&marker) {
+                    Ok(()) => MarkerState::Present(marker),
+                    Err(()) if marker.is_missing() => {
+                        MarkerState::Missing(Some(Arc::clone(&marker.parent)))
+                    }
+                    Err(()) => return Err(()),
+                }
+            }
+            TreePresence::Missing => MarkerState::Missing(None),
+        });
+        Ok(tree)
+    }
+
+    fn prepare_cleanup_identity(
+        &self,
+        cleanup_identity_store: &dyn CleanupIdentityStore,
+    ) -> Result<[u8; CLEANUP_IDENTITY_BYTES], ()> {
+        if !matches!(self.validate_linked_directory()?, TreePresence::Present) {
+            return Err(());
+        }
+        self.validate_marker(false)?;
+        let directory = self.directory()?;
+        if let Some(identity) = cleanup_identity_store.read(directory.as_ref())? {
+            sync_directory(directory.as_ref())?;
+            return Ok(identity);
+        }
+        let mut identity = [0_u8; CLEANUP_IDENTITY_BYTES];
+        getrandom::fill(&mut identity).map_err(|_| ())?;
+        cleanup_identity_store.create(directory.as_ref(), &identity)?;
+        sync_directory(directory.as_ref())?;
+        (cleanup_identity_store.read(directory.as_ref())? == Some(identity))
+            .then_some(identity)
+            .ok_or(())
+    }
+
+    #[cfg(test)]
+    fn read_cleanup_identity(
+        &self,
+        cleanup_identity_store: &dyn CleanupIdentityStore,
+    ) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
+        cleanup_identity_store.read(self.directory()?.as_ref())
+    }
+
+    fn sync_parent(&self) -> Result<(), ()> {
+        if !matches!(self.validate_linked_directory()?, TreePresence::Missing) {
+            return Err(());
+        }
+        let parent = &self.link().ok_or(())?.parent;
+        sync_directory(parent.as_ref())
+    }
+
+    fn validate_during_cleanup(
+        &self,
+        cleanup_identity_store: &dyn CleanupIdentityStore,
+        cleanup_identity: &[u8; CLEANUP_IDENTITY_BYTES],
+    ) -> Result<TreePresence, ()> {
+        match self.validate_linked_directory()? {
+            TreePresence::Missing => return Ok(TreePresence::Missing),
+            TreePresence::Present => {}
+        }
+        if cleanup_identity_store.read(self.directory()?.as_ref())? != Some(*cleanup_identity) {
+            return Err(());
+        }
+        self.validate_marker(true)?;
+        Ok(TreePresence::Present)
+    }
+
     fn link(&self) -> Option<&DirectoryLink> {
         self.lineage.last()
     }
 
     fn directory(&self) -> Result<&Arc<OwnedFd>, ()> {
-        self.link().map(|link| &link.directory).ok_or(())
+        self.link().ok_or(())?.directory.as_ref().ok_or(())
     }
 
     fn install_marker(&mut self, marker: MarkerProof) {
-        self.marker = Some(marker);
+        self.marker = Some(MarkerState::Present(marker));
     }
 
-    fn validate(&self, marker_may_be_missing: bool) -> Result<TreePresence, ()> {
+    fn validate_linked_directory(&self) -> Result<TreePresence, ()> {
         let last = self.lineage.len().checked_sub(1).ok_or(())?;
         for (index, link) in self.lineage.iter().enumerate() {
             match link.validate()? {
@@ -499,15 +1115,60 @@ impl OwnedTree {
                 TreePresence::Missing => return Err(()),
             }
         }
-        if let Some(marker) = &self.marker {
-            match verify_marker(marker) {
-                Ok(()) => {}
-                Err(()) if marker_may_be_missing && marker.is_missing() => {}
-                Err(()) => return Err(()),
-            }
-        }
         Ok(TreePresence::Present)
     }
+
+    fn validate(&self, marker_may_be_missing: bool) -> Result<TreePresence, ()> {
+        match self.validate_linked_directory()? {
+            TreePresence::Missing => Ok(TreePresence::Missing),
+            TreePresence::Present => {
+                self.validate_marker(marker_may_be_missing)?;
+                Ok(TreePresence::Present)
+            }
+        }
+    }
+
+    fn validate_marker(&self, may_be_missing: bool) -> Result<(), ()> {
+        match self.marker.as_ref().ok_or(())? {
+            MarkerState::Present(marker) => match verify_marker(marker) {
+                Ok(()) => Ok(()),
+                Err(()) if may_be_missing && marker.is_missing() => Ok(()),
+                Err(()) => Err(()),
+            },
+            MarkerState::Missing(Some(parent))
+                if may_be_missing
+                    && matches!(
+                        statat(
+                            parent.as_ref(),
+                            OWNERSHIP_MARKER_NAME,
+                            AtFlags::SYMLINK_NOFOLLOW,
+                        ),
+                        Err(Errno::NOENT)
+                    ) =>
+            {
+                Ok(())
+            }
+            MarkerState::Missing(_) => Err(()),
+        }
+    }
+}
+
+fn missing_cleanup_identity(error: Errno) -> bool {
+    error == Errno::NODATA || {
+        #[cfg(target_vendor = "apple")]
+        {
+            error == Errno::NOATTR
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            false
+        }
+    }
+}
+
+fn sync_directory(directory: &OwnedFd) -> Result<(), ()> {
+    let duplicate = fcntl_dupfd_cloexec(directory, 0).map_err(|_| ())?;
+    File::from(duplicate).sync_all().map_err(|_| ())
 }
 
 fn safe_directory(path: &Path) -> Result<Metadata, ()> {
@@ -560,6 +1221,36 @@ fn verify_marker(marker: &MarkerProof) -> Result<(), ()> {
     (contents == marker.contents).then_some(()).ok_or(())
 }
 
+fn verify_private_contents(
+    path: &Path,
+    expected: &[u8],
+    device: u64,
+    inode: u64,
+) -> Result<(), ()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW_FLAG)
+        .open(path)
+        .map_err(|_| ())?;
+    set_close_on_exec(&file)?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
+    if !safe_private_file(&metadata)
+        || path_metadata.dev() != metadata.dev()
+        || path_metadata.ino() != metadata.ino()
+        || metadata.dev() != device
+        || metadata.ino() != inode
+    {
+        return Err(());
+    }
+    let mut contents = Vec::with_capacity(expected.len());
+    std::io::Read::by_ref(&mut file)
+        .take(u64::try_from(expected.len()).map_err(|_| ())? + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| ())?;
+    (contents == expected).then_some(()).ok_or(())
+}
+
 fn safe_private_file_stat(metadata: &Stat) -> bool {
     FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile
         && metadata.st_uid == rustix::process::geteuid().as_raw()
@@ -584,6 +1275,14 @@ pub(super) struct WorkRootLease {
 impl WorkRootLease {
     pub(super) fn acquire(work_root: &Path, boot_id: &str) -> Result<Arc<Self>, WorkRootError> {
         Self::acquire_with(work_root, boot_id, WorkspaceFilesystem::system())
+    }
+
+    #[cfg(test)]
+    pub(super) fn acquire_for_test(
+        work_root: &Path,
+        boot_id: &str,
+    ) -> Result<Arc<Self>, WorkRootError> {
+        Self::acquire_with(work_root, boot_id, WorkspaceFilesystem::testing())
     }
 
     pub(super) fn acquire_with(
@@ -624,9 +1323,23 @@ impl WorkRootLease {
         let engine = CleanupEngine {
             remover: filesystem.remover,
             sleeper: filesystem.sleeper,
+            cleanup_identity: filesystem.cleanup_identity,
             cancellation: Arc::clone(&cancellation),
             authority: authority.clone(),
+            serialized: Arc::new(Mutex::new(())),
         };
+
+        if let Some(proof) = CleanupAuthorityProof::load(&authority)
+            .map_err(|()| WorkRootError::InvalidCleanupAuthority)?
+        {
+            let tree =
+                OwnedTree::recover(&authority.shared.directory_lock, work_root, &proof.record)
+                    .map_err(|()| WorkRootError::InvalidCleanupAuthority)?;
+            classify_startup_cleanup(
+                engine.resume(&tree, proof),
+                WorkRootError::InvalidCleanupAuthority,
+            )?;
+        }
 
         filesystem.hook.before_child_enumeration();
         let children = fs::read_dir(work_root)
@@ -648,7 +1361,7 @@ impl WorkRootLease {
                 continue;
             }
             let path = work_root.join(name);
-            let mut tree = OwnedTree::capture_root(&authority.shared.directory_lock, path.clone())
+            let mut tree = OwnedTree::capture_root(&authority.shared.directory_lock, path)
                 .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?;
             let marker = MarkerProof::capture(
                 Arc::clone(
@@ -659,18 +1372,7 @@ impl WorkRootLease {
             )
             .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?;
             tree.install_marker(marker);
-            match engine.remove(&tree) {
-                CleanupResult::Released => {}
-                CleanupResult::Quarantined(CleanupFailure::Safety) => {
-                    return Err(WorkRootError::AmbiguousOwnedRoot);
-                }
-                CleanupResult::Quarantined(
-                    CleanupFailure::OrdinaryRemovalExhausted | CleanupFailure::Quiescence,
-                )
-                | CleanupResult::Preempted => {
-                    return Err(WorkRootError::StaleRootCleanupFailed);
-                }
-            }
+            classify_startup_cleanup(engine.remove(&tree), WorkRootError::AmbiguousOwnedRoot)?;
         }
 
         authority
@@ -759,7 +1461,12 @@ impl WorkRootLease {
         let engine = self.engine.clone();
         if std::thread::Builder::new()
             .name("runner-boot-root-release".to_owned())
-            .spawn(move || worker_completion.complete(engine.remove(&tree)))
+            .spawn(move || {
+                let result = engine.remove(&tree);
+                drop(engine);
+                drop(tree);
+                worker_completion.complete(result);
+            })
             .is_err()
         {
             completion.complete(CleanupResult::Quarantined(CleanupFailure::Safety));
@@ -774,6 +1481,20 @@ impl WorkRootLease {
     #[cfg(test)]
     pub(super) fn boot_path(&self) -> &Path {
         &self.boot_tree.path
+    }
+}
+
+fn classify_startup_cleanup(
+    result: CleanupResult,
+    safety_error: WorkRootError,
+) -> Result<(), WorkRootError> {
+    match result {
+        CleanupResult::Released => Ok(()),
+        CleanupResult::Quarantined(CleanupFailure::Safety) => Err(safety_error),
+        CleanupResult::Quarantined(
+            CleanupFailure::OrdinaryRemovalExhausted | CleanupFailure::Quiescence,
+        )
+        | CleanupResult::Preempted => Err(WorkRootError::StaleRootCleanupFailed),
     }
 }
 
@@ -1159,8 +1880,9 @@ impl PendingRelease {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::os::unix::fs::symlink;
+    use std::os::unix::process::ExitStatusExt as _;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1169,6 +1891,11 @@ mod tests {
     const BOOT_A: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abc";
     const BOOT_B: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abd";
     const ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const TERMINATION_FIXTURE_ROOT: &str = "SCHERZO_CLEANUP_TERMINATION_FIXTURE_ROOT";
+    const AUTHORITY_PUBLICATION_FIXTURE_ROOT: &str =
+        "SCHERZO_CLEANUP_AUTHORITY_PUBLICATION_FIXTURE_ROOT";
+    const TERMINATION_FIXTURE_STATUS: i32 = 86;
+    const TERMINATION_REMOVED_DESCENDANT: &str = "removed-before-termination";
 
     #[derive(Clone, Copy)]
     enum RemovalOutcome {
@@ -1207,6 +1934,7 @@ mod tests {
                 RemovalOutcome::NotFound => Err(io::Error::from(io::ErrorKind::NotFound)),
                 RemovalOutcome::Success => fs::remove_dir_all(path),
                 RemovalOutcome::Partial => {
+                    let _ = fs::remove_file(path.join(OWNERSHIP_MARKER_NAME));
                     if let Ok(entries) = fs::read_dir(path) {
                         for entry in entries.flatten() {
                             if entry.file_name() != OWNERSHIP_MARKER_NAME {
@@ -1223,6 +1951,52 @@ mod tests {
                     Err(io::Error::other("injected partial removal"))
                 }
             }
+        }
+    }
+
+    struct ProcessTerminatingRemover;
+
+    impl TreeRemover for ProcessTerminatingRemover {
+        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
+            fs::remove_file(tree.path().join(OWNERSHIP_MARKER_NAME))?;
+            fs::remove_file(tree.path().join(TERMINATION_REMOVED_DESCENDANT))?;
+            std::process::exit(TERMINATION_FIXTURE_STATUS);
+        }
+    }
+
+    struct ReplacingRemover {
+        calls: AtomicUsize,
+    }
+
+    impl TreeRemover for ReplacingRemover {
+        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            fs::remove_dir_all(tree.path())?;
+            create_private_directory(tree.path()).map_err(|()| io::Error::other("replace tree"))?;
+            fs::write(
+                tree.path().join("replacement-sentinel"),
+                b"unproven replacement",
+            )?;
+            Err(io::Error::other("tree replaced during removal"))
+        }
+    }
+
+    struct ReplacingAndDeletingRemover;
+
+    impl TreeRemover for ReplacingAndDeletingRemover {
+        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
+            let parent = tree
+                .path()
+                .parent()
+                .ok_or_else(|| io::Error::other("tree has no parent"))?;
+            fs::rename(tree.path(), parent.join("original-moved-by-racer"))?;
+            fs::create_dir(tree.path())?;
+            fs::set_permissions(tree.path(), Permissions::from_mode(0o700))?;
+            fs::write(
+                tree.path().join("replacement-sentinel"),
+                b"unproven replacement",
+            )?;
+            SystemTreeRemover.remove_tree(tree)
         }
     }
 
@@ -1295,6 +2069,22 @@ mod tests {
     impl WorkRootHook for CountingHook {
         fn before_child_enumeration(&self) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct ControlledCleanupIdentityStore(Mutex<[u8; CLEANUP_IDENTITY_BYTES]>);
+
+    impl CleanupIdentityStore for ControlledCleanupIdentityStore {
+        fn read(&self, _directory: &OwnedFd) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
+            Ok(Some(*self.0.lock().unwrap()))
+        }
+
+        fn create(
+            &self,
+            _directory: &OwnedFd,
+            _identity: &[u8; CLEANUP_IDENTITY_BYTES],
+        ) -> Result<(), ()> {
+            Err(())
         }
     }
 
@@ -1450,7 +2240,7 @@ mod tests {
             let first = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
             fs::write(first.boot_path().join("stale"), b"owned").unwrap();
         }
-        let second = WorkRootLease::acquire(root.path(), BOOT_B).unwrap();
+        let second = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
         assert!(!root.path().join(BOOT_A).exists());
         assert!(second.boot_path().exists());
 
@@ -1561,10 +2351,13 @@ mod tests {
     }
 
     #[test]
-    fn partial_removal_and_spurious_not_found_retry_but_exhaustion_quarantines() {
+    fn partial_removal_rechecks_not_found_and_exhaustion_quarantines_enclosing_root() {
         let recovered_root = private_work_root();
-        let recovered_remover =
-            ScriptedRemover::new([RemovalOutcome::Partial, RemovalOutcome::NotFound]);
+        let recovered_remover = ScriptedRemover::new([
+            RemovalOutcome::Partial,
+            RemovalOutcome::NotFound,
+            RemovalOutcome::Success,
+        ]);
         let recovered_sleeper = Arc::new(RecordingSleeper::default());
         let recovered = WorkRootLease::acquire_with(
             recovered_root.path(),
@@ -1616,6 +2409,341 @@ mod tests {
     }
 
     #[test]
+    fn process_termination_after_partial_cleanup_recovers_in_a_fresh_process() {
+        let root = private_work_root();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runner::service::workspace::tests::cleanup_termination_process",
+                "--ignored",
+            ])
+            .env(TERMINATION_FIXTURE_ROOT, root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(TERMINATION_FIXTURE_STATUS));
+
+        let boot_path = root.path().join(BOOT_A);
+        assert!(!boot_path.join(OWNERSHIP_MARKER_NAME).exists());
+        assert!(!boot_path.join(TERMINATION_REMOVED_DESCENDANT).exists());
+        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+
+        let recovered = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
+        assert!(!boot_path.exists());
+        assert!(!root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+        assert_eq!(recovered.boot_path(), root.path().join(BOOT_B));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked only by the termination recovery test"]
+    fn cleanup_termination_process() {
+        let root = std::env::var_os(TERMINATION_FIXTURE_ROOT)
+            .map(PathBuf::from)
+            .expect("termination fixture root is required");
+        let owner = WorkRootLease::acquire_with(
+            &root,
+            BOOT_A,
+            filesystem(
+                Arc::new(ProcessTerminatingRemover),
+                Arc::new(RecordingSleeper::default()),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            owner.boot_path().join(TERMINATION_REMOVED_DESCENDANT),
+            b"owned",
+        )
+        .unwrap();
+        let result = owner.release_boot_root_pending().wait();
+        panic!("termination fixture unexpectedly completed with {result:?}");
+    }
+
+    #[test]
+    fn process_termination_during_authority_publication_recovers_in_a_fresh_process() {
+        let root = private_work_root();
+        let stale = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
+        let stale_boot = stale.boot_path().to_owned();
+        drop(stale);
+
+        let current_exe = std::env::current_exe().unwrap();
+        let status = Command::new("sh")
+            .args([
+                "-c",
+                "ulimit -f 0; exec \"$0\" \"$@\"",
+                current_exe.to_str().unwrap(),
+                "--exact",
+                "runner::service::workspace::tests::cleanup_authority_publication_process",
+                "--ignored",
+            ])
+            .env(AUTHORITY_PUBLICATION_FIXTURE_ROOT, root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGXFSZ));
+        assert!(stale_boot.join(OWNERSHIP_MARKER_NAME).exists());
+        assert!(!root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+
+        let recovered = WorkRootLease::acquire_for_test(root.path(), BOOT_B);
+        assert!(recovered.is_ok());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked only by the authority publication recovery test"]
+    fn cleanup_authority_publication_process() {
+        let root = std::env::var_os(AUTHORITY_PUBLICATION_FIXTURE_ROOT)
+            .map(PathBuf::from)
+            .expect("authority publication fixture root is required");
+        let _result = WorkRootLease::acquire_for_test(&root, BOOT_B);
+        panic!("authority publication fixture unexpectedly completed");
+    }
+
+    #[test]
+    fn persistent_recovery_retains_authority_and_never_creates_a_new_boot() {
+        let root = private_work_root();
+        let first_remover = ScriptedRemover::new([
+            RemovalOutcome::Partial,
+            RemovalOutcome::Error,
+            RemovalOutcome::Error,
+            RemovalOutcome::Error,
+            RemovalOutcome::Error,
+            RemovalOutcome::Error,
+        ]);
+        let first = WorkRootLease::acquire_with(
+            root.path(),
+            BOOT_A,
+            filesystem(
+                first_remover,
+                Arc::new(RecordingSleeper::default()),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .unwrap();
+        let stale_boot = first.boot_path().to_owned();
+        fs::write(stale_boot.join("removed-before-failure"), b"owned").unwrap();
+        assert_eq!(
+            first.release_boot_root_pending().wait(),
+            CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
+        );
+        assert!(!stale_boot.join(OWNERSHIP_MARKER_NAME).exists());
+        assert!(
+            first
+                .boot_tree
+                .read_cleanup_identity(first.engine.cleanup_identity.as_ref())
+                .unwrap()
+                .is_some()
+        );
+        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+        drop(first);
+
+        let persistent_remover = ScriptedRemover::new([RemovalOutcome::Error; 6]);
+        assert_eq!(
+            WorkRootLease::acquire_with(
+                root.path(),
+                BOOT_B,
+                filesystem(
+                    persistent_remover.clone(),
+                    Arc::new(RecordingSleeper::default()),
+                    Arc::new(NoopWorkRootHook),
+                ),
+            )
+            .err()
+            .unwrap(),
+            WorkRootError::StaleRootCleanupFailed
+        );
+        assert_eq!(persistent_remover.calls.load(Ordering::Relaxed), 6);
+        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+        assert!(!root.path().join(BOOT_B).exists());
+
+        let recovered = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
+        assert!(!stale_boot.exists());
+        assert!(!root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+        assert_eq!(recovered.boot_path(), root.path().join(BOOT_B));
+    }
+
+    #[test]
+    fn recovery_rejects_a_same_contents_replacement_marker() {
+        let root = private_work_root();
+        let failed_remover = ScriptedRemover::new([RemovalOutcome::Error; 6]);
+        let first = WorkRootLease::acquire_with(
+            root.path(),
+            BOOT_A,
+            filesystem(
+                failed_remover,
+                Arc::new(RecordingSleeper::default()),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .unwrap();
+        let stale_boot = first.boot_path().to_owned();
+        let marker_path = stale_boot.join(OWNERSHIP_MARKER_NAME);
+        let original_marker = File::open(&marker_path).unwrap();
+        let sentinel = stale_boot.join("operator-sentinel");
+        fs::write(&sentinel, b"do-not-remove").unwrap();
+        assert_eq!(
+            first.release_boot_root_pending().wait(),
+            CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
+        );
+        drop(first);
+
+        fs::remove_file(&marker_path).unwrap();
+        let mut replacement = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&marker_path)
+            .unwrap();
+        replacement.write_all(BOOT_MARKER).unwrap();
+        replacement
+            .set_permissions(Permissions::from_mode(0o600))
+            .unwrap();
+        replacement.sync_all().unwrap();
+
+        let recovery_remover = ScriptedRemover::new([]);
+        let recovered = WorkRootLease::acquire_with(
+            root.path(),
+            BOOT_B,
+            filesystem(
+                recovery_remover.clone(),
+                Arc::new(RecordingSleeper::default()),
+                Arc::new(NoopWorkRootHook),
+            ),
+        );
+
+        assert_eq!(
+            recovered.err().unwrap(),
+            WorkRootError::InvalidCleanupAuthority
+        );
+        assert_eq!(recovery_remover.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fs::read(sentinel).unwrap(), b"do-not-remove");
+        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+        drop(original_marker);
+    }
+
+    #[test]
+    fn recovery_rejects_authority_or_marker_tampering_and_path_replacement() {
+        for mutation in ["authority", "identity", "marker", "replacement"] {
+            let root = private_work_root();
+            let cleanup_identity = Arc::new(ControlledCleanupIdentityStore(Mutex::new(
+                [3_u8; CLEANUP_IDENTITY_BYTES],
+            )));
+            let failed_remover = ScriptedRemover::new([RemovalOutcome::Error; 6]);
+            let first = WorkRootLease::acquire_with(
+                root.path(),
+                BOOT_A,
+                WorkspaceFilesystem::injected_with_cleanup_identity(
+                    failed_remover,
+                    Arc::new(RecordingSleeper::default()),
+                    Arc::new(NoopWorkRootHook),
+                    cleanup_identity.clone(),
+                ),
+            )
+            .unwrap();
+            let stale_boot = first.boot_path().to_owned();
+            let sentinel = stale_boot.join("operator-sentinel");
+            let external_sentinel = root.path().join("operator-external-sentinel");
+            fs::write(&sentinel, b"do-not-remove").unwrap();
+            fs::write(&external_sentinel, b"outside-authority").unwrap();
+            assert!(matches!(
+                first.release_boot_root_pending().wait(),
+                CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
+            ));
+            drop(first);
+
+            match mutation {
+                "authority" => {
+                    fs::write(
+                        root.path().join(CLEANUP_AUTHORITY_NAME),
+                        b"changed-authority\n",
+                    )
+                    .unwrap();
+                }
+                "identity" => {
+                    *cleanup_identity.0.lock().unwrap() = [7_u8; CLEANUP_IDENTITY_BYTES];
+                }
+                "marker" => {
+                    fs::write(stale_boot.join(OWNERSHIP_MARKER_NAME), b"changed-owner\n").unwrap();
+                }
+                "replacement" => {
+                    fs::remove_dir_all(&stale_boot).unwrap();
+                    create_private_directory(&stale_boot).unwrap();
+                    fs::write(&sentinel, b"replacement").unwrap();
+                    *cleanup_identity.0.lock().unwrap() = [8_u8; CLEANUP_IDENTITY_BYTES];
+                }
+                _ => panic!("unknown recovery mutation"),
+            }
+            let recovery_remover = ScriptedRemover::new([]);
+            assert_eq!(
+                WorkRootLease::acquire_with(
+                    root.path(),
+                    BOOT_B,
+                    WorkspaceFilesystem::injected_with_cleanup_identity(
+                        recovery_remover.clone(),
+                        Arc::new(RecordingSleeper::default()),
+                        Arc::new(NoopWorkRootHook),
+                        cleanup_identity.clone(),
+                    ),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{mutation} mutation was accepted")),
+                WorkRootError::InvalidCleanupAuthority
+            );
+            assert_eq!(recovery_remover.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                fs::read(&sentinel).unwrap(),
+                if mutation == "replacement" {
+                    b"replacement".as_slice()
+                } else {
+                    b"do-not-remove".as_slice()
+                }
+            );
+            assert_eq!(fs::read(external_sentinel).unwrap(), b"outside-authority");
+            assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+            assert!(!root.path().join(BOOT_B).exists());
+        }
+    }
+
+    #[test]
+    fn replacement_during_removal_is_quarantined_before_another_traversal() {
+        let root = private_work_root();
+        let remover = Arc::new(ReplacingRemover {
+            calls: AtomicUsize::new(0),
+        });
+        let owner = owner_with_remover(root.path(), remover.clone());
+        let boot_path = owner.boot_path().to_owned();
+
+        assert_eq!(
+            owner.release_boot_root_pending().wait(),
+            CleanupResult::Quarantined(CleanupFailure::Safety)
+        );
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fs::read(boot_path.join("replacement-sentinel")).unwrap(),
+            b"unproven replacement"
+        );
+        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+    }
+
+    #[test]
+    fn replacement_during_the_destructive_call_is_not_deleted() {
+        let root = private_work_root();
+        let owner = owner_with_remover(root.path(), Arc::new(ReplacingAndDeletingRemover));
+        let boot_path = owner.boot_path().to_owned();
+
+        let result = owner.release_boot_root_pending().wait();
+
+        assert_eq!(
+            fs::read(boot_path.join("replacement-sentinel")).unwrap(),
+            b"unproven replacement"
+        );
+        assert_eq!(result, CleanupResult::Quarantined(CleanupFailure::Safety));
+    }
+
+    #[test]
     fn changed_surviving_marker_stops_assignment_root_retry() {
         let root = private_work_root();
         let assignment_path = root.path().join(BOOT_A).join(ASSIGNMENT);
@@ -1657,7 +2785,7 @@ mod tests {
         let sentinel_mode = mode(&sentinel);
         let outside_mode = mode(&outside);
 
-        let owner = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
+        let owner = WorkRootLease::acquire_for_test(root.path(), BOOT_A).unwrap();
         let assignment = owner.create_assignment(ASSIGNMENT).unwrap();
         let assignment_path = assignment.execution.parent().unwrap().to_owned();
         fs::write(assignment.execution.join("ordinary"), b"writable sibling").unwrap();
@@ -1839,7 +2967,7 @@ mod tests {
         drop(inherited_lock_file);
 
         drop(first);
-        let second = WorkRootLease::acquire(root.path(), BOOT_B);
+        let second = WorkRootLease::acquire_for_test(root.path(), BOOT_B);
 
         let _ = child.kill();
         let _ = child.wait();
@@ -1852,7 +2980,7 @@ mod tests {
         let first = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
         let mut child = spawn_ready_helper_child();
         drop(first);
-        let second = WorkRootLease::acquire(root.path(), BOOT_B).unwrap();
+        let second = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
         assert_eq!(second.boot_path(), root.path().join(BOOT_B));
         let _ = child.kill();
         let _ = child.wait();

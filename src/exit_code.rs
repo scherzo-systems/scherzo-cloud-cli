@@ -9,6 +9,7 @@ pub(crate) enum ExitCode {
     UsageError = 2,
     AuthenticationRequired = 3,
     Unavailable = 4,
+    RunnerRecoveryRequired = 5,
     Interrupted = 130,
     Terminated = 143,
 }
@@ -57,6 +58,7 @@ impl ExitCode {
             2 => Some(Self::UsageError),
             3 => Some(Self::AuthenticationRequired),
             4 => Some(Self::Unavailable),
+            5 => Some(Self::RunnerRecoveryRequired),
             130 => Some(Self::Interrupted),
             143 => Some(Self::Terminated),
             _ => None,

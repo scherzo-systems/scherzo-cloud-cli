@@ -92,6 +92,7 @@ Before and after:
 | 2 | `UsageError` | The command line is invalid; this is clap's usage-error code. |
 | 3 | `AuthenticationRequired` | The command requires a signed-in identity. |
 | 4 | `Unavailable` | Scherzo Cloud is unreachable or the request is temporarily rate limited. |
+| 5 | `RunnerRecoveryRequired` | Runner Serve stopped non-admitting for operator recovery. |
 | 130 | `Interrupted` | The command was interrupted by the user. |
 | 143 | `Terminated` | The command received a termination request. |
 

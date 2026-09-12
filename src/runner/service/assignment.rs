@@ -2900,7 +2900,7 @@ pub(super) mod test_support {
         source_broker: Option<Arc<dyn SourceCredentialBroker>>,
         guard_processes: bool,
     ) -> AssignmentManager {
-        let work_root = WorkRootLease::acquire(config.assignment().work_root(), &boot_id)
+        let work_root = WorkRootLease::acquire_for_test(config.assignment().work_root(), &boot_id)
             .unwrap_or_else(|error| panic!("acquire isolated test work root: {error}"));
         let default_source_broker = HttpSourceCredentialBroker::new(
             config.endpoint(),
@@ -3842,7 +3842,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     struct GatedCleanupSleeper {
-        requests: std::sync::mpsc::Sender<CleanupSleepRequest>,
+        requests: tokio::sync::mpsc::UnboundedSender<CleanupSleepRequest>,
     }
 
     impl CleanupSleeper for GatedCleanupSleeper {
@@ -4223,7 +4223,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 config.with_codex_installation(ValidatedCodexInstallation::fixture(executable));
         }
         let boot_id = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
-        let work_root = WorkRootLease::acquire(config.assignment().work_root(), boot_id).unwrap();
+        let work_root =
+            WorkRootLease::acquire_for_test(config.assignment().work_root(), boot_id).unwrap();
         let mut manager = manager_with_fixture_source(&config, &source, work_root);
         manager.retain_lease_policy(&policy()).unwrap();
         let mut environment = manager.environment.variables().clone();
@@ -5327,7 +5328,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         _temporary: tempfile::TempDir,
         manager: AssignmentManager,
         remover: Arc<CleanupRemover>,
-        requests: std::sync::mpsc::Receiver<CleanupSleepRequest>,
+        requests: tokio::sync::mpsc::UnboundedReceiver<CleanupSleepRequest>,
         predecessor_root: PathBuf,
         successor: AssignmentOffer,
     }
@@ -5338,11 +5339,11 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         tempfile::TempDir,
         AssignmentManager,
         Arc<CleanupRemover>,
-        std::sync::mpsc::Receiver<CleanupSleepRequest>,
+        tokio::sync::mpsc::UnboundedReceiver<CleanupSleepRequest>,
     ) {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let remover = CleanupRemover::new(outcomes);
-        let (requests, cleanup_requests) = std::sync::mpsc::channel();
+        let (requests, cleanup_requests) = tokio::sync::mpsc::unbounded_channel();
         let sleeper = Arc::new(GatedCleanupSleeper { requests });
         let (temporary, manager) = manager_fixture_with_cleanup(workflow, remover.clone(), sleeper);
         (temporary, manager, remover, cleanup_requests)
@@ -5382,31 +5383,37 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "timeouts only bound failure to reach deterministic cleanup-sleep handshakes"
-    )]
-    fn release_all_cleanup_retries(requests: &std::sync::mpsc::Receiver<CleanupSleepRequest>) {
+    // Progress is gated by messages, not worker scheduling within a wall-clock budget.
+    // Awaiting also leaves the single-threaded test runtime free to drive manager tasks.
+    // Nextest's test-wide watchdog bounds a worker that never makes progress.
+    async fn release_all_cleanup_retries(
+        manager: &mut AssignmentManager,
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<CleanupSleepRequest>,
+    ) {
         for expected in [100, 250, 500, 1_000, 2_000] {
-            let request = requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("cleanup did not request its deterministic retry prefix");
+            let request = tokio::select! {
+                request = requests.recv() => request
+                    .expect("cleanup retry channel closed before exhaustion"),
+                event = manager.events.recv() => match event {
+                    Some(ManagerEvent::CleanupFinished { result, .. }) => {
+                        panic!("cleanup completed before exhaustion: {result:?}")
+                    }
+                    Some(_) => panic!("unexpected manager event before cleanup exhaustion"),
+                    None => panic!("manager event channel closed before cleanup exhaustion"),
+                },
+            };
             assert_eq!(request.duration, Duration::from_millis(expected));
             request.release.send(()).unwrap();
         }
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the timeout only bounds failure to reach the deterministic cleanup-sleep handshake"
-    )]
     async fn recovered_cleanup_holds_capacity_then_admits_the_deferred_successor() {
         let CleanupAssignmentFixture {
             _temporary,
             mut manager,
             remover,
-            requests,
+            mut requests,
             predecessor_root,
             successor,
         } = cleanup_assignment_fixture([false, true, true]).await;
@@ -5426,8 +5433,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         );
 
         let request = requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("cleanup did not request its deterministic retry delay");
+            .recv()
+            .await
+            .expect("cleanup retry channel closed before recovery");
         assert_eq!(request.duration, Duration::from_millis(100));
         request.release.send(()).unwrap();
         settle_cleanup(&mut manager).await;
@@ -5448,11 +5456,11 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             _temporary,
             mut manager,
             remover,
-            requests,
+            mut requests,
             predecessor_root,
             successor,
         } = cleanup_assignment_fixture([false; 6]).await;
-        release_all_cleanup_retries(&requests);
+        release_all_cleanup_retries(&mut manager, &mut requests).await;
         settle_cleanup(&mut manager).await;
 
         assert!(predecessor_root.exists());
@@ -5481,7 +5489,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     #[tokio::test]
     async fn cleanup_exhaustion_preserves_the_preselected_terminal_report() {
-        let (_temporary, mut manager, remover, requests) = gated_cleanup_manager([false; 6]);
+        let (_temporary, mut manager, remover, mut requests) = gated_cleanup_manager([false; 6]);
         let predecessor = offer("bg");
         let successor = offer("bh");
         offer_then_prepare(&mut manager, &predecessor).await;
@@ -5510,7 +5518,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.pending_observations(&BTreeSet::new(), 10);
         manager.handle_offer(successor.clone()).unwrap();
 
-        release_all_cleanup_retries(&requests);
+        release_all_cleanup_retries(&mut manager, &mut requests).await;
         settle_cleanup(&mut manager).await;
 
         assert!(root_path.exists());

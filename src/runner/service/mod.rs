@@ -19,6 +19,7 @@ mod workspace;
 
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -267,6 +268,7 @@ pub(crate) enum ServiceError {
     LeaseClock(LeaseClockError),
     WorkRootInUse,
     WorkRootIsolation,
+    WorkRootRecovery,
     WorkspaceCleanupFailed,
 }
 
@@ -290,8 +292,23 @@ impl fmt::Display for ServiceError {
             Self::WorkRootIsolation => {
                 formatter.write_str("runner work-root isolation could not be established")
             }
+            Self::WorkRootRecovery => {
+                formatter.write_str("runner work-root recovery did not complete")
+            }
             Self::WorkspaceCleanupFailed => formatter.write_str("runner workspace cleanup failed"),
         }
+    }
+}
+
+impl ServiceError {
+    pub(crate) const fn requires_operator_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkRootInUse
+                | Self::WorkRootIsolation
+                | Self::WorkRootRecovery
+                | Self::WorkspaceCleanupFailed
+        )
     }
 }
 
@@ -304,6 +321,7 @@ impl std::error::Error for ServiceError {
             | Self::ShutdownDeadlineExceeded
             | Self::WorkRootInUse
             | Self::WorkRootIsolation
+            | Self::WorkRootRecovery
             | Self::WorkspaceCleanupFailed => None,
             Self::Connection(error) => Some(error),
             Self::Control(error) => Some(error),
@@ -363,7 +381,7 @@ async fn run_until_cancelled_with_dependencies(
 ) -> Result<(), ServiceError> {
     let boot_id = frame_source.public_id("rbt_");
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
-    run_connection_loop(
+    run_connection_loop_with_filesystem(
         ConnectionLoopDependencies::new(
             config,
             frame_source,
@@ -376,6 +394,7 @@ async fn run_until_cancelled_with_dependencies(
         &WebSocketConnector,
         Backoff::new(),
         shutdown.as_mut(),
+        workspace::WorkspaceFilesystem::testing(),
     )
     .await
 }
@@ -386,12 +405,53 @@ async fn run_connection_loop(
     backoff: Backoff,
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
-    let config_lifetime = dependencies.config.clone();
-    let work_root = workspace::WorkRootLease::acquire(
-        config_lifetime.assignment().work_root(),
-        &dependencies.boot_id,
+    run_connection_loop_acquiring(dependencies, connector, backoff, shutdown, |root, boot| {
+        workspace::WorkRootLease::acquire(&root, &boot)
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn run_connection_loop_with_filesystem(
+    dependencies: ConnectionLoopDependencies,
+    connector: &dyn Connector,
+    backoff: Backoff,
+    shutdown: &mut dyn Shutdown,
+    filesystem: workspace::WorkspaceFilesystem,
+) -> Result<(), ServiceError> {
+    run_connection_loop_acquiring(
+        dependencies,
+        connector,
+        backoff,
+        shutdown,
+        move |root, boot| workspace::WorkRootLease::acquire_with(&root, &boot, filesystem),
     )
-    .map_err(work_root_service_error)?;
+    .await
+}
+
+async fn run_connection_loop_acquiring<Acquire>(
+    dependencies: ConnectionLoopDependencies,
+    connector: &dyn Connector,
+    backoff: Backoff,
+    shutdown: &mut dyn Shutdown,
+    acquire: Acquire,
+) -> Result<(), ServiceError>
+where
+    Acquire: FnOnce(PathBuf, String) -> Result<Arc<workspace::WorkRootLease>, workspace::WorkRootError>
+        + Send
+        + 'static,
+{
+    let work_root_path = dependencies.config.assignment().work_root().to_owned();
+    let boot_id = dependencies.boot_id.clone();
+    let work_root =
+        match tokio::task::spawn_blocking(move || acquire(work_root_path, boot_id)).await {
+            Ok(Ok(work_root)) => work_root,
+            Ok(Err(error)) => {
+                record_non_admitting_failure(&dependencies.recorder, error.error_type());
+                return Err(work_root_service_error(error));
+            }
+            Err(_) => return Err(ServiceError::BuildRuntime),
+        };
     let result = run_connection_loop_with_work_root(
         dependencies,
         connector,
@@ -491,7 +551,7 @@ async fn run_connection_loop_with_work_root(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cleanup_failure_ready_to_exit()
         {
-            return Err(ServiceError::WorkspaceCleanupFailed);
+            return Err(workspace_cleanup_failure(&recorder));
         }
         if assignment_manager
             .lock()
@@ -509,7 +569,7 @@ async fn run_connection_loop_with_work_root(
             let Some(deadline) = shutdown_deadline.as_mut() else {
                 return Err(ServiceError::AssignmentShutdown);
             };
-            return finish_shutdown_cleanup(&work_root, shutdown, deadline).await;
+            return finish_shutdown_cleanup(&work_root, &recorder, shutdown, deadline).await;
         }
         if shutting_down
             && assignment_manager
@@ -577,7 +637,7 @@ async fn run_connection_loop_with_work_root(
                     .cleanup_failure_ready_to_exit()
                 {
                     cancel_attempt(&connection_event, &active_effect_event);
-                    return Err(ServiceError::WorkspaceCleanupFailed);
+                    return Err(workspace_cleanup_failure(&recorder));
                 }
                 if shutting_down
                     && assignment_manager
@@ -589,7 +649,8 @@ async fn run_connection_loop_with_work_root(
                     let Some(deadline) = shutdown_deadline.as_mut() else {
                         return Err(ServiceError::AssignmentShutdown);
                     };
-                    return finish_shutdown_cleanup(&work_root, shutdown, deadline).await;
+                    return finish_shutdown_cleanup(&work_root, &recorder, shutdown, deadline)
+                        .await;
                 }
                 let notification = assignment_manager
                     .lock()
@@ -902,6 +963,7 @@ async fn wait_for_shutdown_progress(
 
 async fn finish_shutdown_cleanup(
     work_root: &workspace::WorkRootLease,
+    recorder: &Recorder,
     shutdown: &mut dyn Shutdown,
     deadline: &mut Pin<Box<dyn Future<Output = ()> + Send>>,
 ) -> Result<(), ServiceError> {
@@ -917,7 +979,7 @@ async fn finish_shutdown_cleanup(
         result = &mut completion => match result {
             workspace::CleanupResult::Released => Ok(()),
             workspace::CleanupResult::Quarantined(_) | workspace::CleanupResult::Preempted => {
-                Err(ServiceError::WorkspaceCleanupFailed)
+                Err(workspace_cleanup_failure(recorder))
             }
         },
         () = deadline.as_mut() => {
@@ -1336,13 +1398,28 @@ fn finish_connection_event(
     event.finish(outcome);
 }
 
+fn workspace_cleanup_failure(recorder: &Recorder) -> ServiceError {
+    record_non_admitting_failure(recorder, "workspace_cleanup_failed");
+    ServiceError::WorkspaceCleanupFailed
+}
+
+fn record_non_admitting_failure(recorder: &Recorder, error_type: &'static str) {
+    recorder
+        .start(
+            "runner.work_root",
+            [KeyValue::new(telemetry::attribute::ERROR_TYPE, error_type)],
+        )
+        .finish(Outcome::Failure);
+}
+
 const fn work_root_service_error(error: workspace::WorkRootError) -> ServiceError {
     match error {
         workspace::WorkRootError::WorkRootInUse => ServiceError::WorkRootInUse,
         workspace::WorkRootError::UnsafeWorkRoot
         | workspace::WorkRootError::AmbiguousOwnedRoot
-        | workspace::WorkRootError::StaleRootCleanupFailed
         | workspace::WorkRootError::CreateBootRoot => ServiceError::WorkRootIsolation,
+        workspace::WorkRootError::InvalidCleanupAuthority
+        | workspace::WorkRootError::StaleRootCleanupFailed => ServiceError::WorkRootRecovery,
     }
 }
 
@@ -1398,8 +1475,8 @@ mod tests {
     use super::{
         AssignmentConfig, Config, ConnectionCause, ConnectionLoopDependencies, FailureKind,
         LiveStatus, ReloadDependencies, ReloadRequest, SHUTDOWN_TIMEOUT, Sequence, ServiceError,
-        Sleeper, TokioSleeper, run_connection_loop_with_work_root,
-        run_until_cancelled_with_dependencies,
+        Sleeper, TokioSleeper, run_connection_loop_with_filesystem,
+        run_connection_loop_with_work_root, run_until_cancelled_with_dependencies,
     };
     use crate::execution::workflow::resolution;
     use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
@@ -1427,6 +1504,14 @@ mod tests {
         }
     }
 
+    struct ImmediateCleanupSleeper;
+
+    impl CleanupSleeper for ImmediateCleanupSleeper {
+        fn sleep(&self, _duration: Duration, cancellation: &CleanupCancellation) -> bool {
+            !cancellation.is_cancelled()
+        }
+    }
+
     struct BlockingCleanupSleeper {
         started: tokio::sync::mpsc::UnboundedSender<()>,
         cancelled: tokio::sync::mpsc::UnboundedSender<()>,
@@ -1445,6 +1530,83 @@ mod tests {
 
     impl WorkRootHook for NoopWorkRootHook {
         fn before_child_enumeration(&self) {}
+    }
+
+    #[tokio::test]
+    async fn persistent_startup_cleanup_stops_before_assignment_admission() {
+        const STALE_BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+        let config = ConfigFixture::new(
+            "ws://127.0.0.1:1/v1/runner/connect",
+            test_credential(),
+            true,
+        )
+        .unwrap();
+        let first_remover = Arc::new(FailingBootRemover {
+            calls: AtomicUsize::new(0),
+        });
+        let first = WorkRootLease::acquire_with(
+            config.assignment().work_root(),
+            STALE_BOOT,
+            WorkspaceFilesystem::injected(
+                first_remover,
+                Arc::new(ImmediateCleanupSleeper),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .unwrap();
+        let stale_path = first.boot_path().to_owned();
+        assert!(matches!(
+            first.release_boot_root_pending().wait(),
+            super::workspace::CleanupResult::Quarantined(
+                super::workspace::CleanupFailure::OrdinaryRemovalExhausted
+            )
+        ));
+        drop(first);
+
+        let frame_source = deterministic_frame_source();
+        let boot_id = frame_source.public_id("rbt_");
+        let (recorder, capture) = test_recorder(&boot_id);
+        let dependencies = ConnectionLoopDependencies::new(
+            config.cloned_config(),
+            frame_source,
+            fixture_sleeper(),
+            recorder,
+            fixture_lease_clock(),
+            boot_id.clone(),
+            None,
+        );
+        let persistent_remover = Arc::new(FailingBootRemover {
+            calls: AtomicUsize::new(0),
+        });
+        let (connector, mut attempts) = scripted_connector(Default::default());
+        let (mut shutdown, _shutdown_trigger) = controlled_shutdown();
+
+        let result = run_connection_loop_with_filesystem(
+            dependencies,
+            &connector,
+            super::Backoff::with_fixed_unit(1.0),
+            shutdown.as_mut(),
+            WorkspaceFilesystem::injected(
+                persistent_remover.clone(),
+                Arc::new(ImmediateCleanupSleeper),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .await;
+
+        assert!(matches!(&result, Err(ServiceError::WorkRootRecovery)));
+        assert!(result.unwrap_err().requires_operator_recovery());
+        assert_eq!(persistent_remover.calls.load(Ordering::Relaxed), 6);
+        assert!(matches!(
+            attempts.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(stale_path.exists());
+        assert!(!config.assignment().work_root().join(boot_id).exists());
+        let event = capture.event("runner.work_root");
+        assert_eq!(event["error.type"], "stale_root_cleanup_exhausted");
+        assert_eq!(event["scherzo.outcome"], "failure");
     }
 
     #[tokio::test]
