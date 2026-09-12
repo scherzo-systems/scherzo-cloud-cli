@@ -93,7 +93,10 @@ pub(crate) use runners::{
     RunnerCredentialStoredState, RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList,
     RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
-pub(crate) use runs::{Run, RunApi, RunCreationAcceptance, RunFailure, RunState};
+pub(crate) use runs::{
+    CreateRunInput, NamedTextInputMetadata, Run, RunApi, RunCreationAcceptance, RunFailure,
+    RunState, TextInputSet,
+};
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations

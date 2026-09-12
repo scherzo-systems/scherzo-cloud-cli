@@ -5,8 +5,15 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use http_body_util::Full;
+use hyper::body::Bytes;
+use hyper::{Method, Request, StatusCode};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Url};
 use zeroize::Zeroize as _;
 
@@ -100,6 +107,41 @@ impl HttpClient {
             .expect("HTTP runtime should exist until the client is dropped")
             .block_on(async { tokio::time::timeout(timeout, future).await })
     }
+
+    pub(super) fn signed_storage_put(
+        &self,
+        url: &Url,
+        headers: HeaderMap,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<StatusCode, SignedStorageRequestError> {
+        let connector = HttpsConnectorBuilder::new()
+            .try_with_platform_verifier()
+            .map_err(|_| SignedStorageRequestError::Build)?;
+        let connector = match self.transport_policy {
+            HttpTransportPolicy::HttpsOnly => connector.https_only(),
+            HttpTransportPolicy::AllowInsecureHttp => connector.https_or_http(),
+        }
+        .enable_http1()
+        .build();
+        let client: HyperClient<_, Full<Bytes>> =
+            HyperClient::builder(TokioExecutor::new()).build(connector);
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri(url.as_str())
+            .body(Full::new(Bytes::copy_from_slice(bytes)))
+            .map_err(|_| SignedStorageRequestError::InvalidRequest)?;
+        *request.headers_mut() = headers;
+        match self.run(timeout, client.request(request)) {
+            Ok(Ok(response)) => Ok(response.status()),
+            Ok(Err(error)) => Err(SignedStorageRequestError::Unreachable(
+                super::current_principal::classify_error_chain(&error),
+            )),
+            Err(_) => Err(SignedStorageRequestError::Unreachable(
+                super::UnreachableCategory::Timeout,
+            )),
+        }
+    }
 }
 
 impl Drop for HttpClient {
@@ -110,6 +152,25 @@ impl Drop for HttpClient {
     }
 }
 
+#[derive(Debug)]
+pub(super) enum SignedStorageRequestError {
+    Build,
+    InvalidRequest,
+    Unreachable(super::UnreachableCategory),
+}
+
+fn blocking_client_builder(
+    transport_policy: HttpTransportPolicy,
+    timeout: Duration,
+) -> reqwest::blocking::ClientBuilder {
+    BlockingClient::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(timeout)
+        .dns_resolver(categorized_dns_resolver())
+        .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
+}
+
 pub(super) fn generated_configuration(
     api_url: &str,
     access_token: &str,
@@ -117,13 +178,7 @@ pub(super) fn generated_configuration(
     timeout: Duration,
 ) -> Result<apis::configuration::Configuration, reqwest::Error> {
     crate::tls::install_provider();
-    let client = BlockingClient::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .timeout(timeout)
-        .dns_resolver(categorized_dns_resolver())
-        .https_only(transport_policy == HttpTransportPolicy::HttpsOnly)
-        .build()?;
+    let client = blocking_client_builder(transport_policy, timeout).build()?;
     let mut configuration = apis::configuration::Configuration::new();
     configuration.base_path = api_url.trim_end_matches('/').to_owned();
     configuration.bearer_access_token = Some(access_token.to_owned());

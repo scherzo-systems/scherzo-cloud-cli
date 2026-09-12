@@ -59,9 +59,25 @@ pub(super) struct RunArtifactReference {
     run_id: String,
 }
 
+pub(super) trait RemoteArtifactError: From<ArtifactApiError> {
+    fn credential_rejected(&self) -> bool;
+}
+
+impl RemoteArtifactError for ArtifactApiError {
+    fn credential_rejected(&self) -> bool {
+        self.credential_rejected()
+    }
+}
+
+pub(super) struct RemoteArtifactResult<'a, T, E> {
+    deployment: &'a str,
+    run: &'a RunArtifactReference,
+    result: Result<T, E>,
+}
+
 pub(super) trait RemoteArtifactOperation {
     type Output;
-    type Error: From<ArtifactApiError>;
+    type Error: RemoteArtifactError;
 
     const SESSION_CONTEXT: &'static str;
 
@@ -70,12 +86,9 @@ pub(super) trait RemoteArtifactOperation {
         api: &mut ArtifactApi,
         run: &RunArtifactReference,
     ) -> Result<Self::Output, Self::Error>;
-    fn credential_rejected(error: &Self::Error) -> bool;
     fn write_result(
         &self,
-        deployment: &str,
-        run: &RunArtifactReference,
-        result: Result<Self::Output, Self::Error>,
+        output: RemoteArtifactResult<'_, Self::Output, Self::Error>,
     ) -> anyhow::Result<crate::exit_code::ExitCode>;
 }
 
@@ -86,10 +99,13 @@ impl<O: RemoteArtifactOperation + Args> RemoteArtifactCommand<O> {
             self.remote.http.transport_policy(),
             O::SESSION_CONTEXT,
             |api| self.operation.request(api, &self.remote.run),
-            O::credential_rejected,
+            RemoteArtifactError::credential_rejected,
             |deployment, result| {
-                self.operation
-                    .write_result(deployment, &self.remote.run, result)
+                self.operation.write_result(RemoteArtifactResult {
+                    deployment,
+                    run: &self.remote.run,
+                    result,
+                })
             },
         )
     }

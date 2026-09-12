@@ -312,7 +312,9 @@ pub(crate) fn classify_reqwest_error(error: &reqwest::Error) -> UnreachableCateg
     }
 }
 
-fn classify_error_chain(error: &(dyn std::error::Error + 'static)) -> UnreachableCategory {
+pub(super) fn classify_error_chain(
+    error: &(dyn std::error::Error + 'static),
+) -> UnreachableCategory {
     let mut source = Some(error);
     let mut timed_out = false;
     let mut dns_failed = false;

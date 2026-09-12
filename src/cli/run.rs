@@ -1,13 +1,22 @@
-use std::io::{self, Write};
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
+use ring::digest::{SHA256, digest};
 use serde::Serialize;
+use zeroize::Zeroizing;
 
-use crate::api::{HttpClient, HttpTransportPolicy, Run, RunApi, RunFailure, RunState};
+use crate::api::{
+    CreateRunInput, HttpClient, HttpTransportPolicy, NamedTextInputMetadata, Run, RunApi,
+    RunFailure, RunState, TextInputSet,
+};
+use crate::execution::workflow::presentation::visible_text;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
@@ -18,6 +27,7 @@ pub(super) const ABOUT: &str = "Work with Scherzo Cloud runs";
 const NAME: &str = "run";
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES: usize = 2;
+const MAXIMUM_TEXT_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -27,7 +37,7 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum RunCommand {
-    #[command(about = "Create an inputless Scherzo Cloud run")]
+    #[command(about = "Create a Scherzo Cloud run")]
     Create(CreateCommand),
     #[command(about = "Show a Scherzo Cloud run")]
     Show(ShowCommand),
@@ -75,6 +85,15 @@ struct CreateCommand {
         help = "Set the run display name"
     )]
     display_name: Option<String>,
+
+    #[arg(
+        long,
+        value_names = ["NAME", "PATH"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named Text value from a regular UTF-8 file (maximum 1 MiB)"
+    )]
+    input_text_file: Vec<OsString>,
 
     #[command(flatten)]
     options: RunOptions,
@@ -145,6 +164,112 @@ struct CreateDispatchState {
     dispatched: AtomicBool,
 }
 
+struct PreparedTextInput {
+    bytes: Zeroizing<Vec<u8>>,
+    metadata: NamedTextInputMetadata,
+}
+
+#[derive(Debug)]
+enum TextInputFileFailure {
+    InvalidArguments,
+    InvalidName,
+    Read { path: PathBuf, source: io::Error },
+    NotRegular { path: PathBuf },
+    TooLarge { path: PathBuf },
+    InvalidUtf8 { path: PathBuf },
+}
+
+fn prepare_text_input(
+    values: &[OsString],
+) -> Result<Option<PreparedTextInput>, TextInputFileFailure> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 2 {
+        return Err(TextInputFileFailure::InvalidArguments);
+    }
+    let name = values[0]
+        .to_str()
+        .filter(|name| valid_input_name(name))
+        .ok_or(TextInputFileFailure::InvalidName)?;
+    let path = Path::new(&values[1]);
+    let mut file = File::open(path).map_err(|source| TextInputFileFailure::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| TextInputFileFailure::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        return Err(TextInputFileFailure::NotRegular {
+            path: path.to_owned(),
+        });
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAXIMUM_TEXT_INPUT_BYTES.min(64 * 1024)));
+    Read::by_ref(&mut file)
+        .take(u64::try_from(MAXIMUM_TEXT_INPUT_BYTES).unwrap_or(u64::MAX) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| TextInputFileFailure::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+    if bytes.len() > MAXIMUM_TEXT_INPUT_BYTES {
+        return Err(TextInputFileFailure::TooLarge {
+            path: path.to_owned(),
+        });
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(TextInputFileFailure::InvalidUtf8 {
+            path: path.to_owned(),
+        });
+    }
+    let observed = digest(&SHA256, &bytes);
+    let mut sha256 = [0_u8; 32];
+    sha256.copy_from_slice(observed.as_ref());
+    let size_bytes = u64::try_from(bytes.len()).map_err(|source| TextInputFileFailure::Read {
+        path: path.to_owned(),
+        source: io::Error::other(source),
+    })?;
+    Ok(Some(PreparedTextInput {
+        bytes,
+        metadata: NamedTextInputMetadata {
+            name: name.to_owned(),
+            size_bytes,
+            sha256,
+        },
+    }))
+}
+
+fn valid_input_name(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value.as_bytes()[1..].iter().all(u8::is_ascii_alphanumeric)
+}
+
+fn finish_create(
+    deployment: &Deployment,
+    organization: &str,
+    result: Result<crate::api::RunCreationAcceptance, RunFailure>,
+    json: bool,
+    cancelled: &AtomicBool,
+    completed: &AtomicBool,
+) -> super::CommandResult {
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(ExitCode::GeneralFailure);
+    }
+    completed.store(true, Ordering::Release);
+    write_create(
+        deployment.fingerprint().api_url(),
+        organization,
+        result,
+        json,
+    )
+    .map_err(Into::into)
+}
+
 impl CreateCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         let state = Arc::new(CreateDispatchState {
@@ -182,33 +307,127 @@ impl CreateCommand {
         cancelled: &AtomicBool,
         completed: &AtomicBool,
     ) -> super::CommandResult {
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let text_input = match prepare_text_input(&self.input_text_file) {
+            Ok(text_input) => text_input,
+            Err(error) => {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(ExitCode::GeneralFailure);
+                }
+                completed.store(true, Ordering::Release);
+                return write_text_input_file_failure(
+                    deployment.fingerprint().api_url(),
+                    &self.organization,
+                    &error,
+                    self.options.json,
+                )
+                .map_err(Into::into);
+            }
+        };
+        let run_idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate Cloud run request identity")?;
         if cancelled.load(Ordering::Acquire) {
             return Ok(ExitCode::GeneralFailure);
         }
+
+        let input_set = if let Some(text_input) = text_input.as_ref() {
+            let create_key = crate::idempotency::generate_idempotency_key()
+                .context("generate Run Input Set request identity")?;
+            let seal_key = crate::idempotency::generate_idempotency_key()
+                .context("generate Run Input Set seal identity")?;
+            let created = with_api(deployment, self.options.http.transport_policy(), |api| {
+                api.create_text_input_set(
+                    &self.organization,
+                    &create_key,
+                    &self.project_id,
+                    &text_input.metadata,
+                )
+            })?;
+            let input_set = match created {
+                Ok(input_set) => input_set,
+                Err(failure) => {
+                    return finish_create(
+                        deployment,
+                        &self.organization,
+                        Err(failure),
+                        self.options.json,
+                        cancelled,
+                        completed,
+                    );
+                }
+            };
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(ExitCode::GeneralFailure);
+            }
+
+            let uploaded = with_api(deployment, self.options.http.transport_policy(), |api| {
+                api.issue_and_upload_text(&self.organization, &input_set, &text_input.bytes)
+            })?;
+            if let Err(failure) = uploaded {
+                let ambiguous_upload = matches!(
+                    failure,
+                    RunFailure::Unreachable(
+                        crate::api::UnreachableCategory::Connection
+                            | crate::api::UnreachableCategory::Timeout
+                    )
+                );
+                if !ambiguous_upload {
+                    return finish_create(
+                        deployment,
+                        &self.organization,
+                        Err(failure),
+                        self.options.json,
+                        cancelled,
+                        completed,
+                    );
+                }
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(ExitCode::GeneralFailure);
+            }
+
+            let sealed = with_api(deployment, self.options.http.transport_policy(), |api| {
+                api.seal_text_input_set(&self.organization, &seal_key, &input_set)
+            })?;
+            if let Err(failure) = sealed {
+                return finish_create(
+                    deployment,
+                    &self.organization,
+                    Err(failure),
+                    self.options.json,
+                    cancelled,
+                    completed,
+                );
+            }
+            Some(input_set)
+        } else {
+            None
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(ExitCode::GeneralFailure);
+        }
+
         let result = with_api(deployment, self.options.http.transport_policy(), |api| {
             state.dispatched.store(true, Ordering::Release);
             api.create(
                 &self.organization,
-                &idempotency_key,
-                &self.project_id,
-                &self.workflow_path,
-                self.source_branch.as_deref(),
-                self.display_name.as_deref(),
+                &run_idempotency_key,
+                CreateRunInput {
+                    project_id: &self.project_id,
+                    workflow_path: &self.workflow_path,
+                    source_branch: self.source_branch.as_deref(),
+                    display_name: self.display_name.as_deref(),
+                    input_set_id: input_set.as_ref().map(TextInputSet::id),
+                },
             )
         })?;
-        if cancelled.load(Ordering::Acquire) {
-            return Ok(ExitCode::GeneralFailure);
-        }
-        completed.store(true, Ordering::Release);
-        write_create(
-            deployment.fingerprint().api_url(),
+        finish_create(
+            deployment,
             &self.organization,
             result,
             self.options.json,
+            cancelled,
+            completed,
         )
-        .map_err(Into::into)
     }
 }
 
@@ -321,7 +540,7 @@ trait RunObservationApi {
     fn get_run(&self, organization: &str, run_id: &str) -> Result<Run, RunFailure>;
 }
 
-impl RunObservationApi for RunApi {
+impl<'a> RunObservationApi for RunApi<'a> {
     fn get_run(&self, organization: &str, run_id: &str) -> Result<Run, RunFailure> {
         self.get(organization, run_id)
     }
@@ -495,7 +714,7 @@ fn parse_wait_timeout(value: &str) -> Result<Duration, String> {
 fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
-    mut operation: impl FnMut(&RunApi) -> Result<T, RunFailure>,
+    mut operation: impl FnMut(&RunApi<'_>) -> Result<T, RunFailure>,
 ) -> anyhow::Result<Result<T, RunFailure>> {
     let client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
@@ -508,6 +727,7 @@ fn with_api<T>(
                 deployment.fingerprint().api_url(),
                 access_token.expose(),
                 transport_policy,
+                &client,
             )
             .map_err(|error| anyhow!(error))
             .context("prepare Cloud run networking")?;
@@ -528,6 +748,54 @@ fn with_api<T>(
             None => Err(anyhow!(error).context("acquire human session for Cloud run operation")),
         },
     }
+}
+
+fn write_text_input_file_failure(
+    deployment: &str,
+    organization: &str,
+    failure: &TextInputFileFailure,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_json(&FailureResult {
+            schema_version: 1,
+            deployment,
+            outcome: "invalid_input",
+            organization_ref: organization,
+            run_id: None,
+            category: None,
+        })?;
+    } else {
+        let diagnostic = match failure {
+            TextInputFileFailure::InvalidArguments => {
+                "error: run creation accepts at most one named Text input file".to_owned()
+            }
+            TextInputFileFailure::InvalidName => {
+                "error: named Text input has an invalid Workflow V1 name".to_owned()
+            }
+            TextInputFileFailure::Read { path, source } => format!(
+                "error: read named Text input file {}: {source}",
+                visible_text(&path.to_string_lossy())
+            ),
+            TextInputFileFailure::NotRegular { path } => format!(
+                "error: named Text input source is not a regular file: {}",
+                visible_text(&path.to_string_lossy())
+            ),
+            TextInputFileFailure::TooLarge { path } => format!(
+                "error: named Text input file exceeds 1 MiB: {}",
+                visible_text(&path.to_string_lossy())
+            ),
+            TextInputFileFailure::InvalidUtf8 { path } => format!(
+                "error: named Text input file is not valid UTF-8: {}",
+                visible_text(&path.to_string_lossy())
+            ),
+        };
+        writeln!(
+            io::stderr().lock(),
+            "{diagnostic}\n\nChoose one valid name and a regular UTF-8 file no larger than 1 MiB, then try again."
+        )?;
+    }
+    Ok(ExitCode::GeneralFailure)
 }
 
 fn write_create(
@@ -798,6 +1066,12 @@ fn write_failure(
             Some(category.as_str()),
             format!("error: contact Cloud run API at {deployment}: {}\n\nCheck network access to the deployment and try again.", category.as_str()),
             super::unreachable_outcome_class(*category),
+        ),
+        RunFailure::InputUploadRejected => (
+            "conflict",
+            None,
+            "error: Cloud run input upload was not accepted\n\nCheck network access and create the run again.".to_owned(),
+            OutcomeClass::GeneralFailure,
         ),
         RunFailure::Protocol { .. } => (
             "invalid_response",

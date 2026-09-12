@@ -171,16 +171,18 @@ The current release supports:
   invitation issuance and lifecycle management, the
   current principal's invitation inbox, one-page member-directory reads, actor-bound GitHub App setup,
   installation and repository discovery, complete project and repository configuration,
-  and inputless Cloud run creation and inspection;
+  and named-Text-backed or inputless Cloud run creation, terminal waiting, Artifact Set
+  download, and inspection;
 - runner and runner-pool administration plus prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
 
 The Cloud management surface is not complete. The CLI can discover and manage accessible
 organizations, manage invitations and membership, connect GitHub App installations,
-discover authorized repositories, manage projects and runner pools, and create or inspect
-an inputless run for a ready project. It cannot yet stage run inputs or guide the rest of
-Cloud onboarding.
+discover authorized repositories, manage projects and runner pools, create named-Text-backed
+or inputless runs for a ready project, wait for terminal status, and download verified
+Artifact Sets. It cannot yet administer general Run Input Sets or guide the rest of Cloud
+onboarding.
 
 ## Public API contract
 
@@ -299,7 +301,10 @@ scherzo-cloud artifact download acme-research \
 
 Download continues through every inventory page, requests fresh exact capabilities in
 bounded batches, verifies each member and the complete portable set, and atomically
-creates the requested output directory only after complete validation.
+creates the requested output directory only after complete validation. Add `--json` for
+one schema-version-1 receipt with `outcome: "downloaded"`, the Run and Artifact Set IDs,
+verified member and byte totals, the committed destination, and deployment. A failed
+transfer or verification emits no receipt and never commits the destination.
 
 ## Portable artifact validation
 
@@ -1068,6 +1073,12 @@ scherzo-cloud run create acme-labs \
   --source-branch main \
   --display-name "Release checks"
 
+# Or bind one caller-owned file to the workflow's named Text input.
+scherzo-cloud run create acme-labs \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --workflow-path workflows/build.yaml \
+  --input-text-file request ./request.txt
+
 # Read the latest public projection.
 scherzo-cloud run show \
   acme-labs \
@@ -1080,11 +1091,17 @@ scherzo-cloud run wait \
   --timeout 30m
 ```
 
-`run create` never selects or stages a Run Input Set. Its receipt reports the accepted
-Run ID and whether the deployment replayed the request. One invocation keeps the same
-idempotency key through an ambiguous transport retry and an access-token refresh; the
-key is not persisted for a later invocation. An interrupt after dispatch reports an
-unknown acceptance commitment rather than claiming that no run was created.
+Without `--input-text-file`, `run create` admits an inputless run. With
+`--input-text-file NAME PATH`, it validates the Workflow V1 input name and checks the
+regular file as at most 1 MiB of UTF-8 before contacting Cloud. It stages the exact bytes
+as one named `text` entry, seals that Run Input Set, and binds it to the accepted run. An
+empty selected file remains a present zero-length Text value. This command accepts one
+named Text file; use the exact input name declared by the selected workflow. The receipt
+reports the accepted Run ID and whether the deployment replayed the request. One
+invocation keeps each mutation's idempotency key through an ambiguous transport retry
+and an access-token refresh; keys are not persisted for a later invocation. An interrupt
+after run dispatch reports an unknown acceptance commitment rather than claiming that no
+run was created.
 
 Add `--json` for schema-version-1 output. A create receipt preserves `replayed` as a
 boolean and identifies the submitted `organizationRef`. Show and terminal wait results
@@ -1098,6 +1115,39 @@ signal. Timeout and SIGINT/SIGTERM stop only local observation; the command send
 mutation or cancellation request. JSON mode emits one document only after a terminal,
 timeout, or fatal observation result and emits nothing when a process signal stops the
 wait.
+
+### Agent named-input-to-artifact loop
+
+An authenticated agent can bind a prompt file to a workflow's named Text input and
+complete the run using only stable JSON command surfaces and the downloaded local result:
+
+```sh
+set -euo pipefail
+organization=acme-labs
+project=prj_01k0z6r1w8f4jy2m7q9v3x5abc
+request_path=./request.txt
+artifact_path=./downloaded-run
+
+scherzo-cloud run create "$organization" \
+  --project-id "$project" \
+  --workflow-path workflows/build.yaml \
+  --input-text-file request "$request_path" \
+  --json > create.json
+run_id=$(jq -er 'select(.outcome == "accepted") | .runId' create.json)
+
+scherzo-cloud run wait "$organization" "$run_id" \
+  --timeout 30m --json > wait.json
+jq -e '.outcome == "succeeded"' wait.json >/dev/null
+
+scherzo-cloud artifact download "$organization" "$run_id" \
+  --output "$artifact_path" --json > download.json
+jq -e '.outcome == "downloaded"' download.json >/dev/null
+jq . "$artifact_path/result.json"
+```
+
+The input bytes remain at the caller-selected source path; they do not enter command
+arguments or JSON receipts. `result.json` is inspected only after the complete Artifact
+Set has been downloaded, verified, and committed at the requested destination.
 
 ## Runner doctor
 

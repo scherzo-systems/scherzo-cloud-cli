@@ -43,21 +43,15 @@ impl super::RemoteArtifactOperation for Operation {
         )
     }
 
-    fn credential_rejected(error: &Self::Error) -> bool {
-        error.credential_rejected()
-    }
-
     fn write_result(
         &self,
-        deployment: &str,
-        run: &super::RunArtifactReference,
-        result: Result<Self::Output, Self::Error>,
+        output: super::RemoteArtifactResult<'_, Self::Output, Self::Error>,
     ) -> anyhow::Result<ExitCode> {
         write_list_result(
-            deployment,
-            &run.organization,
-            &run.run_id,
-            result,
+            output.deployment,
+            &output.run.organization,
+            &output.run.run_id,
+            output.result,
             self.json,
         )
     }

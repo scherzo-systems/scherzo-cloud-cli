@@ -1,5 +1,7 @@
 use super::*;
 
+use ring::digest::{SHA256, digest};
+
 const TOKEN: &str = "unique-artifact-list-token-sentinel";
 const ORGANIZATION: &str = "acme-research";
 const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -73,6 +75,230 @@ fn list_args(json: bool) -> Vec<&'static str> {
     }
     args.push("--allow-insecure-http");
     args
+}
+
+fn artifact_digest(bytes: &[u8]) -> String {
+    digest(&SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn portable_result_bytes() -> Vec<u8> {
+    // Keep this black-box wire fixture independent of the production assembly unit fixture so
+    // the public command cannot pass by sharing the builder that it is expected to validate.
+    // jscpd:ignore-start
+    let document = serde_json::json!({
+        "schemaVersion": 1,
+        "attemptNumber": 1,
+        "workflow": {
+            "path": "workflow.yaml",
+            "provenance": {
+                "kind": "cloud",
+                "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "objectFormat": "sha1",
+                "commitOid": "0123456789abcdef0123456789abcdef01234567"
+            },
+            "digest": {"algorithm": "sha256", "value": "1".repeat(64)}
+        },
+        "execution": {
+            "maximumParallelSteps": 1,
+            "capacity": {
+                "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
+                "sourceClosureDigest": {"algorithm": "sha256", "value": "1".repeat(64)},
+                "generalMaximumTransitions": 8,
+                "selectedMaximumTransitions": 7,
+                "maximumInvocations": 1,
+                "maximumRetainedBytesPerInvocation": 4_194_304,
+                "diagnosticRetentionBytes": 8_388_608,
+                "nativeSessionRetentionBytes": 4_194_304,
+                "aggregateRetentionBytes": 12_582_912,
+                "conditionTransitionCount": 0,
+                "aggregateConditionTransitionBytes": 0,
+                "terminalResultStructureBytes": 67_108_864,
+                "portableResultBytes": 202_027_692,
+                "encodedOutboxBytes": 85_458_944
+            },
+            "startedAt": "2026-08-17T12:00:00Z",
+            "finishedAt": "2026-08-17T12:00:01Z",
+            "durationMilliseconds": 1000
+        },
+        "commandOutputPolicy": {
+            "encoding": "base64",
+            "maximumRetainedBytesPerStream": 4_194_304
+        },
+        "outcome": "succeeded",
+        "steps": [{
+            "id": "produce",
+            "role": "step",
+            "kind": "agent",
+            "failurePolicy": "required",
+            "state": "succeeded",
+            "startedAt": "2026-08-17T12:00:00Z",
+            "durationMilliseconds": 1000
+        }],
+        "exports": {}
+    });
+    // jscpd:ignore-end
+    let mut bytes = serde_json::to_vec_pretty(&document).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+fn complete_inventory_response(result: &[u8]) -> Vec<u8> {
+    inventory_response(serde_json::json!({
+        "artifactSetId": ARTIFACT_SET_ID,
+        "sealedAt": "2998-08-17T12:00:00Z",
+        "expiresAt": "2999-09-17T12:00:00Z",
+        "memberCount": 1,
+        "totalSizeBytes": result.len(),
+        "members": [{
+            "path": "result.json",
+            "mediaType": "application/json",
+            "sizeBytes": result.len(),
+            "digest": {"algorithm": "sha256", "value": artifact_digest(result)}
+        }]
+    }))
+}
+
+fn download_capability_response(result: &[u8], url: &str) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "artifactSetId": ARTIFACT_SET_ID,
+            "expiresAt": "2999-09-17T12:00:00Z",
+            "capabilityExpiresAt": "2998-08-17T12:05:00Z",
+            "members": [{
+                "path": "result.json",
+                "mediaType": "application/json",
+                "sizeBytes": result.len(),
+                "digest": {"algorithm": "sha256", "value": artifact_digest(result)},
+                "url": url
+            }]
+        }))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn artifact_download_json_reports_only_the_verified_committed_set() {
+    let result = portable_result_bytes();
+    let storage = OneShotServer::respond("200 OK", Some("application/json"), &result);
+    let signed_url = format!(
+        "{}/result.json?signature=unique-artifact-capability-sentinel",
+        storage.api_url
+    );
+    let server = ScriptedServer::respond(vec![
+        complete_inventory_response(&result),
+        download_capability_response(&result, &signed_url),
+    ]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture(
+        &credential_path,
+        &server.api_url,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+    let output_root = tempfile::tempdir().unwrap();
+    let destination = output_root.path().join("downloaded");
+
+    let output = run_with_env(
+        &[
+            "artifact",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(destination.join("result.json")).unwrap(), result);
+    assert!(destination.join("exports").is_dir());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "downloaded",
+            "runId": RUN_ID,
+            "artifactSetId": ARTIFACT_SET_ID,
+            "verifiedMemberCount": 1,
+            "verifiedTotalBytes": result.len(),
+            "destination": fs::canonicalize(&destination).unwrap()
+        })
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unique-artifact-capability-sentinel")
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("/artifact-set?limit=200 HTTP/1.1"));
+    assert!(requests[1].contains("/download-capabilities HTTP/1.1"));
+    let download = storage.finish();
+    assert!(download.starts_with("GET "));
+    assert!(!download.contains("authorization:"));
+}
+
+#[test]
+fn artifact_download_verification_failure_emits_no_receipt_or_destination() {
+    let expected = portable_result_bytes();
+    let mut corrupted = expected.clone();
+    let index = corrupted.len() / 3;
+    corrupted[index] = if corrupted[index] == b'x' { b'y' } else { b'x' };
+    let storage = OneShotServer::respond("200 OK", Some("application/json"), &corrupted);
+    let signed_url = format!("{}/result.json?signature=private", storage.api_url);
+    let server = ScriptedServer::respond(vec![
+        complete_inventory_response(&expected),
+        download_capability_response(&expected, &signed_url),
+    ]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture(
+        &credential_path,
+        &server.api_url,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+    let output_root = tempfile::tempdir().unwrap();
+    let destination = output_root.path().join("downloaded");
+
+    let output = run_with_env(
+        &[
+            "artifact",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    assert!(!destination.exists());
+    assert_eq!(server.finish().len(), 2);
+    storage.finish();
 }
 
 #[test]
