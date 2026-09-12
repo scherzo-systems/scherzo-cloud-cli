@@ -1,7 +1,7 @@
 {
   "workflowPath": "workflows/complete.yaml",
   "algorithm": "sha256",
-  "value": "7efc28dc4f76bce363cc9959a8660104b4870e079c068ead5e5476b3bdd72c84",
+  "value": "c3bbb52ad6e0c5f1b0ef58a95e0acc70229629dc0f33c3df9b257a26f1821523",
   "paths": [
     "attachments/data.bin",
     "attachments/finalizer.bin",

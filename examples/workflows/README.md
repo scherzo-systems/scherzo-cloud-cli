@@ -9,7 +9,7 @@ Cloud presentation and execution testing.
 | `single-step.yaml` | Minimal one-step command success |
 | `sequential.yaml` | Four short stages in a strict sequence |
 | `parallel-fanout.yaml` | A wider fan-out followed by a join |
-| `command-dataflow.yaml` | Imported command inputs, `cwd`, path-backed outputs, downstream materialization, and exports |
+| `command-dataflow.yaml` | Required named command inputs, `cwd`, path-backed outputs, downstream materialization, and exports |
 | `recovery.yaml` | Successful immediate retry and command-handler repair |
 | `advisory-failure.yaml` | Control-only continuation and unavailable output after an advisory failure |
 | `output-streams.yaml` | stdout, stderr, a quiet step, and an unterminated line |
@@ -23,7 +23,7 @@ Cloud presentation and execution testing.
 | `agent-claude-basic.yaml` | One low-effort Claude Code agent answering basic arithmetic |
 | `agent-codex-basic.yaml` | One low-effort Codex agent answering basic arithmetic |
 | `agent-claude-structured-result.yaml` | Claude Code producing a schema-validated result |
-| `agent-claude-attachment.yaml` | Static and imported prompts and attachments delivered to Claude Code |
+| `agent-claude-attachment.yaml` | Static and named Text/attachment inputs delivered to Claude Code |
 | `agent-claude-result-pipeline.yaml` | Validated JSON passed between two Claude Code agents |
 | `agent-parallel.yaml` | Three concurrent agents followed by an agent join |
 | `agent-expected-failure.yaml` | Intentional startup failure from a nonexistent model |
@@ -42,15 +42,15 @@ lifecycle, protocol, result, input, and cancellation behavior.
 
 `agent-basic.yaml`, `agent-claude-basic.yaml`, and `agent-codex-basic.yaml` are the
 smallest smoke tests for their respective harnesses. The other Claude examples show
-schema-validated results, static and imported input delivery, and an inferred data
+schema-validated results, static and named input delivery, and an inferred data
 dependency that passes validated JSON to a second agent. Running an agent example
 requires every harness selected by that workflow and its provider credentials, contacts
 the model provider, and may consume billed tokens. Model-generated output remains
 probabilistic.
 
-## Run examples with imported inputs
+## Run examples with named inputs
 
-`command-dataflow.yaml` materializes an imported prompt and attachment collection for a
+`command-dataflow.yaml` materializes required named Text and attachment values for a
 command, captures text, JSON, and file outputs from paths, and supplies all three values
 to a downstream command:
 
@@ -59,22 +59,22 @@ scherzo-cloud workflow run \
   --source-root . \
   --execution-root "$execution_root" \
   --run-dir "$run_dir" \
-  --prompt-file prompts/command-dataflow-request.md \
-  --attachment text/plain attachments/aurora-brief.txt \
+  --input-text-file request prompts/command-dataflow-request.md \
+  --input-attachment evidence text/plain attachments/aurora-brief.txt \
   --plain \
   command-dataflow.yaml
 ```
 
 The Claude attachment workflow includes `attachments/aurora-brief.txt` statically and
-accepts imported instructions and zero or more imported updates:
+accepts required named instructions and updates:
 
 ```sh
 scherzo-cloud workflow run \
   --source-root . \
   --execution-root "$execution_root" \
   --run-dir "$run_dir" \
-  --prompt-file prompts/claude-attachment-focus.md \
-  --attachment text/plain attachments/aurora-update.txt \
+  --input-text-file request prompts/claude-attachment-focus.md \
+  --input-attachment updates text/plain attachments/aurora-update.txt \
   agent-claude-attachment.yaml
 ```
 
@@ -157,6 +157,6 @@ scherzo-cloud workflow retry \
   --json
 ```
 
-Retry uses the retained workflow definition and imported values. A successful run is not
+Retry uses the retained workflow definition and named values. A successful run is not
 retry-eligible. See the main [`cli/README.md`](../../README.md) for the complete command,
 retention, and output contracts.

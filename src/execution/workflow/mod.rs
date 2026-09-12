@@ -163,6 +163,10 @@ pub(crate) fn parse_strict_json(bytes: &[u8]) -> Result<Value, serde_json::Error
     strict_json::from_slice(bytes)
 }
 
+pub(crate) fn is_input_name(value: &str) -> bool {
+    schema_common::is_identifier(value)
+}
+
 pub(crate) fn is_lowercase_hex(value: &str, length: usize) -> bool {
     schema_common::is_lowercase_hex(value, length)
 }

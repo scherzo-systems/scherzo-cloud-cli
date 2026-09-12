@@ -424,14 +424,19 @@ fn initialize_git_repository(repository: &Path) {
 
 fn producer_consumer_source() -> &'static str {
     r#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
+  evidence:
+    kind: attachments
 steps:
   produce:
     kind: cmd
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
       attachments:
-        ref: imports.attachments
+        ref: inputs.evidence
     command:
       argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 91; fi; test -z \"${SCHERZO_PRIVATE_SENTINEL+x}\"; { cat \"$SCHERZO_STEP_INPUTS/values/prompt\"; printf '|'; cat \"$SCHERZO_STEP_INPUTS/collections/attachments/000000\"; printf '|'; cat \"$SCHERZO_STEP_INPUTS/collections/attachments/000001\"; } > produced.txt; printf producer-live"]
     outputs:
@@ -978,6 +983,94 @@ fn conditional_skips_persist_for_steps_and_finalizers() {
 }
 
 #[test]
+fn named_empty_inputs_reach_ordinary_and_finalizer_conditions() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+inputs:
+  request: {kind: text}
+  evidence: {kind: attachments}
+steps:
+  inspect:
+    kind: cmd
+    condition:
+      equals:
+        - ref: inputs.request
+        - value: ""
+    inputs:
+      evidence:
+        ref: inputs.evidence
+    command:
+      argv:
+        - sh
+        - -c
+        - 'set -- "$SCHERZO_STEP_INPUTS/collections/evidence"/*; test "$1" = "$SCHERZO_STEP_INPUTS/collections/evidence/*"'
+finalizers:
+  finish:
+    kind: cmd
+    condition:
+      equals:
+        - ref: inputs.request
+        - value: ""
+    command:
+      argv: ["sh", "-c", "printf finalizer > finalizer.txt"]
+"#,
+    );
+
+    let missing_destination = bundle.result("missing-empty-collection");
+    let mut missing_args = bundle.args(&missing_destination);
+    missing_args.splice(
+        missing_args.len() - 1..missing_args.len() - 1,
+        [
+            "--input-text".to_owned(),
+            "request".to_owned(),
+            "".to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let missing = run(&missing_args);
+    assert_eq!(missing.status.code(), Some(1));
+    let rejection: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(rejection["outcome"], "rejected");
+    assert_eq!(
+        rejection["diagnostics"][0]["code"],
+        "missing_required_input"
+    );
+    assert_eq!(rejection["diagnostics"][0]["location"]["input"], "evidence");
+    assert!(!missing_destination.exists());
+
+    let destination = bundle.result("present-empty-values");
+    let mut args = bundle.args(&destination);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-text".to_owned(),
+            "request".to_owned(),
+            "".to_owned(),
+            "--input-attachments-empty".to_owned(),
+            "evidence".to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let output = run(&args);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["result"]["steps"][0]["state"], "succeeded");
+    assert_eq!(
+        terminal["result"]["finalization"]["finalizers"][0]["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        fs::read(bundle.execution_root.join("finalizer.txt")).unwrap(),
+        b"finalizer"
+    );
+}
+
+#[test]
 fn advisory_failure_keeps_truthful_state_and_returns_success() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
@@ -1420,6 +1513,51 @@ fn workflow_file_and_run_directory_resolve_from_the_initial_working_directory() 
     let run_directory = fs::canonicalize(bundle.result("completable")).unwrap();
     assert_eq!(terminal["runDirectory"], run_directory.to_str().unwrap());
     assert_eq!(terminal["result"]["workflow"]["path"], WORKFLOW_PATH);
+}
+
+#[test]
+fn relative_named_input_paths_resolve_from_the_initial_working_directory() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+inputs:
+  request: {kind: text}
+steps:
+  consume:
+    kind: cmd
+    inputs:
+      request:
+        ref: inputs.request
+    command:
+      argv: ["sh", "-c", "cat \"$SCHERZO_STEP_INPUTS/values/request\" > observed.txt"]
+"#,
+    );
+    let source = bundle.initial_cwd().join("relative-request.txt");
+    fs::write(&source, b"initial-directory-value").unwrap();
+    let destination = bundle.result("relative-input");
+    let mut args = bundle.args(&destination);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-text-file".to_owned(),
+            "request".to_owned(),
+            "relative-request.txt".to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let output = isolated_command(&args)
+        .current_dir(bundle.initial_cwd())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(bundle.execution_root.join("observed.txt")).unwrap(),
+        b"initial-directory-value"
+    );
 }
 
 #[test]
@@ -3278,7 +3416,7 @@ steps:
 }
 
 #[test]
-fn json_run_executes_imports_closed_stdin_publication_and_offline_boundaries() {
+fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundaries() {
     let bundle = RunBundle::new(producer_consumer_source());
     let first = bundle._temporary.path().join("first.txt");
     let second = bundle._temporary.path().join("second.txt");
@@ -3291,12 +3429,15 @@ fn json_run_executes_imports_closed_stdin_publication_and_offline_boundaries() {
     args.splice(
         args.len() - 1..args.len() - 1,
         [
-            "--prompt-file".to_owned(),
+            "--input-text-file".to_owned(),
+            "request".to_owned(),
             "-".to_owned(),
-            "--attachment".to_owned(),
+            "--input-attachment".to_owned(),
+            "evidence".to_owned(),
             "text/plain".to_owned(),
             first.to_string_lossy().into_owned(),
-            "--attachment".to_owned(),
+            "--input-attachment".to_owned(),
+            "evidence".to_owned(),
             "application/octet-stream".to_owned(),
             second.to_string_lossy().into_owned(),
             "--max-parallel".to_owned(),
@@ -3630,7 +3771,7 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     assert!(failed_destination.exists());
 
     let rejected = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  needsPrompt:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: [\"true\"]\n",
+        "schemaVersion: 1\ninputs:\n  request: {kind: text}\nsteps:\n  needsPrompt:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: inputs.request\n    command:\n      argv: [\"true\"]\n",
     );
     let rejected_destination = rejected.result("rejected");
     let mut args = rejected.args(&rejected_destination);
@@ -3642,7 +3783,7 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     assert_eq!(rejection["phase"], "admission");
     assert_eq!(
         rejection["diagnostics"][0]["code"],
-        "missing_required_prompt"
+        "missing_required_input"
     );
     assert!(output.stderr.is_empty());
     assert!(!rejected_destination.exists());
@@ -3685,14 +3826,17 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     let occupied = rejected.result("occupied");
     fs::write(&occupied, b"unchanged").unwrap();
     let mut args = rejected.args(&occupied);
-    args.insert(args.len() - 1, "--prompt-file".to_owned());
-    args.insert(
-        args.len() - 1,
-        rejected
-            .source_root
-            .join(WORKFLOW_PATH)
-            .to_string_lossy()
-            .into_owned(),
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-text-file".to_owned(),
+            "request".to_owned(),
+            rejected
+                .source_root
+                .join(WORKFLOW_PATH)
+                .to_string_lossy()
+                .into_owned(),
+        ],
     );
     let output = run(&args);
     assert_eq!(output.status.code(), Some(1));
@@ -3721,15 +3865,18 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
 }
 
 #[test]
-fn prompt_stdin_accepts_a_redirected_regular_file() {
+fn named_text_stdin_accepts_a_redirected_regular_file() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
 steps:
   consume:
     kind: cmd
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
     command:
       argv: ["sh", "-c", "cat \"$SCHERZO_STEP_INPUTS/values/prompt\" > prompt.txt"]
     outputs:
@@ -3749,7 +3896,11 @@ exports:
     let mut args = bundle.args(&destination);
     args.splice(
         args.len() - 1..args.len() - 1,
-        ["--prompt-file".to_owned(), "-".to_owned()],
+        [
+            "--input-text-file".to_owned(),
+            "request".to_owned(),
+            "-".to_owned(),
+        ],
     );
 
     let output = isolated_command(&args)
@@ -3771,7 +3922,7 @@ exports:
 
 #[cfg(target_os = "linux")]
 #[test]
-fn prompt_stdin_maps_signals_through_the_shared_interruption_outcomes() {
+fn named_text_stdin_maps_signals_through_the_shared_interruption_outcomes() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
     );
@@ -3784,7 +3935,11 @@ fn prompt_stdin_maps_signals_through_the_shared_interruption_outcomes() {
         let mut args = bundle.args(&destination);
         args.splice(
             args.len() - 1..args.len() - 1,
-            ["--prompt-file".to_owned(), "-".to_owned()],
+            [
+                "--input-text-file".to_owned(),
+                "request".to_owned(),
+                "-".to_owned(),
+            ],
         );
         let mut child = isolated_command(&args)
             .stdin(Stdio::piped())
@@ -3794,12 +3949,12 @@ fn prompt_stdin_maps_signals_through_the_shared_interruption_outcomes() {
             .unwrap();
         let process = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
 
-        // Import acquisition has no application-level readiness output. The
+        // Named-input acquisition has no application-level readiness output. The
         // nonblocking stdin flag is the closest observable operating-system
         // boundary proving that the signal observer is installed and the
         // child is waiting in read_stdin_bounded.
         poll_until(
-            "workflow prompt stdin import readiness",
+            "workflow named Text stdin readiness",
             || {
                 fs::read_to_string(format!("/proc/{}/fdinfo/0", child.id()))
                     .ok()
@@ -3832,12 +3987,15 @@ fn prompt_stdin_maps_signals_through_the_shared_interruption_outcomes() {
 fn attachment_paths_accept_non_utf8_host_names() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
+inputs:
+  evidence:
+    kind: attachments
 steps:
   consume:
     kind: cmd
     inputs:
       attachments:
-        ref: imports.attachments
+        ref: inputs.evidence
     command:
       argv: ["sh", "-c", "cat \"$SCHERZO_STEP_INPUTS/collections/attachments/000000\" > attachment.bin"]
     outputs:
@@ -3861,7 +4019,7 @@ exports:
     let workflow_path = args.pop().unwrap();
 
     let output = isolated_command(&args)
-        .args(["--attachment", "application/octet-stream"])
+        .args(["--input-attachment", "evidence", "application/octet-stream"])
         .arg(&attachment)
         .arg(workflow_path)
         .output()
@@ -3906,18 +4064,45 @@ fn initially_unwritable_result_parent_prevents_execution() {
 }
 
 #[test]
-fn invalid_local_import_fails_before_resolution_presentation_or_publication() {
+fn removed_fixed_input_flags_are_usage_errors_before_source_io() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    for (name, legacy) in [
+        (
+            "prompt",
+            vec!["--prompt-file", "/path/that/must/not/be/read"],
+        ),
+        (
+            "attachment",
+            vec!["--attachment", "text/plain", "/path/that/must/not/be/read"],
+        ),
+    ] {
+        let destination = bundle.result(&format!("removed-{name}"));
+        let mut args = bundle.args(&destination);
+        let insertion = args.len() - 1;
+        args.splice(insertion..insertion, legacy.into_iter().map(str::to_owned));
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{name}: {output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn invalid_local_input_fails_before_resolution_presentation_or_publication() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
     );
     let prompt = bundle._temporary.path().join("invalid-prompt");
     fs::write(&prompt, [0xff]).unwrap();
-    let destination = bundle.result("invalid-import");
+    let destination = bundle.result("invalid-input");
     let mut args = bundle.args(&destination);
     args.splice(
         args.len() - 1..args.len() - 1,
         [
-            "--prompt-file".to_owned(),
+            "--input-text-file".to_owned(),
+            "request".to_owned(),
             prompt.to_string_lossy().into_owned(),
             "--json".to_owned(),
         ],
@@ -4016,12 +4201,15 @@ steps:
 fn private_staging_cleanup_failure_is_recorded_in_durable_state() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
 steps:
   moveInputStore:
     kind: cmd
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
     command:
       argv: ["sh", "-c", "store=$(dirname \"$SCHERZO_STEP_INPUTS\"); mv \"$store\" \"$store.moved\""]
 "#,
@@ -4033,7 +4221,8 @@ steps:
     args.splice(
         args.len() - 1..args.len() - 1,
         [
-            "--prompt-file".to_owned(),
+            "--input-text-file".to_owned(),
+            "request".to_owned(),
             prompt.to_string_lossy().into_owned(),
         ],
     );

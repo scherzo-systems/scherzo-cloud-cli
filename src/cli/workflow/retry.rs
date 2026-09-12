@@ -54,9 +54,9 @@ impl Command {
                 return super::run::diagnose(error);
             }
         };
-        let (workflow, imports, maximum_parallel_steps) = {
-            let (workflow, imports, maximum_parallel_steps) = pending.execution_specification();
-            (workflow.clone(), imports.clone(), maximum_parallel_steps)
+        let (workflow, inputs, maximum_parallel_steps) = {
+            let (workflow, inputs, maximum_parallel_steps) = pending.execution_specification();
+            (workflow.clone(), inputs.clone(), maximum_parallel_steps)
         };
         let context = match super::run::execution_context_for_workflow(
             &workflow,
@@ -75,7 +75,7 @@ impl Command {
                 );
             }
         };
-        let admitted = match admit_local_workflow(workflow.clone(), imports, context) {
+        let admitted = match admit_local_workflow(workflow.clone(), inputs, context) {
             Ok(admitted) => admitted,
             Err(failure) => {
                 signal_task.abort();

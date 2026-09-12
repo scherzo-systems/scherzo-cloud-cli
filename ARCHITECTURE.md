@@ -243,7 +243,7 @@ configuration, and runtime layout are not compatibility targets.
 
 ## Workflow execution model
 
-A run invocation resolves one workflow and supplies its resolved imports. Every
+A run invocation resolves one workflow and supplies its required named inputs. Every
 invocation produces the same internal resolved workflow, including its immutable static
 source closure and digest, before execution begins. A local invocation begins from an
 explicit file path and carries no Cloud source provenance. Runner Serve instead receives

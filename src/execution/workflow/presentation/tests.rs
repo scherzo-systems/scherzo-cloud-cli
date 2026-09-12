@@ -12,7 +12,7 @@ use time::format_description::well_known::Rfc3339;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, InputLimits, ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,
 };
 use crate::execution::workflow::artifact::ArtifactStaging;
 use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
@@ -226,7 +226,7 @@ impl Fixture {
         let digest = workflow.content_digest.clone();
         let admitted = admit_workflow(
             workflow.clone(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             execution_context(execution_root.clone()),
         )
         .unwrap();
@@ -608,12 +608,15 @@ fn contracted_admission_rejection_has_the_resolved_workflow_identity() {
     std::fs::write(
         source_root.join("workflow.yaml"),
         "schemaVersion: 1
+inputs:
+  request:
+    kind: text
 steps:
   prompt:
     kind: cmd
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
     command:
       argv: [\"true\"]
 ",
@@ -622,7 +625,7 @@ steps:
     let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
     let failure = admit_workflow(
         workflow.clone(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         execution_context(execution_root),
     )
     .unwrap_err();
@@ -644,7 +647,7 @@ steps:
     );
     assert!(stderr.text().is_empty());
     let value: Value = serde_json::from_str(&stdout.text()).unwrap();
-    assert_eq!(value["diagnostics"][0]["code"], "missing_required_prompt");
+    assert_eq!(value["diagnostics"][0]["code"], "missing_required_input");
     assert_eq!(value["workflow"]["path"], "workflow.yaml");
     assert!(!stdout.text().contains('\u{1b}'));
 }

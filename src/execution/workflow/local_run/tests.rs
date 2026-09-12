@@ -11,7 +11,8 @@ use std::time::Duration;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedInput, ResolvedInputs,
+    admit_workflow,
 };
 use crate::execution::workflow::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
@@ -29,16 +30,38 @@ struct AdmittedFixture {
 
 impl AdmittedFixture {
     fn new() -> Self {
-        Self::from_source(
-            "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+        Self::from_source_with_inputs(
+            "schemaVersion: 1\ninputs:\n  request: {kind: text}\n  evidence: {kind: attachments}\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+            ResolvedInputs::new(BTreeMap::from([
+                (
+                    "request".to_owned(),
+                    ResolvedInput::Text(Arc::from("durable request\n")),
+                ),
+                (
+                    "evidence".to_owned(),
+                    ResolvedInput::Attachments(Arc::from([ResolvedAttachment::new(
+                        Arc::from("application/octet-stream"),
+                        Arc::from([0_u8, 1, 0xff]),
+                    )])),
+                ),
+            ])),
+            1024,
         )
     }
 
     fn from_source(source: &str) -> Self {
-        Self::from_source_with_maximum_step_log_bytes(source, 1024)
+        Self::from_source_with_inputs(source, ResolvedInputs::default(), 1024)
     }
 
     fn from_source_with_maximum_step_log_bytes(source: &str, maximum_step_log_bytes: u64) -> Self {
+        Self::from_source_with_inputs(source, ResolvedInputs::default(), maximum_step_log_bytes)
+    }
+
+    fn from_source_with_inputs(
+        source: &str,
+        inputs: ResolvedInputs,
+        maximum_step_log_bytes: u64,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -50,13 +73,7 @@ impl AdmittedFixture {
         let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
         let admitted = admit_workflow(
             workflow,
-            ResolvedImports::new(
-                Some(Arc::from("durable prompt\n")),
-                Arc::from([ResolvedAttachment::new(
-                    Arc::from("application/octet-stream"),
-                    Arc::from([0_u8, 1, 0xff]),
-                )]),
-            ),
+            inputs,
             ExecutionContext::new(
                 execution_root.clone(),
                 ExecutionPolicyLimits::new(
@@ -321,18 +338,53 @@ fn retained_manifest_rejects_source_files_out_of_canonical_order() {
         maximum_parallel_steps: 1,
         source_files: vec![
             source_file("workflow.yaml", 1),
-            source_file("prompt.txt", 2),
+            source_file("auxiliary.txt", 2),
         ],
-        imports: ManifestImportsV1 {
-            prompt: None,
-            attachments: Vec::new(),
-        },
+        inputs: BTreeMap::new(),
     };
 
     assert_eq!(
         validate_manifest(&manifest),
         Err(LocalRunDirectoryError::SerializationUnavailable)
     );
+}
+
+#[test]
+fn retained_manifest_rejects_duplicate_named_input_keys() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("duplicate-input-key");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    drop(run);
+
+    let manifest_path = run_path.join("workflow/manifest.json");
+    let manifest_bytes = fs::read(&manifest_path).unwrap();
+    let manifest: WorkflowManifestV1 = decode_schema_one(&manifest_bytes).unwrap();
+    let request = serde_json::to_string(&manifest.inputs["request"]).unwrap();
+    let original_entry = format!("\"request\":{request}");
+    let mut duplicate_manifest = serde_json::to_string(&manifest).unwrap();
+    assert_eq!(duplicate_manifest.matches(&original_entry).count(), 1);
+    duplicate_manifest = duplicate_manifest.replacen(
+        &original_entry,
+        &format!("{original_entry},{original_entry}"),
+        1,
+    );
+    duplicate_manifest.push('\n');
+    fs::set_permissions(&manifest_path, Permissions::from_mode(0o600)).unwrap();
+    fs::write(&manifest_path, duplicate_manifest.as_bytes()).unwrap();
+
+    let run_file = run_path.join(RUN_FILE);
+    let mut run_document: LocalRunV1 = decode_schema_one(&fs::read(&run_file).unwrap()).unwrap();
+    run_document.workflow_manifest_digest = DigestV1::sha256(duplicate_manifest.as_bytes());
+    fs::set_permissions(&run_file, Permissions::from_mode(0o600)).unwrap();
+    fs::write(&run_file, encode_json(&run_document).unwrap()).unwrap();
+
+    match acquire_local_retry(&run_path) {
+        Err(LocalRunDirectoryError::StateInvalid) => {}
+        Err(other) => panic!("duplicate named input produced the wrong failure: {other:?}"),
+        Ok(_) => panic!("retry accepted a retained manifest with a duplicate named input key"),
+    }
+    assert!(!run_path.join("attempts/000002").exists());
 }
 
 #[test]
@@ -362,22 +414,22 @@ fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() 
     assert_eq!(manifest["workflowPath"], "workflow.yaml");
     assert_eq!(manifest["maximumParallelSteps"], 2);
     assert_eq!(manifest["sourceFiles"][0]["relativeFile"], "files/0001");
-    assert_eq!(manifest["imports"]["prompt"]["relativeFile"], "files/0002");
     assert_eq!(
-        manifest["imports"]["attachments"][0]["relativeFile"],
-        "files/0003"
+        manifest["inputs"]["evidence"]["items"][0]["relativeFile"],
+        "files/0002"
     );
+    assert_eq!(manifest["inputs"]["request"]["relativeFile"], "files/0003");
     assert_eq!(
         fs::read(run_path.join("workflow/files/0001")).unwrap(),
         fixture.admitted.workflow().source_closure["workflow.yaml"].as_ref()
     );
     assert_eq!(
         fs::read(run_path.join("workflow/files/0002")).unwrap(),
-        b"durable prompt\n"
+        [0_u8, 1, 0xff]
     );
     assert_eq!(
         fs::read(run_path.join("workflow/files/0003")).unwrap(),
-        [0_u8, 1, 0xff]
+        b"durable request\n"
     );
 
     let state = read_state(run.root_handle()).unwrap();
@@ -676,10 +728,16 @@ fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
         panic!("failed attempt should be retryable");
     };
     let pending = *pending;
-    let (_, imports, maximum_parallel_steps) = pending.execution_specification();
+    let (_, inputs, maximum_parallel_steps) = pending.execution_specification();
     assert_eq!(maximum_parallel_steps, 2);
-    assert_eq!(imports.prompt(), Some("durable prompt\n"));
-    assert_eq!(imports.attachments()[0].bytes(), [0_u8, 1, 0xff]);
+    assert!(matches!(
+        inputs.get("request"),
+        Some(ResolvedInput::Text(value)) if value.as_ref() == "durable request\n"
+    ));
+    let Some(ResolvedInput::Attachments(attachments)) = inputs.get("evidence") else {
+        panic!("retained named attachment collection is missing");
+    };
+    assert_eq!(attachments[0].bytes(), [0_u8, 1, 0xff]);
     let retry = pending.begin(&fixture.admitted).unwrap_or_else(|_| {
         panic!("eligible retry should commit");
     });
@@ -921,6 +979,25 @@ fn quiescence_wait_allows_exit_after_ten_seconds() {
         authority.waits.get() * usize::try_from(QUIESCENCE_POLL_INTERVAL.as_millis()).unwrap()
             > 10_000
     );
+}
+
+#[test]
+fn retained_named_input_corruption_rejects_retry_without_fallback() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("corrupt-retained-input");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    drop(run);
+
+    let retained_text = run_path.join("workflow/files/0003");
+    fs::set_permissions(&retained_text, Permissions::from_mode(0o600)).unwrap();
+    fs::write(&retained_text, b"changed retained bytes").unwrap();
+
+    assert!(matches!(
+        acquire_local_retry(&run_path),
+        Err(LocalRunDirectoryError::StateInvalid)
+    ));
+    assert!(!run_path.join("attempts/000002").exists());
 }
 
 #[test]
@@ -1934,8 +2011,13 @@ fn archived_attempt_enforces_stream_prefix_retention_invariants() {
 
 #[test]
 fn archived_attempt_validates_failure_identities_against_the_retained_step() {
-    let fixture = AdmittedFixture::from_source(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: [\"true\"]\n    outputs:\n      artifact:\n        kind: file\n        from: path\n        path: artifact.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+    let fixture = AdmittedFixture::from_source_with_inputs(
+        "schemaVersion: 1\ninputs:\n  request: {kind: text}\nsteps:\n  first:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: inputs.request\n    command:\n      argv: [\"true\"]\n    outputs:\n      artifact:\n        kind: file\n        from: path\n        path: artifact.txt\n        mediaType: text/plain\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+        ResolvedInputs::new(BTreeMap::from([(
+            "request".to_owned(),
+            ResolvedInput::Text(Arc::from("retained request")),
+        )])),
+        1024,
     );
     let run_path = fixture.run_path("archive-failure-identities");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();

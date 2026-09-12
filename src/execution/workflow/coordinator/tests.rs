@@ -14,7 +14,7 @@ use super::*;
 use crate::execution::workflow::admission::{
     CancellationPendingPollBarrier, CancellationPolicy, CancellationReason, CancellationSource,
     CaptureLimits, EnvironmentSnapshot, ExecutionContext, ExecutionPolicyLimits, InputLimits,
-    ResolvedImports, admit_workflow,
+    ResolvedInputs, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 use crate::execution::workflow::runtime::{
@@ -209,7 +209,7 @@ fn admitted_fixture_for_workflow(
     fs::write(source_root.join("workflow.yaml"), workflow).unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(

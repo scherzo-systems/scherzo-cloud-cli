@@ -11,7 +11,7 @@ use rustix::process::Pid;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, ExecutionContext, ExecutionPolicyLimits,
-    InputLimits, ResolvedImports, admit_workflow, default_execution_policy_limits,
+    InputLimits, ResolvedInputs, admit_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::{
     CaptureBoundary, CaptureBoundaryObserver, CarrierBudgetClass,
@@ -112,7 +112,7 @@ fn admitted_capture_with_limits<const N: usize>(
     }
     let admitted = admit_workflow(
         resolution::resolve(&source, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             repository.to_owned(),
             limits,

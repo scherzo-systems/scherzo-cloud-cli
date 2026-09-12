@@ -191,7 +191,7 @@ pub(crate) enum ExecutionSpecInvalidReason {
     InputManifestMismatch,
     InputContentUnavailable,
     InputContentMismatch,
-    InputPromptInvalid,
+    InputTextInvalid,
 }
 
 impl ExecutionSpecInvalidReason {
@@ -212,7 +212,7 @@ impl ExecutionSpecInvalidReason {
             Self::InputManifestMismatch => "input_manifest_mismatch",
             Self::InputContentUnavailable => "input_content_unavailable",
             Self::InputContentMismatch => "input_content_mismatch",
-            Self::InputPromptInvalid => "input_prompt_invalid",
+            Self::InputTextInvalid => "input_text_invalid",
         }
     }
 }
@@ -2077,11 +2077,11 @@ mod tests {
             ),
             (
                 rejected(AssignmentDecline::ExecutionSpecInvalid(
-                    ExecutionSpecInvalidReason::InputPromptInvalid,
+                    ExecutionSpecInvalidReason::InputTextInvalid,
                 )),
                 rejected_payload(json!({
                     "type": "execution_spec_invalid",
-                    "reason": "input_prompt_invalid",
+                    "reason": "input_text_invalid",
                 })),
             ),
             (

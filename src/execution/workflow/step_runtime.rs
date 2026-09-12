@@ -14,7 +14,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::admission::{AdmittedWorkflow, CancellationReason, EnvironmentSnapshot};
+use super::admission::{AdmittedWorkflow, CancellationReason, EnvironmentSnapshot, ResolvedInput};
 use super::agent::dispatch::{AgentInvocationDispatcher, invoke_agent_dispatcher};
 use super::agent::{
     AgentFailure, AgentFailureCause, AgentInvocationIdentity, AgentObservationEnvelope,
@@ -65,7 +65,6 @@ use super::runtime::{
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
     ValidatedCommonStep, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
-    WorkflowImport,
 };
 use super::value::CapturedValue;
 
@@ -1894,7 +1893,9 @@ where
                 let upstream = resolve_agent_upstream_outputs(agent, action_inputs)?;
                 let finalization_context = action_inputs.values().find_map(|input| match input {
                     ActionInput::FinalizationContext(bytes) => Some(bytes.as_ref()),
-                    ActionInput::Import | ActionInput::Output(_) | ActionInput::Unavailable => None,
+                    ActionInput::WorkflowInput
+                    | ActionInput::Output(_)
+                    | ActionInput::Unavailable => None,
                 });
                 let identity = AgentInvocationIdentity::new(run.clone(), Arc::from(step), action);
                 let materialized = materialize_agent_invocation(
@@ -1945,18 +1946,15 @@ where
                     .get(input_identity)
                     .ok_or(StepStartFailure::InputsUnavailable)?;
                 let value = match (&reference.source, action_input) {
-                    (ResolvedValueSource::Import(WorkflowImport::Prompt), ActionInput::Import) => {
-                        InputValue::Prompt(
-                            self.admitted
-                                .imports()
-                                .prompt()
-                                .ok_or(StepStartFailure::InputsUnavailable)?,
-                        )
+                    (ResolvedValueSource::Input(name), ActionInput::WorkflowInput) => {
+                        match self.admitted.inputs().get(name) {
+                            Some(ResolvedInput::Text(text)) => InputValue::Text(text),
+                            Some(ResolvedInput::Attachments(attachments)) => {
+                                InputValue::Attachments(attachments)
+                            }
+                            None => return Err(StepStartFailure::InputsUnavailable),
+                        }
                     }
-                    (
-                        ResolvedValueSource::Import(WorkflowImport::Attachments),
-                        ActionInput::Import,
-                    ) => InputValue::Attachments(self.admitted.imports().attachments()),
                     (
                         ResolvedValueSource::FinalizationContext,
                         ActionInput::FinalizationContext(bytes),
@@ -3329,7 +3327,7 @@ fn resolve_agent_upstream_outputs(
             } => Some(source.clone()),
             ValidatedMessageSource::File { .. }
             | ValidatedMessageSource::Reference {
-                source: ResolvedValueSource::Import(_) | ResolvedValueSource::FinalizationContext,
+                source: ResolvedValueSource::Input(_) | ResolvedValueSource::FinalizationContext,
                 ..
             } => None,
         })
@@ -3361,7 +3359,7 @@ fn resolve_agent_upstream_outputs(
             let value = match action_inputs.get(&source.reference()) {
                 Some(ActionInput::Output(value)) => value.clone(),
                 Some(
-                    ActionInput::Import
+                    ActionInput::WorkflowInput
                     | ActionInput::FinalizationContext(_)
                     | ActionInput::Unavailable,
                 )

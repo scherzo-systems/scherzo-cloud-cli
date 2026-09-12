@@ -1,4 +1,7 @@
 schemaVersion: 1
+inputs:
+  request:
+    kind: text
 agentProfiles:
   coding:
     harness:
@@ -14,7 +17,7 @@ steps:
       systemPrompt: system.md
       message:
         text:
-          - ref: imports.prompt
+          - ref: inputs.request
     outputs:
       result:
         kind: json

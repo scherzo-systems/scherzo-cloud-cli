@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,19 +23,24 @@ use crate::execution::workflow::pi::Thinking;
 use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 
 const COMMAND_WORKFLOW: &str = r#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
+  evidence:
+    kind: attachments
 steps:
   check:
     kind: cmd
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
       attachments:
-        ref: imports.attachments
+        ref: inputs.evidence
     command:
       argv: ["./must-not-run"]
 "#;
 
-const COMMAND_WORKFLOW_WITHOUT_IMPORTS: &str = r#"schemaVersion: 1
+const COMMAND_WORKFLOW_WITHOUT_INPUTS: &str = r#"schemaVersion: 1
 steps:
   check:
     kind: cmd
@@ -43,6 +49,9 @@ steps:
 "#;
 
 const AGENT_WORKFLOW: &str = r#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
 agentProfiles:
   coding:
     harness:
@@ -59,7 +68,7 @@ steps:
       message:
         text:
           - file: message.md
-          - ref: imports.prompt
+          - ref: inputs.request
 "#;
 
 const RECOVERY_AGENT_WORKFLOW: &str = r#"schemaVersion: 1
@@ -85,6 +94,9 @@ steps:
 "#;
 
 const MIXED_WORKFLOW: &str = r#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
 agentProfiles:
   coding:
     harness:
@@ -106,7 +118,7 @@ steps:
       message:
         text:
           - file: message.md
-          - ref: imports.prompt
+          - ref: inputs.request
 "#;
 
 struct WorkflowFixture {
@@ -194,6 +206,26 @@ const THINKING_LEVELS: [(&str, Thinking); 7] = [
     ("xhigh", Thinking::XHigh),
     ("max", Thinking::Max),
 ];
+
+fn text_inputs(value: impl Into<Arc<str>>) -> ResolvedInputs {
+    ResolvedInputs::new(BTreeMap::from([(
+        "request".to_owned(),
+        ResolvedInput::Text(value.into()),
+    )]))
+}
+
+fn text_and_attachments_inputs(
+    value: impl Into<Arc<str>>,
+    attachments: impl Into<Arc<[ResolvedAttachment]>>,
+) -> ResolvedInputs {
+    ResolvedInputs::new(BTreeMap::from([
+        ("request".to_owned(), ResolvedInput::Text(value.into())),
+        (
+            "evidence".to_owned(),
+            ResolvedInput::Attachments(attachments.into()),
+        ),
+    ]))
+}
 
 fn all_thinking_levels_workflow() -> String {
     let mut source = String::from("schemaVersion: 1\nagentProfiles:\n");
@@ -301,7 +333,7 @@ fn admission_partitions_durable_stream_bytes_before_capture() {
         .maximum_retained_bytes_per_invocation;
     let admitted = admit_workflow(
         resolved,
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         fixture.context(1, Duration::from_secs(1)),
     )
     .unwrap();
@@ -317,15 +349,15 @@ fn admission_requires_pi_only_for_graphs_containing_agent_steps() {
     for (source, agent_step_count) in [
         (AGENT_WORKFLOW, 1),
         (MIXED_WORKFLOW, 1),
-        (COMMAND_WORKFLOW_WITHOUT_IMPORTS, 0),
+        (COMMAND_WORKFLOW_WITHOUT_INPUTS, 0),
     ] {
         for supply_installation in [false, true] {
             let fixture = WorkflowFixture::new(source);
             let root_before = root_snapshot(&fixture.execution_root);
             let imports = if agent_step_count == 0 {
-                ResolvedImports::default()
+                ResolvedInputs::default()
             } else {
-                ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([]))
+                text_inputs("Caller prompt.")
             };
             let mut context = fixture.context(1, Duration::from_secs(1));
             if supply_installation {
@@ -368,7 +400,7 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
 
     let local = admit_local_workflow(
         resolved.clone(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         fixture
             .context(1, Duration::from_secs(1))
             .with_capacity_budget(exact)
@@ -384,7 +416,7 @@ fn local_and_runner_admission_preserve_source_bound_capacity_and_guards() {
 
     let runner = admit_runner_workflow(
         resolved.clone(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         fixture
             .context(1, Duration::from_secs(1))
             .with_capacity_budget(exact)
@@ -438,7 +470,7 @@ fn maximal_handler_workflow_admits_exact_cloud_capacity() {
 
     let admitted = admit_runner_workflow(
         resolved,
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         fixture
             .context(1, Duration::from_secs(1))
             .with_capacity_budget(exact)
@@ -457,7 +489,7 @@ fn maximal_handler_workflow_admits_exact_cloud_capacity() {
 
 #[test]
 fn admission_rejects_capacity_reused_after_source_closure_changes() {
-    let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
     let mut resolved = fixture.resolve();
     resolved.source_closure.insert(
         "injected-after-resolution.txt".to_owned(),
@@ -465,8 +497,8 @@ fn admission_rejects_capacity_reused_after_source_closure_changes() {
     );
     let context = || fixture.context(1, Duration::from_secs(1));
 
-    let local = admit_local_workflow(resolved.clone(), ResolvedImports::default(), context());
-    let runner = admit_runner_workflow(resolved, ResolvedImports::default(), context());
+    let local = admit_local_workflow(resolved.clone(), ResolvedInputs::default(), context());
+    let runner = admit_runner_workflow(resolved, ResolvedInputs::default(), context());
     assert_eq!(
         (
             local.err().map(|failure| failure.kind()),
@@ -494,7 +526,7 @@ fn admission_rejects_recovery_placement_capacity_and_binding_before_execution() 
     assert_failure(
         admit_local_workflow(
             resolved.clone(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             context().with_capacity_budget(exact),
         ),
         AdmissionFailureKind::AgentStepRuntimeUnsupported,
@@ -550,7 +582,7 @@ fn admission_rejects_recovery_placement_capacity_and_binding_before_execution() 
         assert_failure(
             admit_runner_workflow(
                 resolved.clone(),
-                ResolvedImports::default(),
+                ResolvedInputs::default(),
                 context()
                     .with_capacity_budget(budget)
                     .with_pi_installation(installation.clone()),
@@ -565,7 +597,7 @@ fn admission_rejects_recovery_placement_capacity_and_binding_before_execution() 
     assert_failure(
         admit_local_workflow(
             mismatched,
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             context()
                 .with_capacity_budget(exact)
                 .with_pi_installation(installation),
@@ -588,7 +620,7 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
     fs::remove_dir_all(&fixture.source_root).unwrap();
     let admitted = admit_workflow(
         resolved,
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             fixture.execution_root.clone(),
             ExecutionPolicyLimits::new(
@@ -724,7 +756,7 @@ fn internal_claude_admission_retains_native_effort_and_profile_limits() {
         ValidatedClaudeCodeInstallation::fixture(fixture.execution_root.join("validated-claude"));
     let admitted = admit_workflow(
         resolved,
-        ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([])),
+        text_inputs("Caller prompt."),
         fixture
             .context(1, Duration::from_secs(1))
             .with_claude_code_installation(installation.clone()),
@@ -767,7 +799,7 @@ fn codex_admission_preserves_the_exact_installation_configuration_and_limits() {
         ValidatedCodexInstallation::fixture(fixture.execution_root.join("validated-codex"));
     let admitted = admit_workflow(
         resolved,
-        ResolvedImports::new(Some(Arc::from("Caller prompt.")), Arc::from([])),
+        text_inputs("Caller prompt."),
         fixture
             .context(1, Duration::from_secs(1))
             .with_codex_installation(installation.clone()),
@@ -826,16 +858,16 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
     let cancellation = CancellationSource::new();
     let caller_cancellation = cancellation.clone();
     let mut cancellation_notifications = cancellation.subscribe();
-    let imports = ResolvedImports::new(
-        Some(Arc::<str>::from("Run the checks.")),
-        Arc::<[ResolvedAttachment]>::from(vec![ResolvedAttachment::new(
+    let inputs = text_and_attachments_inputs(
+        "Run the checks.",
+        vec![ResolvedAttachment::new(
             Arc::<str>::from("application/octet-stream"),
             Arc::<[u8]>::from([0, 0xff, b'\n']),
-        )]),
+        )],
     );
     let admitted = admit_workflow(
         resolved,
-        imports,
+        inputs,
         ExecutionContext::new(
             fixture.execution_root.join("."),
             ExecutionPolicyLimits::new(
@@ -949,16 +981,16 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
         Some(CancellationReason::UserRequest)
     );
 
-    assert_eq!(admitted.imports().prompt(), Some("Run the checks."));
-    assert_eq!(admitted.imports().attachments().len(), 1);
-    assert_eq!(
-        admitted.imports().attachments()[0].media_type(),
-        "application/octet-stream"
-    );
-    assert_eq!(
-        admitted.imports().attachments()[0].bytes(),
-        [0, 0xff, b'\n']
-    );
+    assert!(matches!(
+        admitted.inputs().get("request"),
+        Some(ResolvedInput::Text(value)) if value.as_ref() == "Run the checks."
+    ));
+    let Some(ResolvedInput::Attachments(attachments)) = admitted.inputs().get("evidence") else {
+        panic!("named attachment collection was not admitted");
+    };
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].media_type(), "application/octet-stream");
+    assert_eq!(attachments[0].bytes(), [0, 0xff, b'\n']);
     assert_eq!(admitted.workflow().content_digest, digest);
     assert_eq!(
         admitted.workflow().source_bytes("workflow.yaml"),
@@ -971,25 +1003,25 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
 
 #[test]
 fn admission_rejects_each_invalid_execution_root_kind() {
-    let missing = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let missing = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
     let missing_root = missing.execution_root.join("missing");
     assert_failure(
         admit_workflow(
             missing.resolve(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             execution_context(missing_root, 1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::ExecutionRootUnavailable,
         AdmissionLocation::ExecutionRoot,
     );
 
-    let file = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let file = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
     let file_root = file.execution_root.join("not-a-directory");
     fs::write(&file_root, b"file\n").unwrap();
     assert_failure(
         admit_workflow(
             file.resolve(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             execution_context(file_root, 1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::ExecutionRootNotDirectory,
@@ -999,11 +1031,11 @@ fn admission_rejects_each_invalid_execution_root_kind() {
 
 #[test]
 fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_policy() {
-    let zero_parallelism = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let zero_parallelism = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
     assert_failure(
         admit_workflow(
             zero_parallelism.resolve(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             zero_parallelism.context(0, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::NonPositiveParallelism,
@@ -1033,11 +1065,11 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
             AdmissionLocation::MaximumTotalCapturedBytes,
         ),
     ] {
-        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
         assert_failure(
             admit_workflow(
                 fixture.resolve(),
-                ResolvedImports::default(),
+                ResolvedInputs::default(),
                 ExecutionContext::new(
                     fixture.execution_root.clone(),
                     ExecutionPolicyLimits::new(
@@ -1078,11 +1110,11 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
             AdmissionLocation::MaximumTotalCapturedGitCarrierBytes,
         ),
     ] {
-        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
         assert_failure(
             admit_workflow(
                 fixture.resolve(),
-                ResolvedImports::default(),
+                ResolvedInputs::default(),
                 ExecutionContext::new(
                     fixture.execution_root.clone(),
                     ExecutionPolicyLimits::new(
@@ -1135,11 +1167,11 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
             AdmissionLocation::MaximumLiveInputBytes,
         ),
     ] {
-        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+        let fixture = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
         assert_failure(
             admit_workflow(
                 fixture.resolve(),
-                ResolvedImports::default(),
+                ResolvedInputs::default(),
                 ExecutionContext::new(
                     fixture.execution_root.clone(),
                     ExecutionPolicyLimits::new(
@@ -1157,11 +1189,11 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
         );
     }
 
-    let zero_log_limit = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let zero_log_limit = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
     assert_failure(
         admit_workflow(
             zero_log_limit.resolve(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             ExecutionContext::new(
                 zero_log_limit.execution_root.clone(),
                 ExecutionPolicyLimits::new(
@@ -1178,22 +1210,22 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
         AdmissionLocation::MaximumStepLogBytes,
     );
 
-    let short_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let short_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
     assert_failure(
         admit_workflow(
             short_grace.resolve(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             short_grace.context(1, MINIMUM_CANCELLATION_GRACE - Duration::from_nanos(1)),
         ),
         AdmissionFailureKind::CancellationGraceTooShort,
         AdmissionLocation::CancellationPolicy,
     );
 
-    let excessive_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_IMPORTS);
+    let excessive_grace = WorkflowFixture::new(COMMAND_WORKFLOW_WITHOUT_INPUTS);
     assert_failure(
         admit_workflow(
             excessive_grace.resolve(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             excessive_grace.context(1, MAXIMUM_CANCELLATION_GRACE + Duration::from_nanos(1)),
         ),
         AdmissionFailureKind::CancellationGraceTooLong,
@@ -1202,32 +1234,36 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
 }
 
 #[test]
-fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations() {
-    let missing_prompt = WorkflowFixture::new(COMMAND_WORKFLOW);
+fn admission_rejects_missing_required_input_and_unsupported_agent_steps_at_typed_locations() {
+    let missing_inputs = WorkflowFixture::new(COMMAND_WORKFLOW);
     assert_failure(
         admit_workflow(
-            missing_prompt.resolve(),
-            ResolvedImports::default(),
-            missing_prompt.context(1, Duration::from_secs(1)),
+            missing_inputs.resolve(),
+            ResolvedInputs::default(),
+            missing_inputs.context(1, Duration::from_secs(1)),
         ),
-        AdmissionFailureKind::MissingRequiredPrompt,
-        AdmissionLocation::PromptImport,
+        AdmissionFailureKind::MissingRequiredInput,
+        AdmissionLocation::Input {
+            name: "evidence".to_owned(),
+        },
     );
 
     let agent = WorkflowFixture::new(AGENT_WORKFLOW);
     assert_failure(
         admit_workflow(
             agent.resolve(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             agent.context(1, Duration::from_secs(1)),
         ),
-        AdmissionFailureKind::MissingRequiredPrompt,
-        AdmissionLocation::PromptImport,
+        AdmissionFailureKind::MissingRequiredInput,
+        AdmissionLocation::Input {
+            name: "request".to_owned(),
+        },
     );
     assert_failure(
         admit_workflow(
             agent.resolve(),
-            ResolvedImports::new(Some(Arc::<str>::from("Prompt.")), Arc::from([])),
+            text_inputs("Prompt."),
             agent.context(1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::AgentStepRuntimeUnsupported,
@@ -1238,27 +1274,75 @@ fn admission_rejects_missing_required_prompt_and_agent_steps_at_typed_locations(
 }
 
 #[test]
+fn admission_rejects_wrong_and_extra_named_input_bindings() {
+    let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
+    let wrong_kind = ResolvedInputs::new(BTreeMap::from([
+        (
+            "request".to_owned(),
+            ResolvedInput::Attachments(Arc::from([])),
+        ),
+        (
+            "evidence".to_owned(),
+            ResolvedInput::Attachments(Arc::from([])),
+        ),
+    ]));
+    assert_failure(
+        admit_workflow(
+            fixture.resolve(),
+            wrong_kind,
+            fixture.context(1, Duration::from_secs(1)),
+        ),
+        AdmissionFailureKind::InputKindMismatch,
+        AdmissionLocation::Input {
+            name: "request".to_owned(),
+        },
+    );
+
+    let mut extra = text_and_attachments_inputs("request", Vec::new())
+        .values()
+        .clone();
+    extra.insert(
+        "unexpected".to_owned(),
+        ResolvedInput::Text(Arc::from("extra")),
+    );
+    assert_failure(
+        admit_workflow(
+            fixture.resolve(),
+            ResolvedInputs::new(extra),
+            fixture.context(1, Duration::from_secs(1)),
+        ),
+        AdmissionFailureKind::UnexpectedInput,
+        AdmissionLocation::Input {
+            name: "unexpected".to_owned(),
+        },
+    );
+}
+
+#[test]
 fn admission_rejects_invalid_attachment_media_type() {
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
-    let imports = ResolvedImports::new(
-        Some(Arc::<str>::from("Run the checks.")),
-        Arc::<[ResolvedAttachment]>::from(vec![
+    let inputs = text_and_attachments_inputs(
+        "Run the checks.",
+        vec![
             ResolvedAttachment::new(
                 Arc::<str>::from("application/octet-stream"),
                 Arc::<[u8]>::from([]),
             ),
             ResolvedAttachment::new(Arc::<str>::from("not a media type"), Arc::<[u8]>::from([])),
-        ]),
+        ],
     );
 
     assert_failure(
         admit_workflow(
             fixture.resolve(),
-            imports,
+            inputs,
             fixture.context(1, Duration::from_secs(1)),
         ),
         AdmissionFailureKind::InvalidAttachmentMediaType,
-        AdmissionLocation::AttachmentImport { index: 1 },
+        AdmissionLocation::AttachmentInput {
+            name: "evidence".to_owned(),
+            index: 1,
+        },
     );
 }
 
@@ -1298,7 +1382,7 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
     );
     let local = admit_workflow(
         fixture.resolve(),
-        ResolvedImports::new(Some(Arc::from("prompt")), Arc::from([])),
+        text_and_attachments_inputs("request", Vec::new()),
         context.clone(),
     )
     .unwrap();
@@ -1315,7 +1399,7 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
 
     let cloud = admit_runner_workflow(
         fixture.resolve(),
-        ResolvedImports::new(Some(Arc::from("prompt")), Arc::from([])),
+        text_and_attachments_inputs("request", Vec::new()),
         context.with_source_revision(SourceRevisionProvenance::new(
             "refs/heads/exact-source",
             "0123456789abcdef0123456789abcdef01234567",

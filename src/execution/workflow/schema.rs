@@ -6,8 +6,8 @@ use serde_json::Value;
 use super::document::{
     Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, ConditionOperand,
     ConditionPredicate, ConditionSelector, FailurePolicy, FinalizationTrigger, FinalizerDefinition,
-    HarnessDefinition, MessageSource, NodeBody, Output, OutputReference, RecoveryHandler,
-    StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
+    HarnessDefinition, InputDeclaration, MessageSource, NodeBody, Output, OutputReference,
+    RecoveryHandler, StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -16,6 +16,8 @@ pub(super) struct WorkflowDto {
     #[serde(rename = "schemaVersion")]
     schema_version: u8,
     description: Option<String>,
+    #[serde(default)]
+    inputs: BTreeMap<String, InputDeclarationDto>,
     #[serde(rename = "agentProfiles", default)]
     agent_profiles: BTreeMap<String, AgentProfileDto>,
     steps: BTreeMap<String, StepDto>,
@@ -23,6 +25,15 @@ pub(super) struct WorkflowDto {
     finalizers: BTreeMap<String, FinalizerDto>,
     #[serde(default)]
     exports: BTreeMap<String, ReferenceDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum InputDeclarationDto {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "attachments")]
+    Attachments,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +338,17 @@ impl WorkflowDto {
         step_order: Vec<String>,
         finalizer_order: Vec<String>,
     ) -> Option<WorkflowDocument> {
+        let inputs = self
+            .inputs
+            .into_iter()
+            .map(|(name, declaration)| {
+                let declaration = match declaration {
+                    InputDeclarationDto::Text => InputDeclaration::Text,
+                    InputDeclarationDto::Attachments => InputDeclaration::Attachments,
+                };
+                (name, declaration)
+            })
+            .collect();
         let agent_profiles = self
             .agent_profiles
             .into_iter()
@@ -357,6 +379,7 @@ impl WorkflowDto {
         Some(WorkflowDocument {
             schema_version: self.schema_version,
             description: self.description,
+            inputs,
             agent_profiles,
             steps,
             step_order,
@@ -612,8 +635,8 @@ fn parse_value_reference(reference: &str) -> Option<ValueReference> {
     if reference == "finalization.context" {
         return Some(ValueReference::FinalizationContext);
     }
-    if let Some(name) = reference.strip_prefix("imports.") {
-        return Some(ValueReference::Import {
+    if let Some(name) = reference.strip_prefix("inputs.") {
+        return Some(ValueReference::Input {
             name: name.to_owned(),
         });
     }

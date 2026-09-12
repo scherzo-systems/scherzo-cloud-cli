@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use super::admission::{AdmittedWorkflow, CancellationOperationId, CancellationReason};
+use super::admission::{
+    AdmittedWorkflow, CancellationOperationId, CancellationReason, ResolvedInput,
+};
 use super::condition::{
     self, ConditionDispositions, ConditionEvaluation, ConditionValues, ResolvedPredicate,
     TerminalDisposition,
@@ -514,7 +516,7 @@ struct RuntimeDefinition {
     exports: BTreeMap<String, RuntimeExport>,
     maximum_parallel_steps: NonZeroUsize,
     maximum_transitions: u64,
-    prompt: Option<Arc<str>>,
+    text_inputs: BTreeMap<String, Arc<str>>,
 }
 
 impl RuntimeDefinition {
@@ -524,7 +526,15 @@ impl RuntimeDefinition {
             admitted.execution().limits().maximum_parallel_steps(),
             admitted.capacity().maximum_transitions,
         );
-        definition.prompt = admitted.imports().prompt().map(Arc::<str>::from);
+        definition.text_inputs = admitted
+            .inputs()
+            .values()
+            .iter()
+            .filter_map(|(name, input)| match input {
+                ResolvedInput::Text(value) => Some((name.clone(), Arc::clone(value))),
+                ResolvedInput::Attachments(_) => None,
+            })
+            .collect();
         definition
     }
 
@@ -577,7 +587,7 @@ impl RuntimeDefinition {
             exports,
             maximum_parallel_steps,
             maximum_transitions,
-            prompt: None,
+            text_inputs: BTreeMap::new(),
         }
     }
 }
@@ -626,7 +636,7 @@ fn runtime_step(
                             "finalization.context".to_owned(),
                             ResolvedValueSource::FinalizationContext,
                         )),
-                        ResolvedValueSource::Import(_) => None,
+                        ResolvedValueSource::Input(_) => None,
                     },
                     ValidatedMessageSource::File { .. } => None,
                 })
@@ -834,7 +844,7 @@ pub(crate) enum RunOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ActionInput<Output> {
-    Import,
+    WorkflowInput,
     Output(Output),
     FinalizationContext(Arc<[u8]>),
     Unavailable,
@@ -2377,7 +2387,7 @@ fn condition_sources_available<Cause, Output, Deadline>(
         .condition_values
         .values()
         .all(|source| match source {
-            ResolvedValueSource::Import(_) => state.definition.prompt.is_some(),
+            ResolvedValueSource::Input(name) => state.definition.text_inputs.contains_key(name),
             ResolvedValueSource::FinalizationContext => state.finalization.is_some(),
             ResolvedValueSource::Output(source) => state
                 .steps
@@ -2400,9 +2410,9 @@ where
     let mut values = ConditionValues::default();
     for (canonical, source) in &definition.condition_values {
         match source {
-            ResolvedValueSource::Import(_) => {
-                if let Some(prompt) = state.definition.prompt.as_deref() {
-                    values.insert_text_value(canonical.as_str(), prompt);
+            ResolvedValueSource::Input(name) => {
+                if let Some(text) = state.definition.text_inputs.get(name) {
+                    values.insert_text_value(canonical.as_str(), text);
                 }
             }
             ResolvedValueSource::FinalizationContext => {
@@ -2933,7 +2943,7 @@ where
         .iter()
         .map(|(input, source)| {
             let value = match source {
-                ResolvedValueSource::Import(_) => ActionInput::Import,
+                ResolvedValueSource::Input(_) => ActionInput::WorkflowInput,
                 ResolvedValueSource::FinalizationContext => state
                     .finalization
                     .as_ref()

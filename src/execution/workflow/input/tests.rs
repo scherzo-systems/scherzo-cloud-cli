@@ -10,7 +10,7 @@ use serde_json::json;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, InputLimits, ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,
 };
 use crate::execution::workflow::artifact::{ArtifactStaging, CaptureDeclaration};
 use crate::execution::workflow::resolution;
@@ -65,7 +65,7 @@ impl Fixture {
         .unwrap();
         let admitted = admit_workflow(
             resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             ExecutionContext::new(
                 execution_root.clone(),
                 ExecutionPolicyLimits::new(
@@ -152,7 +152,7 @@ fn materializes_every_value_kind_with_exact_canonical_layout_and_private_copies(
                 value: &json,
             },
         ),
-        ("prompt".to_owned(), InputValue::Prompt("héllo")),
+        ("prompt".to_owned(), InputValue::Text("héllo")),
         (
             "response".to_owned(),
             InputValue::Captured {
@@ -355,7 +355,7 @@ fn dropping_a_view_cleans_it_after_the_staging_parent_moves() {
     let view = fixture
         .inputs
         .materialize(
-            &BTreeMap::from([("prompt".to_owned(), InputValue::Prompt("held"))]),
+            &BTreeMap::from([("prompt".to_owned(), InputValue::Text("held"))]),
             &fixture.artifacts,
         )
         .unwrap();
@@ -377,7 +377,7 @@ fn preparation_rejects_names_limits_types_live_capacity_and_unavailable_sources(
     let name_fixture = Fixture::new(1, 8, 8, 16);
     assert_preparation_failure(
         name_fixture.inputs.materialize(
-            &BTreeMap::from([("../escape".to_owned(), InputValue::Prompt("x"))]),
+            &BTreeMap::from([("../escape".to_owned(), InputValue::Text("x"))]),
             &name_fixture.artifacts,
         ),
         InputPreparationFailureKind::InvalidInputName,
@@ -406,7 +406,7 @@ fn preparation_rejects_names_limits_types_live_capacity_and_unavailable_sources(
     let size_fixture = Fixture::new(1, 8, 3, 16);
     assert_preparation_failure(
         size_fixture.inputs.materialize(
-            &BTreeMap::from([("prompt".to_owned(), InputValue::Prompt("four"))]),
+            &BTreeMap::from([("prompt".to_owned(), InputValue::Text("four"))]),
             &size_fixture.artifacts,
         ),
         InputPreparationFailureKind::ValueSizeLimitExceeded,
@@ -419,7 +419,7 @@ fn preparation_rejects_names_limits_types_live_capacity_and_unavailable_sources(
     assert_preparation_failure(
         total_fixture.inputs.materialize(
             &BTreeMap::from([
-                ("prompt".to_owned(), InputValue::Prompt("abc")),
+                ("prompt".to_owned(), InputValue::Text("abc")),
                 (
                     "response".to_owned(),
                     InputValue::Captured {
@@ -479,7 +479,7 @@ fn preparation_rejects_names_limits_types_live_capacity_and_unavailable_sources(
     assert_eq!(source_fixture.inputs.reservation_usage(), (0, 0, 0));
 
     let live_fixture = Fixture::new(1, 8, 8, 16);
-    let values = BTreeMap::from([("prompt".to_owned(), InputValue::Prompt("held"))]);
+    let values = BTreeMap::from([("prompt".to_owned(), InputValue::Text("held"))]);
     let held = live_fixture
         .inputs
         .materialize(&values, &live_fixture.artifacts)

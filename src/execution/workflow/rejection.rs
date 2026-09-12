@@ -243,10 +243,14 @@ impl<'a> RejectionLocation<'a> {
 
     fn from_admission(location: &'a AdmissionLocation) -> Option<Self> {
         match location {
-            AdmissionLocation::PromptImport => Some(Self::simple("prompt_import")),
-            AdmissionLocation::AttachmentImport { index } => Some(Self {
+            AdmissionLocation::Input { name } => Some(Self {
+                input: Some(name),
+                ..Self::simple("input")
+            }),
+            AdmissionLocation::AttachmentInput { name, index } => Some(Self {
+                input: Some(name),
                 index: Some(*index),
-                ..Self::simple("attachment_import")
+                ..Self::simple("input_attachment")
             }),
             AdmissionLocation::Step { step } => Some(Self::for_step("step", step)),
             AdmissionLocation::RecoveryHandler { step } => {
@@ -461,9 +465,9 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "unknown_agent_profile",
             "Reference an agent profile declared by this workflow.",
         ),
-        ValidationFailureKind::UnknownImport => (
-            "unknown_import",
-            "Use a workflow import name or correct the value reference.",
+        ValidationFailureKind::UnknownInput => (
+            "unknown_input",
+            "Use an input declared by this workflow or correct the value reference.",
         ),
         ValidationFailureKind::UnknownOutputStep => (
             "unknown_output_step",
@@ -693,9 +697,17 @@ fn codex_installation_classification(
 
 fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str, &'static str)> {
     match kind {
-        AdmissionFailureKind::MissingRequiredPrompt => Some((
-            "missing_required_prompt",
-            "Supply --prompt-file because this workflow requires imports.prompt.",
+        AdmissionFailureKind::MissingRequiredInput => Some((
+            "missing_required_input",
+            "Supply the required named workflow input.",
+        )),
+        AdmissionFailureKind::UnexpectedInput => Some((
+            "unexpected_input",
+            "Remove the undeclared named workflow input.",
+        )),
+        AdmissionFailureKind::InputKindMismatch => Some((
+            "input_kind_mismatch",
+            "Supply the declared semantic kind for this workflow input.",
         )),
         AdmissionFailureKind::InvalidAttachmentMediaType => Some((
             "invalid_attachment_media_type",

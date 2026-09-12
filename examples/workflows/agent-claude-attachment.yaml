@@ -1,7 +1,13 @@
 # yaml-language-server: $schema=../../schemas/workflow-v1.schema.json
 schemaVersion: 1
 
-description: Ask a low-effort Claude Code agent to combine a static brief with imported instructions and updates.
+description: Ask a low-effort Claude Code agent to combine a static brief with named instructions and updates.
+
+inputs:
+  request:
+    kind: text
+  updates:
+    kind: attachments
 
 agentProfiles:
   haiku:
@@ -20,10 +26,10 @@ steps:
       message:
         text:
           - file: prompts/claude-attachment-question.md
-          - ref: imports.prompt
+          - ref: inputs.request
         attachments:
           - file: attachments/aurora-brief.txt
-          - ref: imports.attachments
+          - ref: inputs.updates
     outputs:
       response:
         kind: text

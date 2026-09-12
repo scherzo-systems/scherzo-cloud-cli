@@ -5,8 +5,8 @@ use std::time::Duration;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedImports, admit_runner_workflow,
-    admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedInput, ResolvedInputs,
+    admit_runner_workflow, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 
@@ -96,7 +96,7 @@ fn definition(
             .collect(),
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
         maximum_transitions: 10_000,
-        prompt: None,
+        text_inputs: BTreeMap::new(),
     }
 }
 
@@ -415,7 +415,7 @@ fn finalizer_definition(
         exports: BTreeMap::new(),
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
         maximum_transitions: 10_000,
-        prompt: None,
+        text_inputs: BTreeMap::new(),
     }
 }
 
@@ -565,7 +565,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
     .unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(
@@ -598,12 +598,15 @@ fn condition_false_precedes_body_readiness() {
     fs::write(
         source_root.join("workflow.yaml"),
         "schemaVersion: 1
+inputs:
+  request:
+    kind: text
 steps:
   consumer:
     kind: cmd
     condition:
       equals:
-        - ref: imports.prompt
+        - ref: inputs.request
         - value: run
     inputs:
       value:
@@ -624,7 +627,10 @@ steps:
     .unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::new(Some(Arc::from("skip")), Arc::from([])),
+        ResolvedInputs::new(BTreeMap::from([(
+            "request".to_owned(),
+            ResolvedInput::Text(Arc::from("skip")),
+        )])),
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(
@@ -683,7 +689,7 @@ steps:
     .unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(
@@ -4479,7 +4485,7 @@ steps:
     .unwrap();
     let admitted = admit_runner_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(

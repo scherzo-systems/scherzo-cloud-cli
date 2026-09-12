@@ -9,12 +9,19 @@ use super::condition::TerminalDisposition;
 pub(crate) struct WorkflowDocument {
     pub(crate) schema_version: u8,
     pub(crate) description: Option<String>,
+    pub(crate) inputs: BTreeMap<String, InputDeclaration>,
     pub(crate) agent_profiles: BTreeMap<String, AgentProfile>,
     pub(crate) steps: BTreeMap<String, StepDefinition>,
     pub(crate) step_order: Vec<String>,
     pub(crate) finalizers: BTreeMap<String, FinalizerDefinition>,
     pub(crate) finalizer_order: Vec<String>,
     pub(crate) exports: BTreeMap<String, OutputReference>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputDeclaration {
+    Text,
+    Attachments,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +151,7 @@ pub(crate) struct ConditionSelector {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValueReference {
-    Import { name: String },
+    Input { name: String },
     Output(OutputReference),
     FinalizationContext,
 }

@@ -258,8 +258,8 @@ alone therefore does not establish that the CLI will accept the complete workflo
 definition and its referenced files.
 
 A successful human result reports the normalized source-root-relative workflow path,
-the SHA-256 digest of the resolved source closure, step count, and required optional
-imports. It never prints static file contents. Add `--json` for one schema-version-1
+the SHA-256 digest of the resolved source closure, step count, and required named input
+interface. It never prints static file contents. Add `--json` for one schema-version-1
 result with `valid` or `invalid` as its closed `outcome`; invalid results contain one
 bounded CLI-owned diagnostic rather than parser or schema-library error text.
 
@@ -351,7 +351,7 @@ The run directory must not exist and must be disjoint from the execution root. T
 normalizes it from its nearest existing parent and creates any missing parent suffix.
 First-workflow onboarding uses the owner-private `~/.scherzo/runs/` durable state root
 by default; retained runs are application state and do not belong under `~/.config`.
-The CLI retains immutable workflow and import bytes, durable closed run and attempt
+The CLI retains immutable workflow and named-input bytes, durable closed run and attempt
 state, and attempt 1's atomic result beneath `attempts/000001/result`. Every agent
 invocation receives a fresh profile directory under
 `attempts/<attempt>/diagnostics/` with immutable attempt, step, invocation, profile, and
@@ -384,14 +384,17 @@ only the target invocation supplying terminal success commits outputs. Repeated 
 effects are at-least-once: authors supply stable domain idempotency keys through existing
 explicit inputs or admitted environment, never from Scherzo invocation or round IDs.
 
-Use `--prompt-file <PATH>` or `--prompt-file -` for an optional UTF-8 prompt and repeat
-`--attachment <MEDIA_TYPE> <PATH>` for ordered immutable attachments. Imports are read
-completely before execution. Workflow commands always receive closed standard input;
-the CLI never forwards prompt input or terminal input to them.
+Every declared root input is required. Supply Text with `--input-text <NAME> <TEXT>` or
+`--input-text-file <NAME> <PATH|->`; append ordered attachment members with
+`--input-attachment <NAME> <MEDIA_TYPE> <PATH>`, or provide a present empty collection
+with `--input-attachments-empty <NAME>`. This release supports only named `text` and
+`attachments` declarations; JSON and standalone File root inputs are not yet accepted.
+All bindings are acquired before execution, and one Text file input may exclusively claim
+standard input. Workflow commands always receive closed standard input.
 
 Without `--plain` or `--json`, run uses the interactive terminal interface when stdin and
 stdout are terminals, `TERM` is present and neither empty nor `dumb`, and stdin is not
-reserved by `--prompt-file -`. Every other combination keeps the plain line stream.
+reserved by `--input-text-file <NAME> -`. Every other combination keeps the plain line stream.
 Stderr terminal status does not select the interface. `NO_COLOR` disables semantic color
 under `--color=auto` but does not disable interactive mode; `--color=always` overrides it.
 
@@ -1286,8 +1289,8 @@ bearer material. The work root must be an existing directory. An offer reserves 
 assignment-private root but starts no source or input work. After the matching prepare
 effect, Runner Serve checks out the pinned source, verifies the authoritative canonical
 Run Input manifest, downloads every member through fresh exact capabilities into random
-0600 temporary files without redirects, and admits the complete prompt and ordered
-attachments before semantic acceptance. The fixed preparation deadline is not extended
+0600 temporary files without redirects, and admits the exact named Text values and ordered
+attachment collections before semantic acceptance. The fixed preparation deadline is not extended
 by progress. Verified staging remains under the assignment root through execution and is
 removed or quarantined by the existing release path. Cloud commands, agents, and
 finalizers receive the exact recorded source branch and pinned commit as

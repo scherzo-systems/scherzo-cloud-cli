@@ -152,7 +152,7 @@ fn condition_evaluation_is_left_to_right_and_completion_ordered() {
     let text = CapturedText::new(Arc::from("yes"));
     let json = captured_json(r#"{"n":1}"#);
     let mut values = ConditionValues::default();
-    values.insert_text("imports.prompt", &text);
+    values.insert_text("inputs.request", &text);
     values.insert_json("outputs.plan.result", &json);
     let verify = node("verify");
     let mut dispositions = ConditionDispositions::default();
@@ -161,7 +161,7 @@ fn condition_evaluation_is_left_to_right_and_completion_ordered() {
     let predicate = ResolvedPredicate::All(
         vec![
             ResolvedPredicate::Equals([
-                ResolvedOperand::text_reference("imports.prompt"),
+                ResolvedOperand::text_reference("inputs.request"),
                 ResolvedOperand::text_literal("yes"),
             ]),
             ResolvedPredicate::Any(
@@ -217,7 +217,7 @@ fn condition_evaluation_is_left_to_right_and_completion_ordered() {
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),
         [
-            "imports.prompt",
+            "inputs.request",
             "outputs.plan.result",
             "outputs.plan.result"
         ]
@@ -228,11 +228,11 @@ fn condition_evaluation_is_left_to_right_and_completion_ordered() {
 fn condition_evaluation_short_circuits_without_retaining_a_true_trace() {
     let text = CapturedText::new(Arc::from("yes"));
     let mut values = ConditionValues::default();
-    values.insert_text("imports.prompt", &text);
+    values.insert_text("inputs.request", &text);
     let predicate = ResolvedPredicate::Any(
         vec![
             ResolvedPredicate::Equals([
-                ResolvedOperand::text_reference("imports.prompt"),
+                ResolvedOperand::text_reference("inputs.request"),
                 ResolvedOperand::text_literal("yes"),
             ]),
             ResolvedPredicate::Equals([
@@ -253,7 +253,7 @@ fn condition_evaluation_short_circuits_without_retaining_a_true_trace() {
             .iter()
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),
-        ["imports.prompt"]
+        ["inputs.request"]
     );
 }
 
@@ -310,14 +310,14 @@ fn condition_evaluation_missing_pointer_and_unavailable_source_are_distinct() {
 fn condition_evaluation_retains_the_complete_accepted_maximum_trace() {
     fn equal(expected: &str) -> ResolvedPredicate {
         ResolvedPredicate::Equals([
-            ResolvedOperand::text_reference("imports.prompt"),
+            ResolvedOperand::text_reference("inputs.request"),
             ResolvedOperand::text_literal(expected),
         ])
     }
 
     let text = CapturedText::new(Arc::from("yes"));
     let mut values = ConditionValues::default();
-    values.insert_text("imports.prompt", &text);
+    values.insert_text("inputs.request", &text);
     let mut children = Vec::new();
     for _ in 0..62 {
         children.push(ResolvedPredicate::All(
@@ -381,12 +381,15 @@ fn condition_evaluation_supports_every_terminal_disposition_without_source_detai
 fn condition_schema_accepts_the_active_grammar() {
     let document = decode(
         br#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
 steps:
   guarded:
     kind: cmd
     condition:
       equals:
-        - { ref: imports.prompt }
+        - { ref: inputs.request }
         - { value: yes }
     command: { argv: ["true"] }
 "#,
@@ -399,12 +402,12 @@ steps:
 fn review_condition_trace_fits_source_bound_transition_capacity() {
     fn chain(expected: &str) -> (ResolvedPredicate, Value) {
         let mut predicate = ResolvedPredicate::Equals([
-            ResolvedOperand::text_reference("imports.prompt"),
+            ResolvedOperand::text_reference("inputs.request"),
             ResolvedOperand::text_literal(expected),
         ]);
         let mut authored = json!({
             "equals": [
-                { "ref": "imports.prompt" },
+                { "ref": "inputs.request" },
                 { "value": expected }
             ]
         });
@@ -436,7 +439,7 @@ fn review_condition_trace_fits_source_bound_transition_capacity() {
 
     let text = CapturedText::new(Arc::from("yes"));
     let mut values = ConditionValues::default();
-    values.insert_text("imports.prompt", &text);
+    values.insert_text("inputs.request", &text);
     let ConditionEvaluation::False {
         evaluated_predicates,
     } = evaluate(

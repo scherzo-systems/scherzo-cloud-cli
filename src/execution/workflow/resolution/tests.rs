@@ -20,6 +20,9 @@ const RESULT_SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-
 "#;
 const WORKFLOW: &str = r#"schemaVersion: 1
 description: Complete resolution fixture.
+inputs:
+  request:
+    kind: text
 agentProfiles:
   coding:
     harness:
@@ -37,7 +40,7 @@ steps:
       message:
         text:
           - file: ../prompts/message.md
-          - ref: imports.prompt
+          - ref: inputs.request
           - file: ../prompts/message.md
         attachments:
           - file: ../attachments/data.bin
@@ -206,7 +209,10 @@ fn complete_bundle_resolves_canonical_sources_and_retains_an_immutable_snapshot(
     let resolved = bundle.resolve().unwrap();
 
     assert_eq!(resolved.source.workflow_path, WORKFLOW_PATH);
-    assert!(resolved.required_imports().prompt);
+    assert_eq!(
+        resolved.required_inputs().get("request"),
+        Some(&WorkflowValueType::Text)
+    );
     assert_eq!(resolved.content_digest.algorithm.as_str(), "sha256");
     assert_eq!(resolved.content_digest.value.len(), 64);
     assert!(
@@ -490,12 +496,19 @@ fn oversized_retained_source_is_rejected_before_it_can_exhaust_the_closure_budge
 fn shared_cloud_and_runner_rejection_fixtures_fail_resolution() {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/workflow/v1/resolution-invalid");
+    let mut roots = fs::read_dir(&fixtures)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    roots.sort();
+    assert!(!roots.is_empty());
 
-    for fixture in ["unknown-dependency", "nested-result-schema-resource"] {
-        let root = fixtures.join(fixture);
+    for root in roots {
         assert!(
             resolve_workflow_file(&root, &root.join("workflow.yaml")).is_err(),
-            "shared rejection fixture {fixture} unexpectedly resolved"
+            "shared rejection fixture {} unexpectedly resolved",
+            root.display()
         );
     }
 }

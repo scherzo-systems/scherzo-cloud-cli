@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, watch};
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports,
-    admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedInput,
+    ResolvedInputs, admit_workflow,
 };
 use crate::execution::workflow::agent::{AgentProcessDirective, agent_process_control_channel};
 use crate::execution::workflow::artifact::{
@@ -59,6 +59,26 @@ const FIXTURE_PARENT: &str = "parent";
 const FIXTURE_DESCENDANT: &str = "descendant";
 const LITERAL_ARGUMENT: &str = "literal * $HOME; [not-a-glob]";
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
+
+fn text_inputs(value: impl Into<Arc<str>>) -> ResolvedInputs {
+    ResolvedInputs::new(BTreeMap::from([(
+        "request".to_owned(),
+        ResolvedInput::Text(value.into()),
+    )]))
+}
+
+fn text_and_attachments_inputs(
+    value: impl Into<Arc<str>>,
+    attachments: impl Into<Arc<[ResolvedAttachment]>>,
+) -> ResolvedInputs {
+    ResolvedInputs::new(BTreeMap::from([
+        ("request".to_owned(), ResolvedInput::Text(value.into())),
+        (
+            "evidence".to_owned(),
+            ResolvedInput::Attachments(attachments.into()),
+        ),
+    ]))
+}
 
 type TestOccurrence =
     Occurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>;
@@ -535,21 +555,23 @@ async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() 
         let argv = std::iter::once(executable.to_str().unwrap())
             .chain(arguments.iter().map(String::as_str))
             .collect::<Vec<_>>();
-        let mut source = String::from("schemaVersion: 1\nsteps:\n");
+        let mut source = String::from(
+            "schemaVersion: 1\ninputs:\n  request: {kind: text}\n  evidence: {kind: attachments}\nsteps:\n",
+        );
         for step in ["alpha", "beta"] {
             source.push_str(&format!(
-                "  {step}:\n    kind: cmd\n    inputs:\n      attachments:\n        ref: imports.attachments\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: {}\n",
+                "  {step}:\n    kind: cmd\n    inputs:\n      attachments:\n        ref: inputs.evidence\n      prompt:\n        ref: inputs.request\n    command:\n      argv: {}\n",
                 serde_json::to_string(&argv).unwrap()
             ));
         }
         let environment =
             fixture_environment(&control_address, 0, &execution_root, None);
-        let imports = ResolvedImports::new(
-            Some(Arc::from("shared prompt")),
-            Arc::from([ResolvedAttachment::new(
+        let inputs = text_and_attachments_inputs(
+            "shared prompt",
+            [ResolvedAttachment::new(
                 Arc::from("application/octet-stream"),
                 Arc::from([0_u8, 0xff, 7]),
-            )]),
+            )],
         );
         let admitted = admit_fixture_with_inputs(
             temporary.path(),
@@ -563,7 +585,7 @@ async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() 
                     InputLimits::new(8, 1024, 4096, 4096),
                     1024,
                 ),
-                imports,
+                imports: inputs,
             },
         );
         let artifacts = test_artifacts(&admitted);
@@ -2405,7 +2427,7 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
                     InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
-                imports: ResolvedImports::new(Some(Arc::from("failure prompt")), Arc::from([])),
+                imports: text_inputs("failure prompt"),
             },
         );
         let artifacts = test_artifacts(&admitted);
@@ -2446,7 +2468,7 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
                     InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
-                imports: ResolvedImports::new(Some(Arc::from("launch prompt")), Arc::from([])),
+                imports: text_inputs("launch prompt"),
             },
         );
         let launch_artifacts = test_artifacts(&launch_admitted);
@@ -2500,7 +2522,7 @@ async fn input_staging_cleanup_is_deferred_to_caller_and_retryable() {
                     InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
-                imports: ResolvedImports::new(Some(Arc::from("retry prompt")), Arc::from([])),
+                imports: text_inputs("retry prompt"),
             },
         );
         let artifacts = test_artifacts(&admitted);
@@ -2708,10 +2730,7 @@ async fn prelaunch_cancellation_releases_inputs_before_reporting_quiescence() {
                     InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
-                imports: ResolvedImports::new(
-                    Some(Arc::from("cancel before launch")),
-                    Arc::from([]),
-                ),
+                imports: text_inputs("cancel before launch"),
             },
         );
         let deadline = TestInstant(Duration::from_secs(41));
@@ -2812,7 +2831,7 @@ async fn input_view_cleanup_precedes_controlled_cancellation_quiescence() {
                     InputLimits::new(4, 1024, 4096, 4096),
                     1024,
                 ),
-                imports: ResolvedImports::new(Some(Arc::from("cancel prompt")), Arc::from([])),
+                imports: text_inputs("cancel prompt"),
             },
         );
         let deadline = TestInstant(Duration::from_secs(41));
@@ -3854,7 +3873,7 @@ fn install_fixture(source: &Path, destination: &Path) {
 
 fn input_command_source(step: &str, argv: &[&str]) -> String {
     format!(
-        "schemaVersion: 1\nsteps:\n  {step}:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n    command:\n      argv: {}\n",
+        "schemaVersion: 1\ninputs:\n  request: {{kind: text}}\nsteps:\n  {step}:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: inputs.request\n    command:\n      argv: {}\n",
         serde_json::to_string(argv).unwrap()
     )
 }
@@ -3958,7 +3977,7 @@ fn admit_fixture_with_live_input_limit(
                 ),
                 1024 * 1024,
             ),
-            imports: ResolvedImports::default(),
+            imports: ResolvedInputs::default(),
         },
     )
 }
@@ -3984,14 +4003,14 @@ fn admit_fixture_with_limits(
                 InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
                 maximum_log_bytes,
             ),
-            imports: ResolvedImports::default(),
+            imports: ResolvedInputs::default(),
         },
     )
 }
 
 struct FixtureExecution {
     limits: ExecutionPolicyLimits,
-    imports: ResolvedImports,
+    imports: ResolvedInputs,
 }
 
 fn admit_fixture_with_inputs(
@@ -4055,7 +4074,7 @@ steps:
     .unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(

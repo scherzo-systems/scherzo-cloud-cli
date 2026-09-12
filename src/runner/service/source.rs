@@ -1747,7 +1747,7 @@ mod tests {
 
     use super::*;
     use crate::execution::workflow::admission::{
-        CancellationPolicy, CancellationSource, ExecutionContext, ResolvedImports,
+        CancellationPolicy, CancellationSource, ExecutionContext, ResolvedInputs,
         admit_runner_workflow, default_execution_policy_limits,
     };
     use crate::execution::workflow::artifact::ArtifactStaging;
@@ -2724,7 +2724,7 @@ mod tests {
         )
         .with_cloud_git_capture(materialized.git_capture.unwrap());
         let admitted =
-            admit_runner_workflow(materialized.workflow, ResolvedImports::default(), context)
+            admit_runner_workflow(materialized.workflow, ResolvedInputs::default(), context)
                 .unwrap();
         let git = admitted.git_capture().unwrap();
         assert_eq!(admitted.execution().root(), expected_root);

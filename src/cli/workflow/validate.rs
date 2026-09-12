@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use anyhow::Context;
@@ -71,8 +72,8 @@ fn write_human_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
     )?;
     writeln!(
         stdout,
-        "optional imports: {}",
-        human_required_imports(workflow)
+        "required inputs: {}",
+        human_required_inputs(workflow)
     )?;
     Ok(())
 }
@@ -93,20 +94,36 @@ fn write_human_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn human_required_imports(workflow: &ResolvedWorkflow) -> &'static str {
-    if workflow.required_imports().prompt {
-        "prompt"
-    } else {
-        "none"
+fn human_required_inputs(workflow: &ResolvedWorkflow) -> String {
+    if workflow.required_inputs().is_empty() {
+        return "none".to_owned();
+    }
+    workflow
+        .required_inputs()
+        .iter()
+        .map(|(name, kind)| format!("{name}:{}", input_kind(*kind)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn input_kind(kind: crate::execution::workflow::validated::WorkflowValueType) -> &'static str {
+    match kind {
+        crate::execution::workflow::validated::WorkflowValueType::Text => "text",
+        crate::execution::workflow::validated::WorkflowValueType::AttachmentCollection => {
+            "attachments"
+        }
+        crate::execution::workflow::validated::WorkflowValueType::Json => "json",
+        crate::execution::workflow::validated::WorkflowValueType::File => "file",
+        crate::execution::workflow::validated::WorkflowValueType::GitBranch => "git_branch",
     }
 }
 
 fn write_json_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
-    let required_imports = if workflow.required_imports().prompt {
-        vec!["prompt"]
-    } else {
-        Vec::new()
-    };
+    let required_inputs = workflow
+        .required_inputs()
+        .iter()
+        .map(|(name, kind)| (name.as_str(), input_kind(*kind)))
+        .collect::<BTreeMap<_, _>>();
     let report = JsonReport {
         schema_version: 1,
         command: COMMAND_NAME,
@@ -120,7 +137,7 @@ fn write_json_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
             },
             step_count: workflow.definition.steps.len(),
             finalizer_count: workflow.definition.finalizers.len(),
-            required_imports,
+            required_inputs,
         },
     };
     write_json(&report)
@@ -163,8 +180,8 @@ enum JsonResult<'a> {
         step_count: usize,
         #[serde(rename = "finalizerCount")]
         finalizer_count: usize,
-        #[serde(rename = "requiredImports")]
-        required_imports: Vec<&'static str>,
+        #[serde(rename = "requiredInputs")]
+        required_inputs: BTreeMap<&'a str, &'static str>,
     },
     Invalid {
         workflow: Option<WorkflowIdentity<'a>>,

@@ -16,16 +16,7 @@ pub(crate) enum WorkflowValueType {
     GitBranch,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WorkflowImport {
-    Prompt,
-    Attachments,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RequiredImports {
-    pub(crate) prompt: bool,
-}
+pub(crate) type RequiredInputs = BTreeMap<String, WorkflowValueType>;
 
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
@@ -55,7 +46,7 @@ pub(crate) struct ValidatedWorkflow {
     pub(crate) finalizer_source_order: Vec<String>,
     pub(crate) finalizer_presentation_order: Vec<String>,
     pub(crate) exports: BTreeMap<String, ResolvedOutputSource>,
-    pub(crate) required_imports: RequiredImports,
+    pub(crate) required_inputs: RequiredInputs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,7 +126,7 @@ pub(crate) struct ResolvedValueReference {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResolvedValueSource {
-    Import(WorkflowImport),
+    Input(String),
     Output(ResolvedOutputSource),
     FinalizationContext,
 }

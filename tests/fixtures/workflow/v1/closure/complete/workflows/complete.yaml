@@ -1,5 +1,8 @@
 schemaVersion: 1
 description: Shared Cloud and Runner source-closure fixture.
+inputs:
+  request:
+    kind: text
 agentProfiles:
   coding:
     harness:
@@ -23,7 +26,7 @@ steps:
       message:
         text:
           - file: ../prompts/message.md
-          - ref: imports.prompt
+          - ref: inputs.request
           - file: ../prompts/message.md
         attachments:
           - file: ../attachments/data.bin

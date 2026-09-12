@@ -23,7 +23,6 @@ use super::private_staging::{
 use super::validated::WorkflowValueType;
 use super::value::CapturedValue;
 
-const INPUT_NAME_MAX_BYTES: usize = 64;
 const MAX_COLLECTION_ITEMS: usize = 1_000_000;
 const IDENTITY_ATTEMPTS: usize = 16;
 const MANIFEST_SCHEMA_VERSION: u8 = 1;
@@ -132,7 +131,7 @@ impl fmt::Display for InputPreparationFailure {
 impl std::error::Error for InputPreparationFailure {}
 
 pub(crate) enum InputValue<'a> {
-    Prompt(&'a str),
+    Text(&'a str),
     Attachments(&'a [ResolvedAttachment]),
     CanonicalJson(&'a [u8]),
     Captured {
@@ -438,7 +437,7 @@ impl InputStaging {
 
         for (input_identity, value) in inputs {
             match value {
-                InputValue::Prompt(text) => {
+                InputValue::Text(text) => {
                     ensure_directory(&values_root, &mut values_created)?;
                     let relative_path = format!("values/{input_identity}");
                     write_bytes_read_only(&root.join(&relative_path), text.as_bytes())
@@ -654,7 +653,7 @@ impl MaterializationPlan {
         let mut values = 0_usize;
         let mut total_bytes = 0_u64;
         for (input_identity, input) in inputs {
-            if !valid_input_name(input_identity) {
+            if !super::is_input_name(input_identity) {
                 return Err(InputPreparationFailure::for_input(
                     input_identity,
                     InputPreparationFailureKind::InvalidInputName,
@@ -662,7 +661,7 @@ impl MaterializationPlan {
             }
             values = add_value_count(staging, values, 1, input_identity)?;
             match input {
-                InputValue::Prompt(text) => add_payload_size(
+                InputValue::Text(text) => add_payload_size(
                     staging,
                     &mut total_bytes,
                     byte_length(text.as_bytes(), input_identity)?,
@@ -834,14 +833,6 @@ fn artifact_copy_failure(
         ArtifactReadFailure::DestinationWrite => InputPreparationFailureKind::StagingUnavailable,
     };
     InputPreparationFailure::for_input(input_identity, kind)
-}
-
-fn valid_input_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= INPUT_NAME_MAX_BYTES
-        && bytes[0].is_ascii_lowercase()
-        && bytes[1..].iter().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn create_input_staging_root(

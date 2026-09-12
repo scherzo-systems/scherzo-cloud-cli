@@ -1,4 +1,7 @@
 schemaVersion: 1
+inputs:
+  request:
+    kind: text
 agentProfiles:
   coding:
     harness:
@@ -11,10 +14,10 @@ steps:
     kind: agent
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
     agent:
       profile: coding
       systemPrompt: prompts/implement-system.md
       message:
         text:
-          - ref: imports.prompt
+          - ref: inputs.request

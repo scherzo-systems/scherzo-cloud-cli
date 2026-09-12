@@ -45,13 +45,35 @@
       "maxLength": 128,
       "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(\\s*;\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+=[^\\r\\n\\t;]+)*$"
     },
-    "ImportOrOutputReferenceString": {
+    "InputDeclaration": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "text" } },
+          "required": ["kind"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "attachments" } },
+          "required": ["kind"]
+        }
+      ]
+    },
+    "WorkflowInputs": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/InputDeclaration" }
+    },
+    "InputOrOutputReferenceString": {
       "type": "string",
-      "pattern": "^imports\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
     },
     "FinalizerValueReferenceString": {
       "type": "string",
-      "pattern": "^imports\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
     },
     "OutputReferenceString": {
       "type": "string",
@@ -66,11 +88,11 @@
     },
     "OrdinaryConditionReferenceString": {
       "type": "string",
-      "pattern": "^imports\\.prompt$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
     },
     "FinalizerConditionReferenceString": {
       "type": "string",
-      "pattern": "^imports\\.prompt$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
     },
     "OrdinaryConditionOperand": {
       "oneOf": [
@@ -267,14 +289,14 @@
         }
       ]
     },
-    "ImportOrOutputReference": {
+    "InputOrOutputReference": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "ref": { "$ref": "#/$defs/ImportOrOutputReferenceString" }
+        "ref": { "$ref": "#/$defs/InputOrOutputReferenceString" }
       },
       "required": ["ref"],
-      "description": "A step-local value reference. An outputs reference creates a direct data prerequisite on its producer; an imports reference creates no step prerequisite."
+      "description": "A step-local value reference. An outputs reference creates a direct data prerequisite on its producer; an inputs reference creates no step prerequisite."
     },
     "FinalizerValueReference": {
       "type": "object",
@@ -305,13 +327,13 @@
     "TextSource": {
       "oneOf": [
         { "$ref": "#/$defs/FileSource" },
-        { "$ref": "#/$defs/ImportOrOutputReference" }
+        { "$ref": "#/$defs/InputOrOutputReference" }
       ]
     },
     "AttachmentSource": {
       "oneOf": [
         { "$ref": "#/$defs/FileSource" },
-        { "$ref": "#/$defs/ImportOrOutputReference" }
+        { "$ref": "#/$defs/InputOrOutputReference" }
       ]
     },
     "FinalizerAttachmentSource": {
@@ -323,7 +345,7 @@
     "InputBindings": {
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/Identifier" },
-      "additionalProperties": { "$ref": "#/$defs/ImportOrOutputReference" }
+      "additionalProperties": { "$ref": "#/$defs/InputOrOutputReference" }
     },
     "FinalizerInputBindings": {
       "type": "object",
@@ -709,6 +731,7 @@
       "properties": {
         "schemaVersion": { "const": 1 },
         "description": { "type": "string" },
+        "inputs": { "$ref": "#/$defs/WorkflowInputs" },
         "agentProfiles": { "$ref": "#/$defs/AgentProfiles" },
         "steps": {
           "type": "object",

@@ -1,6 +1,12 @@
 schemaVersion: 1
 description: Plan, implement, test, and export a requested change.
 
+inputs:
+  request:
+    kind: text
+  evidence:
+    kind: attachments
+
 agentProfiles:
   coding:
     harness:
@@ -23,9 +29,9 @@ steps:
       systemPrompt: prompts/plan-system.md
       message:
         text:
-          - ref: imports.prompt
+          - ref: inputs.request
         attachments:
-          - ref: imports.attachments
+          - ref: inputs.evidence
     outputs:
       plan:
         kind: json
@@ -45,9 +51,9 @@ steps:
       message:
         text:
           - file: prompts/implement-message.md
-          - ref: imports.prompt
+          - ref: inputs.request
         attachments:
-          - ref: imports.attachments
+          - ref: inputs.evidence
           - ref: outputs.plan.plan
           - ref: outputs.plan.artifact
     outputs:
@@ -60,7 +66,7 @@ steps:
     cwd: packages/api
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
       changeSummary:
         ref: outputs.implement.response
     command:

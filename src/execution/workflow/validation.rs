@@ -9,17 +9,16 @@ use super::condition::{
 };
 use super::document::{
     Agent, CommonNode, ConditionOperand, ConditionPredicate, FailurePolicy, FinalizerDefinition,
-    HarnessDefinition, MessageSource, NodeBody, Output, OutputReference, RecoveryHandler,
-    StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
+    HarnessDefinition, InputDeclaration, MessageSource, NodeBody, Output, OutputReference,
+    RecoveryHandler, StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::validated::{
-    RequiredImports, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
+    RequiredInputs, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
     ResolvedValueSource, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
     ValidatedCommandStep, ValidatedCommonStep, ValidatedFinalizer, ValidatedHarness,
     ValidatedMessageSource, ValidatedOutput, ValidatedRecoveryHandler, ValidatedStep,
-    ValidatedStepRecovery, ValidatedWorkflow, WorkflowImport, WorkflowNode, WorkflowNodeRole,
-    WorkflowValueType,
+    ValidatedStepRecovery, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
 };
 use super::{claude_code, codex, pi};
 
@@ -37,7 +36,7 @@ pub(crate) enum ValidationFailureKind {
     DependencyCycle,
     InvalidAgentProfileConfig,
     UnknownAgentProfile,
-    UnknownImport,
+    UnknownInput,
     UnknownOutputStep,
     UnknownOutput,
     MessageTypeMismatch,
@@ -135,7 +134,17 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
     let finalizer_graph = validate_finalizer_graph(&document)?;
     validate_output_rules(&document)?;
 
-    let mut required_imports = RequiredImports::default();
+    let mut required_inputs = document
+        .inputs
+        .iter()
+        .map(|(name, declaration)| {
+            let value_type = match declaration {
+                InputDeclaration::Text => WorkflowValueType::Text,
+                InputDeclaration::Attachments => WorkflowValueType::AttachmentCollection,
+            };
+            (name.clone(), value_type)
+        })
+        .collect::<RequiredInputs>();
     let mut steps = BTreeMap::new();
     let mut recoveries = BTreeMap::new();
     for (step_name, step) in &document.steps {
@@ -146,7 +155,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
             &step_graph.direct_prerequisites[step_name],
             &document,
             &agent_profiles,
-            &mut required_imports,
+            &mut required_inputs,
         )?;
         let recovery = validate_recovery(step_name, step.recovery.as_ref(), &agent_profiles)?;
         steps.insert(step_name.clone(), body);
@@ -162,7 +171,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
             &finalizer_graph.direct_prerequisites[finalizer_name],
             &document,
             &agent_profiles,
-            &mut required_imports,
+            &mut required_inputs,
         )?;
         finalizers.insert(
             finalizer_name.clone(),
@@ -192,7 +201,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         finalizer_source_order: document.finalizer_order,
         finalizer_presentation_order: finalizer_graph.presentation_order,
         exports,
-        required_imports,
+        required_inputs,
     })
 }
 
@@ -619,8 +628,12 @@ fn infer_condition_value_reference(
 ) -> Result<(), ValidationFailure> {
     let location = condition_location(consumer_name, consumer_role);
     match reference {
-        ValueReference::Import { name } if name == "prompt" => Ok(()),
-        ValueReference::Import { .. } => Err(ValidationFailure::new(
+        ValueReference::Input { name }
+            if document.inputs.get(name) == Some(&InputDeclaration::Text) =>
+        {
+            Ok(())
+        }
+        ValueReference::Input { .. } => Err(ValidationFailure::new(
             ValidationFailureKind::InvalidConditionReference,
             location,
         )),
@@ -828,7 +841,7 @@ fn infer_reference_prerequisite(
     context_allowed: bool,
 ) -> Result<(), ValidationFailure> {
     match reference {
-        ValueReference::Import { .. } => return Ok(()),
+        ValueReference::Input { .. } => return Ok(()),
         ValueReference::FinalizationContext => {
             return if context_allowed {
                 Ok(())
@@ -1066,19 +1079,19 @@ fn resolve_condition_predicate(
     node_name: &str,
     role: WorkflowNodeRole,
     document: &WorkflowDocument,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
     condition_values: &mut BTreeMap<String, ResolvedValueSource>,
 ) -> Result<ResolvedPredicate, ValidationFailure> {
     let resolve_child =
         |child: &ConditionPredicate,
-         required_imports: &mut RequiredImports,
+         required_inputs: &mut RequiredInputs,
          condition_values: &mut BTreeMap<String, ResolvedValueSource>| {
             resolve_condition_predicate(
                 child,
                 node_name,
                 role,
                 document,
-                required_imports,
+                required_inputs,
                 condition_values,
             )
         };
@@ -1086,20 +1099,20 @@ fn resolve_condition_predicate(
         ConditionPredicate::All(children) => Ok(ResolvedPredicate::All(
             children
                 .iter()
-                .map(|child| resolve_child(child, required_imports, condition_values))
+                .map(|child| resolve_child(child, required_inputs, condition_values))
                 .collect::<Result<Vec<_>, _>>()?
                 .into(),
         )),
         ConditionPredicate::Any(children) => Ok(ResolvedPredicate::Any(
             children
                 .iter()
-                .map(|child| resolve_child(child, required_imports, condition_values))
+                .map(|child| resolve_child(child, required_inputs, condition_values))
                 .collect::<Result<Vec<_>, _>>()?
                 .into(),
         )),
         ConditionPredicate::Not(child) => Ok(ResolvedPredicate::Not(Box::new(resolve_child(
             child,
-            required_imports,
+            required_inputs,
             condition_values,
         )?))),
         ConditionPredicate::Equals(operands) => resolve_condition_equals(
@@ -1107,7 +1120,7 @@ fn resolve_condition_predicate(
             node_name,
             role,
             document,
-            required_imports,
+            required_inputs,
             condition_values,
         ),
         ConditionPredicate::Exists(selector) => {
@@ -1116,7 +1129,7 @@ fn resolve_condition_predicate(
                 node_name,
                 role,
                 document,
-                required_imports,
+                required_inputs,
             )?;
             if kind != ConditionValueKind::Json {
                 return Err(ValidationFailure::new(
@@ -1155,7 +1168,7 @@ fn resolve_condition_equals(
     node_name: &str,
     role: WorkflowNodeRole,
     document: &WorkflowDocument,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
     condition_values: &mut BTreeMap<String, ResolvedValueSource>,
 ) -> Result<ResolvedPredicate, ValidationFailure> {
     struct ReferenceResolution {
@@ -1170,7 +1183,7 @@ fn resolve_condition_equals(
             continue;
         };
         let (canonical, source, kind) =
-            resolve_condition_reference(reference, node_name, role, document, required_imports)?;
+            resolve_condition_reference(reference, node_name, role, document, required_inputs)?;
         if kind == ConditionValueKind::Text && pointer.is_some() {
             return Err(ValidationFailure::new(
                 ValidationFailureKind::InvalidConditionType,
@@ -1261,12 +1274,12 @@ fn resolve_condition_reference(
     node_name: &str,
     role: WorkflowNodeRole,
     document: &WorkflowDocument,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
 ) -> Result<(String, ResolvedValueSource, ConditionValueKind), ValidationFailure> {
     let resolved = resolve_value_reference(
         reference,
         document,
-        required_imports,
+        required_inputs,
         condition_location(node_name, role),
         role == WorkflowNodeRole::Finalizer,
     )?;
@@ -1283,13 +1296,7 @@ fn resolve_condition_reference(
         }
     };
     let canonical = match &resolved.source {
-        ResolvedValueSource::Import(WorkflowImport::Prompt) => "imports.prompt".to_owned(),
-        ResolvedValueSource::Import(WorkflowImport::Attachments) => {
-            return Err(ValidationFailure::new(
-                ValidationFailureKind::InvalidConditionReference,
-                condition_location(node_name, role),
-            ));
-        }
+        ResolvedValueSource::Input(name) => format!("inputs.{name}"),
         ResolvedValueSource::Output(output) => output.reference(),
         ResolvedValueSource::FinalizationContext => "finalization.context".to_owned(),
     };
@@ -1303,7 +1310,7 @@ fn validate_body(
     prerequisites: &[ResolvedDirectPrerequisite],
     document: &WorkflowDocument,
     agent_profiles: &BTreeMap<String, ValidatedHarness>,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
 ) -> Result<ValidatedStep, ValidationFailure> {
     let mut condition_values = BTreeMap::new();
     let condition = common_node(body)
@@ -1315,7 +1322,7 @@ fn validate_body(
                 node_name,
                 role,
                 document,
-                required_imports,
+                required_inputs,
                 &mut condition_values,
             )
         })
@@ -1335,7 +1342,7 @@ fn validate_body(
                 role,
                 &command.inputs,
                 document,
-                required_imports,
+                required_inputs,
             )?,
             argv: command.argv.clone(),
         })),
@@ -1353,7 +1360,7 @@ fn validate_body(
                 role,
                 &agent.agent,
                 document,
-                required_imports,
+                required_inputs,
                 harness,
             )?;
             Ok(ValidatedStep::Agent(ValidatedAgentStep {
@@ -1495,7 +1502,7 @@ fn validate_command_inputs(
     role: WorkflowNodeRole,
     inputs: &BTreeMap<String, ValueReference>,
     document: &WorkflowDocument,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
 ) -> Result<BTreeMap<String, ResolvedValueReference>, ValidationFailure> {
     inputs
         .iter()
@@ -1503,7 +1510,7 @@ fn validate_command_inputs(
             resolve_value_reference(
                 reference,
                 document,
-                required_imports,
+                required_inputs,
                 node_input_location(node_name, role, input_name),
                 role == WorkflowNodeRole::Finalizer,
             )
@@ -1515,30 +1522,20 @@ fn validate_command_inputs(
 fn resolve_value_reference(
     reference: &ValueReference,
     document: &WorkflowDocument,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
     location: ValidationLocation,
     context_allowed: bool,
 ) -> Result<ResolvedValueReference, ValidationFailure> {
     match reference {
-        ValueReference::Import { name } => {
-            let (source, value_type) = match name.as_str() {
-                "prompt" => {
-                    required_imports.prompt = true;
-                    (WorkflowImport::Prompt, WorkflowValueType::Text)
-                }
-                "attachments" => (
-                    WorkflowImport::Attachments,
-                    WorkflowValueType::AttachmentCollection,
-                ),
-                _ => {
-                    return Err(ValidationFailure::new(
-                        ValidationFailureKind::UnknownImport,
-                        location,
-                    ));
-                }
+        ValueReference::Input { name } => {
+            let Some(value_type) = required_inputs.get(name).copied() else {
+                return Err(ValidationFailure::new(
+                    ValidationFailureKind::UnknownInput,
+                    location,
+                ));
             };
             Ok(ResolvedValueReference {
-                source: ResolvedValueSource::Import(source),
+                source: ResolvedValueSource::Input(name.clone()),
                 value_type,
             })
         }
@@ -1638,7 +1635,7 @@ fn validate_agent(
     role: WorkflowNodeRole,
     agent: &Agent,
     document: &WorkflowDocument,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
     harness: ValidatedHarness,
 ) -> Result<ValidatedAgent, ValidationFailure> {
     let text = agent
@@ -1653,7 +1650,7 @@ fn validate_agent(
                 index,
                 source,
                 document,
-                required_imports,
+                required_inputs,
                 MessageDestination::Text,
             )
         })
@@ -1670,7 +1667,7 @@ fn validate_agent(
                 index,
                 source,
                 document,
-                required_imports,
+                required_inputs,
                 MessageDestination::Attachment,
             )
         })
@@ -1696,7 +1693,7 @@ fn validate_message_source(
     index: usize,
     source: &MessageSource,
     document: &WorkflowDocument,
-    required_imports: &mut RequiredImports,
+    required_inputs: &mut RequiredInputs,
     destination: MessageDestination,
 ) -> Result<ValidatedMessageSource, ValidationFailure> {
     let attachment = matches!(destination, MessageDestination::Attachment);
@@ -1711,7 +1708,7 @@ fn validate_message_source(
     let value = resolve_value_reference(
         reference,
         document,
-        required_imports,
+        required_inputs,
         location.clone(),
         role == WorkflowNodeRole::Finalizer && attachment,
     )?;

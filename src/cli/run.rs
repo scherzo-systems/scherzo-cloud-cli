@@ -730,16 +730,12 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
         "  input set: {}",
         run.inputs.input_set_id.as_deref().unwrap_or("none")
     )?;
+    writeln!(stdout, "  named values: {}", run.inputs.input_count)?;
     writeln!(
         stdout,
-        "  prompt: {}",
-        if run.inputs.prompt_present {
-            "yes"
-        } else {
-            "no"
-        }
+        "  attachment members: {}",
+        run.inputs.attachment_count
     )?;
-    writeln!(stdout, "  attachments: {}", run.inputs.attachment_count)?;
     writeln!(stdout, "  bytes: {}", run.inputs.aggregate_bytes)?;
     writeln!(
         stdout,
@@ -1020,7 +1016,7 @@ mod tests {
             },
             "inputs": {
                 "inputSetId": null,
-                "promptPresent": false,
+                "inputCount": 0,
                 "attachmentCount": 0,
                 "aggregateBytes": 0,
                 "availability": "available"

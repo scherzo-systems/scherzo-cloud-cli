@@ -16,12 +16,13 @@ use rustix::fs::{
 };
 use rustix::io::{Errno, dup};
 use rustix::process::{Flock, FlockOffsetType, FlockType, fcntl_getlk};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedImports};
+use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedInput, ResolvedInputs};
 use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
@@ -72,11 +73,10 @@ const STATUS_SNAPSHOT_ATTEMPTS: usize = 8;
 pub(super) const MAXIMUM_DURABLE_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_RETAINED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
-const MAXIMUM_RETAINED_PROMPT_BYTES: u64 = 1024 * 1024;
-const MAXIMUM_RETAINED_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_RETAINED_CAPTURED_FILE_BYTES: u64 = MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES
-    + MAXIMUM_RETAINED_PROMPT_BYTES
-    + MAXIMUM_RETAINED_ATTACHMENT_BYTES;
+const MAXIMUM_RETAINED_TEXT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_RETAINED_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_RETAINED_CAPTURED_FILE_BYTES: u64 =
+    MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES + MAXIMUM_RETAINED_INPUT_BYTES;
 const MAXIMUM_RETAINED_RUN_JSON_BYTES: u64 =
     3 * MAXIMUM_DURABLE_JSON_BYTES + super::result_metadata::MAXIMUM_RESULT_NON_STREAM_JSON_BYTES;
 // An archived-attempt read covers the immutable workflow/import captures, the base64
@@ -156,7 +156,7 @@ struct WorkflowManifestV1 {
     source_root: String,
     maximum_parallel_steps: usize,
     source_files: Vec<ManifestSourceFileV1>,
-    imports: ManifestImportsV1,
+    inputs: BTreeMap<String, ManifestInputV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -177,11 +177,15 @@ struct ManifestFileV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ManifestImportsV1 {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt: Option<ManifestFileV1>,
-    attachments: Vec<ManifestAttachmentV1>,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestInputV1 {
+    Text {
+        #[serde(flatten)]
+        file: ManifestFileV1,
+    },
+    Attachments {
+        items: Vec<ManifestAttachmentV1>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -821,7 +825,7 @@ pub(crate) struct PendingLocalRetry {
     lock: File,
     state: Arc<StateStore>,
     workflow: ResolvedWorkflow,
-    imports: ResolvedImports,
+    inputs: ResolvedInputs,
     maximum_parallel_steps: usize,
 }
 
@@ -830,8 +834,8 @@ impl PendingLocalRetry {
         &self.normalized
     }
 
-    pub(crate) fn execution_specification(&self) -> (&ResolvedWorkflow, &ResolvedImports, usize) {
-        (&self.workflow, &self.imports, self.maximum_parallel_steps)
+    pub(crate) fn execution_specification(&self) -> (&ResolvedWorkflow, &ResolvedInputs, usize) {
+        (&self.workflow, &self.inputs, self.maximum_parallel_steps)
     }
 
     pub(crate) fn reused_execution_root_attempts(
@@ -1723,25 +1727,32 @@ fn retain_execution_specification(
             file,
         });
     }
-    let prompt = admitted
-        .imports()
-        .prompt()
-        .map(|prompt| {
-            ordinal = ordinal
-                .checked_add(1)
-                .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
-            retain_file(files, ordinal, prompt.as_bytes())
-        })
-        .transpose()?;
-    let mut attachments = Vec::with_capacity(admitted.imports().attachments().len());
-    for attachment in admitted.imports().attachments() {
-        ordinal = ordinal
-            .checked_add(1)
-            .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
-        attachments.push(ManifestAttachmentV1 {
-            media_type: attachment.media_type().to_owned(),
-            file: retain_file(files, ordinal, attachment.bytes())?,
-        });
+    let mut inputs = BTreeMap::new();
+    for (name, input) in admitted.inputs().values() {
+        let retained = match input {
+            ResolvedInput::Text(text) => {
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                ManifestInputV1::Text {
+                    file: retain_file(files, ordinal, text.as_bytes())?,
+                }
+            }
+            ResolvedInput::Attachments(attachments) => {
+                let mut items = Vec::with_capacity(attachments.len());
+                for attachment in attachments.iter() {
+                    ordinal = ordinal
+                        .checked_add(1)
+                        .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                    items.push(ManifestAttachmentV1 {
+                        media_type: attachment.media_type().to_owned(),
+                        file: retain_file(files, ordinal, attachment.bytes())?,
+                    });
+                }
+                ManifestInputV1::Attachments { items }
+            }
+        };
+        inputs.insert(name.clone(), retained);
     }
     let manifest = WorkflowManifestV1 {
         schema_version: 1,
@@ -1749,10 +1760,7 @@ fn retain_execution_specification(
         source_root,
         maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps().get(),
         source_files,
-        imports: ManifestImportsV1 {
-            prompt,
-            attachments,
-        },
+        inputs,
     };
     validate_manifest(&manifest)?;
     Ok(manifest)
@@ -3011,7 +3019,7 @@ fn open_locked_retry(
         )));
     }
 
-    let (workflow, imports, maximum_parallel_steps) = load_retained_execution(&root, &run)?;
+    let (workflow, inputs, maximum_parallel_steps) = load_retained_execution(&root, &run)?;
     let private = Arc::new(open_directory_at(&root, PRIVATE_DIRECTORY)?);
     let root = Arc::new(root);
     let state = Arc::new(StateStore {
@@ -3026,7 +3034,7 @@ fn open_locked_retry(
         lock,
         state,
         workflow,
-        imports,
+        inputs,
         maximum_parallel_steps,
     })))
 }
@@ -3053,7 +3061,7 @@ fn run_root_entries() -> BTreeSet<Vec<u8>> {
 pub(super) fn load_retained_execution(
     root: &OwnedFd,
     run: &LocalRunV1,
-) -> Result<(ResolvedWorkflow, ResolvedImports, usize), LocalRunDirectoryError> {
+) -> Result<(ResolvedWorkflow, ResolvedInputs, usize), LocalRunDirectoryError> {
     load_retained_execution_with_budget(root, run, &mut RetainedReadBudget::default())
 }
 
@@ -3061,7 +3069,7 @@ pub(super) fn load_retained_execution_with_budget(
     root: &OwnedFd,
     run: &LocalRunV1,
     budget: &mut RetainedReadBudget,
-) -> Result<(ResolvedWorkflow, ResolvedImports, usize), LocalRunDirectoryError> {
+) -> Result<(ResolvedWorkflow, ResolvedInputs, usize), LocalRunDirectoryError> {
     let workflow_directory = open_directory_at(root, WORKFLOW_DIRECTORY)?;
     let expected_workflow_entries = BTreeSet::from([
         WORKFLOW_MANIFEST_FILE.as_bytes().to_vec(),
@@ -3117,27 +3125,51 @@ pub(super) fn load_retained_execution_with_budget(
             return Err(LocalRunDirectoryError::StateInvalid);
         }
     }
-    let prompt = manifest
-        .imports
-        .prompt
-        .as_ref()
-        .map(|file| {
-            String::from_utf8(read_file(file)?)
-                .map(Arc::<str>::from)
-                .map_err(|_| LocalRunDirectoryError::StateInvalid)
-        })
-        .transpose()?;
-    let attachments = manifest
-        .imports
-        .attachments
-        .iter()
-        .map(|attachment| {
-            Ok(ResolvedAttachment::new(
-                Arc::<str>::from(attachment.media_type.as_str()),
-                Arc::<[u8]>::from(read_file(&attachment.file)?),
-            ))
-        })
-        .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
+    let mut input_bytes = 0_u64;
+    let mut attachment_count = 0_usize;
+    let mut inputs = BTreeMap::new();
+    for (name, input) in &manifest.inputs {
+        let value = match input {
+            ManifestInputV1::Text { file } => {
+                let bytes = read_file(file)?;
+                if file.size_bytes > MAXIMUM_RETAINED_TEXT_BYTES {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                let text = String::from_utf8(bytes)
+                    .map(Arc::<str>::from)
+                    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+                ResolvedInput::Text(text)
+            }
+            ManifestInputV1::Attachments { items } => {
+                attachment_count = attachment_count
+                    .checked_add(items.len())
+                    .filter(|count| *count <= 256)
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                let mut attachments = Vec::with_capacity(items.len());
+                for attachment in items {
+                    if attachment.file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES {
+                        return Err(LocalRunDirectoryError::StateInvalid);
+                    }
+                    account_retained_bytes(
+                        &mut input_bytes,
+                        attachment.file.size_bytes,
+                        MAXIMUM_RETAINED_INPUT_BYTES,
+                    )?;
+                    attachments.push(ResolvedAttachment::new(
+                        Arc::<str>::from(attachment.media_type.as_str()),
+                        Arc::<[u8]>::from(read_file(&attachment.file)?),
+                    ));
+                }
+                ResolvedInput::Attachments(Arc::from(attachments))
+            }
+        };
+        inputs.insert(name.clone(), value);
+    }
     let workflow = resolve_retained(
         PathBuf::from(&manifest.source_root),
         &manifest.workflow_path,
@@ -3146,12 +3178,25 @@ pub(super) fn load_retained_execution_with_budget(
     .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
     if workflow.content_digest.algorithm.as_str() != run.workflow_digest.algorithm
         || workflow.content_digest.value != run.workflow_digest.value
+        || workflow.required_inputs().len() != inputs.len()
+        || workflow.required_inputs().iter().any(|(name, kind)| {
+            !matches!(
+                (kind, inputs.get(name)),
+                (
+                    super::validated::WorkflowValueType::Text,
+                    Some(ResolvedInput::Text(_))
+                ) | (
+                    super::validated::WorkflowValueType::AttachmentCollection,
+                    Some(ResolvedInput::Attachments(_))
+                )
+            )
+        })
     {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
     Ok((
         workflow,
-        ResolvedImports::new(prompt, Arc::from(attachments)),
+        ResolvedInputs::new(inputs),
         manifest.maximum_parallel_steps,
     ))
 }
@@ -3159,11 +3204,16 @@ pub(super) fn load_retained_execution_with_budget(
 fn retained_manifest_file_count(
     manifest: &WorkflowManifestV1,
 ) -> Result<u64, LocalRunDirectoryError> {
+    let input_files = manifest.inputs.values().try_fold(0_usize, |count, input| {
+        count.checked_add(match input {
+            ManifestInputV1::Text { .. } => 1,
+            ManifestInputV1::Attachments { items } => items.len(),
+        })
+    });
     let count = manifest
         .source_files
         .len()
-        .checked_add(usize::from(manifest.imports.prompt.is_some()))
-        .and_then(|count| count.checked_add(manifest.imports.attachments.len()))
+        .checked_add(input_files.ok_or(LocalRunDirectoryError::StateInvalid)?)
         .ok_or(LocalRunDirectoryError::StateInvalid)?;
     u64::try_from(count)
         .ok()
@@ -3959,10 +4009,10 @@ fn decode_run(bytes: &[u8]) -> Result<LocalRunV1, LocalRunDirectoryError> {
 }
 
 fn decode_state(bytes: &[u8]) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
-    let document: Value =
-        serde_json::from_slice(bytes).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let document = decode_schema_one_value(bytes)?;
     dispatch_durable_recovery_versions(&document)?;
-    let state: LocalRunStateV1 = decode_schema_one(bytes)?;
+    let state =
+        serde_json::from_value(document).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
     validate_state(&state)?;
     Ok(state)
 }
@@ -4003,11 +4053,18 @@ fn decode_schema_one<Document>(bytes: &[u8]) -> Result<Document, LocalRunDirecto
 where
     Document: for<'de> Deserialize<'de>,
 {
+    serde_json::from_value(decode_schema_one_value(bytes)?)
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)
+}
+
+fn decode_schema_one_value(bytes: &[u8]) -> Result<Value, LocalRunDirectoryError> {
     if bytes.starts_with(&[0xef, 0xbb, 0xbf]) || !bytes.ends_with(b"\n") {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = DuplicateFreeValue::deserialize(&mut deserializer)
+        .and_then(|value| deserializer.end().map(|()| value.0))
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
     if contains_null(&value)
         || value
             .get("schemaVersion")
@@ -4016,7 +4073,88 @@ where
     {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
-    serde_json::from_value(value).map_err(|_| LocalRunDirectoryError::StateInvalid)
+    Ok(value)
+}
+
+struct DuplicateFreeValue(Value);
+
+impl<'de> Deserialize<'de> for DuplicateFreeValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateFreeValueVisitor)
+    }
+}
+
+struct DuplicateFreeValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateFreeValueVisitor {
+    type Value = DuplicateFreeValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a duplicate-free JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(DuplicateFreeValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut sequence = Vec::new();
+        while let Some(value) = values.next_element::<DuplicateFreeValue>()? {
+            sequence.push(value.0);
+        }
+        Ok(DuplicateFreeValue(Value::Array(sequence)))
+    }
+
+    fn visit_map<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = values.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON object member"));
+            }
+            let value = values.next_value::<DuplicateFreeValue>()?;
+            object.insert(key, value.0);
+        }
+        Ok(DuplicateFreeValue(Value::Object(object)))
+    }
 }
 
 fn contains_null(value: &Value) -> bool {
@@ -4046,6 +4184,11 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
         || !is_canonical_absolute_path(&manifest.source_root)
         || !(1..=256).contains(&manifest.maximum_parallel_steps)
         || manifest.source_files.is_empty()
+        || manifest.inputs.len() > 256
+        || manifest
+            .inputs
+            .keys()
+            .any(|name| !super::is_input_name(name))
     {
         return Err(LocalRunDirectoryError::SerializationUnavailable);
     }
@@ -4066,20 +4209,49 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
     if !source_paths.contains(manifest.workflow_path.as_str()) {
         return Err(LocalRunDirectoryError::SerializationUnavailable);
     }
-    let mut expected_ordinal = 1_u64;
-    for file in manifest
+    let mut retained_files = manifest
         .source_files
         .iter()
         .map(|source| &source.file)
-        .chain(manifest.imports.prompt.iter())
-        .chain(
-            manifest
-                .imports
-                .attachments
-                .iter()
-                .map(|attachment| &attachment.file),
-        )
-    {
+        .collect::<Vec<_>>();
+    let mut input_bytes = 0_u64;
+    let mut attachment_count = 0_usize;
+    for input in manifest.inputs.values() {
+        match input {
+            ManifestInputV1::Text { file } => {
+                if file.size_bytes > MAXIMUM_RETAINED_TEXT_BYTES {
+                    return Err(LocalRunDirectoryError::SerializationUnavailable);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                retained_files.push(file);
+            }
+            ManifestInputV1::Attachments { items } => {
+                attachment_count = attachment_count
+                    .checked_add(items.len())
+                    .filter(|count| *count <= 256)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                for attachment in items {
+                    if attachment.file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES
+                        || !super::is_valid_media_type(&attachment.media_type)
+                    {
+                        return Err(LocalRunDirectoryError::SerializationUnavailable);
+                    }
+                    account_retained_bytes(
+                        &mut input_bytes,
+                        attachment.file.size_bytes,
+                        MAXIMUM_RETAINED_INPUT_BYTES,
+                    )?;
+                    retained_files.push(&attachment.file);
+                }
+            }
+        }
+    }
+    let mut expected_ordinal = 1_u64;
+    for file in retained_files {
         if file.ordinal != expected_ordinal
             || file.relative_file
                 != format!(

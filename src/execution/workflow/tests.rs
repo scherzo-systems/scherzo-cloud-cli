@@ -61,14 +61,14 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     assert_eq!(plan_body.agent.system_prompt, "prompts/plan-system.md");
     assert_eq!(
         plan_body.agent.message.text,
-        [MessageSource::Reference(ValueReference::Import {
-            name: "prompt".to_owned()
+        [MessageSource::Reference(ValueReference::Input {
+            name: "request".to_owned()
         })]
     );
     assert_eq!(
         plan_body.agent.message.attachments,
-        [MessageSource::Reference(ValueReference::Import {
-            name: "attachments".to_owned()
+        [MessageSource::Reference(ValueReference::Input {
+            name: "evidence".to_owned()
         })]
     );
     assert_eq!(
@@ -101,16 +101,16 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
             MessageSource::File {
                 path: "prompts/implement-message.md".to_owned()
             },
-            MessageSource::Reference(ValueReference::Import {
-                name: "prompt".to_owned()
+            MessageSource::Reference(ValueReference::Input {
+                name: "request".to_owned()
             })
         ]
     );
     assert_eq!(
         implement_body.agent.message.attachments,
         [
-            MessageSource::Reference(ValueReference::Import {
-                name: "attachments".to_owned()
+            MessageSource::Reference(ValueReference::Input {
+                name: "evidence".to_owned()
             }),
             MessageSource::Reference(ValueReference::Output(OutputReference {
                 node: "plan".to_owned(),
@@ -136,8 +136,8 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     assert_eq!(test_body.argv, ["./scripts/test.sh"]);
     assert_eq!(
         test_body.inputs["prompt"],
-        ValueReference::Import {
-            name: "prompt".to_owned(),
+        ValueReference::Input {
+            name: "request".to_owned(),
         }
     );
     assert_eq!(

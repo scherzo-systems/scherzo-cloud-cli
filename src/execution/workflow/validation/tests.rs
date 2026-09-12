@@ -6,8 +6,8 @@ use super::super::document::{
 use super::super::pi::{PiConfig, Thinking};
 use super::super::validated::{
     ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueSource, ValidatedHarness,
-    ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowImport, WorkflowNode,
-    WorkflowNodeRole, WorkflowValueType,
+    ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
+    WorkflowValueType,
 };
 use super::{ValidationFailureKind, ValidationLocation};
 
@@ -339,7 +339,7 @@ steps:
           - file: prompts/message.md
 ";
     let workflow = validate_yaml(source).unwrap();
-    assert!(!workflow.required_imports.prompt);
+    assert!(workflow.required_inputs.is_empty());
     let ValidatedStep::Agent(agent) = &workflow.steps["agent"] else {
         panic!("agent must be an agent step");
     };
@@ -629,14 +629,17 @@ steps:
 }
 
 #[test]
-fn imports_and_exports_do_not_create_step_prerequisites() {
+fn workflow_inputs_and_exports_do_not_create_step_prerequisites() {
     let source = "schemaVersion: 1
+inputs:
+  request:
+    kind: text
 steps:
   consumer:
     kind: cmd
     inputs:
       prompt:
-        ref: imports.prompt
+        ref: inputs.request
     command:
       argv: [\"true\"]
   producer:
@@ -659,25 +662,28 @@ exports:
         panic!("consumer must be a command step");
     };
     assert!(consumer.common.prerequisites.is_empty());
-    assert!(workflow.required_imports.prompt);
+    assert_eq!(
+        workflow.required_inputs.get("request"),
+        Some(&WorkflowValueType::Text)
+    );
     assert_eq!(workflow.presentation_order, ["consumer", "producer"]);
 }
 
 #[test]
-fn closed_import_namespace_rejects_unknown_imports() {
+fn undeclared_workflow_input_is_rejected() {
     let source = "schemaVersion: 1
 steps:
   consumer:
     kind: cmd
     inputs:
       value:
-        ref: imports.unknown
+        ref: inputs.unknown
     command:
       argv: [\"true\"]
 ";
     assert_failure(
         source,
-        ValidationFailureKind::UnknownImport,
+        ValidationFailureKind::UnknownInput,
         ValidationLocation::StepInput {
             step: "consumer".to_owned(),
             input: "value".to_owned(),
@@ -695,6 +701,11 @@ fn typed_message_workflow(reference: &str, destination: &str) -> String {
     };
     format!(
         "schemaVersion: 1
+inputs:
+  request:
+    kind: text
+  evidence:
+    kind: attachments
 agentProfiles:
   coding:
     harness:
@@ -745,10 +756,77 @@ steps:
 }
 
 #[test]
+fn named_text_conditions_are_phase_valid_and_collections_are_rejected() {
+    let source = "schemaVersion: 1
+inputs:
+  request: {kind: text}
+  evidence: {kind: attachments}
+steps:
+  ordinary:
+    kind: cmd
+    condition:
+      equals:
+        - ref: inputs.request
+        - value: exact
+    command: {argv: [\"true\"]}
+finalizers:
+  finish:
+    kind: cmd
+    condition:
+      equals:
+        - ref: inputs.request
+        - value: exact
+    command: {argv: [\"true\"]}
+";
+    let workflow = validate_yaml(source).unwrap();
+    for (name, step) in [
+        ("ordinary", &workflow.steps["ordinary"]),
+        ("finish", &workflow.finalizers["finish"].body),
+    ] {
+        let common = match step {
+            ValidatedStep::Command(step) => &step.common,
+            ValidatedStep::Agent(_) => panic!("{name} must be a command"),
+        };
+        assert_eq!(
+            common.condition_values.get("inputs.request"),
+            Some(&ResolvedValueSource::Input("request".to_owned()))
+        );
+    }
+    for (node, location) in [
+        (
+            "ordinary",
+            ValidationLocation::StepCondition {
+                step: "ordinary".to_owned(),
+            },
+        ),
+        (
+            "finish",
+            ValidationLocation::FinalizerCondition {
+                finalizer: "finish".to_owned(),
+            },
+        ),
+    ] {
+        let mut invalid = source.to_owned();
+        let start = invalid.find(&format!("  {node}:")).unwrap();
+        let relative = invalid[start..].find("ref: inputs.request").unwrap();
+        let offset = start + relative;
+        invalid.replace_range(
+            offset..offset + "ref: inputs.request".len(),
+            "ref: inputs.evidence",
+        );
+        assert_failure(
+            &invalid,
+            ValidationFailureKind::InvalidConditionReference,
+            location,
+        );
+    }
+}
+
+#[test]
 fn message_type_table_rejects_every_inverse_destination_without_conversion() {
     let cases = [
-        ("imports.prompt", "attachment"),
-        ("imports.attachments", "text"),
+        ("inputs.request", "attachment"),
+        ("inputs.evidence", "text"),
         ("outputs.responseProducer.response", "attachment"),
         ("outputs.resultProducer.result", "text"),
         ("outputs.responseProducer.file", "text"),
@@ -780,6 +858,11 @@ fn message_type_table_rejects_every_inverse_destination_without_conversion() {
 fn validated_definition_preserves_explicit_consumption_and_effective_prerequisites() {
     let source = "schemaVersion: 1
 description: Typed workflow.
+inputs:
+  request:
+    kind: text
+  evidence:
+    kind: attachments
 agentProfiles:
   coding:
     harness:
@@ -831,10 +914,10 @@ steps:
       systemPrompt: prompts/system.md
       message:
         text:
-          - ref: imports.prompt
+          - ref: inputs.request
           - ref: outputs.responseProducer.response
         attachments:
-          - ref: imports.attachments
+          - ref: inputs.evidence
           - ref: outputs.resultProducer.result
           - ref: outputs.responseProducer.file
 exports:
@@ -847,7 +930,16 @@ exports:
 ";
     let workflow = validate_yaml(source).unwrap();
 
-    assert!(workflow.required_imports.prompt);
+    assert_eq!(
+        workflow.required_inputs,
+        std::collections::BTreeMap::from([
+            (
+                "evidence".to_owned(),
+                WorkflowValueType::AttachmentCollection
+            ),
+            ("request".to_owned(), WorkflowValueType::Text),
+        ])
+    );
     let consumer_position = workflow
         .presentation_order
         .iter()
@@ -875,7 +967,7 @@ exports:
         consumer.agent.message.text,
         [
             ValidatedMessageSource::Reference {
-                source: ResolvedValueSource::Import(WorkflowImport::Prompt),
+                source: ResolvedValueSource::Input("request".to_owned()),
                 value_type: WorkflowValueType::Text,
             },
             ValidatedMessageSource::Reference {
@@ -895,7 +987,7 @@ exports:
         consumer.agent.message.attachments,
         [
             ValidatedMessageSource::Reference {
-                source: ResolvedValueSource::Import(WorkflowImport::Attachments),
+                source: ResolvedValueSource::Input("evidence".to_owned()),
                 value_type: WorkflowValueType::AttachmentCollection,
             },
             ValidatedMessageSource::Reference {
@@ -960,7 +1052,7 @@ exports:
 #[test]
 fn direct_message_reference_failures_are_reported_at_the_message_location() {
     for (reference, kind) in [
-        ("imports.unknown", ValidationFailureKind::UnknownImport),
+        ("inputs.unknown", ValidationFailureKind::UnknownInput),
         (
             "outputs.missing.value",
             ValidationFailureKind::UnknownOutputStep,
@@ -1232,10 +1324,14 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
     let NodeBody::Command(command) = &mut document.steps.get_mut("command").unwrap().body else {
         panic!("command must be a command step");
     };
+    document.inputs.insert(
+        "request".to_owned(),
+        super::super::document::InputDeclaration::Text,
+    );
     command.inputs.insert(
         "prompt".to_owned(),
-        ValueReference::Import {
-            name: "prompt".to_owned(),
+        ValueReference::Input {
+            name: "request".to_owned(),
         },
     );
 
@@ -1245,7 +1341,7 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
     };
     assert_eq!(
         command.inputs["prompt"].source,
-        ResolvedValueSource::Import(WorkflowImport::Prompt)
+        ResolvedValueSource::Input("request".to_owned())
     );
 }
 

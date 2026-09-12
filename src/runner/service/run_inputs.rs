@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -15,7 +16,7 @@ use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 
-use crate::execution::workflow::admission::{ResolvedAttachment, ResolvedImports};
+use crate::execution::workflow::admission::{ResolvedAttachment, ResolvedInput, ResolvedInputs};
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::runner::credential::Credential;
 use crate::runner_protocol::RunInputProjectionV1;
@@ -23,12 +24,13 @@ use crate::runner_protocol::RunInputProjectionV1;
 const MANIFEST_RESPONSE_LIMIT: usize = 1024 * 1024;
 const CAPABILITY_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
-const MAXIMUM_PROMPT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_INPUTS: usize = 256;
+const MAXIMUM_TEXT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_ATTACHMENTS: usize = 256;
 const MAXIMUM_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_CAPABILITY_MEMBERS: usize = 100;
-const PROMPT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
+const TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
 
 #[derive(Clone, Copy)]
 pub(super) struct PreparationDeadline {
@@ -86,7 +88,7 @@ pub(super) enum RunInputFailure {
     ManifestMismatch,
     ContentUnavailable,
     ContentMismatch,
-    PromptInvalid,
+    TextInvalid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,13 +110,6 @@ struct DigestV1 {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PromptMember {
-    size_bytes: u64,
-    sha256: String,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttachmentMember {
     index: usize,
     display_name: Option<String>,
@@ -124,11 +119,23 @@ struct AttachmentMember {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestInput {
+    Text {
+        #[serde(rename = "sizeBytes")]
+        size_bytes: u64,
+        sha256: String,
+    },
+    Attachments {
+        items: Vec<AttachmentMember>,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManifestV1 {
     schema_version: u64,
-    prompt: Option<PromptMember>,
-    attachments: Vec<AttachmentMember>,
+    inputs: BTreeMap<String, ManifestInput>,
 }
 
 #[derive(Clone)]
@@ -431,7 +438,7 @@ pub(super) fn materialize(
     deadline: PreparationDeadline,
     cancellation: &CaptureCancellation,
     private_root: &Path,
-) -> Result<ResolvedImports, RunInputFailure> {
+) -> Result<ResolvedInputs, RunInputFailure> {
     materialize_with_clock(
         broker,
         MaterializationIdentity {
@@ -459,9 +466,9 @@ fn materialize_with_clock(
     cancellation: &CaptureCancellation,
     private_root: &Path,
     mut utc_now: impl FnMut() -> OffsetDateTime,
-) -> Result<ResolvedImports, RunInputFailure> {
+) -> Result<ResolvedInputs, RunInputFailure> {
     let Some(projection) = projection else {
-        return Ok(ResolvedImports::default());
+        return Ok(ResolvedInputs::default());
     };
     validate_projection(projection)?;
     let broker = broker.ok_or(RunInputFailure::ServiceUnavailable)?;
@@ -476,7 +483,7 @@ fn materialize_with_clock(
         .map_err(manifest_broker_failure)?;
     let manifest = validate_manifest_envelope(&envelope, projection)?;
 
-    // No capability or member request occurs until the fixed canonical bytes
+    // No capability or member request occurs until the canonical manifest bytes
     // have been compared with the immutable execution projection.
     let staging = tempfile::Builder::new()
         .prefix("run-inputs-")
@@ -527,9 +534,9 @@ fn materialize_with_clock(
             }
         }
     }
-    let imports = construct_imports(&manifest, &completed)?;
+    let inputs = construct_inputs(&manifest, &completed)?;
     let _retained_staging: PathBuf = staging.keep();
-    Ok(imports)
+    Ok(inputs)
 }
 
 pub(super) fn validate_projection(
@@ -569,73 +576,102 @@ fn validate_manifest_envelope(
 
 fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
     if manifest.schema_version != 1
-        || manifest.attachments.len() > MAXIMUM_ATTACHMENTS
-        || (manifest.prompt.is_none() && manifest.attachments.is_empty())
+        || manifest.inputs.is_empty()
+        || manifest.inputs.len() > MAXIMUM_INPUTS
+        || manifest
+            .inputs
+            .keys()
+            .any(|name| !crate::execution::workflow::is_input_name(name))
     {
         return Err(RunInputFailure::ManifestMismatch);
     }
     let mut aggregate = 0_u64;
-    if let Some(prompt) = &manifest.prompt {
-        if prompt.size_bytes > MAXIMUM_PROMPT_BYTES
-            || !crate::execution::workflow::is_lowercase_hex(&prompt.sha256, 64)
-        {
-            return Err(RunInputFailure::ManifestMismatch);
+    let mut attachment_count = 0_usize;
+    for input in manifest.inputs.values() {
+        match input {
+            ManifestInput::Text { size_bytes, sha256 } => {
+                if *size_bytes > MAXIMUM_TEXT_BYTES
+                    || !crate::execution::workflow::is_lowercase_hex(sha256, 64)
+                {
+                    return Err(RunInputFailure::ManifestMismatch);
+                }
+                aggregate = add_manifest_bytes(aggregate, *size_bytes)?;
+            }
+            ManifestInput::Attachments { items } => {
+                attachment_count = attachment_count
+                    .checked_add(items.len())
+                    .filter(|count| *count <= MAXIMUM_ATTACHMENTS)
+                    .ok_or(RunInputFailure::ManifestMismatch)?;
+                for (index, attachment) in items.iter().enumerate() {
+                    if attachment.index != index
+                        || attachment.size_bytes > MAXIMUM_ATTACHMENT_BYTES
+                        || !crate::execution::workflow::is_lowercase_hex(&attachment.sha256, 64)
+                        || !valid_display_name(attachment.display_name.as_deref())
+                        || !crate::execution::workflow::is_valid_media_type(&attachment.media_type)
+                    {
+                        return Err(RunInputFailure::ManifestMismatch);
+                    }
+                    aggregate = add_manifest_bytes(aggregate, attachment.size_bytes)?;
+                }
+            }
         }
-        aggregate = prompt.size_bytes;
-    }
-    for (index, attachment) in manifest.attachments.iter().enumerate() {
-        if attachment.index != index
-            || attachment.size_bytes > MAXIMUM_ATTACHMENT_BYTES
-            || !crate::execution::workflow::is_lowercase_hex(&attachment.sha256, 64)
-            || !valid_display_name(attachment.display_name.as_deref())
-            || !crate::execution::workflow::is_valid_media_type(&attachment.media_type)
-        {
-            return Err(RunInputFailure::ManifestMismatch);
-        }
-        aggregate = aggregate
-            .checked_add(attachment.size_bytes)
-            .filter(|total| *total <= MAXIMUM_AGGREGATE_BYTES)
-            .ok_or(RunInputFailure::ManifestMismatch)?;
     }
     Ok(())
 }
 
+fn add_manifest_bytes(total: u64, size: u64) -> Result<u64, RunInputFailure> {
+    total
+        .checked_add(size)
+        .filter(|total| *total <= MAXIMUM_AGGREGATE_BYTES)
+        .ok_or(RunInputFailure::ManifestMismatch)
+}
+
 fn canonical_manifest(manifest: &ManifestV1) -> Result<String, RunInputFailure> {
-    let mut canonical = String::new();
-    canonical.push_str("{\"attachments\":[");
-    for (index, attachment) in manifest.attachments.iter().enumerate() {
-        if index > 0 {
+    let mut canonical = String::from("{\"inputs\":{");
+    for (input_index, (name, input)) in manifest.inputs.iter().enumerate() {
+        if input_index > 0 {
             canonical.push(',');
         }
-        let display_name = match &attachment.display_name {
-            Some(name) => serde_json::to_string(name),
-            None => Ok("null".to_owned()),
+        canonical
+            .push_str(&serde_json::to_string(name).map_err(|_| RunInputFailure::ManifestMismatch)?);
+        canonical.push(':');
+        match input {
+            ManifestInput::Text { size_bytes, sha256 } => {
+                write!(
+                    canonical,
+                    "{{\"kind\":\"text\",\"sha256\":{},\"sizeBytes\":{size_bytes}}}",
+                    serde_json::to_string(sha256).map_err(|_| RunInputFailure::ManifestMismatch)?,
+                )
+                .map_err(|_| RunInputFailure::ManifestMismatch)?;
+            }
+            ManifestInput::Attachments { items } => {
+                canonical.push_str("{\"items\":[");
+                for (index, attachment) in items.iter().enumerate() {
+                    if index > 0 {
+                        canonical.push(',');
+                    }
+                    let display_name = match &attachment.display_name {
+                        Some(name) => serde_json::to_string(name),
+                        None => Ok("null".to_owned()),
+                    }
+                    .map_err(|_| RunInputFailure::ManifestMismatch)?;
+                    write!(
+                        canonical,
+                        "{{\"displayName\":{display_name},\"index\":{},\"mediaType\":{},\"sha256\":{},\"sizeBytes\":{}}}",
+                        attachment.index,
+                        serde_json::to_string(&attachment.media_type)
+                            .map_err(|_| RunInputFailure::ManifestMismatch)?,
+                        serde_json::to_string(&attachment.sha256)
+                            .map_err(|_| RunInputFailure::ManifestMismatch)?,
+                        attachment.size_bytes,
+                    )
+                    .map_err(|_| RunInputFailure::ManifestMismatch)?;
+                }
+                canonical.push_str("],\"kind\":\"attachments\"}");
+            }
         }
-        .map_err(|_| RunInputFailure::ManifestMismatch)?;
-        write!(
-            canonical,
-            "{{\"displayName\":{display_name},\"index\":{},\"mediaType\":{},\"sha256\":{},\"sizeBytes\":{}}}",
-            attachment.index,
-            serde_json::to_string(&attachment.media_type)
-                .map_err(|_| RunInputFailure::ManifestMismatch)?,
-            serde_json::to_string(&attachment.sha256)
-                .map_err(|_| RunInputFailure::ManifestMismatch)?,
-            attachment.size_bytes,
-        )
-        .map_err(|_| RunInputFailure::ManifestMismatch)?;
     }
-    canonical.push_str("],\"prompt\":");
-    match &manifest.prompt {
-        Some(prompt) => write!(
-            canonical,
-            "{{\"sha256\":{},\"sizeBytes\":{}}}",
-            serde_json::to_string(&prompt.sha256).map_err(|_| RunInputFailure::ManifestMismatch)?,
-            prompt.size_bytes,
-        )
-        .map_err(|_| RunInputFailure::ManifestMismatch)?,
-        None => canonical.push_str("null"),
-    }
-    canonical.push_str(",\"schemaVersion\":1}");
+    canonical.push_str("},\"schemaVersion\":1}");
     Ok(canonical)
 }
 
@@ -648,25 +684,28 @@ struct LogicalMember {
 }
 
 fn logical_members(manifest: &ManifestV1) -> Result<Vec<LogicalMember>, RunInputFailure> {
-    let mut members =
-        Vec::with_capacity(manifest.attachments.len() + usize::from(manifest.prompt.is_some()));
-    if let Some(prompt) = &manifest.prompt {
-        members.push(LogicalMember {
-            member_id: "prompt".to_owned(),
-            media_type: PROMPT_MEDIA_TYPE.to_owned(),
-            size_bytes: prompt.size_bytes,
-            sha256: prompt.sha256.clone(),
-            final_name: "prompt".to_owned(),
-        });
-    }
-    for attachment in &manifest.attachments {
-        members.push(LogicalMember {
-            member_id: format!("attachments/{:06}", attachment.index),
-            media_type: attachment.media_type.clone(),
-            size_bytes: attachment.size_bytes,
-            sha256: attachment.sha256.clone(),
-            final_name: format!("attachment-{:06}", attachment.index),
-        });
+    let mut members = Vec::new();
+    for (name, input) in &manifest.inputs {
+        match input {
+            ManifestInput::Text { size_bytes, sha256 } => members.push(LogicalMember {
+                member_id: format!("inputs/{name}"),
+                media_type: TEXT_MEDIA_TYPE.to_owned(),
+                size_bytes: *size_bytes,
+                sha256: sha256.clone(),
+                final_name: format!("member-{:06}", members.len()),
+            }),
+            ManifestInput::Attachments { items } => {
+                for attachment in items {
+                    members.push(LogicalMember {
+                        member_id: format!("inputs/{name}/{:06}", attachment.index),
+                        media_type: attachment.media_type.clone(),
+                        size_bytes: attachment.size_bytes,
+                        sha256: attachment.sha256.clone(),
+                        final_name: format!("member-{:06}", members.len()),
+                    });
+                }
+            }
+        }
     }
     Ok(members)
 }
@@ -769,44 +808,52 @@ fn download_member(
     Ok(completed)
 }
 
-fn construct_imports(
+fn construct_inputs(
     manifest: &ManifestV1,
     completed: &[PathBuf],
-) -> Result<ResolvedImports, RunInputFailure> {
+) -> Result<ResolvedInputs, RunInputFailure> {
     let mut completed_index = 0;
-    let prompt = if manifest.prompt.is_some() {
-        let path = completed
-            .get(completed_index)
-            .ok_or(RunInputFailure::EnvironmentUnavailable)?;
-        completed_index += 1;
-        let bytes = fs::read(path).map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
-        Some(Arc::<str>::from(
-            String::from_utf8(bytes).map_err(|_| RunInputFailure::PromptInvalid)?,
-        ))
-    } else {
-        None
-    };
-    let mut attachments = Vec::with_capacity(manifest.attachments.len());
-    for attachment in &manifest.attachments {
-        if !crate::execution::workflow::is_valid_media_type(&attachment.media_type) {
-            return Err(RunInputFailure::ManifestMismatch);
-        }
-        let path = completed
-            .get(completed_index)
-            .ok_or(RunInputFailure::EnvironmentUnavailable)?;
-        completed_index += 1;
-        let bytes = fs::read(path).map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
-        let mut resolved =
-            ResolvedAttachment::new(Arc::from(attachment.media_type.as_str()), Arc::from(bytes));
-        if let Some(name) = &attachment.display_name {
-            resolved = resolved.with_diagnostic_source_name(Arc::from(name.as_str()));
-        }
-        attachments.push(resolved);
+    let mut inputs = BTreeMap::new();
+    for (name, input) in &manifest.inputs {
+        let resolved = match input {
+            ManifestInput::Text { .. } => {
+                let path = completed
+                    .get(completed_index)
+                    .ok_or(RunInputFailure::EnvironmentUnavailable)?;
+                completed_index += 1;
+                let bytes = fs::read(path).map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
+                ResolvedInput::Text(Arc::<str>::from(
+                    String::from_utf8(bytes).map_err(|_| RunInputFailure::TextInvalid)?,
+                ))
+            }
+            ManifestInput::Attachments { items } => {
+                let mut attachments = Vec::with_capacity(items.len());
+                for attachment in items {
+                    let path = completed
+                        .get(completed_index)
+                        .ok_or(RunInputFailure::EnvironmentUnavailable)?;
+                    completed_index += 1;
+                    let bytes =
+                        fs::read(path).map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
+                    let mut resolved = ResolvedAttachment::new(
+                        Arc::from(attachment.media_type.as_str()),
+                        Arc::from(bytes),
+                    );
+                    if let Some(display_name) = &attachment.display_name {
+                        resolved =
+                            resolved.with_diagnostic_source_name(Arc::from(display_name.as_str()));
+                    }
+                    attachments.push(resolved);
+                }
+                ResolvedInput::Attachments(Arc::from(attachments))
+            }
+        };
+        inputs.insert(name.clone(), resolved);
     }
     if completed_index != completed.len() {
         return Err(RunInputFailure::EnvironmentUnavailable);
     }
-    Ok(ResolvedImports::new(prompt, Arc::from(attachments)))
+    Ok(ResolvedInputs::new(inputs))
 }
 
 fn required_u64(value: &Value, name: &str) -> Result<u64, BrokerFailure> {
@@ -884,17 +931,25 @@ fn parse_capability_envelope(value: Value) -> Result<CapabilityEnvelope, BrokerF
 }
 
 fn exact_manifest_shape(value: &Value) -> bool {
-    if !exact_object(value, &["schemaVersion", "prompt", "attachments"])
-        || !(value["prompt"].is_null() || exact_object(&value["prompt"], &["sizeBytes", "sha256"]))
-    {
+    if !exact_object(value, &["schemaVersion", "inputs"]) {
         return false;
     }
-    value["attachments"].as_array().is_some_and(|attachments| {
-        attachments.iter().all(|attachment| {
-            exact_object(
-                attachment,
-                &["index", "displayName", "mediaType", "sizeBytes", "sha256"],
-            ) && (attachment["displayName"].is_null() || attachment["displayName"].is_string())
+    value["inputs"].as_object().is_some_and(|inputs| {
+        inputs.values().all(|input| match input["kind"].as_str() {
+            Some("text") => exact_object(input, &["kind", "sizeBytes", "sha256"]),
+            Some("attachments") => {
+                exact_object(input, &["kind", "items"])
+                    && input["items"].as_array().is_some_and(|items| {
+                        items.iter().all(|attachment| {
+                            exact_object(
+                                attachment,
+                                &["index", "displayName", "mediaType", "sizeBytes", "sha256"],
+                            ) && (attachment["displayName"].is_null()
+                                || attachment["displayName"].is_string())
+                        })
+                    })
+            }
+            _ => false,
         })
     })
 }
@@ -1233,9 +1288,8 @@ mod tests {
 
     fn manifest_with_member_count(member_count: usize) -> (ManifestV1, Vec<Vec<u8>>) {
         assert!((1..=MAXIMUM_ATTACHMENTS + 1).contains(&member_count));
-        let prompt = b"prompt".to_vec();
+        let request = b"request".to_vec();
         let mut bodies = Vec::with_capacity(member_count);
-        bodies.push(prompt.clone());
         let mut attachments = Vec::with_capacity(member_count - 1);
         for index in 0..member_count - 1 {
             let body = attachment_body(index);
@@ -1248,23 +1302,47 @@ mod tests {
             });
             bodies.push(body);
         }
+        bodies.push(request.clone());
         (
             ManifestV1 {
                 schema_version: 1,
-                prompt: Some(PromptMember {
-                    size_bytes: u64::try_from(prompt.len()).unwrap(),
-                    sha256: lowercase_hex_bytes(digest(&SHA256, &prompt).as_ref()),
-                }),
-                attachments,
+                inputs: BTreeMap::from([
+                    (
+                        "request".to_owned(),
+                        ManifestInput::Text {
+                            size_bytes: u64::try_from(request.len()).unwrap(),
+                            sha256: lowercase_hex_bytes(digest(&SHA256, &request).as_ref()),
+                        },
+                    ),
+                    (
+                        "evidence".to_owned(),
+                        ManifestInput::Attachments { items: attachments },
+                    ),
+                ]),
             },
             bodies,
         )
     }
 
     fn expected_member_ids(member_count: usize) -> Vec<String> {
-        std::iter::once("prompt".to_owned())
-            .chain((0..member_count - 1).map(|index| format!("attachments/{index:06}")))
+        (0..member_count.saturating_sub(1))
+            .map(|index| format!("inputs/evidence/{index:06}"))
+            .chain(std::iter::once("inputs/request".to_owned()))
             .collect()
+    }
+
+    fn text_value<'a>(inputs: &'a ResolvedInputs, name: &str) -> &'a str {
+        let Some(ResolvedInput::Text(value)) = inputs.get(name) else {
+            panic!("named Text input is missing");
+        };
+        value
+    }
+
+    fn attachment_values<'a>(inputs: &'a ResolvedInputs, name: &str) -> &'a [ResolvedAttachment] {
+        let Some(ResolvedInput::Attachments(values)) = inputs.get(name) else {
+            panic!("named attachment collection is missing");
+        };
+        values
     }
 
     fn assert_private_root_empty(private_root: &Path) {
@@ -1275,7 +1353,7 @@ mod tests {
         broker: &FixtureBroker,
         projection: &RunInputProjectionV1,
         private_root: &Path,
-    ) -> Result<ResolvedImports, RunInputFailure> {
+    ) -> Result<ResolvedInputs, RunInputFailure> {
         materialize(
             Some(broker),
             "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1317,41 +1395,52 @@ mod tests {
     }
 
     #[test]
-    fn verifies_manifest_before_download_and_preserves_empty_prompt_and_order() {
+    fn verifies_manifest_before_download_and_preserves_empty_text_and_collection_order() {
         let empty = Vec::new();
         let second = b"second".to_vec();
         let first = b"first".to_vec();
         let manifest = ManifestV1 {
             schema_version: 1,
-            prompt: Some(PromptMember {
-                size_bytes: 0,
-                sha256: lowercase_hex_bytes(digest(&SHA256, &empty).as_ref()),
-            }),
-            attachments: vec![
-                AttachmentMember {
-                    index: 0,
-                    display_name: Some("reverse-upload-two".to_owned()),
-                    media_type: "application/octet-stream".to_owned(),
-                    size_bytes: u64::try_from(second.len()).unwrap(),
-                    sha256: lowercase_hex_bytes(digest(&SHA256, &second).as_ref()),
-                },
-                AttachmentMember {
-                    index: 1,
-                    display_name: Some("reverse-upload-one".to_owned()),
-                    media_type: "application/octet-stream".to_owned(),
-                    size_bytes: u64::try_from(first.len()).unwrap(),
-                    sha256: lowercase_hex_bytes(digest(&SHA256, &first).as_ref()),
-                },
-            ],
+            inputs: BTreeMap::from([
+                (
+                    "request".to_owned(),
+                    ManifestInput::Text {
+                        size_bytes: 0,
+                        sha256: lowercase_hex_bytes(digest(&SHA256, &empty).as_ref()),
+                    },
+                ),
+                (
+                    "evidence".to_owned(),
+                    ManifestInput::Attachments {
+                        items: vec![
+                            AttachmentMember {
+                                index: 0,
+                                display_name: Some("reverse-upload-two".to_owned()),
+                                media_type: "application/octet-stream".to_owned(),
+                                size_bytes: u64::try_from(second.len()).unwrap(),
+                                sha256: lowercase_hex_bytes(digest(&SHA256, &second).as_ref()),
+                            },
+                            AttachmentMember {
+                                index: 1,
+                                display_name: Some("reverse-upload-one".to_owned()),
+                                media_type: "application/octet-stream".to_owned(),
+                                size_bytes: u64::try_from(first.len()).unwrap(),
+                                sha256: lowercase_hex_bytes(digest(&SHA256, &first).as_ref()),
+                            },
+                        ],
+                    },
+                ),
+            ]),
         };
-        let (broker, projection) = broker_for(manifest, vec![empty, second.clone(), first.clone()]);
+        let (broker, projection) = broker_for(manifest, vec![second.clone(), first.clone(), empty]);
         let private = tempfile::tempdir().unwrap();
-        let imports = materialize_projection(&broker, &projection, private.path()).unwrap();
-        assert_eq!(imports.prompt(), Some(""));
-        assert_eq!(imports.attachments()[0].bytes(), second);
-        assert_eq!(imports.attachments()[1].bytes(), first);
+        let inputs = materialize_projection(&broker, &projection, private.path()).unwrap();
+        assert_eq!(text_value(&inputs, "request"), "");
+        let attachments = attachment_values(&inputs, "evidence");
+        assert_eq!(attachments[0].bytes(), second);
+        assert_eq!(attachments[1].bytes(), first);
         assert_eq!(
-            imports.attachments()[0].diagnostic_source_name(),
+            attachments[0].diagnostic_source_name(),
             Some("reverse-upload-two")
         );
         assert_eq!(*broker.manifest_calls.lock().unwrap(), 1);
@@ -1368,7 +1457,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             names,
-            ["prompt", "attachment-000000", "attachment-000001"]
+            ["member-000000", "member-000001", "member-000002"]
                 .into_iter()
                 .map(std::ffi::OsString::from)
                 .collect()
@@ -1390,11 +1479,13 @@ mod tests {
     fn digest_mismatch_prevents_capabilities_and_downloads_and_null_projection_is_call_free() {
         let manifest = ManifestV1 {
             schema_version: 1,
-            prompt: Some(PromptMember {
-                size_bytes: 0,
-                sha256: lowercase_hex_bytes(digest(&SHA256, &[]).as_ref()),
-            }),
-            attachments: Vec::new(),
+            inputs: BTreeMap::from([(
+                "request".to_owned(),
+                ManifestInput::Text {
+                    size_bytes: 0,
+                    sha256: lowercase_hex_bytes(digest(&SHA256, &[]).as_ref()),
+                },
+            )]),
         };
         let (broker, mut projection) = broker_for(manifest, vec![Vec::new()]);
         projection.manifest_digest.value = "0".repeat(64);
@@ -1416,7 +1507,7 @@ mod tests {
             private.path(),
         )
         .unwrap();
-        assert_eq!(empty, ResolvedImports::default());
+        assert_eq!(empty, ResolvedInputs::default());
         assert_eq!(*broker.manifest_calls.lock().unwrap(), 1);
     }
 
@@ -1427,11 +1518,12 @@ mod tests {
             let (broker, projection) = broker_for(manifest, bodies);
             let private = tempfile::tempdir().unwrap();
 
-            let imports = materialize_projection(&broker, &projection, private.path()).unwrap();
+            let inputs = materialize_projection(&broker, &projection, private.path()).unwrap();
 
-            assert_eq!(imports.prompt(), Some("prompt"));
-            assert_eq!(imports.attachments().len(), member_count - 1);
-            for (index, attachment) in imports.attachments().iter().enumerate() {
+            assert_eq!(text_value(&inputs, "request"), "request");
+            let attachments = attachment_values(&inputs, "evidence");
+            assert_eq!(attachments.len(), member_count - 1);
+            for (index, attachment) in attachments.iter().enumerate() {
                 assert_eq!(attachment.bytes(), attachment_body(index));
             }
             let expected_ids = expected_member_ids(member_count);
@@ -1470,7 +1562,7 @@ mod tests {
         broker.expire_after_download = Some(Arc::clone(&expired));
         let private = tempfile::tempdir().unwrap();
 
-        let imports = materialize_with_clock(
+        let inputs = materialize_with_clock(
             Some(&broker),
             MaterializationIdentity {
                 assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1490,8 +1582,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(imports.prompt(), Some("prompt"));
-        assert_eq!(imports.attachments().len(), 2);
+        assert_eq!(text_value(&inputs, "request"), "request");
+        assert_eq!(attachment_values(&inputs, "evidence").len(), 2);
         assert_eq!(
             *broker.capability_calls.lock().unwrap(),
             vec![expected_member_ids(3), expected_member_ids(3)[1..].to_vec()]
@@ -1499,9 +1591,9 @@ mod tests {
         assert_eq!(
             *broker.download_calls.lock().unwrap(),
             vec![
-                fixture_member_url("prompt", 1),
-                fixture_member_url("attachments/000000", 2),
-                fixture_member_url("attachments/000001", 2),
+                fixture_member_url("inputs/evidence/000000", 1),
+                fixture_member_url("inputs/evidence/000001", 2),
+                fixture_member_url("inputs/request", 2),
             ]
         );
     }
@@ -1607,10 +1699,10 @@ mod tests {
         );
 
         for (body, expected) in [
-            (vec![0xff], RunInputFailure::PromptInvalid),
+            (vec![0xff], RunInputFailure::TextInvalid),
             (b"wrong".to_vec(), RunInputFailure::ContentMismatch),
         ] {
-            let declared = if expected == RunInputFailure::PromptInvalid {
+            let declared = if expected == RunInputFailure::TextInvalid {
                 body.clone()
             } else {
                 b"right".to_vec()
@@ -1618,11 +1710,13 @@ mod tests {
             let (broker, projection) = broker_for(
                 ManifestV1 {
                     schema_version: 1,
-                    prompt: Some(PromptMember {
-                        size_bytes: u64::try_from(declared.len()).unwrap(),
-                        sha256: lowercase_hex_bytes(digest(&SHA256, &declared).as_ref()),
-                    }),
-                    attachments: Vec::new(),
+                    inputs: BTreeMap::from([(
+                        "request".to_owned(),
+                        ManifestInput::Text {
+                            size_bytes: u64::try_from(declared.len()).unwrap(),
+                            sha256: lowercase_hex_bytes(digest(&SHA256, &declared).as_ref()),
+                        },
+                    )]),
                 },
                 vec![body],
             );
@@ -1636,40 +1730,50 @@ mod tests {
     }
 
     #[test]
-    fn materialized_imports_redact_private_values_from_debug() {
-        let prompt = b"prompt-debug-privacy-sentinel".to_vec();
+    fn materialized_inputs_redact_private_values_from_debug() {
+        let request = b"request-debug-privacy-sentinel".to_vec();
         let attachment = b"attachment-debug-privacy-sentinel".to_vec();
         let media_type = "application/x-debug-privacy-sentinel";
         let display_name = "display-debug-privacy-sentinel";
         let manifest = ManifestV1 {
             schema_version: 1,
-            prompt: Some(PromptMember {
-                size_bytes: u64::try_from(prompt.len()).unwrap(),
-                sha256: lowercase_hex_bytes(digest(&SHA256, &prompt).as_ref()),
-            }),
-            attachments: vec![AttachmentMember {
-                index: 0,
-                display_name: Some(display_name.to_owned()),
-                media_type: media_type.to_owned(),
-                size_bytes: u64::try_from(attachment.len()).unwrap(),
-                sha256: lowercase_hex_bytes(digest(&SHA256, &attachment).as_ref()),
-            }],
+            inputs: BTreeMap::from([
+                (
+                    "request".to_owned(),
+                    ManifestInput::Text {
+                        size_bytes: u64::try_from(request.len()).unwrap(),
+                        sha256: lowercase_hex_bytes(digest(&SHA256, &request).as_ref()),
+                    },
+                ),
+                (
+                    "evidence".to_owned(),
+                    ManifestInput::Attachments {
+                        items: vec![AttachmentMember {
+                            index: 0,
+                            display_name: Some(display_name.to_owned()),
+                            media_type: media_type.to_owned(),
+                            size_bytes: u64::try_from(attachment.len()).unwrap(),
+                            sha256: lowercase_hex_bytes(digest(&SHA256, &attachment).as_ref()),
+                        }],
+                    },
+                ),
+            ]),
         };
         let attachment_debug = format!("{attachment:?}");
-        let (broker, projection) = broker_for(manifest, vec![prompt.clone(), attachment]);
+        let (broker, projection) = broker_for(manifest, vec![attachment, request.clone()]);
         let private = tempfile::tempdir().unwrap();
-        let imports = materialize_projection(&broker, &projection, private.path()).unwrap();
-        let debug = format!("{imports:?}");
+        let inputs = materialize_projection(&broker, &projection, private.path()).unwrap();
+        let debug = format!("{inputs:?}");
 
         for private_value in [
-            std::str::from_utf8(&prompt).unwrap(),
+            std::str::from_utf8(&request).unwrap(),
             display_name,
             media_type,
             attachment_debug.as_str(),
         ] {
             assert!(
                 !debug.contains(private_value),
-                "materialized import Debug exposed a private Run Input value"
+                "materialized input Debug exposed a private Run Input value"
             );
         }
     }

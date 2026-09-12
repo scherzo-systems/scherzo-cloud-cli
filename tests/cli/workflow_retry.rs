@@ -158,6 +158,91 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
 }
 
 #[test]
+fn retry_reconstructs_named_inputs_after_original_sources_are_removed() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+inputs:
+  request: {kind: text}
+  evidence: {kind: attachments}
+steps:
+  execute:
+    kind: cmd
+    inputs:
+      request:
+        ref: inputs.request
+      evidence:
+        ref: inputs.evidence
+    command:
+      argv:
+        - sh
+        - -c
+        - >-
+          set -eu;
+          test "$(cat "$SCHERZO_STEP_INPUTS/values/request")" = retained-request;
+          { cat "$SCHERZO_STEP_INPUTS/collections/evidence/000000";
+            cat "$SCHERZO_STEP_INPUTS/collections/evidence/000001"; } > observed;
+          test "$RETRY_PHASE" = retry
+"#,
+    );
+    let request = bundle.source_root().join("runtime-request.txt");
+    let first = bundle.source_root().join("runtime-first.bin");
+    let second = bundle.source_root().join("runtime-second.bin");
+    fs::write(&request, b"retained-request").unwrap();
+    fs::write(&first, b"first-distinct|").unwrap();
+    fs::write(&second, b"second-value").unwrap();
+    let run_directory = bundle.result("retained-named-inputs");
+    let mut args = bundle.args(&run_directory);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-text-file".to_owned(),
+            "request".to_owned(),
+            request.to_string_lossy().into_owned(),
+            "--input-attachment".to_owned(),
+            "evidence".to_owned(),
+            "application/octet-stream".to_owned(),
+            first.to_string_lossy().into_owned(),
+            "--input-attachment".to_owned(),
+            "evidence".to_owned(),
+            "application/octet-stream".to_owned(),
+            second.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let initial = isolated_command(&args)
+        .env("RETRY_PHASE", "initial")
+        .output()
+        .unwrap();
+    assert_eq!(initial.status.code(), Some(1));
+    fs::write(&request, b"changed-request").unwrap();
+    fs::remove_file(&request).unwrap();
+    fs::remove_file(&first).unwrap();
+    fs::remove_file(&second).unwrap();
+
+    let retry = isolated_command(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ))
+    .env("RETRY_PHASE", "retry")
+    .output()
+    .unwrap();
+    assert!(
+        retry.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(
+        fs::read(bundle.execution_root().join("observed")).unwrap(),
+        b"first-distinct|second-value"
+    );
+}
+
+#[test]
 fn finalizer_retry_reruns_both_graphs_with_a_fresh_attempt() {
     let bundle = RunBundle::new(include_str!(
         "../fixtures/workflow-run/finalization-retry.yaml"

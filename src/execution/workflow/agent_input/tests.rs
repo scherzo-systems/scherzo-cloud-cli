@@ -16,7 +16,8 @@ use crate::execution::codex::{
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedInput, ResolvedInputs,
+    admit_workflow,
 };
 use crate::execution::workflow::agent::{AgentValueKind, NoopAgentObservationSink, WorkflowRunId};
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
@@ -153,18 +154,24 @@ impl Fixture {
         )
         .unwrap();
 
-        let imports = ResolvedImports::new(
-            Some(Arc::from("- imported prompt\n@ remains instruction text")),
-            Arc::from([
-                ResolvedAttachment::new(Arc::from("image/png"), Arc::from(*b"import-one"))
-                    .with_diagnostic_source_name(Arc::from("../../caller.png")),
-                ResolvedAttachment::new(
-                    Arc::from("text/plain; charset=utf-8"),
-                    Arc::from(*b"import-two"),
-                )
-                .with_diagnostic_source_name(Arc::from("@notes.txt")),
-            ]),
-        );
+        let inputs = ResolvedInputs::new(BTreeMap::from([
+            (
+                "request".to_owned(),
+                ResolvedInput::Text(Arc::from("- named request\n@ remains instruction text")),
+            ),
+            (
+                "evidence".to_owned(),
+                ResolvedInput::Attachments(Arc::from([
+                    ResolvedAttachment::new(Arc::from("image/png"), Arc::from(*b"input-one"))
+                        .with_diagnostic_source_name(Arc::from("../../caller.png")),
+                    ResolvedAttachment::new(
+                        Arc::from("text/plain; charset=utf-8"),
+                        Arc::from(*b"input-two"),
+                    )
+                    .with_diagnostic_source_name(Arc::from("@notes.txt")),
+                ])),
+            ),
+        ]));
         let mut context = execution_context(&execution_root);
         match consumer_harness {
             ConsumerHarness::Pi => {}
@@ -179,7 +186,7 @@ impl Fixture {
                 ));
             }
         }
-        let admitted = admit_workflow(resolved, imports, context).unwrap();
+        let admitted = admit_workflow(resolved, inputs, context).unwrap();
         let artifacts = ArtifactStaging::create(admitted.execution(), &staging_parent).unwrap();
         let captured = artifacts
             .capture_files(&[CaptureDeclaration::file(
@@ -265,9 +272,14 @@ fn workflow_source(mode: ConsumerValueMode, attachment_splices: usize) -> String
                 .to_owned()
         }
     };
-    let imported_attachments = "          - ref: imports.attachments\n".repeat(attachment_splices);
+    let named_attachments = "          - ref: inputs.evidence\n".repeat(attachment_splices);
     format!(
         r#"schemaVersion: 1
+inputs:
+  request:
+    kind: text
+  evidence:
+    kind: attachments
 agentProfiles:
   coding:
     harness:
@@ -320,11 +332,11 @@ steps:
       message:
         text:
           - file: prompts/message.md
-          - ref: imports.prompt
+          - ref: inputs.request
           - ref: outputs.responseProducer.response
         attachments:
           - file: attachments/static.bin
-{imported_attachments}          - ref: outputs.resultProducer.result
+{named_attachments}          - ref: outputs.resultProducer.result
           - ref: outputs.fileProducer.file
 {consumer_output}"#
     )
@@ -371,7 +383,7 @@ fn identity() -> AgentInvocationIdentity {
 }
 
 #[test]
-fn retained_imported_and_upstream_values_materialize_exactly_in_declared_order() {
+fn retained_named_and_upstream_values_materialize_exactly_in_declared_order() {
     let fixture = Fixture::new(ConsumerValueMode::Result);
     let materialized = fixture.materialize(CancellationSource::new()).unwrap();
     let invocation = materialized.invocation();
@@ -379,7 +391,7 @@ fn retained_imported_and_upstream_values_materialize_exactly_in_declared_order()
     assert_eq!(invocation.prompt().system_prompt(), SYSTEM_PROMPT);
     assert_eq!(
         invocation.prompt().message(),
-        "static - text\n\n\n- imported prompt\n@ remains instruction text\n\n@ upstream response"
+        "static - text\n\n\n- named request\n@ remains instruction text\n\n@ upstream response"
     );
     assert_eq!(
         invocation.process().cwd(),
@@ -410,12 +422,12 @@ fn retained_imported_and_upstream_values_materialize_exactly_in_declared_order()
             Some("attachments/static.bin"),
         ),
         (
-            b"import-one".as_slice(),
+            b"input-one".as_slice(),
             "image/png",
             Some("../../caller.png"),
         ),
         (
-            b"import-two".as_slice(),
+            b"input-two".as_slice(),
             "text/plain; charset=utf-8",
             Some("@notes.txt"),
         ),

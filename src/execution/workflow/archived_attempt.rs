@@ -915,7 +915,7 @@ fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::Resol
             .values()
             .filter_map(|reference| match &reference.source {
                 ResolvedValueSource::Output(source) => Some(source),
-                ResolvedValueSource::Import(_) | ResolvedValueSource::FinalizationContext => None,
+                ResolvedValueSource::Input(_) | ResolvedValueSource::FinalizationContext => None,
             })
             .collect(),
         ValidatedStep::Agent(agent) => agent
@@ -931,7 +931,7 @@ fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::Resol
                 } => Some(source),
                 ValidatedMessageSource::Reference {
                     source:
-                        ResolvedValueSource::Import(_) | ResolvedValueSource::FinalizationContext,
+                        ResolvedValueSource::Input(_) | ResolvedValueSource::FinalizationContext,
                     ..
                 }
                 | ValidatedMessageSource::File { .. } => None,

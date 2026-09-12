@@ -43,6 +43,9 @@ impl WorkflowBundle {
         let workflow = format!(
             r#"schemaVersion: 1
 description: {WORKFLOW_SENTINEL}
+inputs:
+  request:
+    kind: text
 agentProfiles:
   coding:
     harness:
@@ -69,7 +72,7 @@ steps:
       message:
         text:
           - file: ../prompts/message.md
-          - ref: imports.prompt
+          - ref: inputs.request
         attachments:
           - file: ../attachments/data.txt
           - ref: outputs.prepare.artifact
@@ -283,7 +286,10 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
     );
     assert_eq!(report["stepCount"], 3);
     assert_eq!(report["finalizerCount"], 0);
-    assert_eq!(report["requiredImports"], serde_json::json!(["prompt"]));
+    assert_eq!(
+        report["requiredInputs"],
+        serde_json::json!({"request": "text"})
+    );
     assert!(report.get("diagnostics").is_none());
     assert!(json.stdout.ends_with(b"\n"));
     assert!(json.stderr.is_empty());
@@ -391,7 +397,7 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
     let source = fs::read_to_string(missing_message_output.workflow_path())
         .expect("workflow should be readable");
     missing_message_output
-        .replace_workflow(&source.replace("ref: imports.prompt", "ref: outputs.missing.response"));
+        .replace_workflow(&source.replace("ref: inputs.request", "ref: outputs.missing.response"));
 
     for (bundle, expected_code, expected_location) in [
         (malformed, "malformed_yaml", "workflow"),
@@ -434,7 +440,7 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         assert!(report.get("digest").is_none());
         assert!(report.get("stepCount").is_none());
         assert!(report.get("finalizerCount").is_none());
-        assert!(report.get("requiredImports").is_none());
+        assert!(report.get("requiredInputs").is_none());
         assert!(json.stdout.len() < 2048);
         assert!(json.stdout.ends_with(b"\n"));
         assert!(json.stderr.is_empty());

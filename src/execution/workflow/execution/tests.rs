@@ -22,8 +22,8 @@ use crate::execution::codex::ValidatedCodexInstallation;
 use crate::execution::pi::ValidatedPiInstallation;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedImports,
-    admit_local_workflow, admit_workflow,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedInput,
+    ResolvedInputs, admit_local_workflow, admit_workflow,
 };
 use crate::execution::workflow::agent::scripted::{
     ScriptedAgentDispatcher, ScriptedAgentValue, scripted_agent_dispatcher,
@@ -261,7 +261,7 @@ struct ExecutionFixture {
 
 fn execution_fixture(
     source: &str,
-    imports: ResolvedImports,
+    imports: ResolvedInputs,
     environment: EnvironmentSnapshot,
     cancellation: CancellationSource,
     parallelism: usize,
@@ -281,7 +281,7 @@ fn execution_fixture(
 fn execution_fixture_with_source_files(
     source: &str,
     source_files: &[(&str, &[u8])],
-    imports: ResolvedImports,
+    imports: ResolvedInputs,
     environment: EnvironmentSnapshot,
     cancellation: CancellationSource,
     parallelism: usize,
@@ -403,7 +403,7 @@ exports:
 "#;
         let fixture = execution_fixture(
             source,
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([
                 ("PATH", "/bin:/usr/bin"),
                 ("EXPLICIT_VALUE", "retained"),
@@ -487,7 +487,7 @@ steps:
 "#;
         let fixture = execution_fixture(
             source,
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
             CancellationSource::new(),
             1,
@@ -546,7 +546,7 @@ exports:
 "#;
         let fixture = execution_fixture(
             source,
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
             CancellationSource::new(),
             1,
@@ -634,7 +634,7 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
             );
             let fixture = execution_fixture(
                 &source,
-                ResolvedImports::default(),
+                ResolvedInputs::default(),
                 EnvironmentSnapshot::new([(
                     OsString::from("PATH"),
                     env::var_os("PATH").unwrap(),
@@ -683,7 +683,7 @@ async fn configured_inactive_local_recovery_preserves_target_execution() {
     let source = "schemaVersion: 1\nsteps:\n  guarded:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: [\"/bin/sh\", \"-c\", \": > target-started\"]\n";
     let fixture = execution_fixture(
         source,
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
         CancellationSource::new(),
         1,
@@ -691,7 +691,7 @@ async fn configured_inactive_local_recovery_preserves_target_execution() {
     );
     let admitted = admit_local_workflow(
         resolution::resolve(&fixture.source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             fixture.execution_root.clone(),
             ExecutionPolicyLimits::new(
@@ -730,7 +730,7 @@ async fn command_stdin_fixture_process() {
             serde_json::to_string(&["sh", "-c", "if IFS= read -r unexpected; then exit 91; fi",])
                 .unwrap(),
         ),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         EnvironmentSnapshot::new([("PATH", path)]),
         CancellationSource::new(),
         1,
@@ -771,7 +771,7 @@ async fn command_finalizer_receives_the_engine_context_after_ordinary_quiescence
         );
         let fixture = execution_fixture(
             &source,
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             fixture_environment(&listener),
             CancellationSource::new(),
             1,
@@ -856,19 +856,25 @@ printf consumer-standard-output
 printf consumer-standard-error >&2
 "#;
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: imports.prompt\n      attachments:\n        ref: imports.attachments\n    command:\n      argv: {}\n    outputs:\n      produced:\n        kind: file\n        from: path\n        path: produced.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      artifact:\n        ref: outputs.produce.produced\n    command:\n      argv: {}\n    outputs:\n      delivered:\n        kind: file\n        from: path\n        path: exported.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.consume.delivered\n",
+            "schemaVersion: 1\ninputs:\n  request: {{kind: text}}\n  evidence: {{kind: attachments}}\nsteps:\n  produce:\n    kind: cmd\n    inputs:\n      prompt:\n        ref: inputs.request\n      attachments:\n        ref: inputs.evidence\n    command:\n      argv: {}\n    outputs:\n      produced:\n        kind: file\n        from: path\n        path: produced.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      artifact:\n        ref: outputs.produce.produced\n    command:\n      argv: {}\n    outputs:\n      delivered:\n        kind: file\n        from: path\n        path: exported.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.consume.delivered\n",
             serde_json::to_string(&["sh", "-c", producer_script]).unwrap(),
             serde_json::to_string(&["sh", "-c", consumer_script]).unwrap(),
         );
         let fixture = execution_fixture(
             &source,
-            ResolvedImports::new(
-                Some(Arc::from("typed prompt")),
-                Arc::from([
-                    ResolvedAttachment::new(Arc::from("text/plain"), Arc::from(*b"first")),
-                    ResolvedAttachment::new(Arc::from("text/plain"), Arc::from(*b"second")),
-                ]),
-            ),
+            ResolvedInputs::new(BTreeMap::from([
+                (
+                    "request".to_owned(),
+                    ResolvedInput::Text(Arc::from("typed request")),
+                ),
+                (
+                    "evidence".to_owned(),
+                    ResolvedInput::Attachments(Arc::from([
+                        ResolvedAttachment::new(Arc::from("text/plain"), Arc::from(*b"first")),
+                        ResolvedAttachment::new(Arc::from("text/plain"), Arc::from(*b"second")),
+                    ])),
+                ),
+            ])),
             EnvironmentSnapshot::new([("PATH", path)]),
             CancellationSource::new(),
             2,
@@ -910,7 +916,7 @@ printf consumer-standard-error >&2
             .artifacts
             .copy_to(file.handle(), &mut exported)
             .unwrap();
-        assert_eq!(exported, b"typed prompt|first|second");
+        assert_eq!(exported, b"typed request|first|second");
 
         let entries = entries
             .lock()
@@ -952,7 +958,7 @@ async fn failure_stops_new_work_but_retains_the_successful_sibling_output() {
         );
         let fixture = execution_fixture(
             &source,
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             fixture_environment(&listener),
             CancellationSource::new(),
             2,
@@ -1042,7 +1048,7 @@ async fn controlled_cancellation_orders_events_and_waits_for_terminal_delivery()
         environment.insert(OsString::from("WORKFLOW_FIXTURE_ROLE"), OsString::from("active"));
         let fixture = execution_fixture(
             &source,
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new(environment),
             cancellation.clone(),
             1,
@@ -1148,7 +1154,7 @@ async fn initial_cancellation_is_observed_without_starting_a_step() {
         assert!(cancellation.request_cancellation(CancellationReason::CallerOutputFailure));
         let fixture = execution_fixture(
             "schemaVersion: 1\nsteps:\n  never:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             cancellation,
             1,
@@ -1305,7 +1311,7 @@ async fn omitted_recovery_handler_cwd_inherits_agent_target_cwd() {
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("recovery.md", b"Inspect the target working directory.")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
             CancellationSource::new(),
             1,
@@ -1379,7 +1385,7 @@ async fn duplicate_key_agent_decision_stops_without_recheck() {
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("recovery.md", b"Submit a recovery decision.")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
             CancellationSource::new(),
             1,
@@ -1475,7 +1481,7 @@ async fn all_profiles_use_one_fresh_authoritative_recovery_protocol() {
                     "recovery.md",
                     b"Repair the generated workspace, then request a recheck.",
                 )],
-                ResolvedImports::default(),
+                ResolvedInputs::default(),
                 EnvironmentSnapshot::new([
                     ("PATH", "/bin:/usr/bin"),
                     ("SCHERZO_INHERITED", "must-be-scrubbed"),
@@ -1649,7 +1655,7 @@ async fn failed_agent_target_handler_and_recheck_use_three_fresh_accounted_invoc
                     b"Repair the workspace and request a recheck.",
                 ),
             ],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
             CancellationSource::new(),
             1,
@@ -1813,7 +1819,7 @@ async fn cancellation_waits_for_recovery_agent_quiescence_and_rejects_late_decis
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("recovery.md", b"Wait for operator control.")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
             cancellation.clone(),
             1,
@@ -1956,7 +1962,7 @@ exports:
                     br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
                 ),
             ],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             CancellationSource::new(),
             2,
@@ -2102,7 +2108,7 @@ exports:
                     br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
                 ),
             ],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             CancellationSource::new(),
             1,
@@ -2235,7 +2241,7 @@ async fn semantic_outputs_command_and_agent_path_matrix() {
                     br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
                 ),
             ],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             CancellationSource::new(),
             3,
@@ -2386,7 +2392,7 @@ exports:
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("prompt.md", b"produce output")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             CancellationSource::new(),
             1,
@@ -2488,7 +2494,7 @@ async fn run_no_value_agent_transcript() -> AgentEngineTranscript {
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("prompt.md", b"observe only")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             CancellationSource::new(),
             1,
@@ -2617,7 +2623,7 @@ async fn committed_agent_steps_release_staging_while_a_dependent_step_runs() {
             let fixture = execution_fixture_with_source_files(
                 &source,
                 &[("prompt.md", b"complete each step")],
-                ResolvedImports::default(),
+                ResolvedInputs::default(),
                 EnvironmentSnapshot::default(),
                 CancellationSource::new(),
                 1,
@@ -2704,7 +2710,7 @@ exports:
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("prompt.md", b"complete")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             cancellation.clone(),
             1,
@@ -2813,7 +2819,7 @@ exports:
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("prompt.md", b"execute")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             cancellation.clone(),
             3,
@@ -2949,7 +2955,7 @@ exports:
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("prompt.md", b"remain active")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             cancellation.clone(),
             1,
@@ -3047,7 +3053,7 @@ async fn harness_start_failure_is_a_start_failure() {
         let fixture = execution_fixture_with_source_files(
             &source,
             &[("prompt.md", b"start")],
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             EnvironmentSnapshot::default(),
             CancellationSource::new(),
             1,

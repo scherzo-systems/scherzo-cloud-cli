@@ -26,8 +26,8 @@ use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::admit_workflow;
 use crate::execution::workflow::admission::{
     AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
-    EnvironmentSnapshot, ExecutionContext, MAXIMUM_AGENT_PROMPT_BYTES, ResolvedAttachment,
-    ResolvedImports, admit_local_workflow, default_execution_policy_limits,
+    EnvironmentSnapshot, ExecutionContext, ResolvedAttachment, ResolvedInput, ResolvedInputs,
+    admit_local_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::agent::WorkflowRunId;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
@@ -77,15 +77,17 @@ use crate::exit_code::{ExitCode, OutcomeClass};
 pub(super) const ABOUT: &str = "Run a local command and agent workflow";
 pub(super) const AFTER_HELP: &str = "Interactive mode:
   Automatic mode uses the terminal interface only when stdin and stdout are terminals,
-  TERM is usable, and stdin is not reserved by --prompt-file -. Resize keeps the
+  TERM is usable, and stdin is not reserved by --input-text-file <NAME> -. Resize keeps the
   interface active; undersized terminals show a resize notice without changing modes.
   Use Up/Down or j/k to select steps, Enter to inspect logs, ? for complete help,
   Ctrl-C to request cancellation, and q to leave only after publication and cleanup.
   After q, Scherzo restores the terminal and prints the standard plain summary.";
 
+const MAXIMUM_INPUTS: usize = 256;
+const MAXIMUM_TEXT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_ATTACHMENTS: usize = 256;
 const MAXIMUM_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
-const MAXIMUM_TOTAL_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_TOTAL_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const CANCELLATION_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,19 +113,38 @@ pub(super) struct Command {
 
     #[arg(
         long,
-        value_name = "PATH",
-        help = "UTF-8 prompt file, or - to read standard input"
+        value_names = ["NAME", "TEXT"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named Text value"
     )]
-    prompt_file: Option<PathBuf>,
+    input_text: Vec<OsString>,
 
     #[arg(
         long,
-        value_names = ["MEDIA_TYPE", "PATH"],
+        value_names = ["NAME", "PATH"],
         num_args = 2,
         action = clap::ArgAction::Append,
-        help = "Append an immutable attachment with its declared media type"
+        help = "Supply one required named Text value from a regular file, or - for standard input"
     )]
-    attachment: Vec<OsString>,
+    input_text_file: Vec<OsString>,
+
+    #[arg(
+        long,
+        value_names = ["NAME", "MEDIA_TYPE", "PATH"],
+        num_args = 3,
+        action = clap::ArgAction::Append,
+        help = "Append an immutable member to a named attachment collection"
+    )]
+    input_attachment: Vec<OsString>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        action = clap::ArgAction::Append,
+        help = "Supply a present named attachment collection with no members"
+    )]
+    input_attachments_empty: Vec<String>,
 
     #[arg(
         long,
@@ -144,38 +165,38 @@ impl Command {
     }
 
     async fn execute_async(self) -> super::super::CommandResult {
-        let presentation_config = self.presentation_config();
+        let input_plan = plan_inputs(
+            &self.input_text,
+            &self.input_text_file,
+            &self.input_attachment,
+            &self.input_attachments_empty,
+        )
+        .map_err(|error| {
+            super::super::CommandFailure::with_exit_code(error, ExitCode::UsageError)
+        })?;
+        let presentation_config = self.presentation_config_with_input_plan(&input_plan);
         let cancellation = CancellationSource::new();
         let signal_task = match start_signal_observation(cancellation.clone()) {
             Ok(task) => task,
             Err(error) => return Err(error.into()),
         };
 
-        let imports =
-            match acquire_imports(self.prompt_file.as_deref(), &self.attachment, &cancellation)
-                .await
-            {
-                Ok(imports) => imports,
-                Err(error) => {
-                    signal_task.abort();
-                    let failure = match cancellation.cancellation_reason() {
-                        Some(CancellationReason::UserRequest) => {
-                            super::super::CommandFailure::for_outcome(
-                                error,
-                                OutcomeClass::Interrupted,
-                            )
-                        }
-                        Some(CancellationReason::TerminationRequest) => {
-                            super::super::CommandFailure::for_outcome(
-                                error,
-                                OutcomeClass::Terminated,
-                            )
-                        }
-                        _ => error.into(),
-                    };
-                    return Err(failure);
-                }
-            };
+        let inputs = match acquire_inputs(&input_plan, &cancellation).await {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                signal_task.abort();
+                let failure = match cancellation.cancellation_reason() {
+                    Some(CancellationReason::UserRequest) => {
+                        super::super::CommandFailure::for_outcome(error, OutcomeClass::Interrupted)
+                    }
+                    Some(CancellationReason::TerminationRequest) => {
+                        super::super::CommandFailure::for_outcome(error, OutcomeClass::Terminated)
+                    }
+                    _ => error.into(),
+                };
+                return Err(failure);
+            }
+        };
         let workflow =
             match resolve_workflow_file(&self.source.source_root, &self.source.workflow_file) {
                 Ok(workflow) => workflow,
@@ -200,7 +221,7 @@ impl Command {
                 });
             }
         };
-        let admitted = match admit_local_workflow(workflow.clone(), imports, context) {
+        let admitted = match admit_local_workflow(workflow.clone(), inputs, context) {
             Ok(admitted) => admitted,
             Err(failure) => {
                 signal_task.abort();
@@ -240,16 +261,24 @@ impl Command {
         .await
     }
 
-    fn presentation_config(&self) -> PresentationConfig {
-        self.presentation_config_with(TerminalCapabilities::detect())
-    }
-
-    fn presentation_config_with(&self, capabilities: TerminalCapabilities) -> PresentationConfig {
+    fn presentation_config_with_input_plan(&self, input_plan: &InputPlan) -> PresentationConfig {
         presentation_config_with(
             &self.presentation,
-            self.prompt_file.as_deref() == Some(Path::new("-")),
-            capabilities,
+            input_plan.standard_input_reserved,
+            TerminalCapabilities::detect(),
         )
+    }
+
+    #[cfg(test)]
+    fn presentation_config_with(&self, capabilities: TerminalCapabilities) -> PresentationConfig {
+        let standard_input_reserved = plan_inputs(
+            &self.input_text,
+            &self.input_text_file,
+            &self.input_attachment,
+            &self.input_attachments_empty,
+        )
+        .is_ok_and(|plan| plan.standard_input_reserved);
+        presentation_config_with(&self.presentation, standard_input_reserved, capabilities)
     }
 }
 
@@ -803,99 +832,252 @@ pub(super) fn execution_context_for_workflow(
     Ok(context)
 }
 
-async fn acquire_imports(
-    prompt_path: Option<&Path>,
-    attachments: &[OsString],
-    cancellation: &CancellationSource,
-) -> anyhow::Result<ResolvedImports> {
-    let prompt = match prompt_path {
-        None => None,
-        Some(path) if path == Path::new("-") => {
-            let bytes = read_stdin_bounded(MAXIMUM_AGENT_PROMPT_BYTES, cancellation)
-                .await
-                .map_err(|kind| import_error(kind, None))?;
-            Some(decode_prompt(bytes, None)?)
-        }
-        Some(path) => {
-            let file = open_regular_import(path).map_err(|kind| import_error(kind, Some(path)))?;
-            let bytes = read_bounded(file, MAXIMUM_AGENT_PROMPT_BYTES, cancellation)
-                .map_err(|kind| import_error(kind, Some(path)))?;
-            Some(decode_prompt(bytes, Some(path))?)
-        }
-    };
-
-    let pairs = attachments.chunks_exact(2);
-    if !pairs.remainder().is_empty() || pairs.len() > MAXIMUM_ATTACHMENTS {
-        return Err(anyhow!(
-            "acquire local workflow imports: attachment count exceeds 256"
-        ));
-    }
-    let mut total = 0_u64;
-    let mut resolved = Vec::with_capacity(pairs.len());
-    for pair in pairs {
-        if cancellation.is_cancelled() {
-            return Err(import_error(ImportFailureKind::Interrupted, None));
-        }
-        let media_type = pair[0].to_str().ok_or_else(|| {
-            anyhow!("acquire local workflow imports: an attachment media type is not valid UTF-8")
-        })?;
-        let path = Path::new(&pair[1]);
-        let file = open_regular_import(path).map_err(|kind| import_error(kind, Some(path)))?;
-        let remaining_total = MAXIMUM_TOTAL_ATTACHMENT_BYTES.saturating_sub(total);
-        let maximum = MAXIMUM_ATTACHMENT_BYTES.min(remaining_total);
-        let bytes = match read_bounded(file, maximum, cancellation) {
-            Err(ImportFailureKind::TooLarge) if maximum < MAXIMUM_ATTACHMENT_BYTES => {
-                return Err(attachment_bytes_error());
-            }
-            Err(kind) => return Err(import_error(kind, Some(path))),
-            Ok(bytes) => bytes,
-        };
-        let size = u64::try_from(bytes.len()).map_err(|_| attachment_bytes_error())?;
-        total = total
-            .checked_add(size)
-            .filter(|total| *total <= MAXIMUM_TOTAL_ATTACHMENT_BYTES)
-            .ok_or_else(attachment_bytes_error)?;
-        let attachment = ResolvedAttachment::new(Arc::from(media_type), Arc::from(bytes));
-        let attachment = if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-            attachment.with_diagnostic_source_name(Arc::from(name))
-        } else {
-            attachment
-        };
-        resolved.push(attachment);
-    }
-    Ok(ResolvedImports::new(prompt, Arc::from(resolved)))
+#[derive(Debug)]
+enum PlannedInput {
+    TextInline(Arc<str>),
+    TextFile(PathBuf),
+    Attachments(Vec<PlannedAttachment>),
 }
 
-fn import_error(kind: ImportFailureKind, path: Option<&Path>) -> anyhow::Error {
+#[derive(Debug)]
+struct PlannedAttachment {
+    media_type: Arc<str>,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct InputPlan {
+    values: std::collections::BTreeMap<String, PlannedInput>,
+    standard_input_reserved: bool,
+}
+
+fn plan_inputs(
+    text_values: &[OsString],
+    text_files: &[OsString],
+    attachments: &[OsString],
+    empty_attachments: &[String],
+) -> anyhow::Result<InputPlan> {
+    let mut values = std::collections::BTreeMap::new();
+    let inline = text_values.chunks_exact(2);
+    if !inline.remainder().is_empty() {
+        return Err(anyhow!("invalid --input-text binding"));
+    }
+    for binding in inline {
+        let name = input_argument(binding.first(), "input name")?;
+        let text = input_argument(binding.get(1), "Text value")?;
+        insert_scalar_input(&mut values, name, PlannedInput::TextInline(Arc::from(text)))?;
+    }
+    let files = text_files.chunks_exact(2);
+    if !files.remainder().is_empty() {
+        return Err(anyhow!("invalid --input-text-file binding"));
+    }
+    let mut standard_input_reserved = false;
+    for binding in files {
+        let name = input_argument(binding.first(), "input name")?;
+        let path = PathBuf::from(binding.get(1).ok_or_else(|| anyhow!("missing Text path"))?);
+        if path == Path::new("-") {
+            if standard_input_reserved {
+                return Err(anyhow!(
+                    "standard input may supply only one named Text input"
+                ));
+            }
+            standard_input_reserved = true;
+        }
+        insert_scalar_input(&mut values, name, PlannedInput::TextFile(path))?;
+    }
+    let members = attachments.chunks_exact(3);
+    if !members.remainder().is_empty() || members.len() > MAXIMUM_ATTACHMENTS {
+        return Err(anyhow!("invalid named attachment bindings"));
+    }
+    for binding in members {
+        let name = input_argument(binding.first(), "input name")?;
+        let media_type = input_argument(binding.get(1), "attachment media type")?;
+        let path = PathBuf::from(
+            binding
+                .get(2)
+                .ok_or_else(|| anyhow!("missing attachment path"))?,
+        );
+        match values.entry(name.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(PlannedInput::Attachments(vec![PlannedAttachment {
+                    media_type: Arc::from(media_type),
+                    path,
+                }]));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let PlannedInput::Attachments(items) = entry.get_mut() else {
+                    return Err(anyhow!("one input name has incompatible bindings"));
+                };
+                items.push(PlannedAttachment {
+                    media_type: Arc::from(media_type),
+                    path,
+                });
+            }
+        }
+    }
+    for name in empty_attachments {
+        validate_input_name(name)?;
+        insert_scalar_input(&mut values, name, PlannedInput::Attachments(Vec::new()))?;
+    }
+    if values.len() > MAXIMUM_INPUTS {
+        return Err(anyhow!("named input count exceeds 256"));
+    }
+    Ok(InputPlan {
+        values,
+        standard_input_reserved,
+    })
+}
+
+fn input_argument<'a>(value: Option<&'a OsString>, description: &str) -> anyhow::Result<&'a str> {
+    let value = value
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("{description} is not valid UTF-8"))?;
+    if description == "input name" {
+        validate_input_name(value)?;
+    }
+    Ok(value)
+}
+
+fn validate_input_name(name: &str) -> anyhow::Result<()> {
+    if !crate::execution::workflow::is_input_name(name) {
+        return Err(anyhow!("invalid Workflow V1 input name"));
+    }
+    Ok(())
+}
+
+fn insert_scalar_input(
+    values: &mut std::collections::BTreeMap<String, PlannedInput>,
+    name: &str,
+    input: PlannedInput,
+) -> anyhow::Result<()> {
+    validate_input_name(name)?;
+    if values.insert(name.to_owned(), input).is_some() {
+        return Err(anyhow!(
+            "one input name has duplicate or incompatible bindings"
+        ));
+    }
+    Ok(())
+}
+
+async fn acquire_inputs(
+    plan: &InputPlan,
+    cancellation: &CancellationSource,
+) -> anyhow::Result<ResolvedInputs> {
+    let mut total_bytes = 0_u64;
+    let mut values = std::collections::BTreeMap::new();
+    for (name, input) in &plan.values {
+        if cancellation.is_cancelled() {
+            return Err(input_error(
+                InputAcquisitionFailureKind::Interrupted,
+                name,
+                None,
+            ));
+        }
+        let value = match input {
+            PlannedInput::TextInline(text) => {
+                account_input_bytes(&mut total_bytes, text.len() as u64, MAXIMUM_TEXT_BYTES)?;
+                ResolvedInput::Text(Arc::clone(text))
+            }
+            PlannedInput::TextFile(path) => {
+                let bytes = if path == Path::new("-") {
+                    read_stdin_bounded(
+                        remaining_input_bytes(total_bytes, MAXIMUM_TEXT_BYTES),
+                        cancellation,
+                    )
+                    .await
+                    .map_err(|kind| input_error(kind, name, None))?
+                } else {
+                    let file = open_regular_input(path)
+                        .map_err(|kind| input_error(kind, name, Some(path)))?;
+                    read_bounded(
+                        file,
+                        remaining_input_bytes(total_bytes, MAXIMUM_TEXT_BYTES),
+                        cancellation,
+                    )
+                    .map_err(|kind| input_error(kind, name, Some(path)))?
+                };
+                account_input_bytes(
+                    &mut total_bytes,
+                    u64::try_from(bytes.len()).map_err(|_| input_bytes_error())?,
+                    MAXIMUM_TEXT_BYTES,
+                )?;
+                let text = String::from_utf8(bytes).map(Arc::from).map_err(|_| {
+                    input_error(InputAcquisitionFailureKind::InvalidUtf8, name, Some(path))
+                })?;
+                ResolvedInput::Text(text)
+            }
+            PlannedInput::Attachments(items) => {
+                let mut resolved = Vec::with_capacity(items.len());
+                for item in items {
+                    let file = open_regular_input(&item.path)
+                        .map_err(|kind| input_error(kind, name, Some(&item.path)))?;
+                    let bytes = read_bounded(
+                        file,
+                        remaining_input_bytes(total_bytes, MAXIMUM_ATTACHMENT_BYTES),
+                        cancellation,
+                    )
+                    .map_err(|kind| input_error(kind, name, Some(&item.path)))?;
+                    account_input_bytes(
+                        &mut total_bytes,
+                        u64::try_from(bytes.len()).map_err(|_| input_bytes_error())?,
+                        MAXIMUM_ATTACHMENT_BYTES,
+                    )?;
+                    resolved.push(ResolvedAttachment::new(
+                        Arc::clone(&item.media_type),
+                        Arc::from(bytes),
+                    ));
+                }
+                ResolvedInput::Attachments(Arc::from(resolved))
+            }
+        };
+        values.insert(name.clone(), value);
+    }
+    Ok(ResolvedInputs::new(values))
+}
+
+fn remaining_input_bytes(total: u64, per_value_limit: u64) -> u64 {
+    per_value_limit.min(MAXIMUM_TOTAL_INPUT_BYTES.saturating_sub(total))
+}
+
+fn account_input_bytes(total: &mut u64, size: u64, per_value_limit: u64) -> anyhow::Result<()> {
+    if size > per_value_limit {
+        return Err(input_bytes_error());
+    }
+    *total = total
+        .checked_add(size)
+        .filter(|total| *total <= MAXIMUM_TOTAL_INPUT_BYTES)
+        .ok_or_else(input_bytes_error)?;
+    Ok(())
+}
+
+fn input_error(
+    kind: InputAcquisitionFailureKind,
+    name: &str,
+    path: Option<&Path>,
+) -> anyhow::Error {
     let context = path.map_or_else(
-        || "acquire local workflow import".to_owned(),
-        |path| format!("acquire local workflow import {path:?}"),
+        || format!("acquire local workflow input {name}"),
+        |path| format!("acquire local workflow input {name} from {path:?}"),
     );
     anyhow!("{kind:?}").context(context)
 }
 
-fn attachment_bytes_error() -> anyhow::Error {
-    anyhow!("acquire local workflow imports: total attachment bytes exceed 268435456")
+fn input_bytes_error() -> anyhow::Error {
+    anyhow!("acquire local workflow inputs: an input byte bound was exceeded")
 }
 
-fn decode_prompt(bytes: Vec<u8>, path: Option<&Path>) -> anyhow::Result<Arc<str>> {
-    String::from_utf8(bytes)
-        .map(Arc::from)
-        .map_err(|_| import_error(ImportFailureKind::InvalidUtf8, path))
-}
-
-fn open_regular_import(path: &Path) -> Result<File, ImportFailureKind> {
+fn open_regular_input(path: &Path) -> Result<File, InputAcquisitionFailureKind> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|_| ImportFailureKind::Unavailable)?;
+        .map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
     if !file
         .metadata()
-        .map_err(|_| ImportFailureKind::Unavailable)?
+        .map_err(|_| InputAcquisitionFailureKind::Unavailable)?
         .is_file()
     {
-        return Err(ImportFailureKind::NotRegularFile);
+        return Err(InputAcquisitionFailureKind::NotRegularFile);
     }
     Ok(file)
 }
@@ -904,12 +1086,12 @@ fn read_bounded(
     mut reader: impl Read,
     maximum: u64,
     cancellation: &CancellationSource,
-) -> Result<Vec<u8>, ImportFailureKind> {
+) -> Result<Vec<u8>, InputAcquisitionFailureKind> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         if cancellation.is_cancelled() {
-            return Err(ImportFailureKind::Interrupted);
+            return Err(InputAcquisitionFailureKind::Interrupted);
         }
         let remaining = maximum.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let permitted = usize::try_from(remaining.saturating_add(1))
@@ -920,11 +1102,11 @@ fn read_bounded(
             Ok(read) => {
                 bytes.extend_from_slice(&buffer[..read]);
                 if u64::try_from(bytes.len()).map_or(true, |length| length > maximum) {
-                    return Err(ImportFailureKind::TooLarge);
+                    return Err(InputAcquisitionFailureKind::TooLarge);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return Err(ImportFailureKind::Read),
+            Err(_) => return Err(InputAcquisitionFailureKind::Read),
         }
     }
 }
@@ -932,21 +1114,22 @@ fn read_bounded(
 async fn read_stdin_bounded(
     maximum: u64,
     cancellation: &CancellationSource,
-) -> Result<Vec<u8>, ImportFailureKind> {
+) -> Result<Vec<u8>, InputAcquisitionFailureKind> {
     let standard_input = io::stdin();
-    let input =
-        rustix::io::dup(standard_input.as_fd()).map_err(|_| ImportFailureKind::Unavailable)?;
+    let input = rustix::io::dup(standard_input.as_fd())
+        .map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
     let original_flags =
-        fcntl_getfl(&standard_input).map_err(|_| ImportFailureKind::Unavailable)?;
+        fcntl_getfl(&standard_input).map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
     fcntl_setfl(&standard_input, original_flags | OFlags::NONBLOCK)
-        .map_err(|_| ImportFailureKind::Unavailable)?;
+        .map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
     let input = File::from(input);
     let async_input = match AsyncFd::new(input) {
         Ok(input) => input,
         Err(_) => {
-            fcntl_setfl(&standard_input, original_flags).map_err(|_| ImportFailureKind::Read)?;
+            fcntl_setfl(&standard_input, original_flags)
+                .map_err(|_| InputAcquisitionFailureKind::Read)?;
             let input = rustix::io::dup(standard_input.as_fd())
-                .map_err(|_| ImportFailureKind::Unavailable)?;
+                .map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
             return read_bounded(File::from(input), maximum, cancellation);
         }
     };
@@ -954,7 +1137,7 @@ async fn read_stdin_bounded(
     let mut buffer = [0_u8; 64 * 1024];
     let result = loop {
         if cancellation.is_cancelled() {
-            break Err(ImportFailureKind::Interrupted);
+            break Err(InputAcquisitionFailureKind::Interrupted);
         }
         let remaining = maximum.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let permitted = usize::try_from(remaining.saturating_add(1))
@@ -963,11 +1146,11 @@ async fn read_stdin_bounded(
         let mut ready = tokio::select! {
             biased;
             _ = cancellation.wait_for_cancellation() => {
-                break Err(ImportFailureKind::Interrupted);
+                break Err(InputAcquisitionFailureKind::Interrupted);
             }
             ready = async_input.readable() => match ready {
                 Ok(ready) => ready,
-                Err(_) => break Err(ImportFailureKind::Read),
+                Err(_) => break Err(InputAcquisitionFailureKind::Read),
             }
         };
         match ready.try_io(|inner| inner.get_ref().read(&mut buffer[..permitted])) {
@@ -975,16 +1158,16 @@ async fn read_stdin_bounded(
             Ok(Ok(read)) => {
                 bytes.extend_from_slice(&buffer[..read]);
                 if u64::try_from(bytes.len()).map_or(true, |length| length > maximum) {
-                    break Err(ImportFailureKind::TooLarge);
+                    break Err(InputAcquisitionFailureKind::TooLarge);
                 }
             }
             Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {}
-            Ok(Err(_)) => break Err(ImportFailureKind::Read),
+            Ok(Err(_)) => break Err(InputAcquisitionFailureKind::Read),
             Err(_) => {}
         }
     };
     drop(async_input);
-    fcntl_setfl(&standard_input, original_flags).map_err(|_| ImportFailureKind::Read)?;
+    fcntl_setfl(&standard_input, original_flags).map_err(|_| InputAcquisitionFailureKind::Read)?;
     result
 }
 
@@ -1761,8 +1944,8 @@ fn invalid_terminal_result_error() -> anyhow::Error {
     anyhow!("prepare authoritative local workflow terminal result")
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum ImportFailureKind {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InputAcquisitionFailureKind {
     Unavailable,
     NotRegularFile,
     Interrupted,
@@ -1780,10 +1963,13 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::ready;
     use std::io::Write;
+    use std::os::unix::fs::symlink;
     use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
     use rustix::fs::{FlockOperation, fcntl_lock};
     use time::format_description::well_known::Rfc3339;
 
@@ -1877,6 +2063,150 @@ mod tests {
         }
     }
 
+    fn os_arguments(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn named_input_planning_rejects_conflicts_before_source_io() {
+        let missing = "/path/that/must/not/be/read";
+        for (text, text_files, attachments, empty) in [
+            (
+                os_arguments(&["request", "inline"]),
+                os_arguments(&["request", missing]),
+                Vec::new(),
+                Vec::new(),
+            ),
+            (
+                Vec::new(),
+                os_arguments(&["first", "-", "second", "-"]),
+                Vec::new(),
+                Vec::new(),
+            ),
+            (
+                Vec::new(),
+                Vec::new(),
+                os_arguments(&["evidence", "text/plain", missing]),
+                vec!["evidence".to_owned()],
+            ),
+        ] {
+            assert!(plan_inputs(&text, &text_files, &attachments, &empty).is_err());
+        }
+    }
+
+    #[test]
+    fn named_input_planning_enforces_inclusive_name_and_member_bounds() {
+        let mut text = Vec::new();
+        for index in 0..MAXIMUM_INPUTS {
+            text.push(OsString::from(format!("input{index}")));
+            text.push(OsString::from("value"));
+        }
+        assert!(plan_inputs(&text, &[], &[], &[]).is_ok());
+        text.push(OsString::from("oneOver"));
+        text.push(OsString::from("value"));
+        assert!(plan_inputs(&text, &[], &[], &[]).is_err());
+
+        let mut attachments = Vec::new();
+        for index in 0..MAXIMUM_ATTACHMENTS {
+            attachments.extend([
+                OsString::from("evidence"),
+                OsString::from("application/octet-stream"),
+                OsString::from(format!("member-{index}")),
+            ]);
+        }
+        assert!(plan_inputs(&[], &[], &attachments, &[]).is_ok());
+        attachments.extend([
+            OsString::from("evidence"),
+            OsString::from("application/octet-stream"),
+            OsString::from("member-over"),
+        ]);
+        assert!(plan_inputs(&[], &[], &attachments, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn named_input_acquisition_preserves_empty_values_and_member_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        std::fs::write(&first, b"distinct-first").unwrap();
+        std::fs::write(&second, b"second-value").unwrap();
+        let attachments = vec![
+            OsString::from("evidence"),
+            OsString::from("text/plain"),
+            first.into_os_string(),
+            OsString::from("evidence"),
+            OsString::from("application/octet-stream"),
+            second.into_os_string(),
+        ];
+        let plan = plan_inputs(
+            &os_arguments(&["request", ""]),
+            &[],
+            &attachments,
+            &["emptyEvidence".to_owned()],
+        )
+        .unwrap();
+        let inputs = acquire_inputs(&plan, &CancellationSource::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            inputs.get("request"),
+            Some(ResolvedInput::Text(value)) if value.is_empty()
+        ));
+        let Some(ResolvedInput::Attachments(values)) = inputs.get("evidence") else {
+            panic!("named attachment collection is missing");
+        };
+        assert_eq!(values[0].bytes(), b"distinct-first");
+        assert_eq!(values[1].bytes(), b"second-value");
+        assert!(matches!(
+            inputs.get("emptyEvidence"),
+            Some(ResolvedInput::Attachments(values)) if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn named_input_paths_follow_regular_symlinks_and_reject_nonregular_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let regular = temporary.path().join("regular");
+        let link = temporary.path().join("link");
+        let fifo = temporary.path().join("fifo");
+        std::fs::write(&regular, b"regular-bytes").unwrap();
+        symlink(&regular, &link).unwrap();
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        let file = open_regular_input(&link).unwrap();
+        assert_eq!(
+            read_bounded(file, 32, &CancellationSource::new()).unwrap(),
+            b"regular-bytes"
+        );
+        assert_eq!(
+            open_regular_input(temporary.path()).unwrap_err(),
+            InputAcquisitionFailureKind::NotRegularFile
+        );
+        assert_eq!(
+            open_regular_input(&fifo).unwrap_err(),
+            InputAcquisitionFailureKind::NotRegularFile
+        );
+    }
+
+    #[test]
+    fn input_reader_accepts_exact_limit_and_rejects_one_over() {
+        let cancellation = CancellationSource::new();
+        let exact = vec![b'x'; 17];
+        assert_eq!(
+            read_bounded(io::Cursor::new(exact.clone()), 17, &cancellation).unwrap(),
+            exact
+        );
+        assert_eq!(
+            read_bounded(io::Cursor::new(vec![b'y'; 18]), 17, &cancellation),
+            Err(InputAcquisitionFailureKind::TooLarge)
+        );
+
+        let mut aggregate = MAXIMUM_TOTAL_INPUT_BYTES - 1;
+        account_input_bytes(&mut aggregate, 1, MAXIMUM_ATTACHMENT_BYTES).unwrap();
+        assert_eq!(aggregate, MAXIMUM_TOTAL_INPUT_BYTES);
+        assert!(account_input_bytes(&mut aggregate, 1, MAXIMUM_ATTACHMENT_BYTES).is_err());
+    }
+
     #[test]
     fn local_context_discovers_a_recovery_only_agent_harness() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1915,8 +2245,10 @@ mod tests {
                 execution_root: PathBuf::from("execution"),
             },
             run_dir: PathBuf::from("run"),
-            prompt_file: None,
-            attachment: Vec::new(),
+            input_text: Vec::new(),
+            input_text_file: Vec::new(),
+            input_attachment: Vec::new(),
+            input_attachments_empty: Vec::new(),
             max_parallel: 2,
             presentation: super::super::PresentationOptions {
                 plain: false,
@@ -1978,7 +2310,7 @@ mod tests {
         let workflow = resolve(&source_root, Path::new("workflow.yaml")).unwrap();
         let admitted = admit_workflow(
             workflow.clone(),
-            ResolvedImports::default(),
+            ResolvedInputs::default(),
             execution_context_for_workflow(&workflow, execution_root, 1, CancellationSource::new())
                 .unwrap(),
         )

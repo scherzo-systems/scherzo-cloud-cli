@@ -167,6 +167,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_run_input_union_consumes_its_discriminator_once() {
+        let entry = generated::models::RunInputManifestEntry::Text(Box::new(
+            generated::models::RunInputTextEntry::new(
+                generated::models::run_input_text_entry::Kind::Text,
+                0,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            ),
+        ));
+
+        let encoded = serde_json::to_string(&entry).expect("Run Input entry should encode");
+        assert_eq!(encoded.matches("\"kind\"").count(), 1);
+        assert!(matches!(
+            serde_json::from_str::<generated::models::RunInputManifestEntry>(&encoded)
+                .expect("Run Input entry should decode"),
+            generated::models::RunInputManifestEntry::Text(_)
+        ));
+    }
+
+    #[test]
     fn generated_audit_page_decodes_closed_variants() {
         let input = serde_json::json!({
             "items": [

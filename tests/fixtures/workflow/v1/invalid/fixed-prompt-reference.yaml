@@ -1,0 +1,9 @@
+schemaVersion: 1
+steps:
+  consume:
+    kind: cmd
+    inputs:
+      request:
+        ref: imports.prompt
+    command:
+      argv: ["true"]

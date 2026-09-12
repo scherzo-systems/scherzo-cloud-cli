@@ -12,7 +12,7 @@ use super::capacity::{CapacityCalculationFailure, WorkflowCapacity, resolve_work
 use super::result_validation::{JsonSchemaSupportFailure, RetainedJsonSchema};
 use super::schema_common::lowercase_hex;
 use super::validated::{
-    RequiredImports, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNodeRole,
+    RequiredInputs, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNodeRole,
 };
 use super::validation::{ValidationFailureKind, ValidationLocation};
 use super::{DecodeFailureKind, decode, validation};
@@ -157,8 +157,8 @@ pub(crate) struct ResolvedWorkflow {
 }
 
 impl ResolvedWorkflow {
-    pub(crate) fn required_imports(&self) -> RequiredImports {
-        self.definition.required_imports
+    pub(crate) fn required_inputs(&self) -> &RequiredInputs {
+        &self.definition.required_inputs
     }
 
     pub(crate) fn source_bytes(&self, canonical_path: &str) -> Option<&[u8]> {

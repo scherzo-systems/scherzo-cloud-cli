@@ -113,7 +113,7 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
         },
         "inputs": {
             "inputSetId": INPUT_SET_ID,
-            "promptPresent": true,
+            "inputCount": 2,
             "attachmentCount": 2,
             "aggregateBytes": 4096,
             "availability": "available"

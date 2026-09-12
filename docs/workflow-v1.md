@@ -10,9 +10,8 @@ Full language reference: <https://docs.scherzo.dev/reference/workflow-v1.md>
 
 Raw schema: <https://docs.scherzo.dev/schemas/workflow-v1.schema.json>
 
-This is the concise, version-aligned authoring reference embedded in the installed
-`scherzo-cloud` executable. It covers Workflow V1 authoring and definition validation;
-it is not a runbook for executing workflows or changing a repository.
+This concise, version-aligned reference is embedded in `scherzo-cloud`. It covers
+Workflow V1 authoring and definition validation, not execution or repository changes.
 
 ## Authoring loop
 
@@ -54,6 +53,7 @@ it is not a runbook for executing workflows or changing a repository.
 | --- | --- | --- |
 | `schemaVersion` | yes | Integer `1`. |
 | `description` | no | Human metadata with no execution effect. |
+| `inputs` | no | Required named `text` and `attachments` declarations. |
 | `agentProfiles` | no | Workflow-local harness configurations. |
 | `steps` | yes | At least one ordinary `cmd` or `agent` node. |
 | `finalizers` | no | Nodes considered after the ordinary phase. |
@@ -78,7 +78,7 @@ activates.
 - `dependsOn` names unique ordinary steps and creates control-only ordering.
 - An `outputs.<step>.<output>` reference creates a direct inferred data edge. Naming
   the same producer in `dependsOn` is valid and retains both data and control origins.
-- The combined graph must be acyclic. Imports and exports do not create graph edges.
+- The combined graph must be acyclic. Workflow inputs and exports do not create graph edges.
 - A required failure stops new ordinary starts and fails the ordinary outcome. An
   advisory failure remains visible, permits control-only dependents, and does not fail
   the workflow by itself.
@@ -95,11 +95,9 @@ activates.
 
 ## Conditional steps and finalizers
 
-A command, agent step, or finalizer may declare one `condition`, using only `all`, `any`,
-`not`, `equals`, `exists`, and `disposition`. Operands are committed Text or JSON values,
-`imports.prompt`, phase-valid outputs, finalizer-only `finalization.context`, or a prior
-node's terminal disposition. Equality is same-kind without coercion; JSON Pointer follows
-RFC 6901.
+A node `condition` uses `all`, `any`, `not`, `equals`, `exists`, or `disposition`.
+Values are named Text inputs, committed Text/JSON outputs, finalizer-only context, or
+terminal dispositions. Equality never coerces kinds; JSON Pointer follows RFC 6901.
 
 Resolution retains every referenced output and disposition in the static graph, even if
 evaluation short-circuits. Evaluation occurs at most once before body readiness. True
@@ -157,15 +155,15 @@ inputs:
 
 | Reference | Type and availability |
 | --- | --- |
-| `imports.prompt` | Optional UTF-8 text; required at admission when referenced. |
-| `imports.attachments` | Ordered attachment collection, possibly empty. |
+| `inputs.<name>` | The exact required declared Text or attachment-collection value. |
 | `outputs.<node>.<output>` | The declared output's exact type. |
 | `finalization.context` | Engine-owned JSON; finalizer command input or agent attachment only. |
 
-Ordinary nodes may reference imports and ordinary outputs. Finalizers may additionally
-reference finalizer outputs and `finalization.context`. Exports accept only output
-references. Text, JSON, files, attachment collections, and Git branches are distinct;
-V1 performs no implicit conversion.
+Ordinary nodes may reference inputs and ordinary outputs; finalizers may also reference
+finalizer outputs and `finalization.context`. Inputs add no edge. Conditions admit Text,
+not collections. All declarations are required; empty values must be explicit. This
+release accepts only `text` and `attachments`; root JSON/File declarations are invalid.
+Exports accept only outputs. V1 never converts types.
 
 ## Agent profiles
 
@@ -193,6 +191,12 @@ through the link, the run emits a `Claude Code native transcript capture missing
 warning. The retained transcript is diagnostic only.
 
 ```yaml
+inputs:
+  request:
+    kind: text
+  updates:
+    kind: attachments
+
 agentProfiles:
   coding:
     harness:
@@ -210,9 +214,9 @@ steps:
       message:
         text:
           - file: ../prompts/review-request.md
-          - ref: imports.prompt
+          - ref: inputs.request
         attachments:
-          - ref: imports.attachments
+          - ref: inputs.updates
     outputs:
       response:
         kind: text

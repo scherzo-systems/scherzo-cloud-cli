@@ -983,7 +983,7 @@ impl From<models::OrganizationAuditChange> for OrganizationAuditChange {
             Field::CapabilityExpiresAt => "capability_expires_at",
             Field::ProjectId => "project_id",
             Field::ExportName => "export_name",
-            Field::PromptPresent => "prompt_present",
+            Field::InputCount => "input_count",
             Field::AttachmentCount => "attachment_count",
             Field::AggregateSizeBytes => "aggregate_size_bytes",
             Field::HeadOid => "head_oid",

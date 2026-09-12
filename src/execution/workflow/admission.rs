@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 #[cfg(test)]
@@ -497,32 +497,40 @@ impl ResolvedAttachment {
     }
 }
 
-#[derive(Clone, Default, Eq, PartialEq)]
-pub(crate) struct ResolvedImports {
-    prompt: Option<Arc<str>>,
-    attachments: Arc<[ResolvedAttachment]>,
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) enum ResolvedInput {
+    Text(Arc<str>),
+    Attachments(Arc<[ResolvedAttachment]>),
 }
 
-impl std::fmt::Debug for ResolvedImports {
+impl std::fmt::Debug for ResolvedInput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ResolvedImports(<redacted>)")
+        formatter.write_str("ResolvedInput(<redacted>)")
     }
 }
 
-impl ResolvedImports {
-    pub(crate) fn new(prompt: Option<Arc<str>>, attachments: Arc<[ResolvedAttachment]>) -> Self {
-        Self {
-            prompt,
-            attachments,
-        }
+#[derive(Clone, Default, Eq, PartialEq)]
+pub(crate) struct ResolvedInputs {
+    values: BTreeMap<String, ResolvedInput>,
+}
+
+impl std::fmt::Debug for ResolvedInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedInputs(<redacted>)")
+    }
+}
+
+impl ResolvedInputs {
+    pub(crate) fn new(values: BTreeMap<String, ResolvedInput>) -> Self {
+        Self { values }
     }
 
-    pub(crate) fn prompt(&self) -> Option<&str> {
-        self.prompt.as_deref()
+    pub(crate) fn values(&self) -> &BTreeMap<String, ResolvedInput> {
+        &self.values
     }
 
-    pub(crate) fn attachments(&self) -> &[ResolvedAttachment] {
-        &self.attachments
+    pub(crate) fn get(&self, name: &str) -> Option<&ResolvedInput> {
+        self.values.get(name)
     }
 }
 
@@ -1099,7 +1107,7 @@ impl AdmittedHarness {
 #[derive(Clone, Debug)]
 pub(crate) struct AdmittedWorkflow {
     workflow: Arc<ResolvedWorkflow>,
-    imports: ResolvedImports,
+    inputs: ResolvedInputs,
     execution: AdmittedExecutionContext,
     agent_steps: Arc<BTreeMap<String, AdmittedHarness>>,
     recovery_handlers: Arc<BTreeMap<String, AdmittedHarness>>,
@@ -1112,8 +1120,8 @@ impl AdmittedWorkflow {
         &self.workflow
     }
 
-    pub(crate) fn imports(&self) -> &ResolvedImports {
-        &self.imports
+    pub(crate) fn inputs(&self) -> &ResolvedInputs {
+        &self.inputs
     }
 
     pub(crate) fn execution(&self) -> &AdmittedExecutionContext {
@@ -1152,7 +1160,9 @@ impl AdmittedWorkflow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionFailureKind {
-    MissingRequiredPrompt,
+    MissingRequiredInput,
+    UnexpectedInput,
+    InputKindMismatch,
     InvalidAttachmentMediaType,
     AgentStepRuntimeUnsupported,
     ExecutionRootUnavailable,
@@ -1189,8 +1199,8 @@ pub(crate) enum AdmissionFailureKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionLocation {
-    PromptImport,
-    AttachmentImport { index: usize },
+    Input { name: String },
+    AttachmentInput { name: String, index: usize },
     Step { step: String },
     RecoveryHandler { step: String },
     ExecutionRoot,
@@ -1268,20 +1278,20 @@ impl std::error::Error for AdmissionFailure {}
 
 pub(crate) fn admit_local_workflow(
     workflow: ResolvedWorkflow,
-    imports: ResolvedImports,
+    inputs: ResolvedInputs,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    admit_workflow(workflow, imports, context)
+    admit_workflow(workflow, inputs, context)
 }
 
 pub(crate) fn admit_runner_workflow(
     workflow: ResolvedWorkflow,
-    imports: ResolvedImports,
+    inputs: ResolvedInputs,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
     admit_workflow_for(
         workflow,
-        imports,
+        inputs,
         context,
         WorkflowExecutionContract::WorkflowV1CloudInputsArtifactsV1,
     )
@@ -1289,12 +1299,12 @@ pub(crate) fn admit_runner_workflow(
 
 pub(crate) fn admit_workflow(
     workflow: ResolvedWorkflow,
-    imports: ResolvedImports,
+    inputs: ResolvedInputs,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
     admit_workflow_for(
         workflow,
-        imports,
+        inputs,
         context,
         WorkflowExecutionContract::General,
     )
@@ -1302,28 +1312,59 @@ pub(crate) fn admit_workflow(
 
 fn admit_workflow_for(
     workflow: ResolvedWorkflow,
-    imports: ResolvedImports,
+    inputs: ResolvedInputs,
     context: ExecutionContext,
     execution_contract: WorkflowExecutionContract,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
     let capacity = admit_capacity(&workflow, context.capacity_budget, execution_contract)?;
-    if workflow.required_imports().prompt && imports.prompt().is_none() {
-        return Err(AdmissionFailure::new(
-            AdmissionFailureKind::MissingRequiredPrompt,
-            AdmissionLocation::PromptImport,
-        ));
-    }
-
-    if let Some((index, _)) = imports
-        .attachments()
-        .iter()
-        .enumerate()
-        .find(|(_, attachment)| !super::is_valid_media_type(attachment.media_type()))
+    let declared = workflow.required_inputs();
+    for name in declared
+        .keys()
+        .chain(inputs.values().keys())
+        .collect::<BTreeSet<_>>()
     {
-        return Err(AdmissionFailure::new(
-            AdmissionFailureKind::InvalidAttachmentMediaType,
-            AdmissionLocation::AttachmentImport { index },
-        ));
+        let declaration = declared.get(name.as_str());
+        let supplied = inputs.get(name);
+        match (declaration, supplied) {
+            (Some(_), None) => {
+                return Err(AdmissionFailure::new(
+                    AdmissionFailureKind::MissingRequiredInput,
+                    AdmissionLocation::Input { name: name.clone() },
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(AdmissionFailure::new(
+                    AdmissionFailureKind::UnexpectedInput,
+                    AdmissionLocation::Input { name: name.clone() },
+                ));
+            }
+            (Some(super::validated::WorkflowValueType::Text), Some(ResolvedInput::Text(_))) => {}
+            (
+                Some(super::validated::WorkflowValueType::AttachmentCollection),
+                Some(ResolvedInput::Attachments(attachments)),
+            ) => {
+                if let Some((index, _)) = attachments
+                    .iter()
+                    .enumerate()
+                    .find(|(_, attachment)| !super::is_valid_media_type(attachment.media_type()))
+                {
+                    return Err(AdmissionFailure::new(
+                        AdmissionFailureKind::InvalidAttachmentMediaType,
+                        AdmissionLocation::AttachmentInput {
+                            name: name.clone(),
+                            index,
+                        },
+                    ));
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err(AdmissionFailure::new(
+                    AdmissionFailureKind::InputKindMismatch,
+                    AdmissionLocation::Input { name: name.clone() },
+                ));
+            }
+            (None, None) => {}
+        }
     }
 
     let available_harnesses = AvailableHarnesses::new(
@@ -1509,7 +1550,7 @@ fn admit_workflow_for(
     };
     Ok(AdmittedWorkflow {
         workflow: Arc::new(workflow),
-        imports,
+        inputs,
         execution,
         agent_steps: Arc::new(agent_steps),
         recovery_handlers: Arc::new(recovery_handlers),

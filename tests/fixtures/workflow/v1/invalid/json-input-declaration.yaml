@@ -1,0 +1,9 @@
+schemaVersion: 1
+inputs:
+  request:
+    kind: json
+steps:
+  consume:
+    kind: cmd
+    command:
+      argv: ["true"]

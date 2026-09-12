@@ -10,7 +10,7 @@ use serde_json::json;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, InputLimits, ResolvedImports, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,
 };
 use crate::execution::workflow::agent::AgentFailureCause;
 use crate::execution::workflow::resolution;
@@ -130,7 +130,7 @@ fn context_schema_one_materializes_every_required_current_and_prior_round_fact()
     .unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedImports::default(),
+        ResolvedInputs::default(),
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(

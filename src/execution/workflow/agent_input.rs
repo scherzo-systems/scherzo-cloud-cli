@@ -14,7 +14,7 @@ use rustix::io::Errno;
 
 use super::admission::{
     AdmittedExecutionContext, AdmittedHarness, AdmittedWorkflow, CancellationReason,
-    CancellationSource,
+    CancellationSource, ResolvedInput,
 };
 use super::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
@@ -47,7 +47,7 @@ use super::result_validation::RetainedJsonSchema;
 use super::step_runtime::{WorkingDirectoryFailure, resolve_working_directory};
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedMessageSource,
-    ValidatedRecoveryHandler, ValidatedStep, WorkflowImport, WorkflowValueType,
+    ValidatedRecoveryHandler, ValidatedStep, WorkflowValueType,
 };
 use super::value::CapturedValue;
 
@@ -1111,12 +1111,14 @@ fn resolve_text<'a>(
     match source {
         ValidatedMessageSource::File { path } => retained_text(admitted, path),
         ValidatedMessageSource::Reference {
-            source: ResolvedValueSource::Import(WorkflowImport::Prompt),
+            source: ResolvedValueSource::Input(name),
             value_type: WorkflowValueType::Text,
-        } => admitted
-            .imports()
-            .prompt()
-            .ok_or_else(|| start_error(AgentInputStartFailure::InputsUnavailable)),
+        } => match admitted.inputs().get(name) {
+            Some(ResolvedInput::Text(text)) => Ok(text),
+            Some(ResolvedInput::Attachments(_)) | None => {
+                Err(start_error(AgentInputStartFailure::InputsUnavailable))
+            }
+        },
         ValidatedMessageSource::Reference {
             source: ResolvedValueSource::Output(source),
             value_type: WorkflowValueType::Text,
@@ -1155,10 +1157,14 @@ fn resolve_attachments<'a>(
             )?;
         }
         ValidatedMessageSource::Reference {
-            source: ResolvedValueSource::Import(WorkflowImport::Attachments),
+            source: ResolvedValueSource::Input(name),
             value_type: WorkflowValueType::AttachmentCollection,
         } => {
-            for attachment in admitted.imports().attachments() {
+            let Some(ResolvedInput::Attachments(input_attachments)) = admitted.inputs().get(name)
+            else {
+                return Err(start_error(AgentInputStartFailure::InputsUnavailable));
+            };
+            for attachment in input_attachments.iter() {
                 budget.push(
                     PlannedAgentAttachment {
                         payload: PlannedAttachment::Bytes(attachment.bytes()),

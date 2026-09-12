@@ -23,7 +23,7 @@ use super::workspace::{
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
-    CancellationSource, EnvironmentSnapshot, ExecutionContext, ResolvedImports,
+    CancellationSource, EnvironmentSnapshot, ExecutionContext, ResolvedInputs,
     SourceRevisionProvenance, WorkflowCapacityBudget, admit_runner_workflow,
     default_execution_policy_limits,
 };
@@ -1263,7 +1263,7 @@ impl AdmissionRuntime {
         offer: &AssignmentOffer,
         root: AssignmentRoot,
         workflow: crate::execution::workflow::resolution::ResolvedWorkflow,
-        imports: ResolvedImports,
+        inputs: ResolvedInputs,
         git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
         authority: PreparationAuthority<'_>,
     ) -> Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>> {
@@ -1286,7 +1286,7 @@ impl AdmissionRuntime {
                     .map_err(|_| environment_unavailable())?,
                 carried.encoded_outbox_bytes,
             )?;
-            let admitted = admit_runner_workflow(workflow, imports, context)
+            let admitted = admit_runner_workflow(workflow, inputs, context)
                 .map_err(|failure| admission_decline(failure, cloud_git_capture))?;
             authority.ensure_current()?;
             if admitted.capacity().maximum_transitions != carried.selected_maximum_transitions {
@@ -1809,7 +1809,7 @@ impl AssignmentManager {
                 )
                 .map_err(materialization_decline)?;
                 runtime.progress(&worker_offer, 2, "input_download")?;
-                let imports = super::run_inputs::materialize(
+                let inputs = super::run_inputs::materialize(
                     input_broker.as_deref(),
                     &worker_offer.assignment_id,
                     &worker_offer.execution_spec.execution_spec_id,
@@ -1822,10 +1822,10 @@ impl AssignmentManager {
                 runtime.progress(&worker_offer, 3, "workflow_admission")?;
                 let materialized = super::source::resolve_checkout(checkout, &worker_cancellation)
                     .map_err(materialization_decline)?;
-                Ok::<_, AssignmentDecline>((materialized, imports))
+                Ok::<_, AssignmentDecline>((materialized, inputs))
             }));
             let admission = match preparation {
-                Ok(Ok((materialized, imports))) => {
+                Ok(Ok((materialized, inputs))) => {
                     root.execution = materialized.execution_root;
                     let workflow_git = std::env::current_exe()
                         .map_err(anyhow::Error::from)
@@ -1850,7 +1850,7 @@ impl AssignmentManager {
                                 &worker_offer,
                                 root,
                                 materialized.workflow,
-                                imports,
+                                inputs,
                                 materialized.git_capture,
                                 PreparationAuthority {
                                     deadline,
@@ -3557,8 +3557,8 @@ fn run_input_decline(failure: RunInputFailure) -> AssignmentDecline {
         RunInputFailure::ContentMismatch => AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::InputContentMismatch,
         ),
-        RunInputFailure::PromptInvalid => {
-            AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::InputPromptInvalid)
+        RunInputFailure::TextInvalid => {
+            AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::InputTextInvalid)
         }
     }
 }
@@ -5151,9 +5151,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 ),
             ),
             (
-                RunInputFailure::PromptInvalid,
+                RunInputFailure::TextInvalid,
                 AssignmentDecline::ExecutionSpecInvalid(
-                    ExecutionSpecInvalidReason::InputPromptInvalid,
+                    ExecutionSpecInvalidReason::InputTextInvalid,
                 ),
             ),
         ];
