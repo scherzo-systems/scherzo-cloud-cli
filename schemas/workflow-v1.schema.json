@@ -56,6 +56,15 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "json" },
+            "schema": { "$ref": "#/$defs/SourceRelativePath" }
+          },
+          "required": ["kind"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "properties": { "kind": { "const": "attachments" } },
           "required": ["kind"]
         }

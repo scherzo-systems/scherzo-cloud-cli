@@ -6,7 +6,7 @@ use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
     ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedInput, ResolvedInputs,
-    admit_runner_workflow, admit_workflow,
+    ResolvedJsonInput, admit_runner_workflow, admit_workflow,
 };
 use crate::execution::workflow::resolution;
 
@@ -97,6 +97,7 @@ fn definition(
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
         maximum_transitions: 10_000,
         text_inputs: BTreeMap::new(),
+        json_inputs: BTreeMap::new(),
     }
 }
 
@@ -416,6 +417,7 @@ fn finalizer_definition(
         maximum_parallel_steps: NonZeroUsize::new(maximum_parallel_steps).unwrap(),
         maximum_transitions: 10_000,
         text_inputs: BTreeMap::new(),
+        json_inputs: BTreeMap::new(),
     }
 }
 
@@ -589,7 +591,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
 }
 
 #[test]
-fn condition_false_precedes_body_readiness() {
+fn json_input_condition_false_precedes_body_readiness() {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     let execution_root = temporary.path().join("execution");
@@ -600,13 +602,14 @@ fn condition_false_precedes_body_readiness() {
         "schemaVersion: 1
 inputs:
   request:
-    kind: text
+    kind: json
 steps:
   consumer:
     kind: cmd
     condition:
       equals:
         - ref: inputs.request
+          pointer: /decision
         - value: run
     inputs:
       value:
@@ -629,7 +632,12 @@ steps:
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
         ResolvedInputs::new(BTreeMap::from([(
             "request".to_owned(),
-            ResolvedInput::Text(Arc::from("skip")),
+            ResolvedInput::Json(
+                ResolvedJsonInput::from_source(Arc::from(
+                    br#"{"decision":"skip","other":null}"#.as_slice(),
+                ))
+                .unwrap(),
+            ),
         )])),
         ExecutionContext::new(
             execution_root,

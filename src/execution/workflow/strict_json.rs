@@ -139,4 +139,17 @@ mod tests {
             serde_json::from_slice::<Value>(source).unwrap()
         );
     }
+
+    #[test]
+    fn enforces_the_shared_parser_depth() {
+        let nested = |depth: usize| {
+            let mut source = "[".repeat(depth);
+            source.push_str("null");
+            source.push_str(&"]".repeat(depth));
+            source
+        };
+
+        assert!(from_slice(nested(127).as_bytes()).is_ok());
+        assert!(from_slice(nested(128).as_bytes()).is_err());
+    }
 }

@@ -478,7 +478,8 @@
         "input_manifest_mismatch",
         "input_content_unavailable",
         "input_content_mismatch",
-        "input_text_invalid"
+        "input_text_invalid",
+        "input_json_invalid"
       ]
     },
     "AssignmentDecline": {

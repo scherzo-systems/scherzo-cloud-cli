@@ -64,6 +64,18 @@ use crate::human_auth::session::{self, RequiredOperation};
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
+#[derive(Debug, Args)]
+struct JsonInlineInput {
+    #[arg(
+        long,
+        value_names = ["NAME", "JSON"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named JSON value"
+    )]
+    input_json: Vec<OsString>,
+}
+
 #[derive(Clone, Debug)]
 struct OrganizationRef(String);
 

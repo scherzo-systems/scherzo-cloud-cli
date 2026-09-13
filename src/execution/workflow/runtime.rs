@@ -517,6 +517,7 @@ struct RuntimeDefinition {
     maximum_parallel_steps: NonZeroUsize,
     maximum_transitions: u64,
     text_inputs: BTreeMap<String, Arc<str>>,
+    json_inputs: BTreeMap<String, Arc<serde_json::Value>>,
 }
 
 impl RuntimeDefinition {
@@ -532,7 +533,16 @@ impl RuntimeDefinition {
             .iter()
             .filter_map(|(name, input)| match input {
                 ResolvedInput::Text(value) => Some((name.clone(), Arc::clone(value))),
-                ResolvedInput::Attachments(_) => None,
+                ResolvedInput::Json(_) | ResolvedInput::Attachments(_) => None,
+            })
+            .collect();
+        definition.json_inputs = admitted
+            .inputs()
+            .values()
+            .iter()
+            .filter_map(|(name, input)| match input {
+                ResolvedInput::Json(value) => Some((name.clone(), value.value_arc())),
+                ResolvedInput::Text(_) | ResolvedInput::Attachments(_) => None,
             })
             .collect();
         definition
@@ -588,6 +598,7 @@ impl RuntimeDefinition {
             maximum_parallel_steps,
             maximum_transitions,
             text_inputs: BTreeMap::new(),
+            json_inputs: BTreeMap::new(),
         }
     }
 }
@@ -2387,7 +2398,10 @@ fn condition_sources_available<Cause, Output, Deadline>(
         .condition_values
         .values()
         .all(|source| match source {
-            ResolvedValueSource::Input(name) => state.definition.text_inputs.contains_key(name),
+            ResolvedValueSource::Input(name) => {
+                state.definition.text_inputs.contains_key(name)
+                    || state.definition.json_inputs.contains_key(name)
+            }
             ResolvedValueSource::FinalizationContext => state.finalization.is_some(),
             ResolvedValueSource::Output(source) => state
                 .steps
@@ -2413,6 +2427,8 @@ where
             ResolvedValueSource::Input(name) => {
                 if let Some(text) = state.definition.text_inputs.get(name) {
                     values.insert_text_value(canonical.as_str(), text);
+                } else if let Some(json) = state.definition.json_inputs.get(name) {
+                    values.insert_json_value(canonical.as_str(), json);
                 }
             }
             ResolvedValueSource::FinalizationContext => {

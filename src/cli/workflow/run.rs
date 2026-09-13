@@ -27,7 +27,7 @@ use crate::execution::workflow::admission::admit_workflow;
 use crate::execution::workflow::admission::{
     AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
     EnvironmentSnapshot, ExecutionContext, ResolvedAttachment, ResolvedInput, ResolvedInputs,
-    admit_local_workflow, default_execution_policy_limits,
+    ResolvedJsonInput, admit_local_workflow, default_execution_policy_limits,
 };
 use crate::execution::workflow::agent::WorkflowRunId;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
@@ -77,7 +77,7 @@ use crate::exit_code::{ExitCode, OutcomeClass};
 pub(super) const ABOUT: &str = "Run a local command and agent workflow";
 pub(super) const AFTER_HELP: &str = "Interactive mode:
   Automatic mode uses the terminal interface only when stdin and stdout are terminals,
-  TERM is usable, and stdin is not reserved by --input-text-file <NAME> -. Resize keeps the
+  TERM is usable, and stdin is not reserved by a Text or JSON input. Resize keeps the
   interface active; undersized terminals show a resize notice without changing modes.
   Use Up/Down or j/k to select steps, Enter to inspect logs, ? for complete help,
   Ctrl-C to request cancellation, and q to leave only after publication and cleanup.
@@ -129,6 +129,18 @@ pub(super) struct Command {
     )]
     input_text_file: Vec<OsString>,
 
+    #[command(flatten)]
+    json_inline: super::super::JsonInlineInput,
+
+    #[arg(
+        long,
+        value_names = ["NAME", "PATH"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named JSON value from a regular file, or - for standard input"
+    )]
+    input_json_file: Vec<OsString>,
+
     #[arg(
         long,
         value_names = ["NAME", "MEDIA_TYPE", "PATH"],
@@ -168,6 +180,8 @@ impl Command {
         let input_plan = plan_inputs(
             &self.input_text,
             &self.input_text_file,
+            &self.json_inline.input_json,
+            &self.input_json_file,
             &self.input_attachment,
             &self.input_attachments_empty,
         )
@@ -274,6 +288,8 @@ impl Command {
         let standard_input_reserved = plan_inputs(
             &self.input_text,
             &self.input_text_file,
+            &self.json_inline.input_json,
+            &self.input_json_file,
             &self.input_attachment,
             &self.input_attachments_empty,
         )
@@ -836,6 +852,8 @@ pub(super) fn execution_context_for_workflow(
 enum PlannedInput {
     TextInline(Arc<str>),
     TextFile(PathBuf),
+    JsonInline(Arc<[u8]>),
+    JsonFile(PathBuf),
     Attachments(Vec<PlannedAttachment>),
 }
 
@@ -854,6 +872,8 @@ struct InputPlan {
 fn plan_inputs(
     text_values: &[OsString],
     text_files: &[OsString],
+    json_values: &[OsString],
+    json_files: &[OsString],
     attachments: &[OsString],
     empty_attachments: &[String],
 ) -> anyhow::Result<InputPlan> {
@@ -875,15 +895,31 @@ fn plan_inputs(
     for binding in files {
         let name = input_argument(binding.first(), "input name")?;
         let path = PathBuf::from(binding.get(1).ok_or_else(|| anyhow!("missing Text path"))?);
-        if path == Path::new("-") {
-            if standard_input_reserved {
-                return Err(anyhow!(
-                    "standard input may supply only one named Text input"
-                ));
-            }
-            standard_input_reserved = true;
-        }
+        claim_standard_input(&path, &mut standard_input_reserved)?;
         insert_scalar_input(&mut values, name, PlannedInput::TextFile(path))?;
+    }
+    let inline = json_values.chunks_exact(2);
+    if !inline.remainder().is_empty() {
+        return Err(anyhow!("invalid --input-json binding"));
+    }
+    for binding in inline {
+        let name = input_argument(binding.first(), "input name")?;
+        let json = input_argument(binding.get(1), "JSON value")?;
+        insert_scalar_input(
+            &mut values,
+            name,
+            PlannedInput::JsonInline(Arc::from(json.as_bytes())),
+        )?;
+    }
+    let files = json_files.chunks_exact(2);
+    if !files.remainder().is_empty() {
+        return Err(anyhow!("invalid --input-json-file binding"));
+    }
+    for binding in files {
+        let name = input_argument(binding.first(), "input name")?;
+        let path = PathBuf::from(binding.get(1).ok_or_else(|| anyhow!("missing JSON path"))?);
+        claim_standard_input(&path, &mut standard_input_reserved)?;
+        insert_scalar_input(&mut values, name, PlannedInput::JsonFile(path))?;
     }
     let members = attachments.chunks_exact(3);
     if !members.remainder().is_empty() || members.len() > MAXIMUM_ATTACHMENTS {
@@ -926,6 +962,19 @@ fn plan_inputs(
         values,
         standard_input_reserved,
     })
+}
+
+fn claim_standard_input(path: &Path, reserved: &mut bool) -> anyhow::Result<()> {
+    if path != Path::new("-") {
+        return Ok(());
+    }
+    if *reserved {
+        return Err(anyhow!(
+            "standard input may supply only one named Text or JSON input"
+        ));
+    }
+    *reserved = true;
+    Ok(())
 }
 
 fn input_argument<'a>(value: Option<&'a OsString>, description: &str) -> anyhow::Result<&'a str> {
@@ -979,32 +1028,27 @@ async fn acquire_inputs(
                 ResolvedInput::Text(Arc::clone(text))
             }
             PlannedInput::TextFile(path) => {
-                let bytes = if path == Path::new("-") {
-                    read_stdin_bounded(
-                        remaining_input_bytes(total_bytes, MAXIMUM_TEXT_BYTES),
-                        cancellation,
-                    )
-                    .await
-                    .map_err(|kind| input_error(kind, name, None))?
-                } else {
-                    let file = open_regular_input(path)
-                        .map_err(|kind| input_error(kind, name, Some(path)))?;
-                    read_bounded(
-                        file,
-                        remaining_input_bytes(total_bytes, MAXIMUM_TEXT_BYTES),
-                        cancellation,
-                    )
-                    .map_err(|kind| input_error(kind, name, Some(path)))?
-                };
-                account_input_bytes(
-                    &mut total_bytes,
-                    u64::try_from(bytes.len()).map_err(|_| input_bytes_error())?,
-                    MAXIMUM_TEXT_BYTES,
-                )?;
+                let bytes = acquire_scalar_file(path, name, &mut total_bytes, cancellation).await?;
                 let text = String::from_utf8(bytes).map(Arc::from).map_err(|_| {
                     input_error(InputAcquisitionFailureKind::InvalidUtf8, name, Some(path))
                 })?;
                 ResolvedInput::Text(text)
+            }
+            PlannedInput::JsonInline(source) => {
+                account_input_bytes(
+                    &mut total_bytes,
+                    u64::try_from(source.len()).map_err(|_| input_bytes_error())?,
+                    MAXIMUM_TEXT_BYTES,
+                )?;
+                ResolvedInput::Json(ResolvedJsonInput::from_source(Arc::clone(source)).map_err(
+                    |_| input_error(InputAcquisitionFailureKind::InvalidJson, name, None),
+                )?)
+            }
+            PlannedInput::JsonFile(path) => {
+                let bytes = acquire_scalar_file(path, name, &mut total_bytes, cancellation).await?;
+                ResolvedInput::Json(ResolvedJsonInput::from_source(Arc::from(bytes)).map_err(
+                    |_| input_error(InputAcquisitionFailureKind::InvalidJson, name, Some(path)),
+                )?)
             }
             PlannedInput::Attachments(items) => {
                 let mut resolved = Vec::with_capacity(items.len());
@@ -1033,6 +1077,36 @@ async fn acquire_inputs(
         values.insert(name.clone(), value);
     }
     Ok(ResolvedInputs::new(values))
+}
+
+async fn acquire_scalar_file(
+    path: &Path,
+    name: &str,
+    total_bytes: &mut u64,
+    cancellation: &CancellationSource,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = if path == Path::new("-") {
+        read_stdin_bounded(
+            remaining_input_bytes(*total_bytes, MAXIMUM_TEXT_BYTES),
+            cancellation,
+        )
+        .await
+        .map_err(|kind| input_error(kind, name, None))?
+    } else {
+        let file = open_regular_input(path).map_err(|kind| input_error(kind, name, Some(path)))?;
+        read_bounded(
+            file,
+            remaining_input_bytes(*total_bytes, MAXIMUM_TEXT_BYTES),
+            cancellation,
+        )
+        .map_err(|kind| input_error(kind, name, Some(path)))?
+    };
+    account_input_bytes(
+        total_bytes,
+        u64::try_from(bytes.len()).map_err(|_| input_bytes_error())?,
+        MAXIMUM_TEXT_BYTES,
+    )?;
+    Ok(bytes)
 }
 
 fn remaining_input_bytes(total: u64, per_value_limit: u64) -> u64 {
@@ -1952,6 +2026,7 @@ pub(super) enum InputAcquisitionFailureKind {
     Read,
     TooLarge,
     InvalidUtf8,
+    InvalidJson,
 }
 
 pub(super) fn diagnose(error: impl std::fmt::Display) -> super::super::CommandResult {
@@ -2070,27 +2145,43 @@ mod tests {
     #[test]
     fn named_input_planning_rejects_conflicts_before_source_io() {
         let missing = "/path/that/must/not/be/read";
-        for (text, text_files, attachments, empty) in [
+        for (text, text_files, json, json_files, attachments, empty) in [
             (
                 os_arguments(&["request", "inline"]),
+                os_arguments(&["request", missing]),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            (
+                Vec::new(),
+                os_arguments(&["first", "-"]),
+                Vec::new(),
+                os_arguments(&["second", "-"]),
+                Vec::new(),
+                Vec::new(),
+            ),
+            (
+                Vec::new(),
+                Vec::new(),
+                os_arguments(&["request", "null"]),
                 os_arguments(&["request", missing]),
                 Vec::new(),
                 Vec::new(),
             ),
             (
                 Vec::new(),
-                os_arguments(&["first", "-", "second", "-"]),
                 Vec::new(),
-                Vec::new(),
-            ),
-            (
                 Vec::new(),
                 Vec::new(),
                 os_arguments(&["evidence", "text/plain", missing]),
                 vec!["evidence".to_owned()],
             ),
         ] {
-            assert!(plan_inputs(&text, &text_files, &attachments, &empty).is_err());
+            assert!(
+                plan_inputs(&text, &text_files, &json, &json_files, &attachments, &empty,).is_err()
+            );
         }
     }
 
@@ -2101,10 +2192,10 @@ mod tests {
             text.push(OsString::from(format!("input{index}")));
             text.push(OsString::from("value"));
         }
-        assert!(plan_inputs(&text, &[], &[], &[]).is_ok());
+        assert!(plan_inputs(&text, &[], &[], &[], &[], &[]).is_ok());
         text.push(OsString::from("oneOver"));
         text.push(OsString::from("value"));
-        assert!(plan_inputs(&text, &[], &[], &[]).is_err());
+        assert!(plan_inputs(&text, &[], &[], &[], &[], &[]).is_err());
 
         let mut attachments = Vec::new();
         for index in 0..MAXIMUM_ATTACHMENTS {
@@ -2114,13 +2205,13 @@ mod tests {
                 OsString::from(format!("member-{index}")),
             ]);
         }
-        assert!(plan_inputs(&[], &[], &attachments, &[]).is_ok());
+        assert!(plan_inputs(&[], &[], &[], &[], &attachments, &[]).is_ok());
         attachments.extend([
             OsString::from("evidence"),
             OsString::from("application/octet-stream"),
             OsString::from("member-over"),
         ]);
-        assert!(plan_inputs(&[], &[], &attachments, &[]).is_err());
+        assert!(plan_inputs(&[], &[], &[], &[], &attachments, &[]).is_err());
     }
 
     #[tokio::test]
@@ -2141,6 +2232,8 @@ mod tests {
         let plan = plan_inputs(
             &os_arguments(&["request", ""]),
             &[],
+            &os_arguments(&["settings", "{ \"z\": null, \"n\": 1.2300 }"]),
+            &[],
             &attachments,
             &["emptyEvidence".to_owned()],
         )
@@ -2152,6 +2245,12 @@ mod tests {
             inputs.get("request"),
             Some(ResolvedInput::Text(value)) if value.is_empty()
         ));
+        let Some(ResolvedInput::Json(settings)) = inputs.get("settings") else {
+            panic!("named JSON value is missing");
+        };
+        assert_eq!(settings.source(), b"{ \"z\": null, \"n\": 1.2300 }");
+        assert_eq!(settings.canonical(), b"{\"n\":1.2300,\"z\":null}");
+        assert!(settings.value()["z"].is_null());
         let Some(ResolvedInput::Attachments(values)) = inputs.get("evidence") else {
             panic!("named attachment collection is missing");
         };
@@ -2161,6 +2260,19 @@ mod tests {
             inputs.get("emptyEvidence"),
             Some(ResolvedInput::Attachments(values)) if values.is_empty()
         ));
+    }
+
+    #[tokio::test]
+    async fn named_json_acquisition_rejects_duplicate_keys_without_a_fallback() {
+        for source in ["{\"safe\":1,\"safe\":2}", "", "null true"] {
+            let plan =
+                plan_inputs(&[], &[], &os_arguments(&["request", source]), &[], &[], &[]).unwrap();
+            assert!(
+                acquire_inputs(&plan, &CancellationSource::new())
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2185,6 +2297,56 @@ mod tests {
         assert_eq!(
             open_regular_input(&fifo).unwrap_err(),
             InputAcquisitionFailureKind::NotRegularFile
+        );
+    }
+
+    #[tokio::test]
+    async fn json_file_acquisition_accepts_exact_source_bound_and_rejects_one_over() {
+        let temporary = tempfile::tempdir().unwrap();
+        let exact_path = temporary.path().join("exact.json");
+        let one_over_path = temporary.path().join("one-over.json");
+        let mut exact = Vec::with_capacity(usize::try_from(MAXIMUM_TEXT_BYTES).unwrap());
+        exact.push(b'"');
+        exact.extend(std::iter::repeat_n(
+            b'x',
+            usize::try_from(MAXIMUM_TEXT_BYTES).unwrap() - 2,
+        ));
+        exact.push(b'"');
+        let mut one_over = exact.clone();
+        one_over.insert(one_over.len() - 1, b'y');
+        std::fs::write(&exact_path, &exact).unwrap();
+        std::fs::write(&one_over_path, &one_over).unwrap();
+
+        let exact_plan = plan_inputs(
+            &[],
+            &[],
+            &[],
+            &[OsString::from("request"), exact_path.into_os_string()],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let exact_inputs = acquire_inputs(&exact_plan, &CancellationSource::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            exact_inputs.get("request"),
+            Some(ResolvedInput::Json(value)) if value.source().len() == exact.len()
+        ));
+
+        let one_over_plan = plan_inputs(
+            &[],
+            &[],
+            &[],
+            &[OsString::from("request"), one_over_path.into_os_string()],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            acquire_inputs(&one_over_plan, &CancellationSource::new())
+                .await
+                .is_err()
         );
     }
 
@@ -2247,6 +2409,10 @@ mod tests {
             run_dir: PathBuf::from("run"),
             input_text: Vec::new(),
             input_text_file: Vec::new(),
+            json_inline: super::super::super::JsonInlineInput {
+                input_json: Vec::new(),
+            },
+            input_json_file: Vec::new(),
             input_attachment: Vec::new(),
             input_attachments_empty: Vec::new(),
             max_parallel: 2,

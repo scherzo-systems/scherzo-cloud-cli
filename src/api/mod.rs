@@ -94,8 +94,8 @@ pub(crate) use runners::{
     RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub(crate) use runs::{
-    CreateRunInput, NamedTextInputMetadata, Run, RunApi, RunCreationAcceptance, RunFailure,
-    RunState, TextInputSet,
+    CreateRunInput, NamedScalarInputKind, NamedScalarInputMetadata, Run, RunApi,
+    RunCreationAcceptance, RunFailure, RunState, ScalarInputSet,
 };
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 

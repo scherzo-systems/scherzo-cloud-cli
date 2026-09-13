@@ -148,6 +148,10 @@ impl<'a> RejectionLocation<'a> {
                 index: Some(*index),
                 ..Self::for_step("message_attachment", step)
             },
+            ResolutionLocation::InputSchema { input } => Self {
+                input: Some(input),
+                ..Self::simple("input_schema")
+            },
             ResolutionLocation::ResultSchema { step, output } => Self {
                 output: Some(output),
                 ..Self::for_step("result_schema", step)
@@ -306,6 +310,8 @@ impl fmt::Display for RejectionLocation<'_> {
             self.write_node(formatter, "finalizer", finalizer)?;
         } else if let Some(index) = self.index {
             write!(formatter, " (index {index})")?;
+        } else if let Some(input) = self.input {
+            write!(formatter, " ({input})")?;
         } else if let Some(profile) = self.profile {
             write!(formatter, " ({profile}")?;
             if let Some(version) = self.version {
@@ -382,6 +388,26 @@ fn resolution_classification(kind: ResolutionFailureKind) -> (&'static str, &'st
         ResolutionFailureKind::InvalidTextEncoding => (
             "invalid_text_encoding",
             "Encode the system prompt or message text source as UTF-8.",
+        ),
+        ResolutionFailureKind::InvalidInputSchemaEncoding => (
+            "invalid_input_schema_encoding",
+            "Encode the input schema as UTF-8 JSON.",
+        ),
+        ResolutionFailureKind::InvalidInputSchemaJson => (
+            "invalid_input_schema_json",
+            "Provide a well-formed JSON document for the input schema.",
+        ),
+        ResolutionFailureKind::InvalidInputSchemaDialect => (
+            "invalid_input_schema_dialect",
+            "Use one Draft 2020-12 input schema resource without authored vocabularies.",
+        ),
+        ResolutionFailureKind::InvalidInputSchemaReference => (
+            "invalid_input_schema_reference",
+            "Keep input-schema references within one self-contained schema resource.",
+        ),
+        ResolutionFailureKind::InvalidInputSchema => (
+            "invalid_input_schema",
+            "Correct the input schema so it is a valid Draft 2020-12 schema.",
         ),
         ResolutionFailureKind::InvalidResultSchemaEncoding => (
             "invalid_result_schema_encoding",
@@ -708,6 +734,10 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
         AdmissionFailureKind::InputKindMismatch => Some((
             "input_kind_mismatch",
             "Supply the declared semantic kind for this workflow input.",
+        )),
+        AdmissionFailureKind::InputSchemaMismatch => Some((
+            "input_schema_mismatch",
+            "Supply a JSON value that satisfies this workflow input schema.",
         )),
         AdmissionFailureKind::InvalidAttachmentMediaType => Some((
             "invalid_attachment_media_type",

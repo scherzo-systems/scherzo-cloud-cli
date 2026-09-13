@@ -1319,6 +1319,79 @@ fn admission_rejects_wrong_and_extra_named_input_bindings() {
 }
 
 #[test]
+fn json_input_admission_preserves_null_and_applies_the_retained_schema() {
+    let constrained = WorkflowFixture::new(
+        "schemaVersion: 1\ninputs:\n  request: {kind: json, schema: request.schema.json}\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    );
+    fs::write(
+        constrained.source_root.join("request.schema.json"),
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["enabled"],"properties":{"enabled":{"const":true}}}"#,
+    )
+    .unwrap();
+    let valid = ResolvedInputs::new(BTreeMap::from([(
+        "request".to_owned(),
+        ResolvedInput::Json(
+            ResolvedJsonInput::from_source(Arc::from(br#"{"enabled":true}"#.as_slice())).unwrap(),
+        ),
+    )]));
+    assert!(
+        admit_workflow(
+            constrained.resolve(),
+            valid.clone(),
+            constrained.context(1, Duration::from_secs(1)),
+        )
+        .is_ok()
+    );
+    assert!(
+        admit_runner_workflow(
+            constrained.resolve(),
+            valid,
+            constrained.context(1, Duration::from_secs(1)),
+        )
+        .is_ok()
+    );
+
+    let semantic_null = ResolvedInputs::new(BTreeMap::from([(
+        "request".to_owned(),
+        ResolvedInput::Json(ResolvedJsonInput::from_source(Arc::from(b"null".as_slice())).unwrap()),
+    )]));
+    for runner in [false, true] {
+        let result = if runner {
+            admit_runner_workflow(
+                constrained.resolve(),
+                semantic_null.clone(),
+                constrained.context(1, Duration::from_secs(1)),
+            )
+        } else {
+            admit_workflow(
+                constrained.resolve(),
+                semantic_null.clone(),
+                constrained.context(1, Duration::from_secs(1)),
+            )
+        };
+        assert_failure(
+            result,
+            AdmissionFailureKind::InputSchemaMismatch,
+            AdmissionLocation::Input {
+                name: "request".to_owned(),
+            },
+        );
+    }
+
+    let unconstrained = WorkflowFixture::new(
+        "schemaVersion: 1\ninputs:\n  request: {kind: json}\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    );
+    assert!(
+        admit_workflow(
+            unconstrained.resolve(),
+            semantic_null,
+            unconstrained.context(1, Duration::from_secs(1)),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn admission_rejects_invalid_attachment_media_type() {
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
     let inputs = text_and_attachments_inputs(

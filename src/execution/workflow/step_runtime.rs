@@ -1988,6 +1988,9 @@ where
                     (ResolvedValueSource::Input(name), ActionInput::WorkflowInput) => {
                         match self.admitted.inputs().get(name) {
                             Some(ResolvedInput::Text(text)) => InputValue::Text(text),
+                            Some(ResolvedInput::Json(json)) => {
+                                InputValue::CanonicalJson(json.canonical())
+                            }
                             Some(ResolvedInput::Attachments(attachments)) => {
                                 InputValue::Attachments(attachments)
                             }

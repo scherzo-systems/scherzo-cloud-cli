@@ -23,6 +23,7 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
 const TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
+const INPUT_JSON_MEDIA_TYPE: &str = "application/json";
 
 pub(crate) type Run = models::Run;
 pub(crate) type RunState = models::run::State;
@@ -36,43 +37,66 @@ pub(crate) struct CreateRunInput<'a> {
     pub(crate) input_set_id: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NamedScalarInputKind {
+    Text,
+    Json,
+}
+
+impl NamedScalarInputKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+
+    const fn media_type(self) -> &'static str {
+        match self {
+            Self::Text => TEXT_MEDIA_TYPE,
+            Self::Json => INPUT_JSON_MEDIA_TYPE,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NamedTextInputMetadata {
+pub(crate) struct NamedScalarInputMetadata {
     pub(crate) name: String,
+    pub(crate) kind: NamedScalarInputKind,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: [u8; 32],
 }
 
-pub(crate) struct TextInputSet {
+pub(crate) struct ScalarInputSet {
     id: String,
     project_id: String,
-    metadata: NamedTextInputMetadata,
+    metadata: NamedScalarInputMetadata,
     manifest_sha256: [u8; 32],
     open_deadline_at: OffsetDateTime,
 }
 
-impl TextInputSet {
+impl ScalarInputSet {
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
 }
 
-impl fmt::Debug for TextInputSet {
+impl fmt::Debug for ScalarInputSet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TextInputSet([redacted])")
+        formatter.write_str("ScalarInputSet([redacted])")
     }
 }
 
-struct TextUploadCapability {
+struct ScalarUploadCapability {
     url: Url,
     content_length: String,
     content_type: String,
     checksum_sha256: String,
 }
 
-impl fmt::Debug for TextUploadCapability {
+impl fmt::Debug for ScalarUploadCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TextUploadCapability([redacted])")
+        formatter.write_str("ScalarUploadCapability([redacted])")
     }
 }
 
@@ -133,25 +157,36 @@ impl<'a> RunApi<'a> {
         decode_create_response(response, organization, idempotency_key)
     }
 
-    pub(crate) fn create_text_input_set(
+    pub(crate) fn create_scalar_input_set(
         &self,
         organization: &str,
         idempotency_key: &str,
         project_id: &str,
-        metadata: &NamedTextInputMetadata,
-    ) -> Result<TextInputSet, RunFailure> {
+        metadata: &NamedScalarInputMetadata,
+    ) -> Result<ScalarInputSet, RunFailure> {
         let size_bytes =
             i64::try_from(metadata.size_bytes).map_err(|_| RunFailure::InvalidInput)?;
-        let text_entry =
-            models::RunInputManifestEntry::Text(Box::new(models::RunInputTextEntry::new(
-                models::run_input_text_entry::Kind::Text,
-                size_bytes,
-                lowercase_hex_digest(metadata.sha256),
-            )));
+        let sha256 = lowercase_hex_digest(metadata.sha256);
+        let entry = match metadata.kind {
+            NamedScalarInputKind::Text => {
+                models::RunInputManifestEntry::Text(Box::new(models::RunInputTextEntry::new(
+                    models::run_input_text_entry::Kind::Text,
+                    size_bytes,
+                    sha256,
+                )))
+            }
+            NamedScalarInputKind::Json => {
+                models::RunInputManifestEntry::Json(Box::new(models::RunInputJsonEntry::new(
+                    models::run_input_json_entry::Kind::Json,
+                    size_bytes,
+                    sha256,
+                )))
+            }
+        };
         let request = models::CreateRunInputSetRequest::new(
             project_id.to_owned(),
             1,
-            std::collections::HashMap::from([(metadata.name.clone(), text_entry)]),
+            std::collections::HashMap::from([(metadata.name.clone(), entry)]),
         );
         let body = serde_json::to_vec(&request).map_err(|_| RunFailure::protocol(false))?;
         let response = self.input_api_request(InputApiRequest {
@@ -163,8 +198,8 @@ impl<'a> RunApi<'a> {
         })?;
         let set: models::RunInputSet =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        let manifest_sha256 = text_manifest_digest(metadata);
-        let set = validate_text_input_set(
+        let manifest_sha256 = scalar_manifest_digest(metadata);
+        let set = validate_scalar_input_set(
             set,
             project_id,
             metadata,
@@ -179,7 +214,7 @@ impl<'a> RunApi<'a> {
         require_exact_header(response.locations.iter(), &expected_location)?;
         let open_deadline_at =
             parse_timestamp(&set.open_deadline_at).ok_or_else(|| RunFailure::protocol(false))?;
-        Ok(TextInputSet {
+        Ok(ScalarInputSet {
             id: set.id,
             project_id: project_id.to_owned(),
             metadata: metadata.clone(),
@@ -188,10 +223,10 @@ impl<'a> RunApi<'a> {
         })
     }
 
-    pub(crate) fn issue_and_upload_text(
+    pub(crate) fn issue_and_upload_scalar(
         &self,
         organization: &str,
-        input_set: &TextInputSet,
+        input_set: &ScalarInputSet,
         bytes: &[u8],
     ) -> Result<(), RunFailure> {
         if u64::try_from(bytes.len()).ok() != Some(input_set.metadata.size_bytes)
@@ -200,7 +235,7 @@ impl<'a> RunApi<'a> {
             return Err(RunFailure::InvalidInput);
         }
         let body = serde_json::to_vec(&models::RunInputUploadCapabilityRequest::new(vec![
-            text_member_id(&input_set.metadata.name),
+            scalar_member_id(&input_set.metadata.name),
         ]))
         .map_err(|_| RunFailure::protocol(false))?;
         let response = self.input_api_request(InputApiRequest {
@@ -213,15 +248,16 @@ impl<'a> RunApi<'a> {
         require_private_no_store(&response)?;
         let issued: models::RunInputUploadCapabilityResponse =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        let capability = validate_text_upload_capability(issued, input_set, self.transport_policy)?;
-        self.upload_text(&capability, bytes)
+        let capability =
+            validate_scalar_upload_capability(issued, input_set, self.transport_policy)?;
+        self.upload_scalar(&capability, bytes)
     }
 
-    pub(crate) fn seal_text_input_set(
+    pub(crate) fn seal_scalar_input_set(
         &self,
         organization: &str,
         idempotency_key: &str,
-        input_set: &TextInputSet,
+        input_set: &ScalarInputSet,
     ) -> Result<(), RunFailure> {
         let response = self.input_api_request(InputApiRequest {
             organization,
@@ -232,7 +268,7 @@ impl<'a> RunApi<'a> {
         })?;
         let set: models::RunInputSet =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        let set = validate_text_input_set(
+        let set = validate_scalar_input_set(
             set,
             &input_set.project_id,
             &input_set.metadata,
@@ -344,9 +380,9 @@ impl<'a> RunApi<'a> {
         Err(RunFailure::Unreachable(last_transport_failure))
     }
 
-    fn upload_text(
+    fn upload_scalar(
         &self,
-        capability: &TextUploadCapability,
+        capability: &ScalarUploadCapability,
         bytes: &[u8],
     ) -> Result<(), RunFailure> {
         let mut headers = HeaderMap::with_capacity(4);
@@ -506,34 +542,39 @@ enum ExpectedInputSetState {
     Sealed,
 }
 
-fn validate_text_input_set(
+fn validate_scalar_input_set(
     set: models::RunInputSet,
     project_id: &str,
-    metadata: &NamedTextInputMetadata,
+    metadata: &NamedScalarInputMetadata,
     manifest_sha256: [u8; 32],
     expected_state: ExpectedInputSetState,
 ) -> Result<models::RunInputSet, RunFailure> {
-    let text = set.manifest.inputs.get(&metadata.name);
+    let scalar = set.manifest.inputs.get(&metadata.name);
     let mut members = set.members.iter();
-    let text_status = members.next();
+    let scalar_status = members.next();
     let created_at = parse_timestamp(&set.created_at);
     let open_deadline_at = parse_timestamp(&set.open_deadline_at);
-    let expected_text_sha256 = lowercase_hex_digest(metadata.sha256);
+    let expected_scalar_sha256 = lowercase_hex_digest(metadata.sha256);
     let expected_manifest_sha256 = lowercase_hex_digest(manifest_sha256);
-    let expected_member_id = text_member_id(&metadata.name);
+    let expected_member_id = scalar_member_id(&metadata.name);
     let immutable_valid = crate::public_id::valid_typed_id(&set.id, "ris_")
         && crate::public_id::valid_typed_id(&set.organization_id, "org_")
         && set.project_id == project_id
         && set.bounds_profile == 1
         && set.manifest.schema_version == 1
         && set.manifest.inputs.len() == 1
-        && text.is_some_and(|entry| match entry {
-            models::RunInputManifestEntry::Text(text) => {
+        && scalar.is_some_and(|entry| match (metadata.kind, entry) {
+            (NamedScalarInputKind::Text, models::RunInputManifestEntry::Text(text)) => {
                 text.kind == models::run_input_text_entry::Kind::Text
                     && u64::try_from(text.size_bytes).ok() == Some(metadata.size_bytes)
-                    && text.sha256 == expected_text_sha256
+                    && text.sha256 == expected_scalar_sha256
             }
-            models::RunInputManifestEntry::Attachments(_) => false,
+            (NamedScalarInputKind::Json, models::RunInputManifestEntry::Json(json)) => {
+                json.kind == models::run_input_json_entry::Kind::Json
+                    && u64::try_from(json.size_bytes).ok() == Some(metadata.size_bytes)
+                    && json.sha256 == expected_scalar_sha256
+            }
+            (_, _) => false,
         })
         && set.manifest_digest.algorithm
             == models::run_input_digest::Algorithm::RunInputDigestAlgorithmSha256
@@ -541,7 +582,7 @@ fn validate_text_input_set(
         && set.input_count == 1
         && set.attachment_count == 0
         && u64::try_from(set.aggregate_size_bytes).ok() == Some(metadata.size_bytes)
-        && text_status.is_some_and(|member| member.member_id == expected_member_id)
+        && scalar_status.is_some_and(|member| member.member_id == expected_member_id)
         && members.next().is_none()
         && created_at
             .zip(open_deadline_at)
@@ -551,13 +592,13 @@ fn validate_text_input_set(
             set.state == models::run_input_set::State::Open
                 && set.sealed_at.is_none()
                 && set.sealed_deadline_at.is_none()
-                && text_status.is_some_and(|member| !member.upload_confirmed)
+                && scalar_status.is_some_and(|member| !member.upload_confirmed)
         }
         ExpectedInputSetState::Sealed => {
             let sealed_at = set.sealed_at.as_deref().and_then(parse_timestamp);
             let sealed_deadline_at = set.sealed_deadline_at.as_deref().and_then(parse_timestamp);
             set.state == models::run_input_set::State::Sealed
-                && text_status.is_some_and(|member| member.upload_confirmed)
+                && scalar_status.is_some_and(|member| member.upload_confirmed)
                 && sealed_at
                     .zip(sealed_deadline_at)
                     .is_some_and(|(sealed, deadline)| sealed < deadline)
@@ -570,11 +611,11 @@ fn validate_text_input_set(
     }
 }
 
-fn validate_text_upload_capability(
+fn validate_scalar_upload_capability(
     issued: models::RunInputUploadCapabilityResponse,
-    input_set: &TextInputSet,
+    input_set: &ScalarInputSet,
     transport_policy: HttpTransportPolicy,
-) -> Result<TextUploadCapability, RunFailure> {
+) -> Result<ScalarUploadCapability, RunFailure> {
     if issued.input_set_id != input_set.id
         || parse_timestamp(&issued.capability_expires_at)
             .is_none_or(|expires_at| expires_at > input_set.open_deadline_at)
@@ -583,7 +624,7 @@ fn validate_text_upload_capability(
     }
     let mut members = issued.members.into_iter();
     let member = members.next().ok_or_else(|| RunFailure::protocol(false))?;
-    if members.next().is_some() || member.member_id != text_member_id(&input_set.metadata.name) {
+    if members.next().is_some() || member.member_id != scalar_member_id(&input_set.metadata.name) {
         return Err(RunFailure::protocol(false));
     }
     let expected_content_length = input_set.metadata.size_bytes.to_string();
@@ -591,7 +632,7 @@ fn validate_text_upload_capability(
         base64::engine::general_purpose::STANDARD.encode(input_set.metadata.sha256);
     let headers = member.required_headers;
     if headers.content_length != expected_content_length
-        || headers.content_type != TEXT_MEDIA_TYPE
+        || headers.content_type != input_set.metadata.kind.media_type()
         || headers.if_none_match != models::run_input_upload_required_headers::IfNoneMatch::Star
         || headers.x_amz_checksum_sha256 != expected_checksum
     {
@@ -606,7 +647,7 @@ fn validate_text_upload_capability(
     {
         return Err(RunFailure::protocol(false));
     }
-    Ok(TextUploadCapability {
+    Ok(ScalarUploadCapability {
         url,
         content_length: headers.content_length,
         content_type: headers.content_type,
@@ -628,17 +669,18 @@ fn require_private_no_store(response: &ReceivedResponse) -> Result<(), RunFailur
     }
 }
 
-fn text_manifest_digest(metadata: &NamedTextInputMetadata) -> [u8; 32] {
+fn scalar_manifest_digest(metadata: &NamedScalarInputMetadata) -> [u8; 32] {
     let canonical = format!(
-        "{{\"inputs\":{{\"{}\":{{\"kind\":\"text\",\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
+        "{{\"inputs\":{{\"{}\":{{\"kind\":\"{}\",\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
         metadata.name,
+        metadata.kind.as_str(),
         lowercase_hex_digest(metadata.sha256),
         metadata.size_bytes
     );
     digest_bytes(canonical.as_bytes())
 }
 
-fn text_member_id(name: &str) -> String {
+fn scalar_member_id(name: &str) -> String {
     format!("inputs/{name}")
 }
 

@@ -140,11 +140,24 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         .map(|(name, declaration)| {
             let value_type = match declaration {
                 InputDeclaration::Text => WorkflowValueType::Text,
+                InputDeclaration::Json { .. } => WorkflowValueType::Json,
                 InputDeclaration::Attachments => WorkflowValueType::AttachmentCollection,
             };
             (name.clone(), value_type)
         })
         .collect::<RequiredInputs>();
+    let input_json_schema_paths = document
+        .inputs
+        .iter()
+        .filter_map(|(name, declaration)| match declaration {
+            InputDeclaration::Json {
+                schema: Some(schema),
+            } => Some((name.clone(), schema.clone())),
+            InputDeclaration::Text
+            | InputDeclaration::Json { schema: None }
+            | InputDeclaration::Attachments => None,
+        })
+        .collect();
     let mut steps = BTreeMap::new();
     let mut recoveries = BTreeMap::new();
     for (step_name, step) in &document.steps {
@@ -202,6 +215,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         finalizer_presentation_order: finalizer_graph.presentation_order,
         exports,
         required_inputs,
+        input_json_schema_paths,
     })
 }
 
@@ -629,7 +643,10 @@ fn infer_condition_value_reference(
     let location = condition_location(consumer_name, consumer_role);
     match reference {
         ValueReference::Input { name }
-            if document.inputs.get(name) == Some(&InputDeclaration::Text) =>
+            if matches!(
+                document.inputs.get(name),
+                Some(InputDeclaration::Text | InputDeclaration::Json { .. })
+            ) =>
         {
             Ok(())
         }

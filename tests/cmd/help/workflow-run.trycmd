@@ -18,6 +18,10 @@ Options:
           Supply one required named Text value
       --input-text-file <NAME> <PATH>
           Supply one required named Text value from a regular file, or - for standard input
+      --input-json <NAME> <JSON>
+          Supply one required named JSON value
+      --input-json-file <NAME> <PATH>
+          Supply one required named JSON value from a regular file, or - for standard input
       --input-attachment <NAME> <MEDIA_TYPE> <PATH>
           Append an immutable member to a named attachment collection
       --input-attachments-empty <NAME>
@@ -35,7 +39,7 @@ Options:
 
 Interactive mode:
   Automatic mode uses the terminal interface only when stdin and stdout are terminals,
-  TERM is usable, and stdin is not reserved by --input-text-file <NAME> -. Resize keeps the
+  TERM is usable, and stdin is not reserved by a Text or JSON input. Resize keeps the
   interface active; undersized terminals show a resize notice without changing modes.
   Use Up/Down or j/k to select steps, Enter to inspect logs, ? for complete help,
   Ctrl-C to request cancellation, and q to leave only after publication and cleanup.

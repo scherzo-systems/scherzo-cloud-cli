@@ -192,6 +192,7 @@ pub(crate) enum ExecutionSpecInvalidReason {
     InputContentUnavailable,
     InputContentMismatch,
     InputTextInvalid,
+    InputJsonInvalid,
 }
 
 impl ExecutionSpecInvalidReason {
@@ -213,6 +214,7 @@ impl ExecutionSpecInvalidReason {
             Self::InputContentUnavailable => "input_content_unavailable",
             Self::InputContentMismatch => "input_content_mismatch",
             Self::InputTextInvalid => "input_text_invalid",
+            Self::InputJsonInvalid => "input_json_invalid",
         }
     }
 }

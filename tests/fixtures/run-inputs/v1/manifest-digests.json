@@ -17,6 +17,21 @@
       "sha256": "652966c1dd8a640886487013271ea728c7fd44e0758acaaa58d32e4222761bcc"
     },
     {
+      "name": "present-json-null",
+      "manifest": {
+        "schemaVersion": 1,
+        "inputs": {
+          "request": {
+            "kind": "json",
+            "sizeBytes": 4,
+            "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+          }
+        }
+      },
+      "canonical": "{\"inputs\":{\"request\":{\"kind\":\"json\",\"sha256\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"sizeBytes\":4}},\"schemaVersion\":1}",
+      "sha256": "5783ea899e00cab824646ccec768c64a9fef5f7bfe421bb44e633d62ee2a630f"
+    },
+    {
       "name": "zero-object-empty-collection",
       "manifest": {
         "schemaVersion": 1,

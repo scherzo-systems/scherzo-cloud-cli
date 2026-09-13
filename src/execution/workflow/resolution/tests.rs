@@ -1015,6 +1015,100 @@ fn structurally_invalid_source_and_runtime_paths_fail_during_definition_resoluti
     }
 }
 
+#[test]
+fn input_json_schema_is_confined_retained_and_compiled() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    fs::create_dir(root.join("workflows")).unwrap();
+    fs::create_dir(root.join("schemas")).unwrap();
+    fs::write(
+        root.join("workflows/workflow.yaml"),
+        "schemaVersion: 1\ninputs:\n  request: {kind: json, schema: ../schemas/request.schema.json}\nsteps:\n  check:\n    kind: cmd\n    condition:\n      equals:\n        - {ref: inputs.request, pointer: /enabled}\n        - {value: true}\n    command: {argv: [\"true\"]}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("schemas/request.schema.json"),
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["enabled"]}"#,
+    )
+    .unwrap();
+
+    let resolved = resolve(root, Path::new("workflows/workflow.yaml")).unwrap();
+    assert_eq!(
+        resolved.required_inputs().get("request"),
+        Some(&WorkflowValueType::Json)
+    );
+    assert!(
+        resolved
+            .source_closure
+            .contains_key("schemas/request.schema.json")
+    );
+    assert!(
+        resolved
+            .input_json_schema("request")
+            .is_some_and(|schema| schema.is_valid(&serde_json::json!({"enabled": true})))
+    );
+
+    fs::write(
+        root.join("schemas/request.schema.json"),
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"https://example.invalid/schema"}"#,
+    )
+    .unwrap();
+    let failure = resolve(root, Path::new("workflows/workflow.yaml")).unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        ResolutionFailureKind::InvalidInputSchemaReference
+    );
+    assert_eq!(
+        failure.location(),
+        &ResolutionLocation::InputSchema {
+            input: "request".to_owned()
+        }
+    );
+
+    fs::write(
+        root.join("workflows/workflow.yaml"),
+        "schemaVersion: 1\ninputs:\n  request: {kind: json, schema: ../../outside.schema.json}\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        resolve(root, Path::new("workflows/workflow.yaml"))
+            .unwrap_err()
+            .kind(),
+        ResolutionFailureKind::LexicalSourceEscape
+    );
+}
+
+#[test]
+fn input_schema_enforces_the_shared_parser_depth() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    fs::write(
+        root.join("workflow.yaml"),
+        "schemaVersion: 1\ninputs:\n  request: {kind: json, schema: request.schema.json}\nsteps:\n  consume:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    )
+    .unwrap();
+    let nested_schema = |depth: usize| {
+        let mut schema = format!(
+            "{{\"$schema\":\"{JSON_SCHEMA_DIALECT}\",\"not\":{}",
+            "{\"not\":".repeat(depth - 1)
+        );
+        schema.push_str("false");
+        schema.push_str(&"}".repeat(depth));
+        schema
+    };
+
+    fs::write(root.join("request.schema.json"), nested_schema(127)).unwrap();
+    assert!(resolve(root, Path::new("workflow.yaml")).is_ok());
+
+    fs::write(root.join("request.schema.json"), nested_schema(128)).unwrap();
+    assert_eq!(
+        resolve(root, Path::new("workflow.yaml"))
+            .unwrap_err()
+            .kind(),
+        ResolutionFailureKind::InvalidInputSchemaJson
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn runtime_paths_are_not_resolved_against_a_source_or_execution_root() {

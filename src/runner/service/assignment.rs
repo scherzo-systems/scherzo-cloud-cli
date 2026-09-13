@@ -3654,6 +3654,9 @@ fn run_input_decline(failure: RunInputFailure) -> AssignmentDecline {
         RunInputFailure::TextInvalid => {
             AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::InputTextInvalid)
         }
+        RunInputFailure::JsonInvalid => {
+            AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::InputJsonInvalid)
+        }
     }
 }
 
@@ -5290,6 +5293,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 RunInputFailure::TextInvalid,
                 AssignmentDecline::ExecutionSpecInvalid(
                     ExecutionSpecInvalidReason::InputTextInvalid,
+                ),
+            ),
+            (
+                RunInputFailure::JsonInvalid,
+                AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InputJsonInvalid,
                 ),
             ),
         ];

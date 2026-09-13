@@ -22,7 +22,9 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::admission::{AdmittedWorkflow, ResolvedAttachment, ResolvedInput, ResolvedInputs};
+use super::admission::{
+    AdmittedWorkflow, ResolvedAttachment, ResolvedInput, ResolvedInputs, ResolvedJsonInput,
+};
 use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
@@ -180,6 +182,10 @@ struct ManifestFileV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ManifestInputV1 {
     Text {
+        #[serde(flatten)]
+        file: ManifestFileV1,
+    },
+    Json {
         #[serde(flatten)]
         file: ManifestFileV1,
     },
@@ -1738,6 +1744,14 @@ fn retain_execution_specification(
                     file: retain_file(files, ordinal, text.as_bytes())?,
                 }
             }
+            ResolvedInput::Json(json) => {
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                ManifestInputV1::Json {
+                    file: retain_file(files, ordinal, json.source())?,
+                }
+            }
             ResolvedInput::Attachments(attachments) => {
                 let mut items = Vec::with_capacity(attachments.len());
                 for attachment in attachments.iter() {
@@ -3130,7 +3144,7 @@ pub(super) fn load_retained_execution_with_budget(
     let mut inputs = BTreeMap::new();
     for (name, input) in &manifest.inputs {
         let value = match input {
-            ManifestInputV1::Text { file } => {
+            ManifestInputV1::Text { file } | ManifestInputV1::Json { file } => {
                 let bytes = read_file(file)?;
                 if file.size_bytes > MAXIMUM_RETAINED_TEXT_BYTES {
                     return Err(LocalRunDirectoryError::StateInvalid);
@@ -3140,10 +3154,17 @@ pub(super) fn load_retained_execution_with_budget(
                     file.size_bytes,
                     MAXIMUM_RETAINED_INPUT_BYTES,
                 )?;
-                let text = String::from_utf8(bytes)
-                    .map(Arc::<str>::from)
-                    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-                ResolvedInput::Text(text)
+                if matches!(input, ManifestInputV1::Json { .. }) {
+                    ResolvedInput::Json(
+                        ResolvedJsonInput::from_source(Arc::from(bytes))
+                            .map_err(|_| LocalRunDirectoryError::StateInvalid)?,
+                    )
+                } else {
+                    let text = String::from_utf8(bytes)
+                        .map(Arc::<str>::from)
+                        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+                    ResolvedInput::Text(text)
+                }
             }
             ManifestInputV1::Attachments { items } => {
                 attachment_count = attachment_count
@@ -3186,6 +3207,9 @@ pub(super) fn load_retained_execution_with_budget(
                     super::validated::WorkflowValueType::Text,
                     Some(ResolvedInput::Text(_))
                 ) | (
+                    super::validated::WorkflowValueType::Json,
+                    Some(ResolvedInput::Json(_))
+                ) | (
                     super::validated::WorkflowValueType::AttachmentCollection,
                     Some(ResolvedInput::Attachments(_))
                 )
@@ -3206,7 +3230,7 @@ fn retained_manifest_file_count(
 ) -> Result<u64, LocalRunDirectoryError> {
     let input_files = manifest.inputs.values().try_fold(0_usize, |count, input| {
         count.checked_add(match input {
-            ManifestInputV1::Text { .. } => 1,
+            ManifestInputV1::Text { .. } | ManifestInputV1::Json { .. } => 1,
             ManifestInputV1::Attachments { items } => items.len(),
         })
     });
@@ -4218,7 +4242,7 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
     let mut attachment_count = 0_usize;
     for input in manifest.inputs.values() {
         match input {
-            ManifestInputV1::Text { file } => {
+            ManifestInputV1::Text { file } | ManifestInputV1::Json { file } => {
                 if file.size_bytes > MAXIMUM_RETAINED_TEXT_BYTES {
                     return Err(LocalRunDirectoryError::SerializationUnavailable);
                 }

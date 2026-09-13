@@ -17,29 +17,32 @@ use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ArtifactDownloadCapabilityResponse {
-    #[serde(rename = "artifactSetId")]
-    pub artifact_set_id: String,
-    #[serde(rename = "expiresAt")]
-    pub expires_at: String,
-    #[serde(rename = "capabilityExpiresAt")]
-    pub capability_expires_at: String,
-    #[serde(rename = "members")]
-    pub members: Vec<models::ArtifactDownloadCapabilityMember>,
+pub struct RunInputJsonEntry {
+    #[serde(skip)]
+    pub kind: Kind,
+    #[serde(rename = "sizeBytes")]
+    pub size_bytes: i64,
+    #[serde(rename = "sha256")]
+    pub sha256: String,
 }
 
-impl ArtifactDownloadCapabilityResponse {
-    pub fn new(
-        artifact_set_id: String,
-        expires_at: String,
-        capability_expires_at: String,
-        members: Vec<models::ArtifactDownloadCapabilityMember>,
-    ) -> ArtifactDownloadCapabilityResponse {
-        ArtifactDownloadCapabilityResponse {
-            artifact_set_id,
-            expires_at,
-            capability_expires_at,
-            members,
+impl RunInputJsonEntry {
+    pub fn new(kind: Kind, size_bytes: i64, sha256: String) -> RunInputJsonEntry {
+        RunInputJsonEntry {
+            kind,
+            size_bytes,
+            sha256,
         }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Kind {
+    #[serde(rename = "json")]
+    Json,
+}
+
+impl Default for Kind {
+    fn default() -> Kind {
+        Self::Json
     }
 }

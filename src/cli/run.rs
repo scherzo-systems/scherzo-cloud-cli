@@ -13,8 +13,8 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::api::{
-    CreateRunInput, HttpClient, HttpTransportPolicy, NamedTextInputMetadata, Run, RunApi,
-    RunFailure, RunState, TextInputSet,
+    CreateRunInput, HttpClient, HttpTransportPolicy, NamedScalarInputKind,
+    NamedScalarInputMetadata, Run, RunApi, RunFailure, RunState, ScalarInputSet,
 };
 use crate::execution::workflow::presentation::visible_text;
 use crate::exit_code::{ExitCode, OutcomeClass};
@@ -27,7 +27,7 @@ pub(super) const ABOUT: &str = "Work with Scherzo Cloud runs";
 const NAME: &str = "run";
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES: usize = 2;
-const MAXIMUM_TEXT_INPUT_BYTES: usize = 1024 * 1024;
+const MAXIMUM_SCALAR_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -94,6 +94,18 @@ struct CreateCommand {
         help = "Supply one required named Text value from a regular UTF-8 file (maximum 1 MiB)"
     )]
     input_text_file: Vec<OsString>,
+
+    #[command(flatten)]
+    json_inline: super::JsonInlineInput,
+
+    #[arg(
+        long,
+        value_names = ["NAME", "PATH"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named JSON value from a regular UTF-8 file (maximum 1 MiB)"
+    )]
+    input_json_file: Vec<OsString>,
 
     #[command(flatten)]
     options: RunOptions,
@@ -164,79 +176,129 @@ struct CreateDispatchState {
     dispatched: AtomicBool,
 }
 
-struct PreparedTextInput {
+struct PreparedScalarInput {
     bytes: Zeroizing<Vec<u8>>,
-    metadata: NamedTextInputMetadata,
+    metadata: NamedScalarInputMetadata,
 }
 
 #[derive(Debug)]
-enum TextInputFileFailure {
+enum ScalarInputFailure {
     InvalidArguments,
-    InvalidName,
-    Read { path: PathBuf, source: io::Error },
-    NotRegular { path: PathBuf },
-    TooLarge { path: PathBuf },
-    InvalidUtf8 { path: PathBuf },
+    InvalidName {
+        kind: NamedScalarInputKind,
+    },
+    Read {
+        kind: NamedScalarInputKind,
+        path: PathBuf,
+        source: io::Error,
+    },
+    NotRegular {
+        kind: NamedScalarInputKind,
+        path: PathBuf,
+    },
+    TooLarge {
+        kind: NamedScalarInputKind,
+        path: Option<PathBuf>,
+    },
+    InvalidUtf8 {
+        path: PathBuf,
+    },
+    InvalidJson {
+        path: Option<PathBuf>,
+    },
 }
 
-fn prepare_text_input(
-    values: &[OsString],
-) -> Result<Option<PreparedTextInput>, TextInputFileFailure> {
-    if values.is_empty() {
+fn prepare_scalar_input(
+    text_file: &[OsString],
+    json_inline: &[OsString],
+    json_file: &[OsString],
+) -> Result<Option<PreparedScalarInput>, ScalarInputFailure> {
+    let supplied_sources = [text_file, json_inline, json_file]
+        .into_iter()
+        .filter(|values| !values.is_empty())
+        .count();
+    if supplied_sources == 0 {
         return Ok(None);
     }
+    if supplied_sources != 1 {
+        return Err(ScalarInputFailure::InvalidArguments);
+    }
+    let (kind, values, inline) = if !text_file.is_empty() {
+        (NamedScalarInputKind::Text, text_file, false)
+    } else if !json_inline.is_empty() {
+        (NamedScalarInputKind::Json, json_inline, true)
+    } else {
+        (NamedScalarInputKind::Json, json_file, false)
+    };
     if values.len() != 2 {
-        return Err(TextInputFileFailure::InvalidArguments);
+        return Err(ScalarInputFailure::InvalidArguments);
     }
     let name = values[0]
         .to_str()
         .filter(|name| valid_input_name(name))
-        .ok_or(TextInputFileFailure::InvalidName)?;
-    let path = Path::new(&values[1]);
-    let mut file = File::open(path).map_err(|source| TextInputFileFailure::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| TextInputFileFailure::Read {
+        .ok_or(ScalarInputFailure::InvalidName { kind })?;
+    let (bytes, path) = if inline {
+        let source = values[1]
+            .to_str()
+            .ok_or(ScalarInputFailure::InvalidJson { path: None })?;
+        (Zeroizing::new(source.as_bytes().to_vec()), None)
+    } else {
+        let path = Path::new(&values[1]);
+        let mut file = File::open(path).map_err(|source| ScalarInputFailure::Read {
+            kind,
             path: path.to_owned(),
             source,
         })?;
-    if !metadata.is_file() {
-        return Err(TextInputFileFailure::NotRegular {
-            path: path.to_owned(),
-        });
-    }
-    let mut bytes = Zeroizing::new(Vec::with_capacity(MAXIMUM_TEXT_INPUT_BYTES.min(64 * 1024)));
-    Read::by_ref(&mut file)
-        .take(u64::try_from(MAXIMUM_TEXT_INPUT_BYTES).unwrap_or(u64::MAX) + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|source| TextInputFileFailure::Read {
+        let metadata = file.metadata().map_err(|source| ScalarInputFailure::Read {
+            kind,
             path: path.to_owned(),
             source,
         })?;
-    if bytes.len() > MAXIMUM_TEXT_INPUT_BYTES {
-        return Err(TextInputFileFailure::TooLarge {
-            path: path.to_owned(),
-        });
+        if !metadata.is_file() {
+            return Err(ScalarInputFailure::NotRegular {
+                kind,
+                path: path.to_owned(),
+            });
+        }
+        let mut bytes = Zeroizing::new(Vec::with_capacity(
+            MAXIMUM_SCALAR_INPUT_BYTES.min(64 * 1024),
+        ));
+        Read::by_ref(&mut file)
+            .take(u64::try_from(MAXIMUM_SCALAR_INPUT_BYTES).unwrap_or(u64::MAX) + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| ScalarInputFailure::Read {
+                kind,
+                path: path.to_owned(),
+                source,
+            })?;
+        (bytes, Some(path.to_owned()))
+    };
+    if bytes.len() > MAXIMUM_SCALAR_INPUT_BYTES {
+        return Err(ScalarInputFailure::TooLarge { kind, path });
     }
-    if std::str::from_utf8(&bytes).is_err() {
-        return Err(TextInputFileFailure::InvalidUtf8 {
-            path: path.to_owned(),
-        });
+    match kind {
+        NamedScalarInputKind::Text if std::str::from_utf8(&bytes).is_err() => {
+            return Err(ScalarInputFailure::InvalidUtf8 {
+                path: path.ok_or(ScalarInputFailure::InvalidArguments)?,
+            });
+        }
+        NamedScalarInputKind::Json
+            if crate::execution::workflow::parse_strict_json(&bytes).is_err() =>
+        {
+            return Err(ScalarInputFailure::InvalidJson { path });
+        }
+        NamedScalarInputKind::Text | NamedScalarInputKind::Json => {}
     }
     let observed = digest(&SHA256, &bytes);
     let mut sha256 = [0_u8; 32];
     sha256.copy_from_slice(observed.as_ref());
-    let size_bytes = u64::try_from(bytes.len()).map_err(|source| TextInputFileFailure::Read {
-        path: path.to_owned(),
-        source: io::Error::other(source),
-    })?;
-    Ok(Some(PreparedTextInput {
+    let size_bytes =
+        u64::try_from(bytes.len()).map_err(|_| ScalarInputFailure::TooLarge { kind, path })?;
+    Ok(Some(PreparedScalarInput {
         bytes,
-        metadata: NamedTextInputMetadata {
+        metadata: NamedScalarInputMetadata {
             name: name.to_owned(),
+            kind,
             size_bytes,
             sha256,
         },
@@ -307,14 +369,18 @@ impl CreateCommand {
         cancelled: &AtomicBool,
         completed: &AtomicBool,
     ) -> super::CommandResult {
-        let text_input = match prepare_text_input(&self.input_text_file) {
-            Ok(text_input) => text_input,
+        let scalar_input = match prepare_scalar_input(
+            &self.input_text_file,
+            &self.json_inline.input_json,
+            &self.input_json_file,
+        ) {
+            Ok(scalar_input) => scalar_input,
             Err(error) => {
                 if cancelled.load(Ordering::Acquire) {
                     return Ok(ExitCode::GeneralFailure);
                 }
                 completed.store(true, Ordering::Release);
-                return write_text_input_file_failure(
+                return write_scalar_input_failure(
                     deployment.fingerprint().api_url(),
                     &self.organization,
                     &error,
@@ -329,17 +395,17 @@ impl CreateCommand {
             return Ok(ExitCode::GeneralFailure);
         }
 
-        let input_set = if let Some(text_input) = text_input.as_ref() {
+        let input_set = if let Some(scalar_input) = scalar_input.as_ref() {
             let create_key = crate::idempotency::generate_idempotency_key()
                 .context("generate Run Input Set request identity")?;
             let seal_key = crate::idempotency::generate_idempotency_key()
                 .context("generate Run Input Set seal identity")?;
             let created = with_api(deployment, self.options.http.transport_policy(), |api| {
-                api.create_text_input_set(
+                api.create_scalar_input_set(
                     &self.organization,
                     &create_key,
                     &self.project_id,
-                    &text_input.metadata,
+                    &scalar_input.metadata,
                 )
             })?;
             let input_set = match created {
@@ -360,7 +426,7 @@ impl CreateCommand {
             }
 
             let uploaded = with_api(deployment, self.options.http.transport_policy(), |api| {
-                api.issue_and_upload_text(&self.organization, &input_set, &text_input.bytes)
+                api.issue_and_upload_scalar(&self.organization, &input_set, &scalar_input.bytes)
             })?;
             if let Err(failure) = uploaded {
                 let ambiguous_upload = matches!(
@@ -386,7 +452,7 @@ impl CreateCommand {
             }
 
             let sealed = with_api(deployment, self.options.http.transport_policy(), |api| {
-                api.seal_text_input_set(&self.organization, &seal_key, &input_set)
+                api.seal_scalar_input_set(&self.organization, &seal_key, &input_set)
             })?;
             if let Err(failure) = sealed {
                 return finish_create(
@@ -416,7 +482,7 @@ impl CreateCommand {
                     workflow_path: &self.workflow_path,
                     source_branch: self.source_branch.as_deref(),
                     display_name: self.display_name.as_deref(),
-                    input_set_id: input_set.as_ref().map(TextInputSet::id),
+                    input_set_id: input_set.as_ref().map(ScalarInputSet::id),
                 },
             )
         })?;
@@ -750,10 +816,17 @@ fn with_api<T>(
     }
 }
 
-fn write_text_input_file_failure(
+fn scalar_kind_name(kind: NamedScalarInputKind) -> &'static str {
+    match kind {
+        NamedScalarInputKind::Text => "Text",
+        NamedScalarInputKind::Json => "JSON",
+    }
+}
+
+fn write_scalar_input_failure(
     deployment: &str,
     organization: &str,
-    failure: &TextInputFileFailure,
+    failure: &ScalarInputFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     if json {
@@ -767,32 +840,55 @@ fn write_text_input_file_failure(
         })?;
     } else {
         let diagnostic = match failure {
-            TextInputFileFailure::InvalidArguments => {
-                "error: run creation accepts at most one named Text input file".to_owned()
+            ScalarInputFailure::InvalidArguments => {
+                "error: run creation accepts at most one named Text or JSON input".to_owned()
             }
-            TextInputFileFailure::InvalidName => {
-                "error: named Text input has an invalid Workflow V1 name".to_owned()
-            }
-            TextInputFileFailure::Read { path, source } => format!(
-                "error: read named Text input file {}: {source}",
+            ScalarInputFailure::InvalidName { kind } => format!(
+                "error: named {} input has an invalid Workflow V1 name",
+                scalar_kind_name(*kind)
+            ),
+            ScalarInputFailure::Read { kind, path, source } => format!(
+                "error: read named {} input file {}: {source}",
+                scalar_kind_name(*kind),
                 visible_text(&path.to_string_lossy())
             ),
-            TextInputFileFailure::NotRegular { path } => format!(
-                "error: named Text input source is not a regular file: {}",
+            ScalarInputFailure::NotRegular { kind, path } => format!(
+                "error: named {} input source is not a regular file: {}",
+                scalar_kind_name(*kind),
                 visible_text(&path.to_string_lossy())
             ),
-            TextInputFileFailure::TooLarge { path } => format!(
-                "error: named Text input file exceeds 1 MiB: {}",
-                visible_text(&path.to_string_lossy())
+            ScalarInputFailure::TooLarge { kind, path } => path.as_ref().map_or_else(
+                || {
+                    format!(
+                        "error: named {} input exceeds 1 MiB",
+                        scalar_kind_name(*kind)
+                    )
+                },
+                |path| {
+                    format!(
+                        "error: named {} input file exceeds 1 MiB: {}",
+                        scalar_kind_name(*kind),
+                        visible_text(&path.to_string_lossy())
+                    )
+                },
             ),
-            TextInputFileFailure::InvalidUtf8 { path } => format!(
+            ScalarInputFailure::InvalidUtf8 { path } => format!(
                 "error: named Text input file is not valid UTF-8: {}",
                 visible_text(&path.to_string_lossy())
+            ),
+            ScalarInputFailure::InvalidJson { path } => path.as_ref().map_or_else(
+                || "error: named JSON input is not strict JSON".to_owned(),
+                |path| {
+                    format!(
+                        "error: named JSON input file is not strict JSON: {}",
+                        visible_text(&path.to_string_lossy())
+                    )
+                },
             ),
         };
         writeln!(
             io::stderr().lock(),
-            "{diagnostic}\n\nChoose one valid name and a regular UTF-8 file no larger than 1 MiB, then try again."
+            "{diagnostic}\n\nChoose one valid name and one valid Text or strict JSON source no larger than 1 MiB, then try again."
         )?;
     }
     Ok(ExitCode::GeneralFailure)

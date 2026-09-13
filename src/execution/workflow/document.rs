@@ -18,9 +18,10 @@ pub(crate) struct WorkflowDocument {
     pub(crate) exports: BTreeMap<String, OutputReference>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InputDeclaration {
     Text,
+    Json { schema: Option<String> },
     Attachments,
 }
 

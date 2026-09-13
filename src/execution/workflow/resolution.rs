@@ -35,6 +35,11 @@ pub(crate) enum ResolutionFailureKind {
     InvalidWorkflowDocument(DecodeFailureKind),
     InvalidWorkflowDefinition(ValidationFailureKind),
     InvalidTextEncoding,
+    InvalidInputSchemaEncoding,
+    InvalidInputSchemaJson,
+    InvalidInputSchemaDialect,
+    InvalidInputSchemaReference,
+    InvalidInputSchema,
     InvalidResultSchemaEncoding,
     InvalidResultSchemaJson,
     InvalidResultSchemaDialect,
@@ -54,6 +59,7 @@ pub(crate) enum ResolutionLocation {
     SystemPrompt { step: String },
     MessageText { step: String, index: usize },
     MessageAttachment { step: String, index: usize },
+    InputSchema { input: String },
     ResultSchema { step: String, output: String },
     FinalizerSystemPrompt { finalizer: String },
     FinalizerMessageText { finalizer: String, index: usize },
@@ -151,6 +157,7 @@ pub(crate) struct ResolvedWorkflow {
     pub(crate) definition: ValidatedWorkflow,
     pub(crate) source_closure: BTreeMap<String, Arc<[u8]>>,
     json_schemas: BTreeMap<(String, String), RetainedJsonSchema>,
+    input_json_schemas: BTreeMap<String, RetainedJsonSchema>,
     pub(crate) source: WorkflowSourceProvenance,
     pub(crate) content_digest: WorkflowContentDigest,
     pub(crate) capacity: WorkflowCapacity,
@@ -172,6 +179,10 @@ impl ResolvedWorkflow {
 
     pub(crate) fn json_schema(&self, step: &str, output: &str) -> Option<&RetainedJsonSchema> {
         self.json_schemas.get(&(step.to_owned(), output.to_owned()))
+    }
+
+    pub(crate) fn input_json_schema(&self, input: &str) -> Option<&RetainedJsonSchema> {
+        self.input_json_schemas.get(input)
     }
 
     pub(crate) fn requires_git_capture(&self) -> bool {
@@ -287,7 +298,8 @@ fn resolve_loaded_workflow(
             ResolutionLocation::Workflow,
         ));
     };
-    let json_schemas = resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
+    let resolved_schemas =
+        resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
 
     let source_root = sources.canonical_root.clone();
     let source_closure = sources.finish();
@@ -320,7 +332,8 @@ fn resolve_loaded_workflow(
     Ok(ResolvedWorkflow {
         definition,
         source_closure,
-        json_schemas,
+        json_schemas: resolved_schemas.outputs,
+        input_json_schemas: resolved_schemas.inputs,
         source: WorkflowSourceProvenance {
             source_root,
             workflow_path: workflow_source.canonical_path,
@@ -587,18 +600,34 @@ impl SourceResolver {
     }
 }
 
+struct ResolvedJsonSchemas {
+    inputs: BTreeMap<String, RetainedJsonSchema>,
+    outputs: BTreeMap<(String, String), RetainedJsonSchema>,
+}
+
 fn resolve_static_sources(
     definition: &mut ValidatedWorkflow,
     workflow_directory: &Path,
     sources: &mut SourceResolver,
-) -> Result<BTreeMap<(String, String), RetainedJsonSchema>, ResolutionFailure> {
+) -> Result<ResolvedJsonSchemas, ResolutionFailure> {
+    let mut input_json_schemas = BTreeMap::new();
     let mut json_schemas = BTreeMap::new();
     let ValidatedWorkflow {
         steps,
         recoveries,
         finalizers,
+        input_json_schema_paths,
         ..
     } = definition;
+    for (input, schema) in input_json_schema_paths {
+        let location = ResolutionLocation::InputSchema {
+            input: input.clone(),
+        };
+        let (canonical_path, retained) =
+            resolve_json_schema(schema, workflow_directory, sources, location)?;
+        *schema = canonical_path;
+        input_json_schemas.insert(input.clone(), retained);
+    }
     for (node_name, step) in steps {
         if let Some(super::validated::ValidatedStepRecovery {
             handler: Some(super::validated::ValidatedRecoveryHandler::Agent { prompt, .. }),
@@ -633,7 +662,10 @@ fn resolve_static_sources(
             &mut json_schemas,
         )?;
     }
-    Ok(json_schemas)
+    Ok(ResolvedJsonSchemas {
+        inputs: input_json_schemas,
+        outputs: json_schemas,
+    })
 }
 
 fn resolve_node_static_sources(
@@ -794,29 +826,50 @@ fn resolve_json_schema(
     sources: &mut SourceResolver,
     location: ResolutionLocation,
 ) -> Result<(String, RetainedJsonSchema), ResolutionFailure> {
+    let input_schema = matches!(location, ResolutionLocation::InputSchema { .. });
+    let encoding_failure = if input_schema {
+        ResolutionFailureKind::InvalidInputSchemaEncoding
+    } else {
+        ResolutionFailureKind::InvalidResultSchemaEncoding
+    };
     let loaded = load_utf8_static_source(
         source_path,
         workflow_directory,
         sources,
         &location,
-        ResolutionFailureKind::InvalidResultSchemaEncoding,
+        encoding_failure,
     )?;
     let schema = Arc::new(serde_json::from_slice::<Value>(&loaded.bytes).map_err(|_| {
         ResolutionFailure::new(
-            ResolutionFailureKind::InvalidResultSchemaJson,
+            if input_schema {
+                ResolutionFailureKind::InvalidInputSchemaJson
+            } else {
+                ResolutionFailureKind::InvalidResultSchemaJson
+            },
             location.clone(),
         )
     })?);
     let retained =
         RetainedJsonSchema::compile(Arc::clone(&loaded.bytes), schema).map_err(|failure| {
-            let kind = match failure {
-                JsonSchemaSupportFailure::Dialect => {
+            let kind = match (input_schema, failure) {
+                (true, JsonSchemaSupportFailure::Dialect) => {
+                    ResolutionFailureKind::InvalidInputSchemaDialect
+                }
+                (true, JsonSchemaSupportFailure::Reference) => {
+                    ResolutionFailureKind::InvalidInputSchemaReference
+                }
+                (true, JsonSchemaSupportFailure::Schema) => {
+                    ResolutionFailureKind::InvalidInputSchema
+                }
+                (false, JsonSchemaSupportFailure::Dialect) => {
                     ResolutionFailureKind::InvalidResultSchemaDialect
                 }
-                JsonSchemaSupportFailure::Reference => {
+                (false, JsonSchemaSupportFailure::Reference) => {
                     ResolutionFailureKind::InvalidResultSchemaReference
                 }
-                JsonSchemaSupportFailure::Schema => ResolutionFailureKind::InvalidResultSchema,
+                (false, JsonSchemaSupportFailure::Schema) => {
+                    ResolutionFailureKind::InvalidResultSchema
+                }
             };
             ResolutionFailure::new(kind, location)
         })?;

@@ -13,6 +13,8 @@ Options:
       --source-branch <SOURCE_BRANCH>  Exact source branch (the project default when omitted)
       --display-name <DISPLAY_NAME>    Set the run display name
       --input-text-file <NAME> <PATH>  Supply one required named Text value from a regular UTF-8 file (maximum 1 MiB)
+      --input-json <NAME> <JSON>       Supply one required named JSON value
+      --input-json-file <NAME> <PATH>  Supply one required named JSON value from a regular UTF-8 file (maximum 1 MiB)
       --json                           Print the run result as JSON
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                           Print help

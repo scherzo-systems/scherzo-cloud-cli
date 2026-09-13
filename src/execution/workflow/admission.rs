@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::sync::watch;
 
 use super::agent::{AgentCompatibilityProfile, AgentInvocationLimits, PositiveDuration};
@@ -498,8 +499,84 @@ impl ResolvedAttachment {
 }
 
 #[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ResolvedJsonInput {
+    source: Arc<[u8]>,
+    value: Arc<Value>,
+    canonical: Arc<[u8]>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ResolvedJsonInputError {
+    InvalidSource(serde_json::Error),
+    Canonicalization(super::canonical_json::CanonicalJsonError),
+}
+
+impl fmt::Display for ResolvedJsonInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidSource(_) => "named JSON source is invalid",
+            Self::Canonicalization(error) => match error {
+                super::canonical_json::CanonicalJsonError::SizeLimitExceeded => {
+                    "named JSON canonicalization exceeded its limit"
+                }
+                super::canonical_json::CanonicalJsonError::SerializationFailed => {
+                    "named JSON canonicalization failed"
+                }
+            },
+        })
+    }
+}
+
+impl std::error::Error for ResolvedJsonInputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidSource(error) => Some(error),
+            Self::Canonicalization(_) => None,
+        }
+    }
+}
+
+impl ResolvedJsonInput {
+    pub(crate) fn from_source(source: Arc<[u8]>) -> Result<Self, ResolvedJsonInputError> {
+        let value = Arc::new(
+            super::parse_strict_json(&source).map_err(ResolvedJsonInputError::InvalidSource)?,
+        );
+        let canonical = super::canonical_json::to_bounded_bytes(&value, u64::MAX)
+            .map_err(ResolvedJsonInputError::Canonicalization)?;
+        Ok(Self {
+            source,
+            value,
+            canonical,
+        })
+    }
+
+    pub(crate) fn source(&self) -> &[u8] {
+        &self.source
+    }
+
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub(crate) fn value_arc(&self) -> Arc<Value> {
+        Arc::clone(&self.value)
+    }
+
+    pub(crate) fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+
+impl std::fmt::Debug for ResolvedJsonInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedJsonInput(<redacted>)")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ResolvedInput {
     Text(Arc<str>),
+    Json(ResolvedJsonInput),
     Attachments(Arc<[ResolvedAttachment]>),
 }
 
@@ -1163,6 +1240,7 @@ pub(crate) enum AdmissionFailureKind {
     MissingRequiredInput,
     UnexpectedInput,
     InputKindMismatch,
+    InputSchemaMismatch,
     InvalidAttachmentMediaType,
     AgentStepRuntimeUnsupported,
     ExecutionRootUnavailable,
@@ -1339,6 +1417,7 @@ fn admit_workflow_for(
                 ));
             }
             (Some(super::validated::WorkflowValueType::Text), Some(ResolvedInput::Text(_))) => {}
+            (Some(super::validated::WorkflowValueType::Json), Some(ResolvedInput::Json(_))) => {}
             (
                 Some(super::validated::WorkflowValueType::AttachmentCollection),
                 Some(ResolvedInput::Attachments(attachments)),
@@ -1364,6 +1443,20 @@ fn admit_workflow_for(
                 ));
             }
             (None, None) => {}
+        }
+    }
+    for (name, input) in inputs.values() {
+        let ResolvedInput::Json(json) = input else {
+            continue;
+        };
+        if workflow
+            .input_json_schema(name)
+            .is_some_and(|schema| !schema.is_valid(json.value()))
+        {
+            return Err(AdmissionFailure::new(
+                AdmissionFailureKind::InputSchemaMismatch,
+                AdmissionLocation::Input { name: name.clone() },
+            ));
         }
     }
 

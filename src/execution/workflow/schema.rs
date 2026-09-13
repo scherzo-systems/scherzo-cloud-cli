@@ -32,6 +32,8 @@ pub(super) struct WorkflowDto {
 enum InputDeclarationDto {
     #[serde(rename = "text")]
     Text,
+    #[serde(rename = "json")]
+    Json { schema: Option<String> },
     #[serde(rename = "attachments")]
     Attachments,
 }
@@ -344,6 +346,7 @@ impl WorkflowDto {
             .map(|(name, declaration)| {
                 let declaration = match declaration {
                     InputDeclarationDto::Text => InputDeclaration::Text,
+                    InputDeclarationDto::Json { schema } => InputDeclaration::Json { schema },
                     InputDeclarationDto::Attachments => InputDeclaration::Attachments,
                 };
                 (name, declaration)

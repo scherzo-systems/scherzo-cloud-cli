@@ -147,17 +147,26 @@ fn create_args(json: bool) -> Vec<&'static str> {
     args
 }
 
+fn create_args_with_scalar_input<'a>(
+    flag: &'a str,
+    input_name: &'a str,
+    input_source: &'a str,
+    json: bool,
+) -> Vec<&'a str> {
+    let mut args: Vec<&'a str> = create_args(json);
+    let insertion = args.len() - 1;
+    args.insert(insertion, flag);
+    args.insert(insertion + 1, input_name);
+    args.insert(insertion + 2, input_source);
+    args
+}
+
 fn create_args_with_text_input<'a>(
     input_name: &'a str,
     input_file: &'a str,
     json: bool,
 ) -> Vec<&'a str> {
-    let mut args: Vec<&'a str> = create_args(json);
-    let insertion = args.len() - 1;
-    args.insert(insertion, "--input-text-file");
-    args.insert(insertion + 1, input_name);
-    args.insert(insertion + 2, input_file);
-    args
+    create_args_with_scalar_input("--input-text-file", input_name, input_file, json)
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -174,17 +183,18 @@ fn hex_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn text_manifest_digest(bytes: &[u8]) -> String {
+fn scalar_manifest_digest(bytes: &[u8], kind: &str) -> String {
     let canonical = format!(
-        "{{\"inputs\":{{\"request\":{{\"kind\":\"text\",\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
+        "{{\"inputs\":{{\"request\":{{\"kind\":\"{kind}\",\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
         hex_digest(bytes),
         bytes.len()
     );
     hex_digest(canonical.as_bytes())
 }
 
-fn text_input_set_body(
+fn scalar_input_set_body(
     bytes: &[u8],
+    kind: &str,
     state: &str,
     uploaded: bool,
     replayed: bool,
@@ -198,7 +208,7 @@ fn text_input_set_body(
             "schemaVersion": 1,
             "inputs": {
                 "request": {
-                    "kind": "text",
+                    "kind": kind,
                     "sizeBytes": bytes.len(),
                     "sha256": hex_digest(bytes)
                 }
@@ -206,7 +216,7 @@ fn text_input_set_body(
         },
         "manifestDigest": {
             "algorithm": "sha256",
-            "value": text_manifest_digest(bytes)
+            "value": scalar_manifest_digest(bytes, kind)
         },
         "inputCount": 1,
         "attachmentCount": 0,
@@ -224,7 +234,7 @@ fn text_input_set_body(
     body
 }
 
-fn create_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
+fn create_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> Vec<u8> {
     http_response_with_headers(
         "201 Created",
         Some("application/json"),
@@ -235,11 +245,15 @@ fn create_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
                 "/v1/organizations/acme-research/run-input-sets/ris_01k0z6r1w8f4jy2m7q9v3x5abc",
             ),
         ],
-        &serde_json::to_vec(&text_input_set_body(bytes, "open", false, replayed)).unwrap(),
+        &serde_json::to_vec(&scalar_input_set_body(bytes, kind, "open", false, replayed)).unwrap(),
     )
 }
 
-fn upload_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
+fn create_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
+    create_scalar_input_set_response(bytes, "text", replayed)
+}
+
+fn scalar_upload_capability_response(bytes: &[u8], media_type: &str, url: &str) -> Vec<u8> {
     http_response_with_headers(
         "200 OK",
         Some("application/json"),
@@ -252,7 +266,7 @@ fn upload_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
                 "url": url,
                 "requiredHeaders": {
                     "contentLength": bytes.len().to_string(),
-                    "contentType": "text/plain; charset=utf-8",
+                    "contentType": media_type,
                     "ifNoneMatch": "*",
                     "xAmzChecksumSha256": base64::engine::general_purpose::STANDARD.encode(sha256(bytes))
                 }
@@ -262,13 +276,24 @@ fn upload_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
     )
 }
 
-fn seal_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
+fn upload_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
+    scalar_upload_capability_response(bytes, "text/plain; charset=utf-8", url)
+}
+
+fn seal_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> Vec<u8> {
     http_response_with_headers(
         "200 OK",
         Some("application/json"),
         &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
-        &serde_json::to_vec(&text_input_set_body(bytes, "sealed", true, replayed)).unwrap(),
+        &serde_json::to_vec(&scalar_input_set_body(
+            bytes, kind, "sealed", true, replayed,
+        ))
+        .unwrap(),
     )
+}
+
+fn seal_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
+    seal_scalar_input_set_response(bytes, "text", replayed)
 }
 
 fn request_body(request: &str) -> serde_json::Value {
@@ -504,6 +529,123 @@ fn run_create_stages_present_named_text_input_files_before_binding_the_sealed_se
             .map(str::to_owned)
         );
     }
+}
+
+#[test]
+fn run_create_stages_named_json_sources_without_rewriting_bytes() {
+    let input_bytes = b"{\n  \"enabled\": true, \"ratio\": 1.00\n}\n";
+    let input_directory = tempfile::tempdir().unwrap();
+    let input_path = input_directory.path().join("request.json");
+    fs::write(&input_path, input_bytes).unwrap();
+    let input_path = input_path.to_str().unwrap();
+
+    for (flag, source) in [
+        ("--input-json", std::str::from_utf8(input_bytes).unwrap()),
+        ("--input-json-file", input_path),
+    ] {
+        let storage = OneShotServer::respond("204 No Content", None, b"");
+        let signed_url = format!(
+            "{}/private/request?signature=unique-json-capability-sentinel",
+            storage.api_url
+        );
+        let (server, _credential_directory, credential_path) = prepared_run(vec![
+            create_scalar_input_set_response(input_bytes, "json", false),
+            scalar_upload_capability_response(input_bytes, "application/json", &signed_url),
+            seal_scalar_input_set_response(input_bytes, "json", false),
+            acceptance_response(false),
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(
+            &create_args_with_scalar_input(flag, "request", source, true),
+            &environment,
+        );
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert_no_secret_output(
+            &output,
+            &[
+                TOKEN,
+                "unique-json-capability-sentinel",
+                std::str::from_utf8(input_bytes).unwrap(),
+            ],
+        );
+        let requests = server.finish();
+        assert_eq!(
+            request_body(&requests[0]),
+            serde_json::json!({
+                "projectId": PROJECT_ID,
+                "schemaVersion": 1,
+                "inputs": {
+                    "request": {
+                        "kind": "json",
+                        "sizeBytes": input_bytes.len(),
+                        "sha256": hex_digest(input_bytes)
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            request_body(&requests[1]),
+            serde_json::json!({"members": ["inputs/request"]})
+        );
+        assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
+
+        let upload = storage.finish();
+        assert_eq!(
+            upload.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+            input_bytes
+        );
+        assert_eq!(header_value(&upload, "content-type"), "application/json");
+        assert_eq!(
+            header_value(&upload, "x-amz-checksum-sha256"),
+            base64::engine::general_purpose::STANDARD.encode(sha256(input_bytes))
+        );
+    }
+}
+
+#[test]
+fn invalid_json_and_scalar_binding_conflicts_stop_before_cloud_access() {
+    let input_directory = tempfile::tempdir().unwrap();
+    let text_path = input_directory.path().join("request.txt");
+    fs::write(&text_path, b"private text input").unwrap();
+    let text_path = text_path.to_str().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture(&credential_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+    let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
+
+    let malformed = run_with_env(
+        &create_args_with_scalar_input(
+            "--input-json",
+            "request",
+            "{\"secret\":1,\"secret\":2}",
+            true,
+        ),
+        &environment,
+    );
+    assert_eq!(malformed.status.code(), Some(1));
+    assert_no_secret_output(&malformed, &[TOKEN, "secret"]);
+
+    let mut conflicting = create_args_with_text_input("request", text_path, true);
+    let insertion = conflicting.len() - 1;
+    conflicting.splice(insertion..insertion, ["--input-json", "request", "null"]);
+    let conflict = run_with_env(&conflicting, &environment);
+    assert_eq!(conflict.status.code(), Some(1));
+    assert_no_secret_output(&conflict, &[TOKEN, "private text input"]);
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
 }
 
 #[test]

@@ -53,7 +53,7 @@ Workflow V1 authoring and definition validation, not execution or repository cha
 | --- | --- | --- |
 | `schemaVersion` | yes | Integer `1`. |
 | `description` | no | Human metadata with no execution effect. |
-| `inputs` | no | Required named `text` and `attachments` declarations. |
+| `inputs` | no | Named Text, JSON, and attachment declarations; JSON may name a schema. |
 | `agentProfiles` | no | Workflow-local harness configurations. |
 | `steps` | yes | At least one ordinary `cmd` or `agent` node. |
 | `finalizers` | no | Nodes considered after the ordinary phase. |
@@ -96,8 +96,8 @@ activates.
 ## Conditional steps and finalizers
 
 A node `condition` uses `all`, `any`, `not`, `equals`, `exists`, or `disposition`.
-Values are named Text inputs, committed Text/JSON outputs, finalizer-only context, or
-terminal dispositions. Equality never coerces kinds; JSON Pointer follows RFC 6901.
+Values include named Text/JSON inputs and outputs, finalizer context, or terminal
+dispositions. Equality never coerces kinds; JSON Pointer follows RFC 6901.
 
 Resolution retains every referenced output and disposition in the static graph, even if
 evaluation short-circuits. Evaluation occurs at most once before body readiness. True

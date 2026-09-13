@@ -16,7 +16,9 @@ use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 
-use crate::execution::workflow::admission::{ResolvedAttachment, ResolvedInput, ResolvedInputs};
+use crate::execution::workflow::admission::{
+    ResolvedAttachment, ResolvedInput, ResolvedInputs, ResolvedJsonInput,
+};
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::runner::credential::Credential;
 use crate::runner_protocol::RunInputProjectionV1;
@@ -26,11 +28,13 @@ const CAPABILITY_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAXIMUM_INPUTS: usize = 256;
 const MAXIMUM_TEXT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_JSON_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_ATTACHMENTS: usize = 256;
 const MAXIMUM_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_CAPABILITY_MEMBERS: usize = 100;
 const TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
+const JSON_MEDIA_TYPE: &str = "application/json";
 
 #[derive(Clone, Copy)]
 pub(super) struct PreparationDeadline {
@@ -89,6 +93,7 @@ pub(super) enum RunInputFailure {
     ContentUnavailable,
     ContentMismatch,
     TextInvalid,
+    JsonInvalid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +127,11 @@ struct AttachmentMember {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ManifestInput {
     Text {
+        #[serde(rename = "sizeBytes")]
+        size_bytes: u64,
+        sha256: String,
+    },
+    Json {
         #[serde(rename = "sizeBytes")]
         size_bytes: u64,
         sha256: String,
@@ -597,6 +607,14 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
                 }
                 aggregate = add_manifest_bytes(aggregate, *size_bytes)?;
             }
+            ManifestInput::Json { size_bytes, sha256 } => {
+                if *size_bytes > MAXIMUM_JSON_BYTES
+                    || !crate::execution::workflow::is_lowercase_hex(sha256, 64)
+                {
+                    return Err(RunInputFailure::ManifestMismatch);
+                }
+                aggregate = add_manifest_bytes(aggregate, *size_bytes)?;
+            }
             ManifestInput::Attachments { items } => {
                 attachment_count = attachment_count
                     .checked_add(items.len())
@@ -640,6 +658,14 @@ fn canonical_manifest(manifest: &ManifestV1) -> Result<String, RunInputFailure> 
                 write!(
                     canonical,
                     "{{\"kind\":\"text\",\"sha256\":{},\"sizeBytes\":{size_bytes}}}",
+                    serde_json::to_string(sha256).map_err(|_| RunInputFailure::ManifestMismatch)?,
+                )
+                .map_err(|_| RunInputFailure::ManifestMismatch)?;
+            }
+            ManifestInput::Json { size_bytes, sha256 } => {
+                write!(
+                    canonical,
+                    "{{\"kind\":\"json\",\"sha256\":{},\"sizeBytes\":{size_bytes}}}",
                     serde_json::to_string(sha256).map_err(|_| RunInputFailure::ManifestMismatch)?,
                 )
                 .map_err(|_| RunInputFailure::ManifestMismatch)?;
@@ -690,6 +716,13 @@ fn logical_members(manifest: &ManifestV1) -> Result<Vec<LogicalMember>, RunInput
             ManifestInput::Text { size_bytes, sha256 } => members.push(LogicalMember {
                 member_id: format!("inputs/{name}"),
                 media_type: TEXT_MEDIA_TYPE.to_owned(),
+                size_bytes: *size_bytes,
+                sha256: sha256.clone(),
+                final_name: format!("member-{:06}", members.len()),
+            }),
+            ManifestInput::Json { size_bytes, sha256 } => members.push(LogicalMember {
+                member_id: format!("inputs/{name}"),
+                media_type: JSON_MEDIA_TYPE.to_owned(),
                 size_bytes: *size_bytes,
                 sha256: sha256.clone(),
                 final_name: format!("member-{:06}", members.len()),
@@ -826,6 +859,17 @@ fn construct_inputs(
                     String::from_utf8(bytes).map_err(|_| RunInputFailure::TextInvalid)?,
                 ))
             }
+            ManifestInput::Json { .. } => {
+                let path = completed
+                    .get(completed_index)
+                    .ok_or(RunInputFailure::EnvironmentUnavailable)?;
+                completed_index += 1;
+                let bytes = fs::read(path).map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
+                ResolvedInput::Json(
+                    ResolvedJsonInput::from_source(Arc::from(bytes))
+                        .map_err(|_| RunInputFailure::JsonInvalid)?,
+                )
+            }
             ManifestInput::Attachments { items } => {
                 let mut attachments = Vec::with_capacity(items.len());
                 for attachment in items {
@@ -936,7 +980,7 @@ fn exact_manifest_shape(value: &Value) -> bool {
     }
     value["inputs"].as_object().is_some_and(|inputs| {
         inputs.values().all(|input| match input["kind"].as_str() {
-            Some("text") => exact_object(input, &["kind", "sizeBytes", "sha256"]),
+            Some("text" | "json") => exact_object(input, &["kind", "sizeBytes", "sha256"]),
             Some("attachments") => {
                 exact_object(input, &["kind", "items"])
                     && input["items"].as_array().is_some_and(|items| {
@@ -1727,6 +1771,39 @@ mod tests {
             );
             assert_private_root_empty(private.path());
         }
+    }
+
+    #[test]
+    fn json_download_preserves_original_bytes_and_rejects_duplicates() {
+        let source = b"{ \"z\": null, \"n\": 1.2300 }\n".to_vec();
+        let manifest = |bytes: &[u8]| ManifestV1 {
+            schema_version: 1,
+            inputs: BTreeMap::from([(
+                "request".to_owned(),
+                ManifestInput::Json {
+                    size_bytes: u64::try_from(bytes.len()).unwrap(),
+                    sha256: lowercase_hex_bytes(digest(&SHA256, bytes).as_ref()),
+                },
+            )]),
+        };
+        let (broker, projection) = broker_for(manifest(&source), vec![source.clone()]);
+        let private = tempfile::tempdir().unwrap();
+        let inputs = materialize_projection(&broker, &projection, private.path()).unwrap();
+        let Some(ResolvedInput::Json(value)) = inputs.get("request") else {
+            panic!("materialized JSON input is missing");
+        };
+        assert_eq!(value.source(), source);
+        assert_eq!(value.canonical(), b"{\"n\":1.2300,\"z\":null}");
+        assert!(value.value()["z"].is_null());
+
+        let duplicate = br#"{"nested":{"key":1,"key":2}}"#.to_vec();
+        let (broker, projection) = broker_for(manifest(&duplicate), vec![duplicate]);
+        let private = tempfile::tempdir().unwrap();
+        assert_eq!(
+            materialize_projection(&broker, &projection, private.path()),
+            Err(RunInputFailure::JsonInvalid)
+        );
+        assert_private_root_empty(private.path());
     }
 
     #[test]

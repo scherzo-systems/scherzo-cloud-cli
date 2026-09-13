@@ -12,7 +12,7 @@ use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
     ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedInput, ResolvedInputs,
-    admit_workflow,
+    ResolvedJsonInput, admit_workflow,
 };
 use crate::execution::workflow::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
@@ -31,7 +31,7 @@ struct AdmittedFixture {
 impl AdmittedFixture {
     fn new() -> Self {
         Self::from_source_with_inputs(
-            "schemaVersion: 1\ninputs:\n  request: {kind: text}\n  evidence: {kind: attachments}\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
+            "schemaVersion: 1\ninputs:\n  request: {kind: text}\n  settings: {kind: json}\n  evidence: {kind: attachments}\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
             ResolvedInputs::new(BTreeMap::from([
                 (
                     "request".to_owned(),
@@ -43,6 +43,15 @@ impl AdmittedFixture {
                         Arc::from("application/octet-stream"),
                         Arc::from([0_u8, 1, 0xff]),
                     )])),
+                ),
+                (
+                    "settings".to_owned(),
+                    ResolvedInput::Json(
+                        ResolvedJsonInput::from_source(Arc::from(
+                            b"{ \"z\": null, \"n\": 1.2300 }\n".as_slice(),
+                        ))
+                        .unwrap(),
+                    ),
                 ),
             ])),
             1024,
@@ -419,6 +428,7 @@ fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() 
         "files/0002"
     );
     assert_eq!(manifest["inputs"]["request"]["relativeFile"], "files/0003");
+    assert_eq!(manifest["inputs"]["settings"]["relativeFile"], "files/0004");
     assert_eq!(
         fs::read(run_path.join("workflow/files/0001")).unwrap(),
         fixture.admitted.workflow().source_closure["workflow.yaml"].as_ref()
@@ -430,6 +440,10 @@ fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() 
     assert_eq!(
         fs::read(run_path.join("workflow/files/0003")).unwrap(),
         b"durable request\n"
+    );
+    assert_eq!(
+        fs::read(run_path.join("workflow/files/0004")).unwrap(),
+        b"{ \"z\": null, \"n\": 1.2300 }\n"
     );
 
     let state = read_state(run.root_handle()).unwrap();
@@ -738,6 +752,12 @@ fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
         panic!("retained named attachment collection is missing");
     };
     assert_eq!(attachments[0].bytes(), [0_u8, 1, 0xff]);
+    let Some(ResolvedInput::Json(settings)) = inputs.get("settings") else {
+        panic!("retained named JSON input is missing");
+    };
+    assert_eq!(settings.source(), b"{ \"z\": null, \"n\": 1.2300 }\n");
+    assert_eq!(settings.canonical(), b"{\"n\":1.2300,\"z\":null}");
+    assert!(settings.value()["z"].is_null());
     let retry = pending.begin(&fixture.admitted).unwrap_or_else(|_| {
         panic!("eligible retry should commit");
     });
@@ -989,9 +1009,9 @@ fn retained_named_input_corruption_rejects_retry_without_fallback() {
     settle_as_workflow_failed(&run);
     drop(run);
 
-    let retained_text = run_path.join("workflow/files/0003");
-    fs::set_permissions(&retained_text, Permissions::from_mode(0o600)).unwrap();
-    fs::write(&retained_text, b"changed retained bytes").unwrap();
+    let retained_json = run_path.join("workflow/files/0004");
+    fs::set_permissions(&retained_json, Permissions::from_mode(0o600)).unwrap();
+    fs::write(&retained_json, br#"{"key":1,"key":2}"#).unwrap();
 
     assert!(matches!(
         acquire_local_retry(&run_path),

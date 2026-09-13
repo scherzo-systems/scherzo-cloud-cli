@@ -1141,7 +1141,7 @@ fn resolve_text<'a>(
             value_type: WorkflowValueType::Text,
         } => match admitted.inputs().get(name) {
             Some(ResolvedInput::Text(text)) => Ok(text),
-            Some(ResolvedInput::Attachments(_)) | None => {
+            Some(ResolvedInput::Json(_)) | Some(ResolvedInput::Attachments(_)) | None => {
                 Err(start_error(AgentInputStartFailure::InputsUnavailable))
             }
         },
@@ -1178,6 +1178,22 @@ fn resolve_attachments<'a>(
                     payload: PlannedAttachment::Bytes(bytes),
                     media_type: Arc::from(STATIC_ATTACHMENT_MEDIA_TYPE),
                     diagnostic_source_name: Some(Arc::from(path.as_str())),
+                },
+                attachments,
+            )?;
+        }
+        ValidatedMessageSource::Reference {
+            source: ResolvedValueSource::Input(name),
+            value_type: WorkflowValueType::Json,
+        } => {
+            let Some(ResolvedInput::Json(json)) = admitted.inputs().get(name) else {
+                return Err(start_error(AgentInputStartFailure::InputsUnavailable));
+            };
+            budget.push(
+                PlannedAgentAttachment {
+                    payload: PlannedAttachment::CanonicalJson(json.canonical()),
+                    media_type: Arc::from("application/json"),
+                    diagnostic_source_name: Some(Arc::from(format!("inputs.{name}"))),
                 },
                 attachments,
             )?;
