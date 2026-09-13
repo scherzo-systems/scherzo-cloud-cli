@@ -29,17 +29,20 @@ use crate::execution::workflow::agent::{
     AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
     AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
     AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, check_agent_input_bound,
-    failed_agent_outcome, finish_agent_diagnostic_capture,
+    failed_agent_outcome, finish_agent_diagnostic_capture, run_cancellable_blocking_launch,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
-use crate::execution::workflow::child_guard::{StoppedChildGuard, force_stop_direct_child};
+use crate::execution::workflow::child_guard::{
+    ChildGuardCancellation, StoppedChildGuard, force_stop_direct_child,
+};
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::observation::{ExecutionObserver, NoopExecutionObserver};
 use crate::execution::workflow::pi::PiConfig;
 use crate::execution::workflow::process_group::{
-    ProcessGuardRegistration, interrupt_process_group, process_group_is_quiescent,
-    reap_process_group_children, terminate_authenticated_process_group, terminate_process_group,
+    ProcessGuardRegistration, interrupt_process_group, mark_process_guard_quiesced,
+    process_group_is_quiescent, reap_process_group_children, terminate_authenticated_process_group,
+    terminate_process_group,
 };
 use crate::execution::workflow::result_validation::{
     AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
@@ -159,7 +162,7 @@ where
         }
 
         let adapter = self.clone();
-        let (mut invocation, preparation) = match tokio::task::spawn_blocking(move || {
+        let (invocation, preparation) = match tokio::task::spawn_blocking(move || {
             let preparation = prepare_launch(&invocation).and_then(|mut plan| {
                 let result_bridge = adapter.prepare_result_bridge(&invocation)?;
                 if let Some(result_bridge) = result_bridge.as_ref() {
@@ -178,22 +181,63 @@ where
             Ok(preparation) => preparation,
             Err(cause) => return failed(cause),
         };
+        let launch = if invocation.process_guards().is_durable() {
+            let cancellation_source = invocation.cancellation().clone();
+            let diagnostics = self.diagnostics.clone();
+            let maximum_stream_bytes = self.maximum_diagnostic_stream_bytes;
+            match run_cancellable_blocking_launch(
+                &cancellation_source,
+                move |launch_cancellation| {
+                    let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
+                        log: &diagnostics,
+                        maximum_stream_bytes,
+                    };
+                    let launched = launch_guarded_process(
+                        &invocation,
+                        &plan,
+                        spawn_diagnostics,
+                        &launch_cancellation,
+                    );
+                    (invocation, plan, launched)
+                },
+            )
+            .await
+            {
+                Ok((launch, cancellation_reason)) => (launch, cancellation_reason),
+                Err(_) => {
+                    let _ = shutdown_result_bridge(result_bridge).await;
+                    return failed(AgentFailureCause::HarnessStartFailed);
+                }
+            }
+        } else {
+            let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
+                log: &self.diagnostics,
+                maximum_stream_bytes: self.maximum_diagnostic_stream_bytes,
+            };
+            let launched = launch_direct_process(&invocation, &plan, spawn_diagnostics).await;
+            ((invocation, plan, launched), None)
+        };
+        let ((mut invocation, plan, launched), cancellation_reason) = launch;
+        if let Some(reason) = cancellation_reason {
+            if let Ok((mut process, _)) = launched {
+                let _ = process.child.force_stop(process.process_group).await;
+            }
+            let _ = shutdown_result_bridge(result_bridge).await;
+            return AgentOutcome::Cancelled { reason };
+        }
+        let (process, standard_error) = match launched {
+            Ok(launched) => launched,
+            Err(cause) => {
+                let _ = shutdown_result_bridge(result_bridge).await;
+                return failed(cause);
+            }
+        };
         let Some(process_directives) = invocation.take_process_directives() else {
+            let mut process = process;
+            let _ = process.child.force_stop(process.process_group).await;
             let _ = shutdown_result_bridge(result_bridge).await;
             return failed(AgentFailureCause::HarnessStartFailed);
         };
-        let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
-            log: &self.diagnostics,
-            maximum_stream_bytes: self.maximum_diagnostic_stream_bytes,
-        };
-        let (process, standard_error) =
-            match launch_process(&invocation, &plan, spawn_diagnostics).await {
-                Ok(launched) => launched,
-                Err(cause) => {
-                    let _ = shutdown_result_bridge(result_bridge).await;
-                    return failed(cause);
-                }
-            };
         let diagnostic = self.diagnostics.start_standard_error_capture(
             invocation.identity().step().to_owned(),
             invocation.identity().invocation(),
@@ -426,7 +470,7 @@ where
     Ok(command)
 }
 
-async fn launch_process<Sink>(
+async fn launch_direct_process<Sink>(
     invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
     plan: &PiJsonV1LaunchPlan,
     spawn_diagnostics: ProcessSpawnDiagnosticCapture<'_>,
@@ -434,14 +478,22 @@ async fn launch_process<Sink>(
 where
     Sink: AgentObservationSink,
 {
-    if !invocation.process_guards().is_durable() {
-        let mut command = build_command(invocation, plan)?;
-        let child = command
-            .spawn()
-            .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
-        return finish_direct_process_launch(child).await;
-    }
+    let mut command = build_command(invocation, plan)?;
+    let child = command
+        .spawn()
+        .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
+    finish_direct_process_launch(child).await
+}
 
+fn launch_guarded_process<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    plan: &PiJsonV1LaunchPlan,
+    spawn_diagnostics: ProcessSpawnDiagnosticCapture<'_>,
+    cancellation: &ChildGuardCancellation,
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
     let environment = invocation
         .process()
         .environment()
@@ -449,10 +501,11 @@ where
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<Vec<_>>();
-    let mut child = StoppedChildGuard::spawn(
+    let mut child = StoppedChildGuard::spawn_cancellable(
         invocation.adapter().executable(),
         &plan.arguments,
         &environment,
+        cancellation,
         |command| {
             invocation
                 .process()
@@ -464,7 +517,7 @@ where
     let process_group = child.identity().process_group();
     let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
     else {
-        let _ = child.force_stop().await;
+        let _ = child.force_stop_blocking();
         return Err(AgentFailureCause::HarnessStartFailed);
     };
     let mut registration = match invocation.process_guards().register(
@@ -474,13 +527,13 @@ where
     ) {
         Ok(registration) => registration,
         Err(()) => {
-            let _ = child.force_stop().await;
+            let _ = child.force_stop_blocking();
             return Err(AgentFailureCause::HarnessStartFailed);
         }
     };
     if let Err(failure) = release_guarded_pi(invocation.diagnostic_session(), || {
         child
-            .continue_execution()
+            .continue_execution_cancellable(cancellation)
             .map_err(GuardedPiReleaseFailure::ProcessExec)?;
         registration
             .mark_released()
@@ -494,7 +547,7 @@ where
                 AgentFailureCause::HarnessStartFailed
             }
         };
-        let _ = child.force_stop().await;
+        let _ = child.force_stop_blocking();
         let _ = registration.mark_quiesced();
         return Err(cause);
     }
@@ -503,7 +556,7 @@ where
         LaunchedPiProcess {
             child: PiChild::Guarded {
                 child,
-                registration,
+                registration: Some(registration),
             },
             process_group,
             standard_output,
@@ -608,7 +661,7 @@ struct LaunchedPiProcess {
 enum PiChild {
     Guarded {
         child: StoppedChildGuard,
-        registration: ProcessGuardRegistration,
+        registration: Option<ProcessGuardRegistration>,
     },
     Direct(Child),
 }
@@ -628,7 +681,7 @@ impl PiChild {
             Self::Guarded { child, .. } => child.wait().await.map_err(|_| ()),
             Self::Direct(child) => child.wait().await.map_err(|_| ()),
         }?;
-        self.mark_quiesced()?;
+        self.mark_quiesced().await?;
         Ok(status)
     }
 
@@ -638,12 +691,12 @@ impl PiChild {
             Self::Guarded { child, .. } => child.force_stop().await.map_err(|_| ())?,
             Self::Direct(child) => force_stop_direct_child(child).await?,
         }
-        self.mark_quiesced()
+        self.mark_quiesced().await
     }
 
-    fn mark_quiesced(&mut self) -> Result<(), ()> {
+    async fn mark_quiesced(&mut self) -> Result<(), ()> {
         match self {
-            Self::Guarded { registration, .. } => registration.mark_quiesced(),
+            Self::Guarded { registration, .. } => mark_process_guard_quiesced(registration).await,
             Self::Direct(_) => Ok(()),
         }
     }

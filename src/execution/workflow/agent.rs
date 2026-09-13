@@ -13,6 +13,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use super::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use super::agent_diagnostics::AgentDiagnosticSession;
+use super::cancellation::CancellationFlag;
 use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
 use super::process_group::ProcessGuardRegistry;
 use super::result_validation::ResultValidationFatal;
@@ -590,6 +591,28 @@ pub(crate) fn agent_process_control_channel() -> (
 ) {
     let (directives, receiver) = mpsc::unbounded_channel();
     (AgentProcessControl { directives }, receiver)
+}
+
+pub(crate) async fn run_cancellable_blocking_launch<Output>(
+    cancellation_source: &CancellationSource,
+    operation: impl FnOnce(CancellationFlag) -> Output + Send + 'static,
+) -> Result<(Output, Option<CancellationReason>), tokio::task::JoinError>
+where
+    Output: Send + 'static,
+{
+    let cancellation = CancellationFlag::default();
+    let blocking_cancellation = cancellation.clone();
+    let mut launch = tokio::task::spawn_blocking(move || operation(blocking_cancellation));
+    tokio::select! {
+        biased;
+        reason = cancellation_source.wait_for_cancellation() => {
+            cancellation.cancel();
+            launch.await.map(|output| (output, Some(reason)))
+        }
+        result = &mut launch => {
+            result.map(|output| (output, cancellation_source.cancellation_reason()))
+        }
+    }
 }
 
 impl AgentProcessControl {

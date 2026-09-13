@@ -34,7 +34,7 @@ use super::artifact::{
     ArtifactStaging, CaptureAttemptFailure, CaptureCancellation, CaptureCandidateSet,
     CaptureDeclaration, CaptureFailure,
 };
-use super::child_guard::{StoppedChildGuard, force_stop_direct_child};
+use super::child_guard::{ChildGuardCancellation, StoppedChildGuard, force_stop_direct_child};
 use super::coordinator::{
     ActionPort, CommitPort, CommittedReduction, CoordinationError, CoordinationResult, Coordinator,
     CoordinatorClock, DriverOccurrence, DriverOccurrenceAcceptance, DriverOccurrenceClaim,
@@ -53,6 +53,7 @@ use super::observation::{ExecutionObservation, ExecutionObserver, NoopExecutionO
 use super::process_group::{
     AuthenticatedProcessGroup, ProcessGuardRegistration, ProcessGuardRegistry,
     capture_process_group_identity, interrupt_authenticated_process_group,
+    mark_process_guard_quiesced,
 };
 use super::recovery::{
     RECOVERY_CONTEXT_VARIABLE, RECOVERY_RESULT_VARIABLE, RecoveryHandlerFailure, RecoveryStaging,
@@ -111,6 +112,15 @@ pub(crate) enum StepStartFailure {
 pub(crate) enum CommandExecutionFailure {
     UnsuccessfulExit { code: Option<i32> },
     Wait,
+}
+
+pub(crate) fn spawn_isolated_command_launch<Output>(
+    operation: impl FnOnce() -> Output + Send + 'static,
+) -> tokio::task::JoinHandle<Output>
+where
+    Output: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -914,6 +924,83 @@ where
         }
     }
 
+    async fn launch_command(
+        &self,
+        guarded: bool,
+        step: String,
+        action: ActionId,
+        command: PreparedCommand,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> CommandLaunchBoundary<Clock::Instant> {
+        let launch_cancellation = ChildGuardCancellation::default();
+        match self
+            .with_work(|work| work.arm_launch_cancellation(action, launch_cancellation.clone()))
+        {
+            BeginLaunch::Launch => {}
+            BeginLaunch::Cancelled(cancellation) => {
+                return CommandLaunchBoundary::Cancelled(cancellation);
+            }
+            BeginLaunch::Gone => return CommandLaunchBoundary::Gone,
+        }
+        let blocking_cancellation = launch_cancellation.clone();
+        let parameters = CommandLaunchParameters {
+            guarded,
+            step: step.clone(),
+            invocation: action,
+            diagnostic_log: self.diagnostics.clone(),
+            maximum_stream_bytes: self.admitted.execution().limits().maximum_step_log_bytes(),
+            observer: self.observer.clone(),
+        };
+        let process_guards = self.process_guards.clone();
+        let mut launch = spawn_isolated_command_launch(move || {
+            command.launch_registered::<Clock::Instant, _>(
+                parameters,
+                &process_guards,
+                &blocking_cancellation,
+            )
+        });
+        let (result, cancelled) = tokio::select! {
+            biased;
+            _ = &mut *cancellation => {
+                launch_cancellation.cancel();
+                (launch.await, true)
+            }
+            result = &mut launch => (result, false),
+        };
+        if cancelled || launch_cancellation.is_cancelled() {
+            match result {
+                // A successful launch has released user code. Let record_launch
+                // deliver graceful cancellation rather than treating it as an
+                // unlaunched worker that can be force-stopped immediately.
+                Ok(Ok(launched)) => return CommandLaunchBoundary::Launched(launched),
+                Ok(Err(mut failure)) => {
+                    if let Some(mut launched) = failure.launched.take() {
+                        let _ = launched.force_stop().await;
+                        launched.finish_resources().await;
+                    }
+                }
+                Err(_) => {}
+            }
+            return self.cancellation_for(action).map_or(
+                CommandLaunchBoundary::Gone,
+                CommandLaunchBoundary::Cancelled,
+            );
+        }
+        match result {
+            Ok(Ok(launched)) => CommandLaunchBoundary::Launched(launched),
+            Ok(Err(mut failure)) => {
+                if let Some(mut launched) = failure.launched.take() {
+                    let _ = launched.force_stop().await;
+                    launched.finish_resources().await;
+                }
+                CommandLaunchBoundary::Failed(failure.failure)
+            }
+            Err(_) => CommandLaunchBoundary::Failed(StepStartFailure::CommandLaunch(
+                CommandLaunchFailure::Other,
+            )),
+        }
+    }
+
     // Recovery commands share containment mechanics with targets but have private result
     // authority and handler occurrences, so combining the two paths would blur settlement.
     // jscpd:ignore-start
@@ -928,16 +1015,20 @@ where
     ) -> Result<(), StepRuntimeError> {
         // Recovery commands always cross the authenticated child-guard boundary,
         // including source-neutral tests whose commit port has no durable guard store.
-        let mut launched = match command.launch::<Clock::Instant, _>(
-            true,
-            step.clone(),
-            action,
-            &self.diagnostics,
-            self.admitted.execution().limits().maximum_step_log_bytes(),
-            self.observer.clone(),
-        ) {
-            Ok(launched) => launched,
-            Err(_) => {
+        let mut launched = match self
+            .launch_command(true, step.clone(), action, command, &mut cancellation)
+            .await
+        {
+            CommandLaunchBoundary::Launched(launched) => launched,
+            CommandLaunchBoundary::Cancelled(cancellation) => {
+                drop(context);
+                return self.quiesce_unlaunched(action, cancellation).await;
+            }
+            CommandLaunchBoundary::Gone => {
+                drop(context);
+                return Ok(());
+            }
+            CommandLaunchBoundary::Failed(_) => {
                 drop(context);
                 return self
                     .settle_recovery_start_failure(
@@ -962,40 +1053,6 @@ where
                 )
                 .await;
         };
-        let registration = match self.process_guards.register(
-            &step,
-            action.transition_sequence.get(),
-            &process_group,
-        ) {
-            Ok(registration) => registration,
-            Err(()) => {
-                let _ = launched.force_stop().await;
-                launched.finish_resources().await;
-                drop(context);
-                return self
-                    .settle_recovery_start_failure(
-                        step,
-                        round,
-                        action,
-                        RecoveryHandlerFailure::CommandLaunchFailed,
-                    )
-                    .await;
-            }
-        };
-        launched.install_registration(registration);
-        if launched.release().is_err() {
-            let _ = launched.force_stop().await;
-            launched.finish_resources().await;
-            drop(context);
-            return self
-                .settle_recovery_start_failure(
-                    step,
-                    round,
-                    action,
-                    RecoveryHandlerFailure::CommandLaunchFailed,
-                )
-                .await;
-        }
         match self.with_work(|work| work.record_launch(action, process_group)) {
             RecordLaunch::Running => {}
             RecordLaunch::Cancelled {
@@ -1344,16 +1401,24 @@ where
         command: PreparedCommand,
         mut cancellation: oneshot::Receiver<()>,
     ) -> Result<(), StepRuntimeError> {
-        let mut launched = match command.launch::<Clock::Instant, _>(
-            self.process_guards.is_durable(),
-            step.clone(),
-            action,
-            &self.diagnostics,
-            self.admitted.execution().limits().maximum_step_log_bytes(),
-            self.observer.clone(),
-        ) {
-            Ok(launched) => launched,
-            Err(failure) => return self.settle_start_failure(step, action, failure).await,
+        let mut launched = match self
+            .launch_command(
+                self.process_guards.is_durable(),
+                step.clone(),
+                action,
+                command,
+                &mut cancellation,
+            )
+            .await
+        {
+            CommandLaunchBoundary::Launched(launched) => launched,
+            CommandLaunchBoundary::Cancelled(cancellation) => {
+                return self.quiesce_unlaunched(action, cancellation).await;
+            }
+            CommandLaunchBoundary::Gone => return Ok(()),
+            CommandLaunchBoundary::Failed(failure) => {
+                return self.settle_start_failure(step, action, failure).await;
+            }
         };
         let Some(process_group) = launched.process_group().cloned() else {
             let _ = launched.force_stop().await;
@@ -1366,32 +1431,6 @@ where
                 )
                 .await;
         };
-        let registration = match self.process_guards.register(
-            &step,
-            action.transition_sequence.get(),
-            &process_group,
-        ) {
-            Ok(registration) => registration,
-            Err(()) => {
-                let _ = launched.force_stop().await;
-                launched.finish_resources().await;
-                return self
-                    .settle_start_failure(
-                        step,
-                        action,
-                        StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
-                    )
-                    .await;
-            }
-        };
-        launched.install_registration(registration);
-        if let Err(failure) = launched.release() {
-            let _ = launched.force_stop().await;
-            launched.finish_resources().await;
-            return self
-                .settle_start_failure(step, action, StepStartFailure::CommandLaunch(failure))
-                .await;
-        }
 
         match self.with_work(|work| work.record_launch(action, process_group)) {
             RecordLaunch::Running => {}
@@ -2584,6 +2623,7 @@ struct CommandWork<Deadline> {
     agent_deadline_finished: Option<oneshot::Receiver<()>>,
     cancellation: Option<CommandCancellation<Deadline>>,
     cancellation_wake: Option<oneshot::Sender<()>>,
+    launch_cancellation: Option<ChildGuardCancellation>,
     interrupt_sent: bool,
 }
 
@@ -2628,6 +2668,7 @@ where
                 agent_deadline_finished: None,
                 cancellation: None,
                 cancellation_wake: Some(cancellation_wake),
+                launch_cancellation: None,
                 interrupt_sent: false,
             },
         );
@@ -2645,6 +2686,22 @@ where
         BeginLaunch::Launch
     }
 
+    fn arm_launch_cancellation(
+        &mut self,
+        action: ActionId,
+        launch_cancellation: ChildGuardCancellation,
+    ) -> BeginLaunch<Deadline> {
+        let Some(work) = self.active.get_mut(&action) else {
+            return BeginLaunch::Gone;
+        };
+        if let Some(cancellation) = work.cancellation.clone() {
+            launch_cancellation.cancel();
+            return BeginLaunch::Cancelled(cancellation);
+        }
+        work.launch_cancellation = Some(launch_cancellation);
+        BeginLaunch::Launch
+    }
+
     fn record_launch(
         &mut self,
         action: ActionId,
@@ -2655,6 +2712,7 @@ where
         };
         work.phase = WorkPhase::Running;
         work.process_group = Some(process_group.clone());
+        work.launch_cancellation = None;
         let Some(cancellation) = work.cancellation.clone() else {
             return RecordLaunch::Running;
         };
@@ -2731,6 +2789,9 @@ where
             action,
             deadline: deadline.clone(),
         });
+        if let Some(launch_cancellation) = &work.launch_cancellation {
+            launch_cancellation.cancel();
+        }
         let interrupt = match (work.phase, work.process_group.clone()) {
             (WorkPhase::Running | WorkPhase::Started, Some(process_group))
                 if !work.interrupt_sent =>
@@ -2793,6 +2854,9 @@ where
                 });
             }
         }
+        if let Some(launch_cancellation) = &work.launch_cancellation {
+            launch_cancellation.cancel();
+        }
         ForceAbortRegistration::Active {
             wake: work.cancellation_wake.take(),
             process_group: work.process_group.clone(),
@@ -2819,6 +2883,9 @@ where
                 action,
                 deadline: deadline.clone(),
             });
+            if let Some(launch_cancellation) = &work.launch_cancellation {
+                launch_cancellation.cancel();
+            }
             let interrupt = match (work.phase, work.process_group.clone()) {
                 (WorkPhase::Running | WorkPhase::Started, Some(process_group))
                     if !work.interrupt_sent =>
@@ -2923,6 +2990,13 @@ enum StartDelivery<Deadline> {
     Published,
     Cancelled(CommandCancellation<Deadline>),
     Gone,
+}
+
+enum CommandLaunchBoundary<Deadline> {
+    Launched(Box<LaunchedStepBody>),
+    Cancelled(CommandCancellation<Deadline>),
+    Gone,
+    Failed(StepStartFailure),
 }
 
 enum AgentLifecycleBoundary {
@@ -3446,15 +3520,79 @@ struct PreparedCommand {
     inputs: Option<InputView>,
 }
 
+struct CommandLaunchParameters<Observer> {
+    guarded: bool,
+    step: String,
+    invocation: ActionId,
+    diagnostic_log: StepDiagnosticLog,
+    maximum_stream_bytes: NonZeroU64,
+    observer: Observer,
+}
+
 impl PreparedCommand {
+    fn launch_registered<Deadline, Observer>(
+        self,
+        parameters: CommandLaunchParameters<Observer>,
+        process_guards: &ProcessGuardRegistry,
+        cancellation: &ChildGuardCancellation,
+    ) -> Result<Box<LaunchedStepBody>, BlockingCommandLaunchFailure>
+    where
+        Deadline: Send + 'static,
+        Observer: ExecutionObserver<Deadline>,
+    {
+        let step = parameters.step.clone();
+        let invocation = parameters.invocation;
+        let mut launched = self
+            .launch::<Deadline, _>(parameters, cancellation)
+            .map_err(BlockingCommandLaunchFailure::before_launch)?;
+        let process_group = match launched.process_group().cloned() {
+            Some(process_group) => process_group,
+            None => {
+                return Err(BlockingCommandLaunchFailure::after_launch(
+                    launched,
+                    StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                ));
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Err(BlockingCommandLaunchFailure::after_launch(
+                launched,
+                StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+            ));
+        }
+        let registration = match process_guards.register(
+            &step,
+            invocation.transition_sequence.get(),
+            &process_group,
+        ) {
+            Ok(registration) => registration,
+            Err(()) => {
+                return Err(BlockingCommandLaunchFailure::after_launch(
+                    launched,
+                    StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                ));
+            }
+        };
+        launched.install_registration(registration);
+        if cancellation.is_cancelled() {
+            return Err(BlockingCommandLaunchFailure::after_launch(
+                launched,
+                StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+            ));
+        }
+        if let Err(failure) = launched.release(cancellation) {
+            return Err(BlockingCommandLaunchFailure::after_launch(
+                launched,
+                StepStartFailure::CommandLaunch(failure),
+            ));
+        }
+        Ok(Box::new(launched))
+    }
+
     fn launch<Deadline, Observer>(
         self,
-        guarded: bool,
-        step: String,
-        invocation: ActionId,
-        diagnostic_log: &StepDiagnosticLog,
-        maximum_stream_bytes: NonZeroU64,
-        observer: Observer,
+        parameters: CommandLaunchParameters<Observer>,
+        cancellation: &ChildGuardCancellation,
     ) -> Result<LaunchedStepBody, StepStartFailure>
     where
         Deadline: Send + 'static,
@@ -3467,6 +3605,17 @@ impl PreparedCommand {
             environment,
             inputs,
         } = self;
+        let CommandLaunchParameters {
+            guarded,
+            step,
+            invocation,
+            diagnostic_log,
+            maximum_stream_bytes,
+            observer,
+        } = parameters;
+        if cancellation.is_cancelled() {
+            return Err(StepStartFailure::CommandLaunch(CommandLaunchFailure::Other));
+        }
         if !cwd.validate_execution_root() {
             return Err(StepStartFailure::WorkingDirectory(
                 WorkingDirectoryFailure::ExecutionRootRebound,
@@ -3479,10 +3628,16 @@ impl PreparedCommand {
             .collect::<Vec<_>>();
         let child = if guarded {
             CommandChild::Guarded(
-                StoppedChildGuard::spawn(&program, &arguments, &environment, |command| {
-                    cwd.bind_command(command);
-                    Ok(())
-                })
+                StoppedChildGuard::spawn_cancellable(
+                    &program,
+                    &arguments,
+                    &environment,
+                    cancellation,
+                    |command| {
+                        cwd.bind_command(command);
+                        Ok(())
+                    },
+                )
                 .map_err(|failure| {
                     StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
                 })?,
@@ -3507,11 +3662,32 @@ impl PreparedCommand {
             child,
             step,
             invocation,
-            diagnostic_log,
+            &diagnostic_log,
             maximum_stream_bytes,
             inputs,
             observer,
         )
+    }
+}
+
+struct BlockingCommandLaunchFailure {
+    launched: Option<Box<LaunchedStepBody>>,
+    failure: StepStartFailure,
+}
+
+impl BlockingCommandLaunchFailure {
+    fn before_launch(failure: StepStartFailure) -> Self {
+        Self {
+            launched: None,
+            failure,
+        }
+    }
+
+    fn after_launch(launched: LaunchedStepBody, failure: StepStartFailure) -> Self {
+        Self {
+            launched: Some(Box::new(launched)),
+            failure,
+        }
     }
 }
 
@@ -3636,7 +3812,10 @@ impl LaunchedStepBody {
         }
     }
 
-    fn release(&mut self) -> Result<(), CommandLaunchFailure> {
+    fn release(
+        &mut self,
+        cancellation: &ChildGuardCancellation,
+    ) -> Result<(), CommandLaunchFailure> {
         match self {
             Self::Command {
                 child,
@@ -3645,7 +3824,7 @@ impl LaunchedStepBody {
             } => {
                 if let CommandChild::Guarded(child) = child {
                     child
-                        .continue_execution()
+                        .continue_execution_cancellable(cancellation)
                         .map_err(|failure| classify_launch_failure(&failure))?;
                 }
                 registration
@@ -3667,7 +3846,7 @@ impl LaunchedStepBody {
                 ..
             } => child.wait().await.map_err(|_| ()),
         }?;
-        self.mark_quiesced()?;
+        self.mark_quiesced().await?;
         Ok(status)
     }
 
@@ -3708,15 +3887,12 @@ impl LaunchedStepBody {
                 ..
             } => force_stop_direct_child(child).await?,
         }
-        self.mark_quiesced()
+        self.mark_quiesced().await
     }
 
-    fn mark_quiesced(&mut self) -> Result<(), ()> {
+    async fn mark_quiesced(&mut self) -> Result<(), ()> {
         match self {
-            Self::Command { registration, .. } => match registration {
-                Some(registration) => registration.mark_quiesced(),
-                None => Ok(()),
-            },
+            Self::Command { registration, .. } => mark_process_guard_quiesced(registration).await,
         }
     }
 

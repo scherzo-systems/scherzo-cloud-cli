@@ -8,6 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use nix::sys::stat::Mode;
@@ -46,8 +47,9 @@ use crate::execution::workflow::result_validation::{
 };
 use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
 use crate::execution::workflow::test_support::{
-    process_fixture_interrupt_receiver, process_fixture_output, spawn_process_fixture,
-    write_process_fixture_id, write_process_fixture_signal,
+    process_fixture_interrupt_receiver, process_fixture_output, run_with_stalled_child_guard,
+    spawn_process_fixture, wait_for_stalled_child_guard, write_process_fixture_id,
+    write_process_fixture_signal,
 };
 
 const MAXIMUM_INPUT_BYTES: u64 = MAXIMUM_AGENT_PROMPT_BYTES;
@@ -59,6 +61,8 @@ const TERMINAL_TOOL_USE: &str = include_str!("fixtures/terminal-tool-use.jsonl")
 const STREAMED_THINKING: &str = "**Reading package.json contents**";
 const EXPECTED_RESPONSE: &str = "package contents";
 const SPAWN_DIAGNOSTIC_SECRET: &str = "SENTINEL_PI_SPAWN_ENVIRONMENT_SECRET";
+const STALLED_GUARD_PID_PATH: &str = "PI_STALLED_GUARD_PID_PATH";
+const STALLED_GUARD_LAUNCH_FIXTURE: &str = "execution::workflow::pi_json_v1::adapter_tests::cancelled_stalled_guarded_launch_cleans_worker_fixture";
 
 fn assert_agent_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
     let AgentOutcome::Failed(failure) = outcome else {
@@ -299,6 +303,41 @@ impl DurableProcessGuardStore for AcceptingProcessGuardStore {
     }
 
     fn mark_quiesced(&self, _guard_id: &str) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+struct RecordingProcessGuardStore {
+    operation_threads: Arc<Mutex<Vec<ThreadId>>>,
+}
+
+impl RecordingProcessGuardStore {
+    fn record_operation_thread(&self) {
+        self.operation_threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+    }
+}
+
+impl DurableProcessGuardStore for RecordingProcessGuardStore {
+    fn register(
+        &self,
+        _step: &str,
+        _action_id: u64,
+        _identity: &AuthenticatedProcessGroup,
+    ) -> Result<String, ()> {
+        self.record_operation_thread();
+        Ok("recorded-test-guard".to_owned())
+    }
+
+    fn mark_released(&self, _guard_id: &str) -> Result<(), ()> {
+        self.record_operation_thread();
+        Ok(())
+    }
+
+    fn mark_quiesced(&self, _guard_id: &str) -> Result<(), ()> {
+        self.record_operation_thread();
         Ok(())
     }
 }
@@ -1592,6 +1631,78 @@ async fn guarded_process_spawn_failure_retains_os_diagnostic() {
         "system".to_owned(),
         "message".to_owned(),
     ))
+    .await;
+}
+
+#[tokio::test]
+async fn cancelled_stalled_guarded_launch_does_not_leave_the_agent_worker_live() {
+    with_watchdog(async {
+        let status =
+            run_with_stalled_child_guard(STALLED_GUARD_LAUNCH_FIXTURE, STALLED_GUARD_PID_PATH)
+                .await;
+        assert!(status.success());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn guarded_launch_and_durable_writes_leave_the_agent_executor() {
+    with_watchdog(async {
+        let executor_thread = std::thread::current().id();
+        let operation_threads = Arc::new(Mutex::new(Vec::new()));
+        let fixture = ProcessFixture::new_with_declared_cwd_and_value_mode(
+            "success",
+            "system".to_owned(),
+            "message".to_owned(),
+            "worktree",
+            AgentValueMode::None,
+            ProcessGuardRegistry::durable(Arc::new(RecordingProcessGuardStore {
+                operation_threads: Arc::clone(&operation_threads),
+            })),
+        );
+
+        let _run = run_success(fixture).await;
+
+        let operation_threads = operation_threads.lock().unwrap();
+        assert_eq!(operation_threads.len(), 3);
+        assert!(
+            operation_threads
+                .iter()
+                .all(|operation_thread| *operation_thread != executor_thread)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "launched in an isolated test-binary tree by the stalled guard integration test"]
+async fn cancelled_stalled_guarded_launch_cleans_worker_fixture() {
+    with_watchdog(async {
+        let fixture = ProcessFixture::new_with_durable_process_guard(
+            "success",
+            "system".to_owned(),
+            "message".to_owned(),
+        );
+        let cancellation = fixture.invocation.cancellation().clone();
+        let (task, started, terminal) = start_invocation(fixture.invocation, fixture.diagnostics);
+        let worker_pid = wait_for_stalled_child_guard(STALLED_GUARD_PID_PATH).await;
+        let worker = Pid::from_raw(worker_pid).unwrap();
+        assert!(rustix::process::test_kill_process(worker).is_ok());
+
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        assert_eq!(
+            terminal.receive().await.unwrap(),
+            AgentOutcome::Cancelled {
+                reason: CancellationReason::UserRequest,
+            }
+        );
+        assert_eq!(
+            started.receive().await,
+            Err(AgentStartReceiveError::CallbackDropped)
+        );
+        task.await.unwrap();
+        assert!(rustix::process::test_kill_process(worker).is_err());
+    })
     .await;
 }
 

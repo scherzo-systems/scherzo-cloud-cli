@@ -19,6 +19,7 @@ use rustix::fs::{
 use rustix::io::Errno;
 
 use super::admission::AdmittedExecutionContext;
+use super::cancellation::CancellationFlag;
 use super::canonical_json::{self, CanonicalJsonError};
 use super::execution_root::{AdmittedExecutionRoot, directory_open_flags, open_directory};
 use super::private_staging::{
@@ -38,18 +39,18 @@ const IDENTITY_ATTEMPTS: usize = 16;
 
 #[derive(Clone, Default)]
 pub(crate) struct CaptureCancellation {
-    cancelled: Arc<AtomicBool>,
+    cancelled: CancellationFlag,
     #[cfg(test)]
     observer: Option<Arc<dyn CaptureBoundaryObserver>>,
 }
 
 impl CaptureCancellation {
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancelled.cancel();
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancelled.is_cancelled()
     }
 
     pub(crate) fn check(&self) -> Result<(), CaptureAttemptFailure> {
@@ -80,7 +81,7 @@ impl CaptureCancellation {
     #[cfg(test)]
     pub(crate) fn with_observer(observer: Arc<dyn CaptureBoundaryObserver>) -> Self {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: CancellationFlag::default(),
             observer: Some(observer),
         }
     }

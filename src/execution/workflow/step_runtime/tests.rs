@@ -9,9 +9,10 @@ use std::ops::Add;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar};
 use std::task::Poll;
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,9 @@ use crate::execution::workflow::runtime::{
     self, Action, ActiveStepInvocation, ExportValue, Occurrence, RequestedAction, StepState,
     TargetExecutionNumber, TransitionSequence, WorkflowState,
 };
-use crate::execution::workflow::test_support::process_fixture_interrupt_handler;
+use crate::execution::workflow::test_support::{
+    process_fixture_interrupt_handler, run_with_stalled_child_guard, wait_for_stalled_child_guard,
+};
 use crate::execution::workflow::value::CapturedValue;
 
 const FIXTURE_TEST_NAME: &str = "execution::workflow::step_runtime::tests::command_fixture_process";
@@ -55,6 +58,9 @@ const FIXTURE_ROLE: &str = "WORKFLOW_FIXTURE_ROLE";
 const FIXTURE_MODE_INTERRUPTIBLE: &str = "interruptible-group";
 const FIXTURE_MODE_STUBBORN: &str = "stubborn-group";
 const FIXTURE_MODE_PARENT_EXITS: &str = "parent-exits";
+const STALLED_GUARD_PID_PATH: &str = "WORKFLOW_STALLED_GUARD_PID_PATH";
+const STALLED_GUARD_LAUNCH_FIXTURE: &str =
+    "execution::workflow::step_runtime::tests::cancelled_stalled_launch_cleans_worker_fixture";
 const FIXTURE_PARENT: &str = "parent";
 const FIXTURE_DESCENDANT: &str = "descendant";
 const LITERAL_ARGUMENT: &str = "literal * $HOME; [not-a-glob]";
@@ -494,6 +500,109 @@ struct RecordingCommitPort {
     commits: mpsc::UnboundedSender<WorkflowCommit>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardStoreOperation {
+    Register,
+    Release,
+    Quiesce,
+}
+
+struct GuardStoreState {
+    release_register: bool,
+    operations: Vec<(GuardStoreOperation, ThreadId)>,
+}
+
+struct BlockingGuardStore {
+    pause_at: GuardStoreOperation,
+    state: Arc<(Mutex<GuardStoreState>, Condvar)>,
+    register_started: mpsc::UnboundedSender<()>,
+}
+
+struct BlockingGuardStoreControl {
+    state: Arc<(Mutex<GuardStoreState>, Condvar)>,
+    register_started: mpsc::UnboundedReceiver<()>,
+}
+
+impl BlockingGuardStore {
+    fn new() -> (Self, BlockingGuardStoreControl) {
+        Self::pausing_at(GuardStoreOperation::Register)
+    }
+
+    fn pausing_at(pause_at: GuardStoreOperation) -> (Self, BlockingGuardStoreControl) {
+        let state = Arc::new((
+            Mutex::new(GuardStoreState {
+                release_register: false,
+                operations: Vec::new(),
+            }),
+            Condvar::new(),
+        ));
+        let (register_started, started) = mpsc::unbounded_channel();
+        (
+            Self {
+                pause_at,
+                state: Arc::clone(&state),
+                register_started,
+            },
+            BlockingGuardStoreControl {
+                state,
+                register_started: started,
+            },
+        )
+    }
+
+    fn record(&self, operation: GuardStoreOperation) {
+        let (state, release) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state
+            .operations
+            .push((operation, std::thread::current().id()));
+        if operation == self.pause_at {
+            let _ = self.register_started.send(());
+            while !state.release_register {
+                state = release.wait(state).unwrap();
+            }
+        }
+    }
+}
+
+impl crate::execution::workflow::process_group::DurableProcessGuardStore for BlockingGuardStore {
+    fn register(
+        &self,
+        _step: &str,
+        _action_id: u64,
+        _identity: &AuthenticatedProcessGroup,
+    ) -> Result<String, ()> {
+        self.record(GuardStoreOperation::Register);
+        Ok("guard-operation-fixture".to_owned())
+    }
+
+    fn mark_released(&self, _guard_id: &str) -> Result<(), ()> {
+        self.record(GuardStoreOperation::Release);
+        Ok(())
+    }
+
+    fn mark_quiesced(&self, _guard_id: &str) -> Result<(), ()> {
+        self.record(GuardStoreOperation::Quiesce);
+        Ok(())
+    }
+}
+
+impl BlockingGuardStoreControl {
+    async fn wait_until_register_started(&mut self) {
+        self.register_started.recv().await.unwrap();
+    }
+
+    fn release_register(&self) {
+        let (state, release) = &*self.state;
+        state.lock().unwrap().release_register = true;
+        release.notify_one();
+    }
+
+    fn operations(&self) -> Vec<(GuardStoreOperation, ThreadId)> {
+        self.state.0.lock().unwrap().operations.clone()
+    }
+}
+
 impl CommitPort<WorkflowCommit> for RecordingCommitPort {
     type Error = std::convert::Infallible;
 
@@ -501,6 +610,202 @@ impl CommitPort<WorkflowCommit> for RecordingCommitPort {
         let _ = self.commits.send(commit);
         std::future::ready(Ok(()))
     }
+}
+
+#[tokio::test]
+async fn command_launch_and_durable_guard_writes_leave_the_executor_responsive() {
+    with_watchdog(async {
+        let PreparedGroupCommand {
+            _temporary,
+            listener,
+            admitted,
+        } = prepare_group_command(FIXTURE_MODE_INTERRUPTIBLE).await;
+        let action = start_actions(&admitted)["task"];
+        let (store, mut control) = BlockingGuardStore::new();
+        let registry = ProcessGuardRegistry::durable(Arc::new(store));
+        let (clock, mut clock_control) = ControlledClock::new(TestInstant(Duration::ZERO));
+        let responsiveness_clock = clock.clone();
+        let responsive_at = TestInstant(Duration::from_secs(17));
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let runtime = StepRuntime::with_observer(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            StepDiagnosticLog::default(),
+            sender,
+            clock,
+            NoopExecutionObserver,
+            AgentExecution::disabled(),
+            registry,
+        );
+        let executor_thread = std::thread::current().id();
+        let execution =
+            tokio::spawn(async move { runtime.execute_step("task".to_owned(), action).await });
+
+        control.wait_until_register_started().await;
+        let (responsive, response) = oneshot::channel();
+        drop(tokio::spawn(async move {
+            responsiveness_clock.wait_until(responsive_at).await;
+            let _ = responsive.send(());
+        }));
+        assert_eq!(clock_control.next_deadline().await, responsive_at);
+        clock_control.release();
+        response.await.unwrap();
+        control.release_register();
+
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action,
+            }
+        );
+        let processes = accept_group(&listener).await;
+        release_group(&processes).await;
+        assert!(matches!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepExecutionCompleted { action: completed, .. } if completed == action
+        ));
+        assert_eq!(execution.await.unwrap(), Ok(()));
+
+        let operations = control.operations();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            vec![
+                GuardStoreOperation::Register,
+                GuardStoreOperation::Release,
+                GuardStoreOperation::Quiesce,
+            ]
+        );
+        assert!(
+            operations
+                .iter()
+                .all(|(_, operation_thread)| *operation_thread != executor_thread)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_during_a_stalled_launch_quiesces_before_the_controlled_deadline() {
+    with_watchdog(async {
+        let PreparedGroupCommand {
+            _temporary,
+            listener,
+            admitted,
+        } = prepare_group_command(FIXTURE_MODE_INTERRUPTIBLE).await;
+        let deadline = TestInstant(Duration::from_secs(31));
+        let (start, cancel) = running_cancellation_actions(&admitted, deadline);
+        let cancel_action = cancel.id;
+        let (clock, control_clock) = ControlledClock::new(TestInstant(Duration::ZERO));
+        let (store, mut guard_control) = BlockingGuardStore::new();
+        let registry = ProcessGuardRegistry::durable(Arc::new(store));
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime = StepRuntime::with_observer(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            StepDiagnosticLog::default(),
+            sender,
+            clock,
+            NoopExecutionObserver,
+            AgentExecution::disabled(),
+            registry,
+        );
+
+        runtime.release(start).await;
+        guard_control.wait_until_register_started().await;
+        runtime.release(cancel).await;
+        guard_control.release_register();
+
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancel_action,
+            }
+        );
+        assert_eq!(control_clock.active_waiters(), 0);
+        assert_eq!(runtime.active_work_count(), 0);
+        assert_eq!(
+            guard_control
+                .operations()
+                .into_iter()
+                .map(|(operation, _)| operation)
+                .collect::<Vec<_>>(),
+            vec![GuardStoreOperation::Register, GuardStoreOperation::Quiesce]
+        );
+        let listener = listener.into_std().unwrap();
+        assert!(
+            matches!(listener.accept(), Err(failure) if failure.kind() == io::ErrorKind::WouldBlock)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancelled_stalled_launch_does_not_report_quiescence_while_worker_is_live() {
+    with_watchdog(async {
+        let status =
+            run_with_stalled_child_guard(STALLED_GUARD_LAUNCH_FIXTURE, STALLED_GUARD_PID_PATH)
+                .await;
+        assert!(status.success());
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "launched in an isolated test-binary tree by the stalled guard integration test"]
+async fn cancelled_stalled_launch_cleans_worker_fixture() {
+    with_watchdog(async {
+        let PreparedGroupCommand {
+            _temporary,
+            listener: _,
+            admitted,
+        } = prepare_group_command(FIXTURE_MODE_INTERRUPTIBLE).await;
+        let deadline = TestInstant(Duration::from_secs(31));
+        let (start, cancel) = running_cancellation_actions(&admitted, deadline);
+        let start_action = start.id;
+        let cancel_action = cancel.id;
+        let (store, guard_control) = BlockingGuardStore::new();
+        guard_control.release_register();
+        let registry = ProcessGuardRegistry::durable(Arc::new(store));
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime = StepRuntime::with_observer(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            StepDiagnosticLog::default(),
+            sender,
+            TestClock,
+            NoopExecutionObserver,
+            AgentExecution::disabled(),
+            registry,
+        );
+
+        runtime.release(start).await;
+        let worker_pid = wait_for_stalled_child_guard(STALLED_GUARD_PID_PATH).await;
+        let worker = Pid::from_raw(worker_pid).unwrap();
+        assert!(rustix::process::test_kill_process(worker).is_ok());
+        runtime.release(cancel).await;
+        assert!(runtime.cancellation_for(start_action).is_some());
+
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancel_action,
+            }
+        );
+        assert!(rustix::process::test_kill_process(worker).is_err());
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -3157,7 +3462,7 @@ async fn cancellation_before_launch_revokes_the_action_and_duplicate_delivery_is
 }
 
 #[tokio::test]
-async fn running_cancellation_interrupts_the_child_and_descendant_and_reaps_once() {
+async fn cancellation_before_launch_returns_interrupts_the_released_group_and_reaps_once() {
     with_watchdog(async {
         let PreparedGroupCommand {
             _temporary,
@@ -3172,27 +3477,30 @@ async fn running_cancellation_interrupts_the_child_and_descendant_and_reaps_once
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
         let artifacts = test_artifacts(&admitted);
         let diagnostics = StepDiagnosticLog::default();
-        let mut runtime = StepRuntime::with_diagnostics(
+        let (store, mut guard_control) =
+            BlockingGuardStore::pausing_at(GuardStoreOperation::Release);
+        let mut runtime = StepRuntime::with_observer(
             admitted,
             artifacts.staging.clone(),
             artifacts.inputs.clone(),
             diagnostics.clone(),
             sender,
             clock,
+            NoopExecutionObserver,
+            AgentExecution::disabled(),
+            ProcessGuardRegistry::durable(Arc::new(store)),
         );
 
         runtime.release(start).await;
-        assert_eq!(
-            next_occurrence(&mut receiver).await,
-            Occurrence::StepStarted {
-                step: "task".to_owned(),
-                action: start_action,
-            }
-        );
+        guard_control.wait_until_register_started().await;
         let mut processes = accept_group(&listener).await;
 
+        // User code is ready, but the launch worker cannot return until the
+        // durable release write completes. Cancellation must still be graceful.
         runtime.release(cancel.clone()).await;
         runtime.release(cancel).await;
+        assert!(runtime.cancellation_for(start_action).is_some());
+        guard_control.release_register();
         assert_group_interrupted(&processes).await;
         assert_eq!(control.next_deadline().await, deadline);
         assert_eq!(

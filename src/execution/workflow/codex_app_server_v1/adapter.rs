@@ -30,16 +30,17 @@ use crate::execution::workflow::agent::{
     AgentObservation, AgentObservationSink, AgentOutcome, AgentProcessDirective,
     AgentStartCallback, AgentTerminalCallback, AgentValueMode, PositiveDuration,
     check_agent_input_bound, failed_agent_outcome, finish_agent_diagnostic_capture,
+    run_cancellable_blocking_launch,
 };
 use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSession;
-use crate::execution::workflow::child_guard::StoppedChildGuard;
+use crate::execution::workflow::child_guard::{ChildGuardCancellation, StoppedChildGuard};
 use crate::execution::workflow::codex::CodexConfig;
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::diagnostic::StepDiagnosticLog;
 use crate::execution::workflow::observation::ExecutionObserver;
 use crate::execution::workflow::process_group::{
-    ProcessGuardRegistration, process_group_is_quiescent, terminate_authenticated_process_group,
-    terminate_process_group,
+    ProcessGuardRegistration, mark_process_guard_quiesced, process_group_is_quiescent,
+    terminate_authenticated_process_group, terminate_process_group,
 };
 use crate::execution::workflow::result_validation::{
     AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
@@ -190,7 +191,7 @@ where
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
-        let (mut invocation, mut plan) = match tokio::task::spawn_blocking(move || {
+        let (invocation, plan) = match tokio::task::spawn_blocking(move || {
             let plan = prepare_launch(&invocation);
             (invocation, plan)
         })
@@ -215,15 +216,34 @@ where
             )),
             AgentValueMode::None | AgentValueMode::Response { .. } => None,
         };
-        let Some(process_directives) = invocation.take_process_directives() else {
-            return setup_failed(AgentHarnessSetupStage::ExecutableLaunch);
-        };
-        if let Some(reason) = invocation.cancellation().cancellation_reason() {
+        let cancellation_source = invocation.cancellation().clone();
+        let ((mut invocation, mut plan, launched), cancellation_reason) =
+            match run_cancellable_blocking_launch(
+                &cancellation_source,
+                move |launch_cancellation| {
+                    let launched = launch_process(&invocation, &plan, &launch_cancellation);
+                    (invocation, plan, launched)
+                },
+            )
+            .await
+            {
+                Ok(launch) => launch,
+                Err(_) => return setup_failed(AgentHarnessSetupStage::ExecutableLaunch),
+            };
+        if let Some(reason) = cancellation_reason {
+            if let Ok((mut process, _)) = launched {
+                let _ = process.child.force_stop(process.process_group).await;
+            }
             return AgentOutcome::Cancelled { reason };
         }
-        let (process, standard_error) = match launch_process(&invocation, &plan).await {
+        let (process, standard_error) = match launched {
             Ok(process) => process,
             Err(cause) => return failed_agent_outcome(cause),
+        };
+        let Some(process_directives) = invocation.take_process_directives() else {
+            let mut process = process;
+            let _ = process.child.force_stop(process.process_group).await;
+            return setup_failed(AgentHarnessSetupStage::ExecutableLaunch);
         };
         // jscpd:ignore-end
         let diagnostic = self.diagnostics.start_standard_error_capture(
@@ -455,7 +475,7 @@ struct LaunchedCodexProcess {
 
 struct CodexChild {
     child: StoppedChildGuard,
-    registration: ProcessGuardRegistration,
+    registration: Option<ProcessGuardRegistration>,
 }
 
 impl CodexChild {
@@ -465,14 +485,14 @@ impl CodexChild {
 
     async fn wait(&mut self) -> Result<ExitStatus, ()> {
         let status = self.child.wait().await.map_err(|_| ())?;
-        self.registration.mark_quiesced()?;
+        mark_process_guard_quiesced(&mut self.registration).await?;
         Ok(status)
     }
 
     async fn force_stop(&mut self, process_group: Pid) -> Result<(), ()> {
         self.force_process_group();
         self.child.force_stop().await.map_err(|_| ())?;
-        self.registration.mark_quiesced()?;
+        mark_process_guard_quiesced(&mut self.registration).await?;
         if process_group_is_quiescent(process_group) {
             Ok(())
         } else {
@@ -481,9 +501,10 @@ impl CodexChild {
     }
 }
 
-async fn launch_process<Sink>(
+fn launch_process<Sink>(
     invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
     plan: &CodexAppServerV1LaunchPlan,
+    cancellation: &ChildGuardCancellation,
 ) -> Result<(LaunchedCodexProcess, tokio::process::ChildStderr), AgentFailureCause>
 where
     Sink: AgentObservationSink,
@@ -492,10 +513,11 @@ where
     // and setup-stage attribution instead of creating a cross-harness launch abstraction.
     // jscpd:ignore-start
     let environment = invocation_environment(invocation);
-    let (mut child, standard_input) = StoppedChildGuard::spawn_with_stdin(
+    let (mut child, standard_input) = StoppedChildGuard::spawn_with_stdin_cancellable(
         invocation.adapter().executable(),
         &plan.arguments,
         &environment,
+        cancellation,
         |command| {
             invocation
                 .process()
@@ -509,7 +531,7 @@ where
     let process_group = child.identity().process_group();
     let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
     else {
-        let _ = child.force_stop().await;
+        let _ = child.force_stop_blocking();
         return Err(AgentFailureCause::HarnessSetupFailed {
             stage: AgentHarnessSetupStage::ExecutableLaunch,
         });
@@ -521,19 +543,21 @@ where
     ) {
         Ok(registration) => registration,
         Err(()) => {
-            let _ = child.force_stop().await;
+            let _ = child.force_stop_blocking();
             return Err(AgentFailureCause::HarnessSetupFailed {
                 stage: AgentHarnessSetupStage::ExecutableLaunch,
             });
         }
     };
     if release_guarded_codex(invocation.diagnostic_session(), || {
-        child.continue_execution().map_err(|_| ())?;
+        child
+            .continue_execution_cancellable(cancellation)
+            .map_err(|_| ())?;
         registration.mark_released()
     })
     .is_err()
     {
-        let _ = child.force_stop().await;
+        let _ = child.force_stop_blocking();
         let _ = registration.mark_quiesced();
         return Err(AgentFailureCause::HarnessSetupFailed {
             stage: AgentHarnessSetupStage::ExecutableLaunch,
@@ -544,7 +568,7 @@ where
         LaunchedCodexProcess {
             child: CodexChild {
                 child,
-                registration,
+                registration: Some(registration),
             },
             process_group,
             standard_input,

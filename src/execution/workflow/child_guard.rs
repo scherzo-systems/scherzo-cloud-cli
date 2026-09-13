@@ -22,7 +22,7 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use crate::exit_code::ExitCode;
 
-use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
+use super::cancellation::{CancellationFlag, MAXIMUM_CANCELLATION_GRACE};
 #[cfg(any(target_vendor = "apple", test))]
 use super::process_group::process_group_is_quiescent;
 use super::process_group::{
@@ -120,6 +120,8 @@ impl Drop for ActivityLease {
     }
 }
 
+pub(crate) type ChildGuardCancellation = CancellationFlag;
+
 pub(crate) struct StoppedChildGuard {
     child: Child,
     identity: AuthenticatedProcessGroup,
@@ -129,28 +131,48 @@ pub(crate) struct StoppedChildGuard {
 }
 
 impl StoppedChildGuard {
-    pub(crate) fn spawn(
+    pub(crate) fn spawn_cancellable(
         program: &Path,
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
+        cancellation: &ChildGuardCancellation,
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let (child, _standard_input) =
-            Self::spawn_inner(program, arguments, environment, false, configure)?;
+        let (child, _standard_input) = Self::spawn_inner(
+            program,
+            arguments,
+            environment,
+            false,
+            cancellation,
+            configure,
+        )?;
         Ok(child)
     }
 
-    pub(crate) fn spawn_with_stdin(
+    pub(crate) fn spawn_with_stdin_cancellable(
         program: &Path,
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
+        cancellation: &ChildGuardCancellation,
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<(Self, tokio::net::UnixStream)> {
-        let (child, standard_input) =
-            Self::spawn_inner(program, arguments, environment, true, configure)?;
-        let standard_input = standard_input
-            .ok_or_else(|| io::Error::other("guarded child standard input unavailable"))?;
-        Ok((child, standard_input))
+        let (mut child, standard_input) = Self::spawn_inner(
+            program,
+            arguments,
+            environment,
+            true,
+            cancellation,
+            configure,
+        )?;
+        match standard_input {
+            Some(standard_input) => Ok((child, standard_input)),
+            None => {
+                let cleanup = child.force_stop_blocking();
+                Err(io::Error::other(format!(
+                    "guarded child standard input unavailable; cleanup={cleanup:?}"
+                )))
+            }
+        }
     }
 
     fn spawn_inner(
@@ -158,6 +180,7 @@ impl StoppedChildGuard {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
         streaming_standard_input: bool,
+        cancellation: &ChildGuardCancellation,
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<(Self, Option<tokio::net::UnixStream>)> {
         if !cfg!(any(target_os = "linux", target_vendor = "apple")) {
@@ -192,68 +215,121 @@ impl StoppedChildGuard {
         command.as_std_mut().process_group(0);
         configure(command.as_std_mut())?;
         let mut child = command.spawn()?;
-        let owner_control = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("guard control pipe unavailable"))?
-            .into_owned_fd()
-            .map(File::from)?;
+        let owner_control = match child.stdin.take() {
+            Some(control) => match control.into_owned_fd().map(File::from) {
+                Ok(control) => control,
+                Err(failure) => {
+                    let cleanup = terminate_unready_guard(&mut child);
+                    return Err(io::Error::new(
+                        failure.kind(),
+                        format!("{failure}; cleanup={cleanup:?}"),
+                    ));
+                }
+            },
+            None => {
+                let cleanup = terminate_unready_guard(&mut child);
+                return Err(io::Error::other(format!(
+                    "guard control pipe unavailable; cleanup={cleanup:?}"
+                )));
+            }
+        };
 
-        let ready = wait_for_json::<ReadyIdentity>(&mut child, &staging.path().join(READY_FILE))
-            .map_err(|failure| {
-                io::Error::new(
+        let ready = match wait_for_json::<ReadyIdentity>(
+            &mut child,
+            &staging.path().join(READY_FILE),
+            cancellation,
+        ) {
+            Ok(ready) => ready,
+            Err(failure) => {
+                let worker = fs::read_to_string(staging.path().join(WORKER_FAILURE_FILE))
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                drop(owner_control);
+                let cleanup = terminate_unready_guard(&mut child);
+                return Err(io::Error::new(
                     failure.kind(),
-                    format!(
-                        "{failure}; worker={}",
-                        fs::read_to_string(staging.path().join(WORKER_FAILURE_FILE))
-                            .unwrap_or_else(|_| "unknown".to_owned())
-                    ),
-                )
-            })?;
-        let process_group = Pid::from_raw(ready.process_group_id)
-            .ok_or_else(|| io::Error::other("invalid guarded process group"))?;
-        let identity = AuthenticatedProcessGroup::new(process_group, ready.leader_start_identity)
-            .ok_or_else(|| io::Error::other("invalid guarded process identity"))?;
+                    format!("{failure}; worker={worker}; cleanup={cleanup:?}"),
+                ));
+            }
+        };
+        let process_group = match Pid::from_raw(ready.process_group_id) {
+            Some(process_group) => process_group,
+            None => {
+                drop(owner_control);
+                let cleanup = terminate_unready_guard(&mut child);
+                return Err(io::Error::other(format!(
+                    "invalid guarded process group; cleanup={cleanup:?}"
+                )));
+            }
+        };
+        let identity =
+            match AuthenticatedProcessGroup::new(process_group, ready.leader_start_identity) {
+                Some(identity) => identity,
+                None => {
+                    drop(owner_control);
+                    let cleanup = terminate_unready_guard(&mut child);
+                    return Err(io::Error::other(format!(
+                        "invalid guarded process identity; cleanup={cleanup:?}"
+                    )));
+                }
+            };
+        let mut guard = Self {
+            child,
+            identity,
+            owner_control: Some(owner_control),
+            staging,
+            _activity_lease: activity_lease,
+        };
         if !matches!(
-            system_process_identity_observation(&identity),
+            system_process_identity_observation(&guard.identity),
             ProcessIdentityObservation::Exact {
                 leader: LeaderState::Stopped
             }
         ) {
-            return Err(io::Error::other("guarded process did not remain stopped"));
+            let cleanup = guard.force_stop_blocking();
+            return Err(io::Error::other(format!(
+                "guarded process did not remain stopped; cleanup={cleanup:?}"
+            )));
         }
-        let standard_input = standard_input_listener
+        let standard_input = match standard_input_listener
             .map(|listener| {
                 let (standard_input, _) = listener.accept()?;
                 standard_input.set_nonblocking(true)?;
                 tokio::net::UnixStream::from_std(standard_input)
             })
-            .transpose()?;
+            .transpose()
+        {
+            Ok(standard_input) => standard_input,
+            Err(failure) => {
+                let cleanup = guard.force_stop_blocking();
+                return Err(io::Error::new(
+                    failure.kind(),
+                    format!("{failure}; cleanup={cleanup:?}"),
+                ));
+            }
+        };
 
-        Ok((
-            Self {
-                child,
-                identity,
-                owner_control: Some(owner_control),
-                staging,
-                _activity_lease: activity_lease,
-            },
-            standard_input,
-        ))
+        Ok((guard, standard_input))
     }
 
     pub(crate) fn identity(&self) -> &AuthenticatedProcessGroup {
         &self.identity
     }
 
-    pub(crate) fn continue_execution(&mut self) -> io::Result<()> {
+    pub(crate) fn continue_execution_cancellable(
+        &mut self,
+        cancellation: &ChildGuardCancellation,
+    ) -> io::Result<()> {
         let control = self
             .owner_control
             .as_mut()
             .ok_or_else(|| io::Error::other("guard owner control unavailable"))?;
         control.write_all(&[CONTINUE])?;
         control.flush()?;
-        match wait_for_file(&mut self.child, &self.staging.path().join(RELEASED_FILE)) {
+        match wait_for_file(
+            &mut self.child,
+            &self.staging.path().join(RELEASED_FILE),
+            cancellation,
+        ) {
             Ok(()) => Ok(()),
             Err(failure) => {
                 match fs::read_to_string(self.staging.path().join(EXEC_FAILURE_FILE))
@@ -290,12 +366,27 @@ impl StoppedChildGuard {
     }
 
     pub(crate) async fn force_stop(&mut self) -> io::Result<()> {
+        let termination = self.request_stop();
+        let _ = self.child.wait().await;
+        self.finish_forced_stop(termination)
+    }
+
+    pub(crate) fn force_stop_blocking(&mut self) -> io::Result<()> {
+        let termination = self.request_stop();
+        wait_for_guard_exit(&mut self.child)?;
+        self.finish_forced_stop(termination)
+    }
+
+    fn request_stop(&mut self) -> AuthenticatedSignalResult {
         let termination = terminate_authenticated_process_group(&self.identity);
         if let Some(mut control) = self.owner_control.take() {
             let _ = control.write_all(&[TERMINATE]);
             let _ = control.flush();
         }
-        let _ = self.child.wait().await;
+        termination
+    }
+
+    fn finish_forced_stop(&self, termination: AuthenticatedSignalResult) -> io::Result<()> {
         if require_quiesced_marker(self.staging.path()).is_ok() {
             return Ok(());
         }
@@ -348,11 +439,43 @@ pub(crate) async fn force_stop_direct_child(child: &mut Child) -> Result<(), ()>
     child.wait().await.map(|_| ()).map_err(|_| ())
 }
 
-fn wait_for_json<Document>(child: &mut Child, path: &Path) -> io::Result<Document>
+fn terminate_unready_guard(child: &mut Child) -> io::Result<()> {
+    if let Some(process_group) = child
+        .id()
+        .and_then(|process_id| i32::try_from(process_id).ok())
+        .and_then(Pid::from_raw)
+    {
+        let _ = kill_process_group(process_group, Signal::KILL);
+    }
+    let _ = child.start_kill();
+    wait_for_guard_exit(child)
+}
+
+fn wait_for_guard_exit(child: &mut Child) -> io::Result<()> {
+    let started = crate::timing::monotonic_now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if crate::timing::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child process guard did not exit",
+            ));
+        }
+        crate::timing::sleep(WORKER_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_json<Document>(
+    child: &mut Child,
+    path: &Path,
+    cancellation: &ChildGuardCancellation,
+) -> io::Result<Document>
 where
     Document: for<'de> Deserialize<'de>,
 {
-    wait_for_boundary(child, path, |path| match fs::read(path) {
+    wait_for_boundary(child, path, cancellation, |path| match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(io::Error::other),
@@ -361,8 +484,12 @@ where
     })
 }
 
-fn wait_for_file(child: &mut Child, path: &Path) -> io::Result<()> {
-    wait_for_boundary(child, path, |path| match fs::metadata(path) {
+fn wait_for_file(
+    child: &mut Child,
+    path: &Path,
+    cancellation: &ChildGuardCancellation,
+) -> io::Result<()> {
+    wait_for_boundary(child, path, cancellation, |path| match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(Some(())),
         Ok(_) => Err(io::Error::other("guard boundary is not a file")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -373,6 +500,7 @@ fn wait_for_file(child: &mut Child, path: &Path) -> io::Result<()> {
 fn wait_for_boundary<Output>(
     child: &mut Child,
     path: &Path,
+    cancellation: &ChildGuardCancellation,
     mut inspect: impl FnMut(&Path) -> io::Result<Option<Output>>,
 ) -> io::Result<Output> {
     let started = crate::timing::monotonic_now();
@@ -380,11 +508,21 @@ fn wait_for_boundary<Output>(
         if let Some(output) = inspect(path)? {
             return Ok(output);
         }
-        check_worker_boundary(child, started)?;
+        check_worker_boundary(child, started, cancellation)?;
     }
 }
 
-fn check_worker_boundary(child: &mut Child, started: Instant) -> io::Result<()> {
+fn check_worker_boundary(
+    child: &mut Child,
+    started: Instant,
+    cancellation: &ChildGuardCancellation,
+) -> io::Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "child process guard launch cancelled",
+        ));
+    }
     if child.try_wait()?.is_some() {
         return Err(io::Error::other("child process guard exited early"));
     }
@@ -1003,6 +1141,9 @@ mod tests {
     use super::super::process_group::capture_process_group_identity;
     use super::*;
 
+    const STALLED_BOUNDARY_FIXTURE: &str =
+        "execution::workflow::child_guard::tests::stalled_ready_boundary_fixture";
+
     struct UnavailableInspector;
 
     impl ProcessIdentityInspector for UnavailableInspector {
@@ -1017,17 +1158,64 @@ mod tests {
         assert!(worker_boundary_timed_out(MAXIMUM_CANCELLATION_GRACE));
     }
 
+    #[test]
+    #[ignore = "launched only as the stalled child-guard boundary fixture"]
+    fn stalled_ready_boundary_fixture() {
+        let mut byte = [0_u8; 1];
+        let _ = std::io::stdin().read_exact(&mut byte);
+    }
+
+    #[tokio::test]
+    async fn stalled_ready_boundary_observes_cancellation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ready = temporary.path().join(READY_FILE);
+        let cancellation = ChildGuardCancellation::default();
+        let blocking_cancellation = cancellation.clone();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", STALLED_BOUNDARY_FIXTURE, "--ignored"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let boundary = tokio::task::spawn_blocking(move || {
+            let mut entered = Some(entered);
+            let result = wait_for_boundary(&mut child, &ready, &blocking_cancellation, |_| {
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(());
+                }
+                Ok::<_, io::Error>(None::<()>)
+            });
+            (child, result)
+        });
+
+        entry.await.unwrap();
+        cancellation.cancel();
+        let (mut child, result) = boundary.await.unwrap();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+    }
+
     #[tokio::test]
     async fn guarded_child_can_receive_streaming_standard_input() {
         let arguments = [
             OsString::from("-c"),
             OsString::from("IFS= read -r line; printf 'received:%s\\n' \"$line\""),
         ];
-        let (mut child, mut standard_input) =
-            StoppedChildGuard::spawn_with_stdin(Path::new("/bin/sh"), &arguments, &[], |_| Ok(()))
-                .unwrap();
+        let cancellation = ChildGuardCancellation::default();
+        let (mut child, mut standard_input) = StoppedChildGuard::spawn_with_stdin_cancellable(
+            Path::new("/bin/sh"),
+            &arguments,
+            &[],
+            &cancellation,
+            |_| Ok(()),
+        )
+        .unwrap();
         let mut standard_output = child.take_stdout().unwrap();
-        child.continue_execution().unwrap();
+        child.continue_execution_cancellable(&cancellation).unwrap();
 
         standard_input.write_all(b"exact input\n").await.unwrap();
         standard_input.shutdown().await.unwrap();

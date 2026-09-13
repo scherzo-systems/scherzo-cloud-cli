@@ -111,6 +111,26 @@ impl ProcessGuardRegistration {
     }
 }
 
+pub(crate) async fn mark_process_guard_quiesced(
+    registration: &mut Option<ProcessGuardRegistration>,
+) -> Result<(), ()> {
+    let Some(mut pending) = registration.take() else {
+        return Ok(());
+    };
+    let marked = tokio::task::spawn_blocking(move || {
+        let result = pending.mark_quiesced();
+        (pending, result)
+    })
+    .await;
+    match marked {
+        Ok((pending, result)) => {
+            *registration = Some(pending);
+            result
+        }
+        Err(_) => Err(()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LeaderState {
     Running,

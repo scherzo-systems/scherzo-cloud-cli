@@ -2885,7 +2885,7 @@ mod tests {
     use crate::execution::workflow::validated::WorkflowNodeRole;
     use crate::runner::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
     use crate::runner::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
-    use crate::runner_protocol::MAXIMUM_ORDINARY_FRAME_BYTES;
+    use crate::runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
     // jscpd:ignore-end
 
     fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {
@@ -2918,6 +2918,7 @@ mod tests {
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
         authority: tokio::sync::watch::Sender<LeaseAuthority>,
+        outbox: ObservationOutbox,
     }
 
     fn supervise_execution<Execution, Output>(
@@ -2950,6 +2951,7 @@ mod tests {
         let cancellation = crate::execution::workflow::admission::CancellationSource::new();
         let observed_cancellation = cancellation.clone();
         let outbox = ObservationOutbox::new();
+        let observed_outbox = outbox.clone();
         let fence = PostStopFence::with_workflow_git(None);
         let observed_fence = fence.clone();
         let observed_guards = guards.clone();
@@ -2977,6 +2979,7 @@ mod tests {
             fence: observed_fence,
             guards: observed_guards,
             authority: authority_sender,
+            outbox: observed_outbox,
         }
     }
 
@@ -3054,6 +3057,78 @@ mod tests {
             &supervised.fence,
             &supervised.guards,
         );
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_continues_while_command_launch_is_stalled() {
+        let (lease_clock, _control, mut waits) = controlled_lease_clock();
+        let basis = lease_clock.now().unwrap();
+        let (launch_started, started) = tokio::sync::oneshot::channel();
+        let (release_launch, released) = std::sync::mpsc::channel();
+        let execution = async move {
+            crate::execution::workflow::step_runtime::spawn_isolated_command_launch(move || {
+                let _ = launch_started.send(());
+                let _ = released.recv();
+                "launch-completed"
+            })
+            .await
+            .expect("blocking launch task failed")
+        };
+        let supervised = supervise_execution(lease_clock, lease_authority(basis), execution);
+
+        started.await.expect("blocking launch did not start");
+        let notification = supervised.outbox.notification();
+        lease_wait_request(&mut waits, Duration::from_secs(2))
+            .await
+            .release();
+        let renewal = with_watchdog(async {
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                if let Some(renewal) = supervised
+                    .outbox
+                    .pending(&BTreeSet::new(), 4)
+                    .into_iter()
+                    .find(|pending| {
+                        matches!(
+                            pending.observation,
+                            AssignmentObservation::LeaseRenewalRequested { .. }
+                        )
+                    })
+                {
+                    break renewal;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("lease renewal was delayed by the blocking launch");
+        let renewal_frame = renewal.observation.runner_frame(RunnerEnvelope {
+            message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+            boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+            sequence: 9,
+            sent_at: "2026-07-23T00:00:02Z".to_owned(),
+        });
+        assert!(matches!(
+            renewal_frame,
+            RunnerFrame::ExecutionLeaseRenewalRequested {
+                current_lease_sequence: 4,
+                ..
+            }
+        ));
+
+        release_launch.send(()).unwrap();
+        assert!(matches!(
+            with_watchdog(supervised.task)
+                .await
+                .expect("lease supervision timed out")
+                .expect("lease supervision task failed"),
+            LeaseExecution::Completed {
+                output: "launch-completed",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
