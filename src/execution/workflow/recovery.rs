@@ -831,19 +831,10 @@ fn write_private_file(
 }
 
 fn verify_regular_path_binding(path: &Path, directory: &OwnedFd, name: &str) -> Result<(), ()> {
-    let descriptor = openat(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| ())?;
-    let opened = fstat(&descriptor).map_err(|_| ())?;
+    let (_, opened) =
+        crate::execution::owned_tree::open_regular_file_at(directory, name).map_err(|_| ())?;
     let named = stat(path).map_err(|_| ())?;
-    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
-        || opened.st_dev != named.st_dev
-        || opened.st_ino != named.st_ino
-    {
+    if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
         return Err(());
     }
     Ok(())

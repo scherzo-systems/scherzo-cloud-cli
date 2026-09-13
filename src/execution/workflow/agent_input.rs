@@ -35,7 +35,7 @@ use super::pi_json_v1::PiJsonV1ProtocolLimits;
 #[cfg(test)]
 use super::private_staging::CleanupBlocker;
 use super::private_staging::{
-    StagingLifecycle, cleanup_staging, create_staging_root, finish_payload_file,
+    StagingDropPolicy, StagingLifecycle, cleanup_staging, create_staging_root, finish_payload_file,
     mark_cleanup_failed, remove_open_tree_at, remove_staging_root,
 };
 use super::process_group::ProcessGuardRegistry;
@@ -244,6 +244,7 @@ struct AgentInputStagingInner {
     staging_path: PathBuf,
     staging_identity: Arc<str>,
     lifecycle: RwLock<StagingLifecycle>,
+    drop_policy: StagingDropPolicy,
     active_views: Mutex<BTreeSet<Arc<str>>>,
     #[cfg(test)]
     observer: Option<Arc<dyn AgentMaterializationBoundaryObserver>>,
@@ -376,6 +377,7 @@ impl AgentInputStaging {
                 staging_path,
                 staging_identity,
                 lifecycle: RwLock::new(StagingLifecycle::Active),
+                drop_policy: StagingDropPolicy::cleanup(),
                 active_views: Mutex::new(BTreeSet::new()),
                 #[cfg(test)]
                 observer,
@@ -402,9 +404,21 @@ impl AgentInputStaging {
                 .is_same_directory(execution.root_identity())
     }
 
+    // Each concrete staging owner keeps a typed release API while delegating the
+    // shared preserve-on-drop transition to StagingDropPolicy.
+    // jscpd:ignore-start
     pub(crate) fn release(&self) -> Result<(), AgentInputStagingReleaseFailure> {
         self.inner.cleanup()
     }
+
+    pub(crate) fn preserve(&self) {
+        self.inner.drop_policy.preserve(&self.inner.lifecycle);
+    }
+
+    pub(crate) fn preserve_on_drop(&self) {
+        self.inner.drop_policy.preserve_on_drop();
+    }
+    // jscpd:ignore-end
 
     fn reserve_view(&self) -> Result<AgentInputStagingLease, AgentInputMaterializationError> {
         for _ in 0..IDENTITY_ATTEMPTS {
@@ -501,11 +515,20 @@ impl AgentInputStaging {
 }
 
 impl AgentInputStagingInner {
+    // Agent views and input reservations have different open-handle and ledger
+    // transitions after this shared preservation check.
+    // jscpd:ignore-start
     fn remove_view(&self, identity: &str, directory: &OwnedFd) -> bool {
+        if self.drop_policy.is_preserved() {
+            return true;
+        }
         let Ok(lifecycle) = self.lifecycle.read() else {
             return false;
         };
-        if *lifecycle == StagingLifecycle::Released {
+        if matches!(
+            *lifecycle,
+            StagingLifecycle::Preserved | StagingLifecycle::Released
+        ) {
             return true;
         }
         #[cfg(test)]
@@ -523,6 +546,7 @@ impl AgentInputStagingInner {
         }
         removed
     }
+    // jscpd:ignore-end
 
     fn cleanup(&self) -> Result<(), AgentInputStagingReleaseFailure> {
         cleanup_staging(
@@ -550,7 +574,9 @@ impl AgentInputStagingInner {
 
 impl Drop for AgentInputStagingInner {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if !self.drop_policy.is_preserved() {
+            let _ = self.cleanup();
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _, symlink};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _, symlink,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -127,6 +129,25 @@ pub(super) struct WorkflowGitTeardownReport {
 }
 
 impl WorkflowGitTeardownReport {
+    pub(super) fn no_issuance() -> Self {
+        Self::from_observations(Vec::new(), true)
+    }
+
+    pub(super) fn revocation_succeeded(&self) -> bool {
+        matches!(
+            self.summary,
+            RevocationSummary::NoIssuance
+                | RevocationSummary::FullyRevoked
+                | RevocationSummary::FullyRevokedWithReplay
+                | RevocationSummary::Expired
+                | RevocationSummary::SettledByRevocationAndExpiry
+        )
+    }
+
+    pub(super) fn succeeded(&self) -> bool {
+        self.local_state_destroyed && self.revocation_succeeded()
+    }
+
     fn from_observations(
         observations: Vec<RevocationObservation>,
         local_state_destroyed: bool,
@@ -195,17 +216,43 @@ pub(super) struct WorkflowGitAuthority {
     inner: Arc<WorkflowGitAuthorityInner>,
 }
 
+#[derive(Clone, Copy)]
+struct PathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl PathIdentity {
+    fn capture(path: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        metadata.dev() == self.device && metadata.ino() == self.inode
+    }
+}
+
 struct WorkflowGitAuthorityInner {
     assignment_id: Arc<str>,
     origin: Url,
     origin_text: Arc<str>,
     workspace: PathBuf,
     environment: EnvironmentSnapshot,
+    scoped_helper_key: Arc<str>,
+    helper_value: Arc<str>,
     helper_path: PathBuf,
+    helper_identity: PathIdentity,
+    helper_contents: Arc<[u8]>,
     socket_path: PathBuf,
     socket_address: PathBuf,
     alias_directory: PathBuf,
+    alias_directory_identity: PathIdentity,
     alias_link: PathBuf,
+    alias_link_identity: PathIdentity,
     broker: Arc<dyn SourceCredentialBroker>,
     clock: Arc<dyn Sleeper>,
     recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
@@ -221,6 +268,7 @@ struct AuthorityState {
     issuances: Vec<ProviderCredential>,
     current_issuance: Option<usize>,
     expired_observations: Vec<RevocationObservation>,
+    socket_identity: Option<PathIdentity>,
     teardown_report: Option<WorkflowGitTeardownReport>,
 }
 
@@ -277,14 +325,25 @@ impl WorkflowGitAuthority {
         }
         let helper_path = private_root.join(HELPER_FILE);
         let socket_path = private_root.join(SOCKET_FILE);
-        let (alias_directory, alias_link, socket_address) =
+        let socket_alias =
             create_socket_alias(private_root).context("create workflow Git socket alias")?;
-        let helper = helper_script(helper_executable, &socket_address)
-            .context("construct workflow Git helper")?;
-        if let Err(error) = write_executable(&helper_path, helper.as_bytes()) {
-            let _ = remove_socket_alias(&alias_directory, &alias_link);
+        let helper_contents: Arc<[u8]> =
+            helper_script(helper_executable, &socket_alias.socket_address)
+                .context("construct workflow Git helper")?
+                .into_bytes()
+                .into();
+        if let Err(error) = write_executable(&helper_path, helper_contents.as_ref()) {
+            let _ = remove_socket_alias(&socket_alias);
             return Err(error).context("write workflow Git helper");
         }
+        let helper_identity = match PathIdentity::capture(&helper_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = fs::remove_file(&helper_path);
+                let _ = remove_socket_alias(&socket_alias);
+                return Err(error).context("record workflow Git helper identity");
+            }
+        };
         let helper_value = format!("!f() {{ exec {} \"$@\"; }}; f", shell_quote(&helper_path)?);
         let scoped_helper_key = format!("credential.{}.helper", origin);
         let configured = set_local_config(
@@ -313,11 +372,27 @@ impl WorkflowGitAuthority {
             )
         });
         if let Err(error) = configured {
-            let _ = unset_workflow_git_config(workspace, environment, &scoped_helper_key);
-            let _ = fs::remove_file(&helper_path);
-            let _ = remove_socket_alias(&alias_directory, &alias_link);
+            let _ = unset_workflow_git_config(
+                workspace,
+                environment,
+                &scoped_helper_key,
+                &helper_value,
+            );
+            let _ = remove_recorded_path(
+                &helper_path,
+                Some(helper_identity),
+                Some(helper_contents.as_ref()),
+            );
+            let _ = remove_socket_alias(&socket_alias);
             return Err(error).context("configure workflow Git helper");
         }
+        let SocketAlias {
+            directory: alias_directory,
+            directory_identity: alias_directory_identity,
+            link: alias_link,
+            link_identity: alias_link_identity,
+            socket_address,
+        } = socket_alias;
         Ok(Self {
             inner: Arc::new(WorkflowGitAuthorityInner {
                 assignment_id: Arc::from(assignment_id),
@@ -325,11 +400,17 @@ impl WorkflowGitAuthority {
                 origin_text: origin,
                 workspace: workspace.to_owned(),
                 environment: environment.clone(),
+                scoped_helper_key: scoped_helper_key.into(),
+                helper_value: helper_value.into(),
                 helper_path,
+                helper_identity,
+                helper_contents,
                 socket_path,
                 socket_address,
                 alias_directory,
+                alias_directory_identity,
                 alias_link,
+                alias_link_identity,
                 broker,
                 clock,
                 recorder,
@@ -341,6 +422,7 @@ impl WorkflowGitAuthority {
                     issuances: Vec::new(),
                     current_issuance: None,
                     expired_observations: Vec::new(),
+                    socket_identity: None,
                     teardown_report: None,
                 }),
                 teardown_changed: Condvar::new(),
@@ -363,12 +445,32 @@ impl WorkflowGitAuthority {
         }
         let listener = UnixListener::bind(&self.inner.socket_address)
             .context("bind workflow Git authority socket")?;
+        let socket_identity = match PathIdentity::capture(&self.inner.socket_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(listener);
+                let _ = fs::remove_file(&self.inner.socket_path);
+                return Err(error).context("record workflow Git authority socket identity");
+            }
+        };
         if let Err(error) =
             fs::set_permissions(&self.inner.socket_path, Permissions::from_mode(0o600))
         {
             drop(listener);
-            let _ = fs::remove_file(&self.inner.socket_path);
+            let _ = remove_recorded_path(&self.inner.socket_path, Some(socket_identity), None);
             return Err(error).context("protect workflow Git authority socket");
+        }
+        {
+            let mut state = self.lock();
+            if state.lifecycle != AuthorityLifecycle::Installed {
+                drop(state);
+                drop(listener);
+                let _ = remove_recorded_path(&self.inner.socket_path, Some(socket_identity), None);
+                return Err(anyhow!(
+                    "workflow Git authority was fenced during activation"
+                ));
+            }
+            state.socket_identity = Some(socket_identity);
         }
         let active = ActiveLease {
             lease_clock,
@@ -432,8 +534,8 @@ impl WorkflowGitAuthority {
         wake_helper(&self.inner.socket_address);
     }
 
-    pub(super) fn teardown(&self, quiescence: ProcessQuiescence) -> WorkflowGitTeardownReport {
-        let worker = {
+    pub(super) fn teardown(&self, _quiescence: ProcessQuiescence) -> WorkflowGitTeardownReport {
+        let (worker, socket_identity) = {
             let mut state = self.lock();
             loop {
                 match state.lifecycle {
@@ -457,7 +559,7 @@ impl WorkflowGitAuthority {
                         }
                         state.lifecycle = AuthorityLifecycle::TearingDown;
                         self.inner.stop.store(true, Ordering::Release);
-                        break state.worker.take();
+                        break (state.worker.take(), state.socket_identity.take());
                     }
                 }
             }
@@ -465,26 +567,25 @@ impl WorkflowGitAuthority {
         wake_helper(&self.inner.socket_address);
         let worker_stopped = worker.is_none_or(|worker| worker.join().is_ok());
 
-        let scoped_helper_key = format!("credential.{}.helper", self.inner.origin_text);
-        let mut config_removed = unset_workflow_git_config(
+        let config_removed = unset_workflow_git_config(
             &self.inner.workspace,
             &self.inner.environment,
-            &scoped_helper_key,
+            &self.inner.scoped_helper_key,
+            &self.inner.helper_value,
         );
-        if !config_removed
-            && quiescence == ProcessQuiescence::Proven
-            && remove_file_if_present(&self.inner.workspace.join(".git/config.lock"))
-        {
-            config_removed = unset_workflow_git_config(
-                &self.inner.workspace,
-                &self.inner.environment,
-                &scoped_helper_key,
-            );
-        }
-        let socket_removed = remove_file_if_present(&self.inner.socket_path);
-        let helper_removed = remove_file_if_present(&self.inner.helper_path);
-        let alias_removed =
-            remove_socket_alias(&self.inner.alias_directory, &self.inner.alias_link);
+        let socket_removed = remove_recorded_path(&self.inner.socket_path, socket_identity, None);
+        let helper_removed = remove_recorded_path(
+            &self.inner.helper_path,
+            Some(self.inner.helper_identity),
+            Some(self.inner.helper_contents.as_ref()),
+        );
+        let alias_removed = remove_socket_alias(&SocketAlias {
+            directory: self.inner.alias_directory.clone(),
+            directory_identity: self.inner.alias_directory_identity,
+            link: self.inner.alias_link.clone(),
+            link_identity: self.inner.alias_link_identity,
+            socket_address: self.inner.socket_address.clone(),
+        });
 
         let mut state = self.lock();
         retire_expired_issuances(&mut state, self.inner.clock.utc_now());
@@ -495,7 +596,7 @@ impl WorkflowGitAuthority {
                 RevocationObservation::LocallyExpired {
                     provider_expires_at: credential.expires_at,
                 }
-            } else if quiescence == ProcessQuiescence::Proven {
+            } else {
                 match self
                     .inner
                     .broker
@@ -507,10 +608,6 @@ impl WorkflowGitAuthority {
                     Ok(_) | Err(_) => RevocationObservation::UnconfirmedUntilExpiry {
                         provider_expires_at: credential.expires_at,
                     },
-                }
-            } else {
-                RevocationObservation::UnconfirmedUntilExpiry {
-                    provider_expires_at: credential.expires_at,
                 }
             };
             observations.push(observation);
@@ -732,7 +829,15 @@ fn read_frame(stream: &mut UnixStream, maximum: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn create_socket_alias(private_root: &Path) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+struct SocketAlias {
+    directory: PathBuf,
+    directory_identity: PathIdentity,
+    link: PathBuf,
+    link_identity: PathIdentity,
+    socket_address: PathBuf,
+}
+
+fn create_socket_alias(private_root: &Path) -> io::Result<SocketAlias> {
     for _ in 0..16 {
         let identity = ulid::Ulid::generate().to_string().to_ascii_lowercase();
         let directory = Path::new(SOCKET_ALIAS_ROOT).join(format!(".szg-{identity}"));
@@ -740,13 +845,34 @@ fn create_socket_alias(private_root: &Path) -> io::Result<(PathBuf, PathBuf, Pat
         builder.mode(0o700);
         match builder.create(&directory) {
             Ok(()) => {
+                let directory_identity = match PathIdentity::capture(&directory) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let _ = fs::remove_dir(&directory);
+                        return Err(error);
+                    }
+                };
                 let link = directory.join(SOCKET_ALIAS_LINK);
                 if let Err(error) = symlink(private_root, &link) {
                     let _ = fs::remove_dir(&directory);
                     return Err(error);
                 }
-                let address = link.join(SOCKET_FILE);
-                return Ok((directory, link, address));
+                let link_identity = match PathIdentity::capture(&link) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let _ = fs::remove_file(&link);
+                        let _ = fs::remove_dir(&directory);
+                        return Err(error);
+                    }
+                };
+                let socket_address = link.join(SOCKET_FILE);
+                return Ok(SocketAlias {
+                    directory,
+                    directory_identity,
+                    link,
+                    link_identity,
+                    socket_address,
+                });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -758,19 +884,39 @@ fn create_socket_alias(private_root: &Path) -> io::Result<(PathBuf, PathBuf, Pat
     ))
 }
 
-fn remove_socket_alias(directory: &Path, link: &Path) -> bool {
-    remove_file_if_present(link)
-        & match fs::remove_dir(directory) {
-            Ok(()) => true,
-            Err(error) => error.kind() == io::ErrorKind::NotFound,
+fn remove_socket_alias(alias: &SocketAlias) -> bool {
+    let link_removed = remove_recorded_path(&alias.link, Some(alias.link_identity), None);
+    let directory_removed = match fs::symlink_metadata(&alias.directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Ok(metadata) if alias.directory_identity.matches(&metadata) => {
+            fs::remove_dir(&alias.directory).is_ok()
         }
+        Ok(_) | Err(_) => false,
+    };
+    link_removed && directory_removed
 }
 
-fn remove_file_if_present(path: &Path) -> bool {
-    match fs::remove_file(path) {
-        Ok(()) => true,
-        Err(error) => error.kind() == io::ErrorKind::NotFound,
+fn remove_recorded_path(
+    path: &Path,
+    identity: Option<PathIdentity>,
+    expected_contents: Option<&[u8]>,
+) -> bool {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let Some(identity) = identity else {
+        return false;
+    };
+    if !identity.matches(&metadata)
+        || expected_contents.is_some_and(|expected| {
+            !fs::read(path).is_ok_and(|contents| contents.as_slice() == expected)
+        })
+    {
+        return false;
     }
+    fs::remove_file(path).is_ok()
 }
 
 fn helper_script(executable: &Path, socket: &Path) -> io::Result<String> {
@@ -827,19 +973,71 @@ fn unset_workflow_git_config(
     workspace: &Path,
     environment: &EnvironmentSnapshot,
     scoped_helper_key: &str,
+    helper_value: &str,
 ) -> bool {
-    let scoped_helper_removed = unset_local_config(workspace, environment, scoped_helper_key);
-    let helper_reset_removed = unset_local_config(workspace, environment, "credential.helper");
+    let scoped_helper_removed =
+        unset_injected_local_config(workspace, environment, scoped_helper_key, helper_value);
+    let helper_reset_removed =
+        unset_injected_local_config(workspace, environment, "credential.helper", "");
     let use_http_path_removed =
-        unset_local_config(workspace, environment, "credential.useHttpPath");
+        unset_injected_local_config(workspace, environment, "credential.useHttpPath", "true");
     scoped_helper_removed && helper_reset_removed && use_http_path_removed
 }
 
-fn unset_local_config(workspace: &Path, environment: &EnvironmentSnapshot, key: &str) -> bool {
-    isolated_git(workspace, environment)
-        .args(["config", "--local", "--unset-all", key])
-        .status()
-        .is_ok_and(|status| status.success() || status.code() == Some(5))
+fn unset_injected_local_config(
+    workspace: &Path,
+    environment: &EnvironmentSnapshot,
+    key: &str,
+    injected_value: &str,
+) -> bool {
+    let Some(values) = local_config_values(workspace, environment, key) else {
+        return false;
+    };
+    match values.as_slice() {
+        [] => true,
+        [value] if value.as_slice() == injected_value.as_bytes() => {
+            isolated_git(workspace, environment)
+                .args([
+                    "config",
+                    "--local",
+                    "--fixed-value",
+                    "--unset-all",
+                    key,
+                    injected_value,
+                ])
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+        _ => false,
+    }
+}
+
+fn local_config_values(
+    workspace: &Path,
+    environment: &EnvironmentSnapshot,
+    key: &str,
+) -> Option<Vec<Vec<u8>>> {
+    let output = super::source::isolated_git_command(workspace, environment)
+        .args(["config", "--local", "--null", "--get-all", key])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.code() == Some(1) {
+        return Some(Vec::new());
+    }
+    if !output.status.success() {
+        return None;
+    }
+    let mut values = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if values.last().is_some_and(Vec::is_empty) {
+        values.pop();
+    }
+    Some(values)
 }
 
 fn isolated_git(workspace: &Path, environment: &EnvironmentSnapshot) -> Command {
@@ -1418,8 +1616,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_process_quiescence_destroys_local_state_without_claiming_provider_revocation() {
+    fn failed_process_quiescence_still_targets_only_recorded_runner_credentials() {
         let fixture = fixture();
+        let workload_credential = fixture.workspace.join("operator-credential.txt");
+        fs::write(&workload_credential, b"synthetic workload material").unwrap();
         let expires = crate::timing::utc_now() + time::Duration::hours(1);
         let broker = fixture_broker(
             [(b"process-loss-token".as_slice(), expires)],
@@ -1435,10 +1635,79 @@ mod tests {
         let report = authority.teardown(ProcessQuiescence::Failed);
 
         assert!(report.local_state_destroyed);
-        assert_eq!(report.summary, RevocationSummary::ResidualUntilExpiry);
-        assert!(broker.revoked_tokens.lock().unwrap().is_empty());
+        assert_eq!(report.summary, RevocationSummary::FullyRevoked);
+        assert_eq!(
+            broker.revoked_tokens.lock().unwrap().as_slice(),
+            [b"process-loss-token".as_slice()]
+        );
+        assert_eq!(
+            fs::read(workload_credential).unwrap(),
+            b"synthetic workload material"
+        );
         assert!(!authority.inner.helper_path.exists());
         assert!(!authority.inner.socket_path.exists());
+    }
+
+    #[test]
+    fn teardown_preserves_workload_replacements_of_runner_injected_material() {
+        let fixture = fixture();
+        let expires = crate::timing::utc_now() + time::Duration::hours(1);
+        let broker = fixture_broker([(b"unused-token".as_slice(), expires)], []);
+        let authority = install(&fixture, broker);
+        let _lease = activate(&authority);
+        let scoped_helper_key = format!("credential.{}.helper", authority.inner.origin_text);
+
+        fs::remove_file(&authority.inner.helper_path).unwrap();
+        fs::write(
+            &authority.inner.helper_path,
+            b"workload-owned helper replacement\n",
+        )
+        .unwrap();
+        for (key, value) in [
+            ("credential.helper", "workload-helper"),
+            ("credential.useHttpPath", "false"),
+            (&scoped_helper_key, "workload-scoped-helper"),
+        ] {
+            assert!(
+                run_git(
+                    &fixture.workspace,
+                    ["config", "--local", "--replace-all", key, value],
+                )
+                .status
+                .success()
+            );
+        }
+
+        let report = authority.teardown(ProcessQuiescence::Proven);
+
+        assert!(!report.local_state_destroyed);
+        let helper = run_git(
+            &fixture.workspace,
+            ["config", "--local", "--get-all", "credential.helper"],
+        );
+        let use_http_path = run_git(
+            &fixture.workspace,
+            ["config", "--local", "--get-all", "credential.useHttpPath"],
+        );
+        let scoped = run_git(
+            &fixture.workspace,
+            ["config", "--local", "--get-all", &scoped_helper_key],
+        );
+        assert_eq!(
+            (
+                helper.stdout,
+                use_http_path.stdout,
+                scoped.stdout,
+                fs::read(&authority.inner.helper_path).ok(),
+            ),
+            (
+                b"workload-helper\n".to_vec(),
+                b"false\n".to_vec(),
+                b"workload-scoped-helper\n".to_vec(),
+                Some(b"workload-owned helper replacement\n".to_vec()),
+            ),
+            "teardown must target the injected values and file identity, not workload replacements",
+        );
     }
 
     #[test]

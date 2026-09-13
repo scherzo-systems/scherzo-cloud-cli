@@ -23,8 +23,8 @@ use super::cancellation::CancellationFlag;
 use super::canonical_json::{self, CanonicalJsonError};
 use super::execution_root::{AdmittedExecutionRoot, directory_open_flags, open_directory};
 use super::private_staging::{
-    StagingLifecycle, cleanup_staging, mark_cleanup_failed as mark_staging_cleanup_failed,
-    same_file,
+    StagingDropPolicy, StagingLifecycle, cleanup_staging,
+    mark_cleanup_failed as mark_staging_cleanup_failed, same_file,
 };
 use super::result_validation::RetainedJsonSchema;
 use super::schema_common::lowercase_hex;
@@ -843,6 +843,7 @@ struct ArtifactStagingInner {
     file_limits: CarrierLimits,
     git_limits: CarrierLimits,
     lifecycle: RwLock<StagingLifecycle>,
+    drop_policy: StagingDropPolicy,
     artifacts: Mutex<BTreeSet<Arc<str>>>,
     identity_guards: Mutex<BTreeMap<Arc<str>, Arc<str>>>,
     budget: Mutex<CaptureBudgetLedger>,
@@ -994,6 +995,7 @@ impl ArtifactStaging {
                 file_limits,
                 git_limits,
                 lifecycle: RwLock::new(StagingLifecycle::Active),
+                drop_policy: StagingDropPolicy::cleanup(),
                 artifacts: Mutex::new(BTreeSet::new()),
                 identity_guards: Mutex::new(BTreeMap::new()),
                 budget: Mutex::new(CaptureBudgetLedger::default()),
@@ -1450,9 +1452,21 @@ impl ArtifactStaging {
         Ok(())
     }
 
+    // Each concrete staging owner keeps a typed release API while delegating the
+    // shared preserve-on-drop transition to StagingDropPolicy.
+    // jscpd:ignore-start
     pub(crate) fn release(&self) -> Result<(), ArtifactReleaseFailure> {
         self.inner.cleanup()
     }
+
+    pub(crate) fn preserve(&self) {
+        self.inner.drop_policy.preserve(&self.inner.lifecycle);
+    }
+
+    pub(crate) fn preserve_on_drop(&self) {
+        self.inner.drop_policy.preserve_on_drop();
+    }
+    // jscpd:ignore-end
 
     #[cfg(test)]
     pub(crate) fn staged_artifact_count(&self) -> usize {
@@ -2030,11 +2044,20 @@ impl ArtifactStagingInner {
         usage.captured_bytes = usage.captured_bytes.saturating_sub(size);
     }
 
+    // Artifact leases have identity-guard and budget transitions that do not
+    // belong in the input-view cleanup implementations.
+    // jscpd:ignore-start
     fn remove_artifact(&self, artifact_identity: &str) -> bool {
+        if self.drop_policy.is_preserved() {
+            return true;
+        }
         let Ok(mut lifecycle) = self.lifecycle.write() else {
             return false;
         };
-        if *lifecycle == StagingLifecycle::Released {
+        if matches!(
+            *lifecycle,
+            StagingLifecycle::Preserved | StagingLifecycle::Released
+        ) {
             return true;
         }
         let removed = self.remove_artifact_while_active(artifact_identity);
@@ -2043,6 +2066,7 @@ impl ArtifactStagingInner {
         }
         removed
     }
+    // jscpd:ignore-end
 
     fn remove_artifact_while_active(&self, artifact_identity: &str) -> bool {
         #[cfg(test)]
@@ -2149,7 +2173,9 @@ impl ArtifactStagingInner {
 
 impl Drop for ArtifactStagingInner {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if !self.drop_policy.is_preserved() {
+            let _ = self.cleanup();
+        }
     }
 }
 

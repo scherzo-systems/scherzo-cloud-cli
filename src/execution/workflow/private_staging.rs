@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, fchmod, fstat, mkdirat, open, openat, unlinkat};
 use rustix::io::Errno;
@@ -17,7 +18,36 @@ pub(super) use crate::execution::owned_tree::{remove_open_tree_at, remove_tree_a
 pub(super) enum StagingLifecycle {
     Active,
     CleanupFailed,
+    Preserved,
     Released,
+}
+
+pub(super) struct StagingDropPolicy(AtomicBool);
+
+impl StagingDropPolicy {
+    pub(super) const fn cleanup() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub(super) fn preserve(&self, lifecycle: &RwLock<StagingLifecycle>) {
+        self.preserve_on_drop();
+        preserve_staging(lifecycle);
+    }
+
+    pub(super) fn preserve_on_drop(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(super) fn is_preserved(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+pub(super) fn preserve_staging(lifecycle: &RwLock<StagingLifecycle>) {
+    let mut lifecycle = lifecycle
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *lifecycle = StagingLifecycle::Preserved;
 }
 
 pub(super) fn mark_cleanup_failed(lifecycle: &RwLock<StagingLifecycle>) {
@@ -35,7 +65,10 @@ pub(super) fn cleanup_staging<Error>(
     cleanup_active: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut lifecycle = lifecycle.write().map_err(|_| unavailable)?;
-    if *lifecycle == StagingLifecycle::Released {
+    if matches!(
+        *lifecycle,
+        StagingLifecycle::Preserved | StagingLifecycle::Released
+    ) {
         return Ok(());
     }
     let result = cleanup_active();
@@ -123,9 +156,6 @@ pub(super) fn open_directory_path(path: &Path) -> Result<OwnedFd, Errno> {
 fn directory_open_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
-
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 #[derive(Default)]

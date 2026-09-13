@@ -18,7 +18,8 @@ use super::run_inputs::{HttpRunInputBroker, PreparationDeadline, RunInputBroker,
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitInstall};
 use super::workspace::{
-    AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, WorkRootLease,
+    AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, RetentionReason,
+    WorkRootLease, WorkspaceDisposition,
 };
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
@@ -70,12 +71,25 @@ pub(super) struct AssignmentOffer {
 }
 
 pub(super) trait AssignmentRootPreparer: Send + Sync {
-    fn prepare(&self, assignment_id: &str) -> Result<AssignmentRoot, AssignmentRootCreationError>;
+    fn prepare(
+        &self,
+        offer: &AssignmentOffer,
+        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    ) -> Result<AssignmentRoot, AssignmentRootCreationError>;
 }
 
 impl AssignmentRootPreparer for WorkRootLease {
-    fn prepare(&self, assignment_id: &str) -> Result<AssignmentRoot, AssignmentRootCreationError> {
-        self.create_assignment(assignment_id)
+    fn prepare(
+        &self,
+        offer: &AssignmentOffer,
+        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
+        self.create_assignment_for_attempt(
+            &offer.assignment_id,
+            &offer.run_id,
+            &offer.attempt_id,
+            recorder,
+        )
     }
 }
 
@@ -118,7 +132,8 @@ impl AssignmentRootPreparationHandoff {
 }
 
 struct AssignmentRootPreparation {
-    assignment_id: String,
+    offer: AssignmentOffer,
+    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
     root_preparer: Arc<dyn AssignmentRootPreparer>,
     handoff: Arc<AssignmentRootPreparationHandoff>,
     event_sender: mpsc::UnboundedSender<ManagerEvent>,
@@ -155,21 +170,28 @@ impl AssignmentRootPreparationWorker {
 
 fn prepare_assignment_root(request: AssignmentRootPreparation) {
     let AssignmentRootPreparation {
-        assignment_id,
+        offer,
+        recorder,
         root_preparer,
         handoff,
         event_sender,
         wake,
     } = request;
+    let assignment_id = offer.assignment_id.clone();
     let root = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        root_preparer.prepare(&assignment_id)
+        root_preparer.prepare(&offer, recorder)
     })) {
         Ok(result) => result.map(Box::new),
         Err(_) => Err(AssignmentRootCreationError::CleanupFailed),
     };
     if !handoff.claim_delivery() {
         if let Ok(root) = root {
-            let _ = root.release_pending(ProcessQuiescence::Proven).wait();
+            let _ = root
+                .release_pending(
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Failed),
+                )
+                .wait();
         }
         wake.wake();
         return;
@@ -181,7 +203,12 @@ fn prepare_assignment_root(request: AssignmentRootPreparation) {
     if let Err(error) = event_sender.send(event)
         && let ManagerEvent::WorkspacePrepared { root: Ok(root), .. } = error.0
     {
-        let _ = root.release_pending(ProcessQuiescence::Proven).wait();
+        let _ = root
+            .release_pending(
+                ProcessQuiescence::Proven,
+                WorkspaceDisposition::Retain(RetentionReason::Failed),
+            )
+            .wait();
     }
     wake.wake();
 }
@@ -1145,6 +1172,7 @@ struct FinishingAssignment {
     identity: AssignmentIdentity,
     final_observation_id: u64,
     root: Option<AssignmentRoot>,
+    workspace_disposition: WorkspaceDisposition,
 }
 
 enum ReleaseAfter {
@@ -1187,6 +1215,7 @@ pub(super) enum ManagerEvent {
         lease_clock_failed: bool,
         retained_root: Option<Box<AssignmentRoot>>,
         quiescence: ProcessQuiescence,
+        workspace_disposition: WorkspaceDisposition,
     },
     FinalGraceElapsed {
         assignment_id: String,
@@ -1568,10 +1597,11 @@ impl AssignmentManager {
             self.retire_assignment_observations(&finishing.identity.assignment_id);
             if let Some(root) = finishing.root {
                 self.deferred_successor = Some(offer);
-                self.begin_assignment_cleanup(
+                self.begin_assignment_finalization(
                     finishing.identity.assignment_id,
                     root,
                     ProcessQuiescence::Proven,
+                    finishing.workspace_disposition,
                     ReleaseAfter::Idle,
                 );
                 return Ok(());
@@ -1596,7 +1626,7 @@ impl AssignmentManager {
             return self.retain_decision(offer, response);
         }
 
-        let assignment_id = offer.assignment_id.clone();
+        let root_offer = offer.clone();
         let root_preparation = Arc::new(AssignmentRootPreparationHandoff::new());
         self.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
             offer,
@@ -1607,7 +1637,7 @@ impl AssignmentManager {
             preparation_event: None,
         })));
         if self
-            .begin_workspace_preparation(assignment_id, root_preparation)
+            .begin_workspace_preparation(root_offer, root_preparation)
             .is_err()
         {
             let Some(LocalSlot::Preparing(preparing)) = self.slot.take() else {
@@ -1706,12 +1736,13 @@ impl AssignmentManager {
 
     fn begin_workspace_preparation(
         &self,
-        assignment_id: String,
+        offer: AssignmentOffer,
         handoff: Arc<AssignmentRootPreparationHandoff>,
     ) -> Result<(), ()> {
         self.root_preparation_worker
             .prepare(AssignmentRootPreparation {
-                assignment_id,
+                offer,
+                recorder: self.recorder.clone(),
                 root_preparer: Arc::clone(&self.root_preparer),
                 handoff,
                 event_sender: self.event_sender.clone(),
@@ -2240,10 +2271,11 @@ impl AssignmentManager {
                 };
                 self.reporting = None;
                 if let Some(root) = finishing.root {
-                    self.begin_assignment_cleanup(
+                    self.begin_assignment_finalization(
                         finishing.identity.assignment_id,
                         root,
                         ProcessQuiescence::Proven,
+                        finishing.workspace_disposition,
                         ReleaseAfter::Idle,
                     );
                 }
@@ -2353,15 +2385,53 @@ impl AssignmentManager {
         Ok(())
     }
 
+    fn finish_without_reporting(
+        &mut self,
+        assignment_id: String,
+        root: Option<AssignmentRoot>,
+        quiescence: ProcessQuiescence,
+        disposition: WorkspaceDisposition,
+    ) {
+        self.retire_assignment_observations(&assignment_id);
+        self.cleanup_retained_root(
+            assignment_id,
+            root,
+            quiescence,
+            disposition,
+            ReleaseAfter::Idle,
+        );
+        self.outbox.wake();
+    }
+
+    fn retain_after_lease_clock_failure(
+        &mut self,
+        assignment_id: String,
+        root: Option<AssignmentRoot>,
+        quiescence: ProcessQuiescence,
+        disposition: WorkspaceDisposition,
+        identity: AssignmentIdentity,
+        final_observation_id: u64,
+    ) {
+        self.begin_lease_clock_failure_reporting(final_observation_id);
+        self.cleanup_retained_root(
+            assignment_id,
+            root,
+            quiescence,
+            disposition,
+            ReleaseAfter::Reporting(Box::new(identity)),
+        );
+    }
+
     fn cleanup_retained_root(
         &mut self,
         assignment_id: String,
         root: Option<AssignmentRoot>,
         quiescence: ProcessQuiescence,
+        disposition: WorkspaceDisposition,
         after: ReleaseAfter,
     ) {
         if let Some(root) = root {
-            self.begin_assignment_cleanup(assignment_id, root, quiescence, after);
+            self.begin_assignment_finalization(assignment_id, root, quiescence, disposition, after);
         } else if let ReleaseAfter::Reporting(identity) = after {
             self.reporting = Some(*identity);
         }
@@ -2374,6 +2444,23 @@ impl AssignmentManager {
         quiescence: ProcessQuiescence,
         after: ReleaseAfter,
     ) {
+        self.begin_assignment_finalization(
+            assignment_id,
+            root,
+            quiescence,
+            WorkspaceDisposition::Retain(RetentionReason::Failed),
+            after,
+        );
+    }
+
+    fn begin_assignment_finalization(
+        &mut self,
+        assignment_id: String,
+        root: AssignmentRoot,
+        quiescence: ProcessQuiescence,
+        disposition: WorkspaceDisposition,
+        after: ReleaseAfter,
+    ) {
         self.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
             assignment_id: assignment_id.clone(),
             after,
@@ -2382,7 +2469,7 @@ impl AssignmentManager {
         let wake = self.outbox.clone();
         // Run the synchronous release chain on the blocking pool, not the manager caller.
         tokio::task::spawn_blocking(move || {
-            let result = root.release_pending(quiescence).wait();
+            let result = root.release_pending(quiescence, disposition).wait();
             let _ = sender.send(ManagerEvent::CleanupFinished {
                 assignment_id,
                 result,
@@ -2404,7 +2491,7 @@ impl AssignmentManager {
             ReleaseAfter::Reporting(identity) => self.reporting = Some(*identity),
         }
         match result {
-            CleanupResult::Released => {
+            CleanupResult::Released | CleanupResult::Retained => {
                 if let Some(successor) = self.deferred_successor.take()
                     && let Err(failure) = self.handle_offer_after_drain(successor)
                 {
@@ -2440,10 +2527,16 @@ impl AssignmentManager {
                 },
             })
             .map_err(|_| AssignmentManagerFailure::DecisionCapacity)?;
+        let workspace_disposition = WorkspaceDisposition::Retain(match reason {
+            "graceful_shutdown" => RetentionReason::Cancelled,
+            "execution_lease_expired" => RetentionReason::Interrupted,
+            _ => RetentionReason::Failed,
+        });
         self.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
             identity: identity.clone(),
             final_observation_id,
             root: Some(root),
+            workspace_disposition,
         })));
         let deadline = self
             .lease_clock
@@ -2683,6 +2776,7 @@ impl AssignmentManager {
                     lease_clock_failed,
                     retained_root,
                     quiescence,
+                    workspace_disposition,
                 } => {
                     let Some(LocalSlot::Running(running)) = self.slot.take() else {
                         continue;
@@ -2701,61 +2795,59 @@ impl AssignmentManager {
                             ReleaseAfter::Idle
                         };
                         if let Some(root) = retained_root {
-                            self.begin_assignment_cleanup(
+                            self.begin_assignment_finalization(
                                 assignment_id,
                                 root,
                                 ProcessQuiescence::Failed,
+                                workspace_disposition,
                                 after,
                             );
-                        } else {
-                            self.cleanup_failed = true;
-                            self.outbox.wake();
+                        } else if let ReleaseAfter::Reporting(identity) = after {
+                            self.reporting = Some(*identity);
                         }
                         continue;
                     }
                     let Some(final_observation_id) = final_observation_id else {
-                        self.retire_assignment_observations(&assignment_id);
                         self.lease_clock_failed |= lease_clock_failed;
-                        self.cleanup_retained_root(
+                        self.finish_without_reporting(
                             assignment_id,
                             retained_root,
                             quiescence,
-                            ReleaseAfter::Idle,
+                            workspace_disposition,
                         );
-                        self.outbox.wake();
                         continue;
                     };
                     if lease_clock_failed {
-                        self.begin_lease_clock_failure_reporting(final_observation_id);
-                        self.cleanup_retained_root(
+                        self.retain_after_lease_clock_failure(
                             assignment_id,
                             retained_root,
                             quiescence,
-                            ReleaseAfter::Reporting(Box::new(identity)),
+                            workspace_disposition,
+                            identity,
+                            final_observation_id,
                         );
                         continue;
                     }
                     let Some(final_delivery_deadline) = final_delivery_deadline else {
-                        self.retire_assignment_observations(&assignment_id);
-                        self.cleanup_retained_root(
+                        self.finish_without_reporting(
                             assignment_id,
                             retained_root,
                             quiescence,
-                            ReleaseAfter::Idle,
+                            workspace_disposition,
                         );
-                        self.outbox.wake();
                         continue;
                     };
                     let final_delivery_deadline =
                         match self.clamp_to_shutdown_cleanup_deadline(final_delivery_deadline) {
                             Ok(deadline) => deadline,
                             Err(_) => {
-                                self.begin_lease_clock_failure_reporting(final_observation_id);
-                                self.cleanup_retained_root(
+                                self.retain_after_lease_clock_failure(
                                     assignment_id,
                                     retained_root,
                                     quiescence,
-                                    ReleaseAfter::Reporting(Box::new(identity)),
+                                    workspace_disposition,
+                                    identity,
+                                    final_observation_id,
                                 );
                                 continue;
                             }
@@ -2768,31 +2860,31 @@ impl AssignmentManager {
                         Ok(std::cmp::Ordering::Less) => true,
                         Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => false,
                         Err(_) => {
-                            self.begin_lease_clock_failure_reporting(final_observation_id);
-                            self.cleanup_retained_root(
+                            self.retain_after_lease_clock_failure(
                                 assignment_id,
                                 retained_root,
                                 quiescence,
-                                ReleaseAfter::Reporting(Box::new(identity)),
+                                workspace_disposition,
+                                identity,
+                                final_observation_id,
                             );
                             continue;
                         }
                     };
                     if !deadline_pending {
-                        self.retire_assignment_observations(&assignment_id);
-                        self.cleanup_retained_root(
+                        self.finish_without_reporting(
                             assignment_id,
                             retained_root,
                             quiescence,
-                            ReleaseAfter::Idle,
+                            workspace_disposition,
                         );
-                        self.outbox.wake();
                         continue;
                     }
                     self.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
                         identity: identity.clone(),
                         final_observation_id,
                         root: retained_root,
+                        workspace_disposition,
                     })));
                     if self
                         .start_final_grace(
@@ -2817,6 +2909,7 @@ impl AssignmentManager {
                     if finishing.identity.assignment_id == assignment_id
                         && finishing.final_observation_id == final_observation_id
                     {
+                        let workspace_disposition = finishing.workspace_disposition;
                         let after = if continue_reporting {
                             ReleaseAfter::Reporting(Box::new(finishing.identity))
                         } else {
@@ -2824,10 +2917,11 @@ impl AssignmentManager {
                             ReleaseAfter::Idle
                         };
                         if let Some(root) = finishing.root {
-                            self.begin_assignment_cleanup(
+                            self.begin_assignment_finalization(
                                 assignment_id,
                                 root,
                                 ProcessQuiescence::Proven,
+                                workspace_disposition,
                                 after,
                             );
                         } else if let ReleaseAfter::Reporting(identity) = after {
@@ -3642,7 +3736,12 @@ fn admission_decline(failure: AdmissionFailure, cloud_git_capture: bool) -> Assi
 
 fn release_unclaimed_assignment_root(root: AssignmentRoot) {
     tokio::task::spawn_blocking(move || {
-        let _ = root.release_pending(ProcessQuiescence::Proven).wait();
+        let _ = root
+            .release_pending(
+                ProcessQuiescence::Proven,
+                WorkspaceDisposition::Retain(RetentionReason::Failed),
+            )
+            .wait();
     });
 }
 
@@ -3915,7 +4014,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     impl AssignmentRootPreparer for GatedAssignmentRootPreparer {
         fn prepare(
             &self,
-            assignment_id: &str,
+            offer: &AssignmentOffer,
+            recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
         ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
             let _ = self.started.send(());
             self.release
@@ -3924,9 +4024,13 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 .recv()
                 .map_err(|_| AssignmentRootCreationError::Unavailable)?;
             match &self.outcome {
-                GatedRootPreparationOutcome::Create(work_root) => {
-                    work_root.create_assignment(assignment_id)
-                }
+                GatedRootPreparationOutcome::Create(work_root) => work_root
+                    .create_assignment_for_attempt(
+                        &offer.assignment_id,
+                        &offer.run_id,
+                        &offer.attempt_id,
+                        recorder,
+                    ),
                 GatedRootPreparationOutcome::Unavailable => {
                     Err(AssignmentRootCreationError::Unavailable)
                 }
@@ -4269,6 +4373,27 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }))
         .await
         .expect("assignment cleanup did not complete");
+    }
+
+    async fn wait_for_execution_finalization(manager: &mut AssignmentManager) {
+        with_watchdog(wait_for_manager_state(manager, |manager| {
+            manager.drain_events();
+            !matches!(manager.slot, Some(LocalSlot::Running(_)))
+        }))
+        .await
+        .expect("execution workspace disposition did not complete");
+    }
+
+    async fn acknowledge_terminal_and_settle(manager: &mut AssignmentManager) {
+        wait_for_execution_finalization(manager).await;
+        let terminal_id = manager
+            .pending_observations(&BTreeSet::new(), 100)
+            .into_iter()
+            .find(|entry| entry.observation.is_terminal())
+            .expect("terminal observation")
+            .id;
+        manager.acknowledge_observation(terminal_id);
+        settle_cleanup(manager).await;
     }
 
     fn release_current(manager: &mut AssignmentManager, offered: &AssignmentOffer, reason: &str) {
@@ -4733,6 +4858,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 lease_clock_failed: false,
                 retained_root: None,
                 quiescence: ProcessQuiescence::Proven,
+                workspace_disposition: WorkspaceDisposition::Remove,
             })
             .unwrap();
         final_observation_id
@@ -4785,6 +4911,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         AssignmentManager,
         tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
         AssignmentOffer,
+        PathBuf,
     ) {
         let workflow = "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let (temporary, mut manager) = manager_fixture(workflow);
@@ -4792,8 +4919,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.lease_clock = lease_clock;
         let offered = offer("bg");
         offer_then_prepare(&mut manager, &offered).await;
+        let workspace = match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => accepted.root.workspace.path(),
+            _ => panic!("fixture assignment must be accepted"),
+        };
+        fs::write(
+            workspace.join("lease-loss-sentinel"),
+            b"retained lease bytes",
+        )
+        .unwrap();
         spawn_execution(&mut manager, &offered);
-        (temporary, manager, lease_waits, offered)
+        (temporary, manager, lease_waits, offered, workspace)
     }
 
     async fn lease_wait_request(
@@ -5273,7 +5409,58 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[tokio::test]
-    async fn staged_carrier_delivery_begins_only_after_the_workspace_is_released() {
+    async fn command_failure_retains_git_dirty_untracked_ignored_and_build_bytes() {
+        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf committed > tracked-output.txt; git add tracked-output.txt; git -c user.name=Fixture -c user.email=fixture@example.test commit --quiet -m 'retained fixture'; printf dirty-tracked > tracked-output.txt; printf '*.cache\\\\n' > .gitignore; printf untracked > untracked.txt; printf ignored > ignored.cache; mkdir build; printf build-output > build/result; exit 23\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let (workspace, private) = match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => (
+                accepted.root.workspace.path(),
+                accepted.root.private.path().to_owned(),
+            ),
+            _ => panic!("fixture assignment must be accepted"),
+        };
+
+        let reports = execute_to_terminal(&mut manager, &offered).await;
+
+        assert!(matches!(
+            reports.last(),
+            Some(ExecutionReport::Finished { outcome, .. })
+                if outcome["outcome"] == "failed"
+        ));
+        assert!(workspace.join(".git/HEAD").exists());
+        assert_eq!(
+            run_fixture_git(&workspace, &["log", "-1", "--format=%s"]),
+            "retained fixture"
+        );
+        assert_eq!(
+            fs::read(workspace.join("tracked-output.txt")).unwrap(),
+            b"dirty-tracked"
+        );
+        assert_eq!(
+            fs::read(workspace.join("untracked.txt")).unwrap(),
+            b"untracked"
+        );
+        assert_eq!(
+            fs::read(workspace.join("ignored.cache")).unwrap(),
+            b"ignored"
+        );
+        assert_eq!(
+            run_fixture_git(&workspace, &["check-ignore", "ignored.cache"]),
+            "ignored.cache"
+        );
+        assert_eq!(
+            fs::read(workspace.join("build/result")).unwrap(),
+            b"build-output"
+        );
+        assert!(private.read_dir().unwrap().next().is_some());
+        acknowledge_terminal_and_settle(&mut manager).await;
+        assert!(workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn staged_carrier_delivery_reads_while_the_workspace_remains_available() {
         let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf staged > value.txt\"]\n    outputs:\n      value:\n        kind: file\n        from: path\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
@@ -5294,9 +5481,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let pending = with_watchdog(wait_for_carrier_registration(&mut manager))
             .await
             .expect("carrier registration was not reached");
-        assert!(!workspace.exists());
+        assert_eq!(fs::read(workspace.join("value.txt")).unwrap(), b"staged");
         assert!(private.exists());
-        assert!(!helper.exists());
+        assert!(helper.exists());
         assert!(!pending.iter().any(|entry| entry.observation.is_terminal()));
         assert!(fail_pending_artifact_registrations(&mut manager, &pending));
 
@@ -5307,12 +5494,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             reports.last(),
             Some(ExecutionReport::Finished { .. })
         ));
-        assert!(!workspace.exists());
+        wait_for_execution_finalization(&mut manager).await;
+        assert_eq!(fs::read(workspace.join("value.txt")).unwrap(), b"staged");
         assert!(private.exists());
+        assert!(!helper.exists());
     }
 
     #[tokio::test]
-    async fn nested_workflow_result_survives_read_only_input_cleanup_and_assignment_release() {
+    async fn nested_workflow_result_and_staging_survive_delivery_failure() {
         let nested_arguments = serde_json::to_string(&command_fixture_arguments_for(
             NESTED_WORKFLOW_FIXTURE_TEST_NAME,
         ))
@@ -5359,29 +5548,30 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 && *size_bytes == u64::try_from(expected.len()).unwrap()
                 && sha256 == &expected_sha256
         )));
-        assert!(!assignment_path.join("workspace").exists());
+        assert!(assignment_path.join("workspace").exists());
         assert!(fail_pending_artifact_registrations(&mut manager, &pending));
 
         let reports = with_watchdog(wait_for_terminal(&mut manager))
             .await
             .expect("nested workflow terminal report was not selected");
         assert_succeeded(&reports);
-        let terminal_id = manager
-            .pending_observations(&BTreeSet::new(), 100)
-            .into_iter()
-            .find(|entry| entry.observation.is_terminal())
-            .unwrap()
-            .id;
-        manager.acknowledge_observation(terminal_id);
-        settle_cleanup(&mut manager).await;
+        acknowledge_terminal_and_settle(&mut manager).await;
         assert!(!manager.cleanup_failed);
         assert!(manager.slot.is_none());
-        assert!(!assignment_path.exists());
+        assert!(assignment_path.exists());
+        assert!(
+            assignment_path
+                .join("private")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_some()
+        );
     }
 
     #[tokio::test]
-    async fn workspace_release_survives_a_stale_git_config_lock() {
-        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"touch .git/config.lock; printf staged > value.txt\"]\n    outputs:\n      value:\n        kind: file\n        from: path\n        path: value.txt\n        mediaType: text/plain\nexports:\n  result:\n    ref: outputs.write.value\n";
+    async fn credential_teardown_failure_after_prepared_delivery_retains_and_admits_a_successor() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
         offer_then_prepare(&mut manager, &offered).await;
@@ -5389,19 +5579,53 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             Some(LocalSlot::Accepted(accepted)) => accepted.root.workspace.path(),
             _ => panic!("fixture assignment must be accepted"),
         };
-        spawn_execution(&mut manager, &offered);
+        let job = execution_job(&mut manager, &offered);
+        drop(job);
+        fs::write(workspace.join(".git/config.lock"), b"synthetic lock").unwrap();
+        let deadline = manager
+            .lease_clock
+            .now()
+            .unwrap()
+            .checked_add(Duration::from_secs(5))
+            .unwrap();
+        let final_observation_id = enqueue_completion(&manager, deadline);
 
-        let pending = with_watchdog(wait_for_carrier_registration(&mut manager))
-            .await
-            .expect("carrier registration was not reached");
-        assert!(
-            !workspace.exists(),
-            "a stale Git config lock must not retain the checkout through delivery"
-        );
-        assert!(fail_pending_artifact_registrations(&mut manager, &pending));
-        with_watchdog(wait_for_terminal(&mut manager))
-            .await
-            .expect("terminal report was not selected");
+        wait_for_execution_finalization(&mut manager).await;
+        let pending = manager.pending_observations(&BTreeSet::new(), 100);
+        assert!(pending.iter().any(|entry| {
+            entry.id == final_observation_id
+                && matches!(
+                    &entry.observation,
+                    AssignmentObservation::Execution {
+                        report: ExecutionReport::Finished {
+                            outcome,
+                            artifact_delivery,
+                            ..
+                        },
+                        ..
+                    } if outcome["outcome"] == "succeeded"
+                        && artifact_delivery["outcome"] == "prepared"
+                )
+        }));
+        manager.acknowledge_observation(final_observation_id);
+        settle_cleanup(&mut manager).await;
+        assert!(workspace.join(".git/config.lock").exists());
+        assert!(workspace.exists());
+
+        let successor = offer("bh");
+        manager.handle_offer(successor.clone()).unwrap();
+        wait_for_offer_preparation(&mut manager).await;
+        let successor_workspace = match &manager.slot {
+            Some(LocalSlot::Preparing(preparing)) => preparing
+                .root
+                .as_ref()
+                .expect("successor root")
+                .workspace
+                .path(),
+            _ => panic!("successor must receive a fresh preparing slot"),
+        };
+        assert_ne!(successor_workspace, workspace);
+        assert!(workspace.exists());
     }
 
     #[tokio::test]
@@ -5454,7 +5678,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[tokio::test]
-    async fn release_during_root_preparation_cleans_the_late_root() {
+    async fn release_during_root_preparation_retains_the_late_root() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
@@ -5489,7 +5713,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         settle_cleanup(&mut manager).await;
 
         assert!(manager.slot.is_none());
-        assert!(!root_path.exists());
+        assert!(root_path.join("workspace").exists());
         assert!(!has_offer_preparation(&mut manager));
     }
 
@@ -5605,15 +5829,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         .await;
     }
 
-    struct CleanupAssignmentFixture {
-        _temporary: tempfile::TempDir,
-        manager: AssignmentManager,
-        remover: Arc<CleanupRemover>,
-        requests: tokio::sync::mpsc::UnboundedReceiver<CleanupSleepRequest>,
-        predecessor_root: PathBuf,
-        successor: AssignmentOffer,
-    }
-
     fn gated_cleanup_manager(
         outcomes: impl IntoIterator<Item = bool>,
     ) -> (
@@ -5628,40 +5843,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let sleeper = Arc::new(GatedCleanupSleeper { requests });
         let (temporary, manager) = manager_fixture_with_cleanup(workflow, remover.clone(), sleeper);
         (temporary, manager, remover, cleanup_requests)
-    }
-
-    async fn cleanup_assignment_fixture(
-        outcomes: impl IntoIterator<Item = bool>,
-    ) -> CleanupAssignmentFixture {
-        let (temporary, mut manager, remover, cleanup_requests) = gated_cleanup_manager(outcomes);
-        let predecessor = offer("bg");
-        let successor = offer("bh");
-        offer_then_prepare(&mut manager, &predecessor).await;
-        let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
-        manager.acknowledge_observation(acceptance);
-        let predecessor_root = match &manager.slot {
-            Some(LocalSlot::Accepted(accepted)) => {
-                accepted.root.execution.parent().unwrap().to_owned()
-            }
-            _ => panic!("predecessor must be accepted"),
-        };
-        manager
-            .handle_release(
-                &predecessor.assignment_id,
-                &predecessor.run_id,
-                &predecessor.attempt_id,
-                "stale_or_invalid_acceptance",
-            )
-            .unwrap();
-        manager.handle_offer(successor.clone()).unwrap();
-        CleanupAssignmentFixture {
-            _temporary: temporary,
-            manager,
-            remover,
-            requests: cleanup_requests,
-            predecessor_root,
-            successor,
-        }
     }
 
     // Progress is gated by messages, not worker scheduling within a wall-clock budget.
@@ -5689,86 +5870,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[tokio::test]
-    async fn recovered_cleanup_holds_capacity_then_admits_the_deferred_successor() {
-        let CleanupAssignmentFixture {
-            _temporary,
-            mut manager,
-            remover,
-            mut requests,
-            predecessor_root,
-            successor,
-        } = cleanup_assignment_fixture([false, true, true]).await;
-        assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
-        assert_eq!(
-            manager
-                .deferred_successor
-                .as_ref()
-                .map(|offer| offer.assignment_id.as_str()),
-            Some(successor.assignment_id.as_str())
-        );
-        assert!(
-            manager
-                .decisions
-                .iter()
-                .all(|decision| decision.offer.assignment_id != successor.assignment_id)
-        );
-
-        let request = requests
-            .recv()
-            .await
-            .expect("cleanup retry channel closed before recovery");
-        assert_eq!(request.duration, Duration::from_millis(100));
-        request.release.send(()).unwrap();
-        settle_cleanup(&mut manager).await;
-
-        assert!(!predecessor_root.exists());
-        assert_eq!(remover.calls.load(Ordering::Relaxed), 3);
-        assert!(!manager.cleanup_failed);
-        assert!(matches!(
-            &manager.slot,
-            Some(LocalSlot::Preparing(preparing))
-                if preparing.offer.assignment_id == successor.assignment_id
-        ));
-    }
-
-    #[tokio::test]
-    async fn exhausted_cleanup_quarantines_and_rejects_the_deferred_successor() {
-        let CleanupAssignmentFixture {
-            _temporary,
-            mut manager,
-            remover,
-            mut requests,
-            predecessor_root,
-            successor,
-        } = cleanup_assignment_fixture([false; 6]).await;
-        release_all_cleanup_retries(&mut manager, &mut requests).await;
-        settle_cleanup(&mut manager).await;
-
-        assert!(predecessor_root.exists());
-        assert_eq!(remover.calls.load(Ordering::Relaxed), 6);
-        assert!(manager.cleanup_failed);
-        let pending = manager.pending_observations(&BTreeSet::new(), 10);
-        let successor_rejection = pending.iter().find(|entry| {
-            matches!(
-                &entry.observation,
-                AssignmentObservation::Decision(AssignmentDecision::Rejected {
-                    assignment_id,
-                    decline: AssignmentDecline::RunnerUnable(
-                        RunnerUnableReason::ExecutionEnvironmentUnavailable
-                    ),
-                    ..
-                }) if assignment_id == &successor.assignment_id
-            )
-        });
-        assert!(successor_rejection.is_some());
-        assert!(!manager.cleanup_failure_ready_to_exit());
-        for observation in pending {
-            manager.mark_observation_encoded(observation.id);
-        }
-        assert!(manager.cleanup_failure_ready_to_exit());
-    }
-
-    #[tokio::test]
     async fn cleanup_exhaustion_preserves_the_preselected_terminal_report() {
         let (_temporary, mut manager, remover, mut requests) = gated_cleanup_manager([false; 6]);
         let predecessor = offer("bg");
@@ -5787,6 +5888,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             identity: identity.clone(),
             final_observation_id,
             root: Some(accepted.root),
+            workspace_disposition: WorkspaceDisposition::Remove,
         })));
         manager
             .event_sender
@@ -6048,6 +6150,7 @@ steps:
             identity: accepted.identity,
             final_observation_id,
             root: Some(accepted.root),
+            workspace_disposition: WorkspaceDisposition::Remove,
         })));
         let (lease_clock, _control, mut waits) = controlled_lease_clock();
         manager.lease_clock = lease_clock;
@@ -6595,6 +6698,7 @@ steps:
         })
         .await
         .expect("workflow did not select a terminal report");
+        wait_for_execution_finalization(&mut manager).await;
 
         let (artifact_duration, _artifact_release) =
             with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
@@ -6630,6 +6734,7 @@ steps:
                 lease_clock_failed: false,
                 retained_root: None,
                 quiescence: ProcessQuiescence::Proven,
+                workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::Failed),
             })
             .unwrap();
 
@@ -6708,7 +6813,7 @@ steps:
 
     #[tokio::test]
     async fn schedules_renewal_before_initial_lease_loss_cancellation() {
-        let (_temporary, _manager, mut sleep_requests, _offered) =
+        let (_temporary, _manager, mut sleep_requests, _offered, _workspace) =
             controlled_running_fixture().await;
 
         let (duration, _release) = with_watchdog(sleep_requests.recv())
@@ -6726,7 +6831,7 @@ steps:
 
     #[tokio::test]
     async fn lease_loss_quiescence_attempts_artifact_delivery_before_terminal_report() {
-        let (_temporary, mut manager, mut sleep_requests, _offered) =
+        let (_temporary, mut manager, mut sleep_requests, _offered, workspace) =
             controlled_running_fixture().await;
 
         lease_wait_request(&mut sleep_requests, Duration::from_secs(303))
@@ -6802,6 +6907,10 @@ steps:
             ),
             "unexpected lease-loss report: {report:?}"
         );
+        assert_eq!(
+            fs::read(workspace.join("lease-loss-sentinel")).unwrap(),
+            b"retained lease bytes"
+        );
     }
 
     #[tokio::test]
@@ -6834,7 +6943,7 @@ steps:
 
     #[tokio::test]
     async fn exact_next_renewal_replaces_the_running_authority() {
-        let (_temporary, mut manager, mut sleep_requests, offered) =
+        let (_temporary, mut manager, mut sleep_requests, offered, _workspace) =
             controlled_running_fixture().await;
 
         let (duration, release) = with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
@@ -7519,6 +7628,7 @@ steps:
             identity: predecessor,
             final_observation_id,
             root: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
         })));
 
         let successor = offer("80");
@@ -7541,6 +7651,7 @@ steps:
             identity: identity.clone(),
             final_observation_id,
             root: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
         })));
         manager
             .event_sender
@@ -7562,6 +7673,7 @@ steps:
             identity,
             final_observation_id,
             root: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
         })));
         manager.handle_offer(offer("bh")).unwrap();
         wait_for_offer_preparation(&mut manager).await;

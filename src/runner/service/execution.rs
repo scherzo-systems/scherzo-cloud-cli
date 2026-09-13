@@ -26,6 +26,7 @@ use super::assignment::{
 use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
 };
+use super::workspace::{RetentionReason, WorkspaceDisposition};
 use crate::execution::workflow::admission::CancellationReason;
 use crate::execution::workflow::agent::WorkflowRunId;
 use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
@@ -243,31 +244,42 @@ struct ExecutionCompletion {
     final_observation_id: Option<u64>,
     final_delivery_deadline: Option<LeaseInstant>,
     lease_clock_failed: bool,
+    workspace_disposition: WorkspaceDisposition,
 }
 
 impl ExecutionCompletion {
-    fn selected(final_observation_id: Option<u64>) -> Self {
+    fn retained(final_observation_id: Option<u64>, reason: RetentionReason) -> Self {
         Self {
             final_observation_id,
             final_delivery_deadline: None,
             lease_clock_failed: false,
+            workspace_disposition: WorkspaceDisposition::Retain(reason),
         }
     }
 
     fn ordinary(final_observation_id: Option<u64>) -> Self {
-        Self::selected(final_observation_id)
+        Self::retained(final_observation_id, RetentionReason::Failed)
     }
 
     fn fenced(final_observation_id: Option<u64>, _delivery_budget: Option<Duration>) -> Self {
-        Self::selected(final_observation_id)
+        Self::retained(final_observation_id, RetentionReason::Interrupted)
     }
 
-    fn with_budget(final_observation_id: Option<u64>, _delivery_budget: Option<Duration>) -> Self {
-        Self::selected(final_observation_id)
+    fn with_budget(
+        final_observation_id: Option<u64>,
+        _delivery_budget: Option<Duration>,
+        workspace_disposition: WorkspaceDisposition,
+    ) -> Self {
+        Self {
+            final_observation_id,
+            final_delivery_deadline: None,
+            lease_clock_failed: false,
+            workspace_disposition,
+        }
     }
 
     fn without_report() -> Self {
-        Self::selected(None)
+        Self::retained(None, RetentionReason::OutcomeUnknown)
     }
 
     fn lease_clock_failed(final_observation_id: Option<u64>) -> Self {
@@ -275,6 +287,7 @@ impl ExecutionCompletion {
             final_observation_id,
             final_delivery_deadline: None,
             lease_clock_failed: true,
+            workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::OutcomeUnknown),
         }
     }
 }
@@ -283,6 +296,70 @@ pub(super) struct ExecutionAuthority {
     pub(super) lease_clock: LeaseClock,
     pub(super) causal_lease: CausalLease,
     pub(super) updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+}
+
+trait PreservableStaging {
+    fn preserve(&self);
+    fn preserve_on_drop(&self);
+}
+
+impl PreservableStaging for ArtifactStaging {
+    fn preserve(&self) {
+        ArtifactStaging::preserve(self);
+    }
+
+    fn preserve_on_drop(&self) {
+        ArtifactStaging::preserve_on_drop(self);
+    }
+}
+
+impl PreservableStaging for InputStaging {
+    fn preserve(&self) {
+        InputStaging::preserve(self);
+    }
+
+    fn preserve_on_drop(&self) {
+        InputStaging::preserve_on_drop(self);
+    }
+}
+
+impl PreservableStaging for AgentInputStaging {
+    fn preserve(&self) {
+        AgentInputStaging::preserve(self);
+    }
+
+    fn preserve_on_drop(&self) {
+        AgentInputStaging::preserve_on_drop(self);
+    }
+}
+
+struct PreserveOnDrop<T: PreservableStaging> {
+    staging: T,
+}
+
+impl<T: PreservableStaging> PreserveOnDrop<T> {
+    fn new(staging: T) -> Self {
+        staging.preserve_on_drop();
+        Self { staging }
+    }
+
+    fn from_result<Error>(result: Result<T, Error>) -> Option<Self> {
+        result.ok().map(Self::new)
+    }
+}
+
+impl<T: PreservableStaging> std::ops::Deref for PreserveOnDrop<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.staging
+    }
+}
+
+impl<T: PreservableStaging> Drop for PreserveOnDrop<T> {
+    fn drop(&mut self) {
+        self.staging.preserve();
+    }
 }
 
 pub(super) struct ExecutionJob {
@@ -339,7 +416,10 @@ impl ExecutionJob {
                 };
                 workflow_git.disable();
                 let release = root
-                    .release_workspace_pending(quiescence)
+                    .release_workspace_pending(
+                        quiescence,
+                        WorkspaceDisposition::Retain(RetentionReason::Failed),
+                    )
                     .wait_async()
                     .await;
                 let _ = manager_events.send(ManagerEvent::WorkspaceReleased {
@@ -353,6 +433,7 @@ impl ExecutionJob {
                     lease_clock_failed: false,
                     retained_root: Some(Box::new(root)),
                     quiescence,
+                    workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::Failed),
                 });
                 outbox.wake();
             }
@@ -367,6 +448,12 @@ impl ExecutionJob {
         let mut completion = self
             .run_workflow(&assignment_id, &attempt_id, &run_id)
             .await;
+        if matches!(
+            completion.workspace_disposition,
+            WorkspaceDisposition::Retain(_)
+        ) {
+            self.accepted.process_guards.begin_forced_containment();
+        }
         if completion.final_observation_id.is_some() && !completion.lease_clock_failed {
             match self.terminal_report_deadline() {
                 Ok(deadline) => completion.final_delivery_deadline = Some(deadline),
@@ -378,7 +465,9 @@ impl ExecutionJob {
         } else {
             super::workspace::ProcessQuiescence::Failed
         };
-        let _ = self.release_workspace(quiescence).await;
+        let _ = self
+            .release_workspace(quiescence, completion.workspace_disposition)
+            .await;
         let retained_root = self.accepted.root;
         let _ = self.manager_events.send(ManagerEvent::Finished {
             assignment_id,
@@ -387,6 +476,7 @@ impl ExecutionJob {
             lease_clock_failed: completion.lease_clock_failed,
             retained_root: Some(Box::new(retained_root)),
             quiescence,
+            workspace_disposition: completion.workspace_disposition,
         });
         self.outbox.wake();
     }
@@ -403,12 +493,13 @@ impl ExecutionJob {
     async fn release_workspace(
         &self,
         quiescence: super::workspace::ProcessQuiescence,
+        disposition: WorkspaceDisposition,
     ) -> super::workspace::CleanupResult {
         self.accepted.workflow_git.disable();
         let result = self
             .accepted
             .root
-            .release_workspace_pending(quiescence)
+            .release_workspace_pending(quiescence, disposition)
             .wait_async()
             .await;
         if !self.workspace_release_reported.swap(true, Ordering::AcqRel) {
@@ -421,29 +512,27 @@ impl ExecutionJob {
         result
     }
 
-    fn process_quiescence(&self) -> super::workspace::ProcessQuiescence {
-        if self.accepted.process_guards.is_quiescent() {
-            super::workspace::ProcessQuiescence::Proven
-        } else {
-            super::workspace::ProcessQuiescence::Failed
-        }
-    }
-
-    async fn abort_after_workspace_release(
+    fn abort_retained(
         &self,
         assignment_id: &str,
         attempt_id: &str,
         last_execution_event_sequence: u64,
         reason: &str,
     ) -> ExecutionCompletion {
-        let quiescence = self.process_quiescence();
-        let _ = self.release_workspace(quiescence).await;
         ExecutionCompletion::ordinary(self.abort(
             assignment_id,
             attempt_id,
             last_execution_event_sequence,
             reason,
         ))
+    }
+
+    fn execution_environment_lost(
+        &self,
+        assignment_id: &str,
+        attempt_id: &str,
+    ) -> ExecutionCompletion {
+        self.abort_retained(assignment_id, attempt_id, 0, "execution_environment_lost")
     }
 
     async fn run_workflow(
@@ -464,33 +553,13 @@ impl ExecutionJob {
         if !self.workflow_git_activated
             && cancellation.cancellation_reason() != Some(CancellationReason::RunnerShutdown)
         {
-            return self
-                .abort_after_workspace_release(
-                    assignment_id,
-                    attempt_id,
-                    0,
-                    "execution_environment_lost",
-                )
-                .await;
+            return self.execution_environment_lost(assignment_id, attempt_id);
         }
-        match self.has_execution_authority() {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = self
-                    .release_workspace(super::workspace::ProcessQuiescence::Proven)
-                    .await;
-                return ExecutionCompletion::without_report();
-            }
-            Err(_) => {
-                return self
-                    .fail_before_execution(
-                        &cancellation,
-                        &post_stop_fence,
-                        assignment_id,
-                        attempt_id,
-                    )
-                    .await;
-            }
+        if let Err(completion) = self
+            .ensure_execution_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
+            .await
+        {
+            return completion;
         }
         let initial_authority = self.authority_updates.borrow().clone();
         let initial_wait = match self
@@ -509,38 +578,17 @@ impl ExecutionJob {
                     .await;
             }
         };
-        let artifacts = match ArtifactStaging::create(
+        let Some(artifacts) = PreserveOnDrop::from_result(ArtifactStaging::create(
             self.accepted.admitted.execution(),
             &self.accepted.root.private,
-        ) {
-            Ok(staging) => staging,
-            Err(_) => {
-                return self
-                    .abort_after_workspace_release(
-                        assignment_id,
-                        attempt_id,
-                        0,
-                        "execution_environment_lost",
-                    )
-                    .await;
-            }
+        )) else {
+            return self.execution_environment_lost(assignment_id, attempt_id);
         };
-        let inputs = match InputStaging::create(
+        let Some(inputs) = PreserveOnDrop::from_result(InputStaging::create(
             self.accepted.admitted.execution(),
             &self.accepted.root.private,
-        ) {
-            Ok(staging) => staging,
-            Err(_) => {
-                let _ = artifacts.release();
-                return self
-                    .abort_after_workspace_release(
-                        assignment_id,
-                        attempt_id,
-                        0,
-                        "execution_environment_lost",
-                    )
-                    .await;
-            }
+        )) else {
+            return self.execution_environment_lost(assignment_id, attempt_id);
         };
         let agent_staging = if self.accepted.admitted.agent_steps().is_empty() {
             None
@@ -549,19 +597,8 @@ impl ExecutionJob {
                 self.accepted.admitted.execution(),
                 &self.accepted.root.private,
             ) {
-                Ok(staging) => Some(staging),
-                Err(_) => {
-                    let _ = inputs.release();
-                    let _ = artifacts.release();
-                    return self
-                        .abort_after_workspace_release(
-                            assignment_id,
-                            attempt_id,
-                            0,
-                            "execution_environment_lost",
-                        )
-                        .await;
-                }
+                Ok(staging) => Some(PreserveOnDrop::new(staging)),
+                Err(_) => return self.execution_environment_lost(assignment_id, attempt_id),
             }
         };
 
@@ -577,42 +614,17 @@ impl ExecutionJob {
                 .ok()
             }) {
                 Some(sessions) => Some(sessions),
-                None => {
-                    let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                    return self
-                        .abort_after_workspace_release(
-                            assignment_id,
-                            attempt_id,
-                            0,
-                            "execution_environment_lost",
-                        )
-                        .await;
-                }
+                None => return self.execution_environment_lost(assignment_id, attempt_id),
             }
         } else {
             None
         };
 
-        match self.has_execution_authority() {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                let _ = self
-                    .release_workspace(super::workspace::ProcessQuiescence::Proven)
-                    .await;
-                return ExecutionCompletion::without_report();
-            }
-            Err(_) => {
-                let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                return self
-                    .fail_before_execution(
-                        &cancellation,
-                        &post_stop_fence,
-                        assignment_id,
-                        attempt_id,
-                    )
-                    .await;
-            }
+        if let Err(completion) = self
+            .ensure_execution_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
+            .await
+        {
+            return completion;
         }
 
         let started_at = RunnerExecutionClock.now();
@@ -620,15 +632,7 @@ impl ExecutionJob {
             .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
             .is_none()
         {
-            let _ = release_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            return self
-                .abort_after_workspace_release(
-                    assignment_id,
-                    attempt_id,
-                    0,
-                    "runner_internal_failure",
-                )
-                .await;
+            return self.abort_retained(assignment_id, attempt_id, 0, "runner_internal_failure");
         }
 
         let diagnostics = StepDiagnosticLog::default();
@@ -664,19 +668,16 @@ impl ExecutionJob {
                 RunnerExecutionClock,
                 observer.clone(),
             ) else {
-                let _ = release_staging(&inputs, Some(agent_staging), &artifacts);
-                return self
-                    .abort_after_workspace_release(
-                        assignment_id,
-                        attempt_id,
-                        observer.last_sequence(),
-                        "runner_internal_failure",
-                    )
-                    .await;
+                return self.abort_retained(
+                    assignment_id,
+                    attempt_id,
+                    observer.last_sequence(),
+                    "runner_internal_failure",
+                );
             };
             let agents = AgentExecution::enabled_with_accounting(
                 WorkflowRunId::from(Arc::from(run_id)),
-                agent_staging.clone(),
+                (**agent_staging).clone(),
                 diagnostic_sessions,
                 dispatcher,
                 accounting.clone(),
@@ -741,7 +742,6 @@ impl ExecutionJob {
             result
         };
         self.accepted.workflow_git.disable();
-        let support_cleanup_failed = release_support_staging(&inputs, agent_staging.as_ref());
 
         let (result, final_delivery_budget) = match execution {
             LeaseExecution::Completed {
@@ -752,7 +752,6 @@ impl ExecutionJob {
                 output: Err(_),
                 final_delivery_budget,
             } => {
-                let _ = artifacts.release();
                 return self
                     .abort_unless_fenced(
                         &post_stop_fence,
@@ -765,20 +764,9 @@ impl ExecutionJob {
                     .await;
             }
             LeaseExecution::ContainmentDeadline => {
-                let _ = artifacts.release();
-                let _ = self
-                    .release_workspace(super::workspace::ProcessQuiescence::Failed)
-                    .await;
                 return ExecutionCompletion::fenced(None, None);
             }
             LeaseExecution::LeaseClockFailed { quiescent } => {
-                let _ = artifacts.release();
-                let quiescence = if quiescent {
-                    super::workspace::ProcessQuiescence::Proven
-                } else {
-                    super::workspace::ProcessQuiescence::Failed
-                };
-                let _ = self.release_workspace(quiescence).await;
                 let report = quiescent.then(|| {
                     self.abort(
                         assignment_id,
@@ -790,21 +778,7 @@ impl ExecutionJob {
                 return ExecutionCompletion::lease_clock_failed(report.flatten());
             }
         };
-        if support_cleanup_failed {
-            let _ = artifacts.release();
-            return self
-                .abort_unless_fenced(
-                    &post_stop_fence,
-                    assignment_id,
-                    attempt_id,
-                    observer.last_sequence(),
-                    "execution_environment_lost",
-                    final_delivery_budget,
-                )
-                .await;
-        }
         if observer.faulted() {
-            let _ = artifacts.release();
             return self
                 .abort_unless_fenced(
                     &post_stop_fence,
@@ -829,7 +803,6 @@ impl ExecutionJob {
             || !terminal_result_agrees(observer.terminal_state().as_ref(), &result.outcome)
             || has_finalizers != result.finalization_summary.is_some()
         {
-            let _ = artifacts.release();
             return self
                 .abort_unless_fenced(
                     &post_stop_fence,
@@ -865,18 +838,7 @@ impl ExecutionJob {
             Some(prepared) => verify_prepared_carriers(&artifacts, prepared).await,
             None => false,
         };
-        let quiescence = if self.accepted.process_guards.is_quiescent() {
-            super::workspace::ProcessQuiescence::Proven
-        } else {
-            super::workspace::ProcessQuiescence::Failed
-        };
-        let _workspace_release = self.release_workspace(quiescence).await;
-        let carriers_independent = carriers_ready
-            && match &prepared {
-                Some(prepared) => verify_prepared_carriers(&artifacts, prepared).await,
-                None => false,
-            };
-        let delivery = match (prepared, carriers_independent) {
+        let delivery = match (prepared, carriers_ready) {
             (Some(prepared), true) => {
                 self.deliver_artifacts(assignment_id, attempt_id, &artifacts, prepared)
                     .await
@@ -888,7 +850,6 @@ impl ExecutionJob {
             Err(_) => {
                 post_stop_fence.fence();
                 self.accepted.process_guards.begin_forced_containment();
-                let _ = artifacts.release();
                 return ExecutionCompletion::lease_clock_failed(self.abort(
                     assignment_id,
                     attempt_id,
@@ -898,10 +859,32 @@ impl ExecutionJob {
             }
         };
         if delivery == ArtifactDeliveryOutcome::AuthorityLost {
-            let _ = artifacts.release();
             return ExecutionCompletion::without_report();
         }
-        let _ = artifacts.release();
+        let workspace_disposition = match (&result.outcome, &delivery) {
+            (RunOutcome::Succeeded, ArtifactDeliveryOutcome::Prepared { .. }) => {
+                WorkspaceDisposition::Remove
+            }
+            (RunOutcome::Succeeded, _) => {
+                WorkspaceDisposition::Retain(RetentionReason::ArtifactDeliveryFailed)
+            }
+            (RunOutcome::Failed { .. }, _) => WorkspaceDisposition::Retain(RetentionReason::Failed),
+            (
+                RunOutcome::Cancelled {
+                    reason: CancellationReason::ExecutionLeaseExpired,
+                },
+                _,
+            ) => WorkspaceDisposition::Retain(RetentionReason::Interrupted),
+            (
+                RunOutcome::Cancelled {
+                    reason: CancellationReason::RunnerShutdown,
+                },
+                _,
+            ) => WorkspaceDisposition::Retain(RetentionReason::Cancelled),
+            (RunOutcome::Cancelled { .. }, _) => {
+                WorkspaceDisposition::Retain(RetentionReason::Failed)
+            }
+        };
         let artifact_delivery = artifact_delivery_result(&delivery);
 
         let finalization = result
@@ -976,6 +959,7 @@ impl ExecutionJob {
         ExecutionCompletion::with_budget(
             self.enqueue(assignment_id, attempt_id, report),
             final_delivery_budget,
+            workspace_disposition,
         )
     }
 
@@ -1214,6 +1198,22 @@ impl ExecutionJob {
         }
     }
 
+    async fn ensure_execution_authority(
+        &self,
+        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        post_stop_fence: &PostStopFence,
+        assignment_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), ExecutionCompletion> {
+        match self.has_execution_authority() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ExecutionCompletion::without_report()),
+            Err(_) => Err(self
+                .fail_before_execution(cancellation, post_stop_fence, assignment_id, attempt_id)
+                .await),
+        }
+    }
+
     async fn fail_before_execution(
         &self,
         cancellation: &crate::execution::workflow::admission::CancellationSource,
@@ -1222,12 +1222,6 @@ impl ExecutionJob {
         attempt_id: &str,
     ) -> ExecutionCompletion {
         begin_forced_containment(cancellation, post_stop_fence, &self.accepted.process_guards);
-        let quiescence = if self.accepted.process_guards.is_quiescent() {
-            super::workspace::ProcessQuiescence::Proven
-        } else {
-            super::workspace::ProcessQuiescence::Failed
-        };
-        let _ = self.release_workspace(quiescence).await;
         ExecutionCompletion::lease_clock_failed(self.abort(
             assignment_id,
             attempt_id,
@@ -1266,7 +1260,6 @@ impl ExecutionJob {
         reason: &str,
         final_delivery_budget: Option<Duration>,
     ) -> ExecutionCompletion {
-        let _ = self.release_workspace(self.process_quiescence()).await;
         if post_stop_fence.is_fenced() {
             ExecutionCompletion::fenced(None, final_delivery_budget)
         } else {
@@ -1278,6 +1271,7 @@ impl ExecutionJob {
                     reason,
                 ),
                 final_delivery_budget,
+                WorkspaceDisposition::Retain(RetentionReason::Failed),
             )
         }
     }
@@ -1882,18 +1876,6 @@ fn hex_nibble(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
     }
-}
-
-fn release_staging(
-    inputs: &InputStaging,
-    agent: Option<&AgentInputStaging>,
-    artifacts: &ArtifactStaging,
-) -> bool {
-    release_support_staging(inputs, agent) | artifacts.release().is_err()
-}
-
-fn release_support_staging(inputs: &InputStaging, agent: Option<&AgentInputStaging>) -> bool {
-    agent.is_some_and(|staging| staging.release().is_err()) | inputs.release().is_err()
 }
 
 #[derive(Clone)]

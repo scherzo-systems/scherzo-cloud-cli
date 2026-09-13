@@ -2667,7 +2667,7 @@ mod tests {
     use crate::runner::credential::test_credential;
     use crate::runner::service::artifact_delivery::{ArtifactDeliverySpec, ArtifactUploadBody};
     use crate::runner::service::assignment::{
-        AssignmentManager, AssignmentRootPreparer,
+        AssignmentManager, AssignmentOffer, AssignmentRootPreparer,
         test_support::{
             artifact_delivery, enqueue_finalization_terminal, enqueue_lease_clock_failure_report,
             enqueue_transitions, install_root_preparer, manager as manager_fixture,
@@ -2707,7 +2707,8 @@ mod tests {
     impl AssignmentRootPreparer for GatedFailingAssignmentRootPreparer {
         fn prepare(
             &self,
-            _assignment_id: &str,
+            _offer: &AssignmentOffer,
+            _recorder: Option<Arc<Recorder>>,
         ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
             let _ = self.started.send(());
             self.release

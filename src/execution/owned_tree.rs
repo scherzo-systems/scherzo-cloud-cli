@@ -25,6 +25,31 @@ pub(crate) fn open_directory_at(parent: &OwnedFd, identity: &str) -> Result<Owne
     openat(parent, identity, directory_open_flags(), Mode::empty())
 }
 
+#[allow(
+    dead_code,
+    reason = "the standalone owned-tree regression fixture omits regular-file consumers"
+)]
+pub(crate) fn open_regular_file_at(
+    parent: &OwnedFd,
+    identity: &str,
+) -> Result<(OwnedFd, Stat), Errno> {
+    let descriptor = openat(
+        parent,
+        identity,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let opened = fstat(&descriptor)?;
+    let named = statat(parent, identity, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+        || !same_identity(&opened, &named)
+    {
+        return Err(Errno::INVAL);
+    }
+    Ok((descriptor, opened))
+}
+
 pub(crate) fn remove_tree_at(parent: &OwnedFd, identity: &str) -> Result<(), RemovalError> {
     let directory = match openat(parent, identity, directory_open_flags(), Mode::empty()) {
         Ok(directory) => directory,

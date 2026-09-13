@@ -268,7 +268,6 @@ pub(crate) enum ServiceError {
     LeaseClock(LeaseClockError),
     WorkRootInUse,
     WorkRootIsolation,
-    WorkRootRecovery,
     WorkspaceCleanupFailed,
 }
 
@@ -292,9 +291,6 @@ impl fmt::Display for ServiceError {
             Self::WorkRootIsolation => {
                 formatter.write_str("runner work-root isolation could not be established")
             }
-            Self::WorkRootRecovery => {
-                formatter.write_str("runner work-root recovery did not complete")
-            }
             Self::WorkspaceCleanupFailed => formatter.write_str("runner workspace cleanup failed"),
         }
     }
@@ -304,10 +300,7 @@ impl ServiceError {
     pub(crate) const fn requires_operator_recovery(&self) -> bool {
         matches!(
             self,
-            Self::WorkRootInUse
-                | Self::WorkRootIsolation
-                | Self::WorkRootRecovery
-                | Self::WorkspaceCleanupFailed
+            Self::WorkRootInUse | Self::WorkRootIsolation | Self::WorkspaceCleanupFailed
         )
     }
 }
@@ -321,7 +314,6 @@ impl std::error::Error for ServiceError {
             | Self::ShutdownDeadlineExceeded
             | Self::WorkRootInUse
             | Self::WorkRootIsolation
-            | Self::WorkRootRecovery
             | Self::WorkspaceCleanupFailed => None,
             Self::Connection(error) => Some(error),
             Self::Control(error) => Some(error),
@@ -452,6 +444,7 @@ where
             }
             Err(_) => return Err(ServiceError::BuildRuntime),
         };
+    record_startup_retention(&dependencies.recorder, work_root.startup_retained());
     let result = run_connection_loop_with_work_root(
         dependencies,
         connector,
@@ -977,7 +970,7 @@ async fn finish_shutdown_cleanup(
             Err(ServiceError::ShutdownForced)
         }
         result = &mut completion => match result {
-            workspace::CleanupResult::Released => Ok(()),
+            workspace::CleanupResult::Released | workspace::CleanupResult::Retained => Ok(()),
             workspace::CleanupResult::Quarantined(_) | workspace::CleanupResult::Preempted => {
                 Err(workspace_cleanup_failure(recorder))
             }
@@ -1398,6 +1391,37 @@ fn finish_connection_event(
     event.finish(outcome);
 }
 
+fn record_startup_retention(recorder: &Recorder, retained: &[workspace::RetainedWorkspace]) {
+    for workspace in retained {
+        let mut attributes = vec![
+            KeyValue::new(
+                telemetry::attribute::WORKSPACE_PATH,
+                workspace.path.to_string_lossy().into_owned(),
+            ),
+            KeyValue::new(
+                telemetry::attribute::RETENTION_REASON,
+                workspace.reason.as_str(),
+            ),
+        ];
+        if let Some(assignment_id) = &workspace.assignment_id {
+            attributes.push(KeyValue::new(
+                telemetry::attribute::ASSIGNMENT_ID,
+                assignment_id.clone(),
+            ));
+        }
+        if let Some(run_id) = &workspace.run_id {
+            attributes.push(KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()));
+        }
+        if let Some(attempt_id) = &workspace.attempt_id {
+            attributes.push(KeyValue::new(
+                telemetry::attribute::ATTEMPT_ID,
+                attempt_id.clone(),
+            ));
+        }
+        recorder.record("runner.workspace_retained", attributes);
+    }
+}
+
 fn workspace_cleanup_failure(recorder: &Recorder) -> ServiceError {
     record_non_admitting_failure(recorder, "workspace_cleanup_failed");
     ServiceError::WorkspaceCleanupFailed
@@ -1415,11 +1439,9 @@ fn record_non_admitting_failure(recorder: &Recorder, error_type: &'static str) {
 const fn work_root_service_error(error: workspace::WorkRootError) -> ServiceError {
     match error {
         workspace::WorkRootError::WorkRootInUse => ServiceError::WorkRootInUse,
-        workspace::WorkRootError::UnsafeWorkRoot
-        | workspace::WorkRootError::AmbiguousOwnedRoot
-        | workspace::WorkRootError::CreateBootRoot => ServiceError::WorkRootIsolation,
-        workspace::WorkRootError::InvalidCleanupAuthority
-        | workspace::WorkRootError::StaleRootCleanupFailed => ServiceError::WorkRootRecovery,
+        workspace::WorkRootError::UnsafeWorkRoot | workspace::WorkRootError::CreateBootRoot => {
+            ServiceError::WorkRootIsolation
+        }
     }
 }
 
@@ -1475,8 +1497,8 @@ mod tests {
     use super::{
         AssignmentConfig, Config, ConnectionCause, ConnectionLoopDependencies, FailureKind,
         LiveStatus, ReloadDependencies, ReloadRequest, SHUTDOWN_TIMEOUT, Sequence, ServiceError,
-        Sleeper, TokioSleeper, run_connection_loop_with_filesystem,
-        run_connection_loop_with_work_root, run_until_cancelled_with_dependencies,
+        Sleeper, TokioSleeper, record_startup_retention, run_connection_loop_with_work_root,
+        run_until_cancelled_with_dependencies,
     };
     use crate::execution::workflow::resolution;
     use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
@@ -1532,8 +1554,8 @@ mod tests {
         fn before_child_enumeration(&self) {}
     }
 
-    #[tokio::test]
-    async fn persistent_startup_cleanup_stops_before_assignment_admission() {
+    #[test]
+    fn startup_retains_an_interrupted_cleanup_and_allows_a_fresh_assignment() {
         const STALE_BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abc";
 
         let config = ConfigFixture::new(
@@ -1567,46 +1589,45 @@ mod tests {
         let frame_source = deterministic_frame_source();
         let boot_id = frame_source.public_id("rbt_");
         let (recorder, capture) = test_recorder(&boot_id);
-        let dependencies = ConnectionLoopDependencies::new(
-            config.cloned_config(),
-            frame_source,
-            fixture_sleeper(),
-            recorder,
-            fixture_lease_clock(),
-            boot_id.clone(),
-            None,
-        );
         let persistent_remover = Arc::new(FailingBootRemover {
             calls: AtomicUsize::new(0),
         });
-        let (connector, mut attempts) = scripted_connector(Default::default());
-        let (mut shutdown, _shutdown_trigger) = controlled_shutdown();
-
-        let result = run_connection_loop_with_filesystem(
-            dependencies,
-            &connector,
-            super::Backoff::with_fixed_unit(1.0),
-            shutdown.as_mut(),
+        let current = WorkRootLease::acquire_with(
+            config.assignment().work_root(),
+            &boot_id,
             WorkspaceFilesystem::injected(
                 persistent_remover.clone(),
                 Arc::new(ImmediateCleanupSleeper),
                 Arc::new(NoopWorkRootHook),
             ),
         )
-        .await;
+        .unwrap();
+        record_startup_retention(&recorder, current.startup_retained());
+        let fresh = current
+            .create_assignment_for_attempt(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "run_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+                None,
+            )
+            .unwrap();
 
-        assert!(matches!(&result, Err(ServiceError::WorkRootRecovery)));
-        assert!(result.unwrap_err().requires_operator_recovery());
-        assert_eq!(persistent_remover.calls.load(Ordering::Relaxed), 6);
-        assert!(matches!(
-            attempts.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
+        assert_eq!(persistent_remover.calls.load(Ordering::Relaxed), 0);
         assert!(stale_path.exists());
-        assert!(!config.assignment().work_root().join(boot_id).exists());
-        let event = capture.event("runner.work_root");
-        assert_eq!(event["error.type"], "stale_root_cleanup_exhausted");
-        assert_eq!(event["scherzo.outcome"], "failure");
+        assert!(fresh.workspace.path().starts_with(current.boot_path()));
+        let event = capture
+            .records()
+            .into_iter()
+            .find(|event| event["event.name"] == "runner.workspace_retained")
+            .expect("startup retention diagnostic");
+        assert_eq!(
+            event["scherzo.workspace.path"],
+            stale_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            event["scherzo.workspace.retention_reason"],
+            "outcome_unknown"
+        );
     }
 
     #[tokio::test]

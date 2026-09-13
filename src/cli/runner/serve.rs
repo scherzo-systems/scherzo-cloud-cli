@@ -194,7 +194,6 @@ mod tests {
         for error in [
             crate::runner::service::ServiceError::WorkRootInUse,
             crate::runner::service::ServiceError::WorkRootIsolation,
-            crate::runner::service::ServiceError::WorkRootRecovery,
             crate::runner::service::ServiceError::WorkspaceCleanupFailed,
         ] {
             assert_eq!(service_exit_code(&error), ExitCode::RunnerRecoveryRequired);

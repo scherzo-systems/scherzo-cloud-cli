@@ -17,7 +17,7 @@ use super::execution_root::{AdmittedExecutionRoot, open_directory};
 #[cfg(test)]
 use super::private_staging::CleanupBlocker;
 use super::private_staging::{
-    StagingLifecycle, cleanup_staging, create_payload_file, create_staging_root,
+    StagingDropPolicy, StagingLifecycle, cleanup_staging, create_payload_file, create_staging_root,
     finish_payload_file, mark_cleanup_failed, remove_staging_root, remove_tree_at, same_file,
 };
 use super::validated::WorkflowValueType;
@@ -162,6 +162,7 @@ struct InputStagingInner {
     maximum_total_bytes: u64,
     maximum_live_bytes: u64,
     lifecycle: RwLock<StagingLifecycle>,
+    drop_policy: StagingDropPolicy,
     reservations: Mutex<ReservationLedger>,
     #[cfg(test)]
     cleanup_blocker: CleanupBlocker,
@@ -293,6 +294,7 @@ impl InputStaging {
                 maximum_total_bytes,
                 maximum_live_bytes,
                 lifecycle: RwLock::new(StagingLifecycle::Active),
+                drop_policy: StagingDropPolicy::cleanup(),
                 reservations: Mutex::new(ReservationLedger::default()),
                 #[cfg(test)]
                 cleanup_blocker: CleanupBlocker::default(),
@@ -352,9 +354,21 @@ impl InputStaging {
         }
     }
 
+    // Each concrete staging owner keeps a typed release API while delegating the
+    // shared preserve-on-drop transition to StagingDropPolicy.
+    // jscpd:ignore-start
     pub(crate) fn release(&self) -> Result<(), InputStagingReleaseFailure> {
         self.inner.cleanup()
     }
+
+    pub(crate) fn preserve(&self) {
+        self.inner.drop_policy.preserve(&self.inner.lifecycle);
+    }
+
+    pub(crate) fn preserve_on_drop(&self) {
+        self.inner.drop_policy.preserve_on_drop();
+    }
+    // jscpd:ignore-end
 
     fn reserve(
         &self,
@@ -586,11 +600,20 @@ impl InputStagingInner {
         reservations.usage.bytes = reservations.usage.bytes.saturating_sub(released.bytes);
     }
 
+    // Input reservations and agent views have different ledgers after the shared
+    // preservation check, so keeping their deletion transitions local is clearer.
+    // jscpd:ignore-start
     fn remove_view(&self, identity: &str) -> bool {
+        if self.drop_policy.is_preserved() {
+            return true;
+        }
         let Ok(lifecycle) = self.lifecycle.read() else {
             return false;
         };
-        if *lifecycle == StagingLifecycle::Released {
+        if matches!(
+            *lifecycle,
+            StagingLifecycle::Preserved | StagingLifecycle::Released
+        ) {
             return true;
         }
         let cleaned = self.remove_view_entry(identity);
@@ -600,6 +623,7 @@ impl InputStagingInner {
         }
         cleaned
     }
+    // jscpd:ignore-end
 
     fn remove_view_entry(&self, identity: &str) -> bool {
         #[cfg(test)]
@@ -637,7 +661,9 @@ impl InputStagingInner {
 
 impl Drop for InputStagingInner {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if !self.drop_policy.is_preserved() {
+            let _ = self.cleanup();
+        }
     }
 }
 

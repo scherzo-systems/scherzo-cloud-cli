@@ -12,16 +12,20 @@ use base64::Engine as _;
 use fs4::{FileExt, TryLockError};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use rustix::fs::{
-    AtFlags, Dev, FileType, Mode, OFlags, RenameFlags, Stat, fstat, openat, renameat_with, statat,
+    AtFlags, Dev, Dir, FileType, Mode, OFlags, RenameFlags, Stat, fstat, openat, renameat_with,
+    statat,
 };
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
-use super::workflow_git::WorkflowGitAuthority;
+use super::workflow_git::{WorkflowGitAuthority, WorkflowGitTeardownReport};
 use crate::execution::owned_tree::{self, RemovalError};
 
 const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
 const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
-const CLEANUP_AUTHORITY_NAME: &str = ".scherzo-runner-serve-cleanup-v1";
+const ATTEMPT_RECORD_NAME: &str = ".scherzo-runner-serve-attempt-v1";
+const ATTEMPT_RECORD_STAGING_PREFIX: &str = ".scherzo-runner-serve-attempt-staging-";
+const ATTEMPT_RECORD_HEADER: &str = "scherzo-runner-serve/attempt/v1";
+const CLEANUP_AUTHORITY_PREFIX: &str = ".scherzo-runner-serve-cleanup-v1-";
 const CLEANUP_AUTHORITY_STAGING_PREFIX: &str = ".scherzo-runner-serve-cleanup-staging-";
 const CLEANUP_AUTHORITY_HEADER: &str = "scherzo-runner-serve/cleanup-authority/v1";
 const CLEANUP_IDENTITY_ATTRIBUTE: &str = "user.scherzo.runner-cleanup-v1";
@@ -30,6 +34,7 @@ const BOOT_MARKER: &[u8] = b"scherzo-runner-serve/boot-root/v1\n";
 const ASSIGNMENT_MARKER: &[u8] = b"scherzo-runner-serve/assignment-root/v1\n";
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const MAXIMUM_ATTEMPT_RECORD_BYTES: u64 = 512;
 const MAXIMUM_CLEANUP_AUTHORITY_BYTES: u64 = 512;
 const REMOVAL_DELAYS: [Duration; 5] = [
     Duration::from_millis(100),
@@ -69,8 +74,59 @@ fn normalized_device(device: Dev) -> u64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CleanupResult {
     Released,
+    Retained,
     Quarantined(CleanupFailure),
     Preempted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RetentionReason {
+    Failed,
+    Cancelled,
+    Interrupted,
+    ArtifactDeliveryFailed,
+    OutcomeUnknown,
+    ProcessStopFailed,
+    CredentialTeardownFailed,
+    ReleaseWorkerUnavailable,
+}
+
+impl RetentionReason {
+    const ALL: [Self; 8] = [
+        Self::Failed,
+        Self::Cancelled,
+        Self::Interrupted,
+        Self::ArtifactDeliveryFailed,
+        Self::OutcomeUnknown,
+        Self::ProcessStopFailed,
+        Self::CredentialTeardownFailed,
+        Self::ReleaseWorkerUnavailable,
+    ];
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::ArtifactDeliveryFailed => "artifact_delivery_failed",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::ProcessStopFailed => "process_stop_failed",
+            Self::CredentialTeardownFailed => "credential_teardown_failed",
+            Self::ReleaseWorkerUnavailable => "release_worker_unavailable",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceDisposition {
+    Remove,
+    Retain(RetentionReason),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,9 +146,6 @@ pub(super) enum ProcessQuiescence {
 pub(super) enum WorkRootError {
     WorkRootInUse,
     UnsafeWorkRoot,
-    AmbiguousOwnedRoot,
-    InvalidCleanupAuthority,
-    StaleRootCleanupFailed,
     CreateBootRoot,
 }
 
@@ -101,9 +154,6 @@ impl fmt::Display for WorkRootError {
         formatter.write_str(match self {
             Self::WorkRootInUse => "runner work root is already in use",
             Self::UnsafeWorkRoot => "runner work root ownership state is unsafe",
-            Self::AmbiguousOwnedRoot => "runner work root contains ambiguous boot state",
-            Self::InvalidCleanupAuthority => "runner work root cleanup authority is invalid",
-            Self::StaleRootCleanupFailed => "runner stale work-root cleanup failed",
             Self::CreateBootRoot => "runner boot root could not be created",
         })
     }
@@ -114,9 +164,6 @@ impl WorkRootError {
         match self {
             Self::WorkRootInUse => "work_root_in_use",
             Self::UnsafeWorkRoot => "unsafe_work_root",
-            Self::AmbiguousOwnedRoot => "ambiguous_owned_root",
-            Self::InvalidCleanupAuthority => "invalid_cleanup_authority",
-            Self::StaleRootCleanupFailed => "stale_root_cleanup_exhausted",
             Self::CreateBootRoot => "boot_root_creation_failed",
         }
     }
@@ -140,6 +187,21 @@ pub(super) trait CleanupSleeper: Send + Sync {
 
 pub(super) trait WorkRootHook: Send + Sync {
     fn before_child_enumeration(&self);
+}
+
+trait WorkspaceReleaseSpawner: Send + Sync {
+    fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) -> io::Result<()>;
+}
+
+struct ThreadWorkspaceReleaseSpawner;
+
+impl WorkspaceReleaseSpawner for ThreadWorkspaceReleaseSpawner {
+    fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("runner-workspace-boundary-release".to_owned())
+            .spawn(task)
+            .map(drop)
+    }
 }
 
 struct SystemTreeRemover;
@@ -265,6 +327,7 @@ pub(super) struct WorkspaceFilesystem {
     sleeper: Arc<dyn CleanupSleeper>,
     hook: Arc<dyn WorkRootHook>,
     cleanup_identity: Arc<dyn CleanupIdentityStore>,
+    workspace_release_spawner: Arc<dyn WorkspaceReleaseSpawner>,
 }
 
 impl WorkspaceFilesystem {
@@ -274,6 +337,7 @@ impl WorkspaceFilesystem {
             sleeper: Arc::new(InterruptibleSleeper),
             hook: Arc::new(NoopWorkRootHook),
             cleanup_identity: Arc::new(ExtendedAttributeCleanupIdentityStore),
+            workspace_release_spawner: Arc::new(ThreadWorkspaceReleaseSpawner),
         }
     }
 
@@ -284,6 +348,7 @@ impl WorkspaceFilesystem {
             sleeper: Arc::new(InterruptibleSleeper),
             hook: Arc::new(NoopWorkRootHook),
             cleanup_identity: Arc::new(MetadataCleanupIdentityStore),
+            workspace_release_spawner: Arc::new(ThreadWorkspaceReleaseSpawner),
         }
     }
 
@@ -313,7 +378,14 @@ impl WorkspaceFilesystem {
             sleeper,
             hook,
             cleanup_identity,
+            workspace_release_spawner: Arc::new(ThreadWorkspaceReleaseSpawner),
         }
+    }
+
+    #[cfg(test)]
+    fn with_workspace_release_spawner(mut self, spawner: Arc<dyn WorkspaceReleaseSpawner>) -> Self {
+        self.workspace_release_spawner = spawner;
+        self
     }
 }
 
@@ -401,6 +473,73 @@ impl Drop for WorkRootAuthorityShared {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct AttemptRecord {
+    assignment_id: String,
+    run_id: String,
+    attempt_id: String,
+    disposition: RetentionReason,
+}
+
+impl AttemptRecord {
+    fn new(assignment_id: &str, run_id: &str, attempt_id: &str) -> Result<Self, ()> {
+        assignment_id
+            .parse::<crate::runner_protocol::generated::AssignmentId>()
+            .map_err(|_| ())?;
+        run_id
+            .parse::<crate::runner_protocol::generated::RunId>()
+            .map_err(|_| ())?;
+        attempt_id
+            .parse::<crate::runner_protocol::generated::AttemptId>()
+            .map_err(|_| ())?;
+        Ok(Self {
+            assignment_id: assignment_id.to_owned(),
+            run_id: run_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            disposition: RetentionReason::OutcomeUnknown,
+        })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "{ATTEMPT_RECORD_HEADER}\nassignment-id={}\nrun-id={}\nattempt-id={}\ndisposition={}\n",
+            self.assignment_id,
+            self.run_id,
+            self.attempt_id,
+            self.disposition.as_str(),
+        )
+        .into_bytes()
+    }
+
+    fn decode(contents: &[u8]) -> Result<Self, ()> {
+        let contents = std::str::from_utf8(contents).map_err(|_| ())?;
+        let mut lines = contents.split('\n');
+        if lines.next() != Some(ATTEMPT_RECORD_HEADER) {
+            return Err(());
+        }
+        let assignment_id = parse_authority_field(&mut lines, "assignment-id=")?;
+        let run_id = parse_authority_field(&mut lines, "run-id=")?;
+        let attempt_id = parse_authority_field(&mut lines, "attempt-id=")?;
+        let disposition =
+            RetentionReason::parse(parse_authority_field(&mut lines, "disposition=")?).ok_or(())?;
+        if lines.next() != Some("") || lines.next().is_some() {
+            return Err(());
+        }
+        let mut record = Self::new(assignment_id, run_id, attempt_id)?;
+        record.disposition = disposition;
+        Ok(record)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RetainedWorkspace {
+    pub(super) assignment_id: Option<String>,
+    pub(super) run_id: Option<String>,
+    pub(super) attempt_id: Option<String>,
+    pub(super) path: PathBuf,
+    pub(super) reason: RetentionReason,
+}
+
 struct CleanupAuthorityRecord {
     relative_path: String,
     parent_device: u64,
@@ -420,10 +559,8 @@ impl CleanupAuthorityRecord {
     ) -> Result<Self, ()> {
         let relative_path = tree.path.strip_prefix(work_root).map_err(|_| ())?;
         let relative_path = relative_path.to_str().ok_or(())?.to_owned();
-        let _ = CleanupTarget::parse(&relative_path)?;
-        let Some(MarkerState::Present(marker)) = tree.marker.as_ref() else {
-            return Err(());
-        };
+        validate_cleanup_target(&relative_path)?;
+        let marker = tree.marker.as_ref().ok_or(())?;
         let link = tree.link().ok_or(())?;
         let parent = fstat(link.parent.as_ref()).map_err(|_| ())?;
         if !safe_owned_directory_stat(&parent) {
@@ -455,40 +592,6 @@ impl CleanupAuthorityRecord {
         )
         .into_bytes()
     }
-
-    fn decode(contents: &[u8]) -> Result<Self, ()> {
-        let contents = std::str::from_utf8(contents).map_err(|_| ())?;
-        let mut lines = contents.split('\n');
-        if lines.next() != Some(CLEANUP_AUTHORITY_HEADER) {
-            return Err(());
-        }
-        let relative_path = parse_authority_field(&mut lines, "path=")?.to_owned();
-        let _ = CleanupTarget::parse(&relative_path)?;
-        let parent_device = parse_authority_number(&mut lines, "parent-device=")?;
-        let parent_inode = parse_authority_number(&mut lines, "parent-inode=")?;
-        let device = parse_authority_number(&mut lines, "device=")?;
-        let inode = parse_authority_number(&mut lines, "inode=")?;
-        let marker_device = parse_authority_number(&mut lines, "marker-device=")?;
-        let marker_inode = parse_authority_number(&mut lines, "marker-inode=")?;
-        let cleanup_identity = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(parse_authority_field(&mut lines, "cleanup-identity=")?)
-            .map_err(|_| ())?
-            .try_into()
-            .map_err(|_| ())?;
-        if lines.next() != Some("") || lines.next().is_some() {
-            return Err(());
-        }
-        Ok(Self {
-            relative_path,
-            parent_device,
-            parent_inode,
-            device,
-            inode,
-            marker_device,
-            marker_inode,
-            cleanup_identity,
-        })
-    }
 }
 
 fn parse_authority_field<'a>(
@@ -501,48 +604,17 @@ fn parse_authority_field<'a>(
         .ok_or(())
 }
 
-fn parse_authority_number<'a>(
-    lines: &mut impl Iterator<Item = &'a str>,
-    prefix: &str,
-) -> Result<u64, ()> {
-    parse_authority_field(lines, prefix)?
-        .parse()
-        .map_err(|_| ())
-}
-
-struct CleanupTarget {
-    relative_path: PathBuf,
-    marker_contents: &'static [u8],
-    marker_in_parent: bool,
-}
-
-impl CleanupTarget {
-    fn parse(relative_path: &str) -> Result<Self, ()> {
-        let components = relative_path.split('/').collect::<Vec<_>>();
-        match components.as_slice() {
-            [boot] if valid_boot_id(boot) => Ok(Self {
-                relative_path: PathBuf::from(boot),
-                marker_contents: BOOT_MARKER,
-                marker_in_parent: false,
-            }),
-            [boot, assignment] if valid_boot_id(boot) && valid_assignment_id(assignment) => {
-                Ok(Self {
-                    relative_path: PathBuf::from(boot).join(assignment),
-                    marker_contents: ASSIGNMENT_MARKER,
-                    marker_in_parent: false,
-                })
-            }
-            [boot, assignment, "workspace"]
-                if valid_boot_id(boot) && valid_assignment_id(assignment) =>
-            {
-                Ok(Self {
-                    relative_path: PathBuf::from(boot).join(assignment).join("workspace"),
-                    marker_contents: ASSIGNMENT_MARKER,
-                    marker_in_parent: true,
-                })
-            }
-            _ => Err(()),
+fn validate_cleanup_target(relative_path: &str) -> Result<(), ()> {
+    let components = relative_path.split('/').collect::<Vec<_>>();
+    match components.as_slice() {
+        [boot] if valid_boot_id(boot) => Ok(()),
+        [boot, assignment] if valid_boot_id(boot) && valid_assignment_id(assignment) => Ok(()),
+        [boot, assignment, "workspace"]
+            if valid_boot_id(boot) && valid_assignment_id(assignment) =>
+        {
+            Ok(())
         }
+        _ => Err(()),
     }
 }
 
@@ -580,61 +652,28 @@ impl CleanupAuthorityProof {
         if u64::try_from(contents.len()).map_err(|_| ())? > MAXIMUM_CLEANUP_AUTHORITY_BYTES {
             return Err(());
         }
-        let (staging_name, staging_path, mut file) = create_cleanup_authority_staging(authority)?;
-        file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))
-            .and_then(|()| file.write_all(&contents))
-            .and_then(|()| file.sync_all())
-            .map_err(|_| ())?;
+        let (staging_name, staging_path, final_name, final_path, file) =
+            create_cleanup_authority_staging(authority)?;
+        write_private_record(
+            file.try_clone().map_err(|_| ())?,
+            &contents,
+            MAXIMUM_CLEANUP_AUTHORITY_BYTES,
+        )?;
         authority.validate()?;
         verify_private_file_identity(&staging_path, &file)?;
         renameat_with(
             &authority.shared.directory_lock,
             &staging_name,
             &authority.shared.directory_lock,
-            CLEANUP_AUTHORITY_NAME,
+            &final_name,
             RenameFlags::NOREPLACE,
         )
         .map_err(|_| ())?;
         authority.sync()?;
-        Self::capture(authority.work_root().join(CLEANUP_AUTHORITY_NAME))
-    }
-
-    fn load(authority: &WorkRootAuthority) -> Result<Option<Self>, ()> {
-        authority.validate()?;
-        let path = authority.work_root().join(CLEANUP_AUTHORITY_NAME);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => Self::capture(path).map(Some),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(()),
-        }
-    }
-
-    fn capture(path: PathBuf) -> Result<Self, ()> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(NOFOLLOW_FLAG)
-            .open(&path)
-            .map_err(|_| ())?;
-        set_close_on_exec(&file)?;
+        verify_private_file_identity(&final_path, &file)?;
         let metadata = file.metadata().map_err(|_| ())?;
-        let path_metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
-        if !safe_private_file(&metadata)
-            || path_metadata.dev() != metadata.dev()
-            || path_metadata.ino() != metadata.ino()
-        {
-            return Err(());
-        }
-        let mut contents = Vec::new();
-        std::io::Read::by_ref(&mut file)
-            .take(MAXIMUM_CLEANUP_AUTHORITY_BYTES + 1)
-            .read_to_end(&mut contents)
-            .map_err(|_| ())?;
-        if u64::try_from(contents.len()).map_err(|_| ())? > MAXIMUM_CLEANUP_AUTHORITY_BYTES {
-            return Err(());
-        }
-        let record = CleanupAuthorityRecord::decode(&contents)?;
         Ok(Self {
-            path,
+            path: final_path,
             contents,
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -656,15 +695,15 @@ impl CleanupAuthorityProof {
 
 fn create_cleanup_authority_staging(
     authority: &WorkRootAuthority,
-) -> Result<(String, PathBuf, File), ()> {
+) -> Result<(String, PathBuf, String, PathBuf, File), ()> {
     for _ in 0..8 {
         let mut identity = [0_u8; 16];
         getrandom::fill(&mut identity).map_err(|_| ())?;
-        let name = format!(
-            "{CLEANUP_AUTHORITY_STAGING_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identity)
-        );
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identity);
+        let name = format!("{CLEANUP_AUTHORITY_STAGING_PREFIX}{encoded}");
         let path = authority.work_root().join(&name);
+        let final_name = format!("{CLEANUP_AUTHORITY_PREFIX}{encoded}");
+        let final_path = authority.work_root().join(&final_name);
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -674,7 +713,7 @@ fn create_cleanup_authority_staging(
         {
             Ok(file) => {
                 set_close_on_exec(&file)?;
-                return Ok((name, path, file));
+                return Ok((name, path, final_name, final_path, file));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(()),
@@ -721,14 +760,6 @@ impl CleanupEngine {
             Ok(proof) => proof,
             Err(()) => return CleanupResult::Quarantined(CleanupFailure::Safety),
         };
-        self.remove_with_proof(tree, proof)
-    }
-
-    fn resume(&self, tree: &OwnedTree, proof: CleanupAuthorityProof) -> CleanupResult {
-        let _serialized = self
-            .serialized
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.remove_with_proof(tree, proof)
     }
 
@@ -821,12 +852,6 @@ impl MarkerProof {
 }
 
 #[derive(Clone)]
-enum MarkerState {
-    Present(MarkerProof),
-    Missing(Option<Arc<OwnedFd>>),
-}
-
-#[derive(Clone)]
 struct DirectoryLink {
     parent: Arc<OwnedFd>,
     identity: Arc<str>,
@@ -870,41 +895,6 @@ impl DirectoryLink {
             device: normalized_device(opened.st_dev),
             inode: opened.st_ino,
         })
-    }
-
-    fn recover(
-        parent: Arc<OwnedFd>,
-        identity: Arc<str>,
-        device: u64,
-        inode: u64,
-    ) -> Result<Self, ()> {
-        match statat(
-            parent.as_ref(),
-            identity.as_ref(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        ) {
-            Ok(_) => {
-                let link = Self::capture(parent, identity)?;
-                if link.device != device || link.inode != inode {
-                    return Err(());
-                }
-                Ok(link)
-            }
-            Err(Errno::NOENT) => {
-                let parent_metadata = fstat(parent.as_ref()).map_err(|_| ())?;
-                if !safe_owned_directory_stat(&parent_metadata) {
-                    return Err(());
-                }
-                Ok(Self {
-                    parent,
-                    identity,
-                    directory: None,
-                    device,
-                    inode,
-                })
-            }
-            Err(_) => Err(()),
-        }
     }
 
     fn validate(&self) -> Result<TreePresence, ()> {
@@ -952,7 +942,7 @@ impl DirectoryLink {
 pub(super) struct OwnedTree {
     path: PathBuf,
     lineage: Vec<DirectoryLink>,
-    marker: Option<MarkerState>,
+    marker: Option<MarkerProof>,
 }
 
 #[derive(Clone, Copy)]
@@ -997,66 +987,6 @@ impl OwnedTree {
         })
     }
 
-    fn recover(
-        work_root_directory: &File,
-        work_root: &Path,
-        record: &CleanupAuthorityRecord,
-    ) -> Result<Self, ()> {
-        let target = CleanupTarget::parse(&record.relative_path)?;
-        let path = work_root.join(&target.relative_path);
-        let component_count = target.relative_path.iter().count();
-        let mut parent = Arc::new(fcntl_dupfd_cloexec(work_root_directory, 0).map_err(|_| ())?);
-        let mut lineage = Vec::with_capacity(component_count);
-        for (index, component) in target.relative_path.iter().enumerate() {
-            let identity = component.to_str().map(Arc::<str>::from).ok_or(())?;
-            let link = if index + 1 == component_count {
-                DirectoryLink::recover(Arc::clone(&parent), identity, record.device, record.inode)?
-            } else {
-                DirectoryLink::capture(Arc::clone(&parent), identity)?
-            };
-            if index + 1 < component_count {
-                parent = Arc::clone(link.directory.as_ref().ok_or(())?);
-            }
-            lineage.push(link);
-        }
-        let mut tree = Self {
-            path,
-            lineage,
-            marker: None,
-        };
-        let link = tree.link().ok_or(())?;
-        let parent_metadata = fstat(link.parent.as_ref()).map_err(|_| ())?;
-        if normalized_device(parent_metadata.st_dev) != record.parent_device
-            || parent_metadata.st_ino != record.parent_inode
-        {
-            return Err(());
-        }
-        tree.marker = Some(match tree.validate_linked_directory()? {
-            TreePresence::Present => {
-                let marker_parent = if target.marker_in_parent {
-                    Arc::clone(&tree.link().ok_or(())?.parent)
-                } else {
-                    Arc::clone(tree.directory()?)
-                };
-                let marker = MarkerProof {
-                    parent: marker_parent,
-                    contents: target.marker_contents,
-                    device: record.marker_device,
-                    inode: record.marker_inode,
-                };
-                match verify_marker(&marker) {
-                    Ok(()) => MarkerState::Present(marker),
-                    Err(()) if marker.is_missing() => {
-                        MarkerState::Missing(Some(Arc::clone(&marker.parent)))
-                    }
-                    Err(()) => return Err(()),
-                }
-            }
-            TreePresence::Missing => MarkerState::Missing(None),
-        });
-        Ok(tree)
-    }
-
     fn prepare_cleanup_identity(
         &self,
         cleanup_identity_store: &dyn CleanupIdentityStore,
@@ -1077,14 +1007,6 @@ impl OwnedTree {
         (cleanup_identity_store.read(directory.as_ref())? == Some(identity))
             .then_some(identity)
             .ok_or(())
-    }
-
-    #[cfg(test)]
-    fn read_cleanup_identity(
-        &self,
-        cleanup_identity_store: &dyn CleanupIdentityStore,
-    ) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
-        cleanup_identity_store.read(self.directory()?.as_ref())
     }
 
     fn sync_parent(&self) -> Result<(), ()> {
@@ -1120,7 +1042,7 @@ impl OwnedTree {
     }
 
     fn install_marker(&mut self, marker: MarkerProof) {
-        self.marker = Some(MarkerState::Present(marker));
+        self.marker = Some(marker);
     }
 
     fn validate_linked_directory(&self) -> Result<TreePresence, ()> {
@@ -1146,26 +1068,11 @@ impl OwnedTree {
     }
 
     fn validate_marker(&self, may_be_missing: bool) -> Result<(), ()> {
-        match self.marker.as_ref().ok_or(())? {
-            MarkerState::Present(marker) => match verify_marker(marker) {
-                Ok(()) => Ok(()),
-                Err(()) if may_be_missing && marker.is_missing() => Ok(()),
-                Err(()) => Err(()),
-            },
-            MarkerState::Missing(Some(parent))
-                if may_be_missing
-                    && matches!(
-                        statat(
-                            parent.as_ref(),
-                            OWNERSHIP_MARKER_NAME,
-                            AtFlags::SYMLINK_NOFOLLOW,
-                        ),
-                        Err(Errno::NOENT)
-                    ) =>
-            {
-                Ok(())
-            }
-            MarkerState::Missing(_) => Err(()),
+        let marker = self.marker.as_ref().ok_or(())?;
+        match verify_marker(marker) {
+            Ok(()) => Ok(()),
+            Err(()) if may_be_missing && marker.is_missing() => Ok(()),
+            Err(()) => Err(()),
         }
     }
 }
@@ -1248,28 +1155,11 @@ fn verify_private_contents(
     device: u64,
     inode: u64,
 ) -> Result<(), ()> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(NOFOLLOW_FLAG)
-        .open(path)
-        .map_err(|_| ())?;
-    set_close_on_exec(&file)?;
-    let metadata = file.metadata().map_err(|_| ())?;
-    let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !safe_private_file(&metadata)
-        || path_metadata.dev() != metadata.dev()
-        || path_metadata.ino() != metadata.ino()
-        || metadata.dev() != device
-        || metadata.ino() != inode
-    {
-        return Err(());
-    }
-    let mut contents = Vec::with_capacity(expected.len());
-    std::io::Read::by_ref(&mut file)
-        .take(u64::try_from(expected.len()).map_err(|_| ())? + 1)
-        .read_to_end(&mut contents)
-        .map_err(|_| ())?;
-    (contents == expected).then_some(()).ok_or(())
+    let maximum = u64::try_from(expected.len()).map_err(|_| ())?;
+    let (metadata, contents) = read_private_record(path, maximum)?;
+    (metadata.dev() == device && metadata.ino() == inode && contents == expected)
+        .then_some(())
+        .ok_or(())
 }
 
 #[allow(
@@ -1290,10 +1180,96 @@ fn safe_private_file(metadata: &Metadata) -> bool {
         && metadata.nlink() == 1
 }
 
+fn discover_retained_workspaces(boot: &OwnedTree, retained: &mut Vec<RetainedWorkspace>) {
+    let initial_count = retained.len();
+    let Ok(directory) = boot.directory() else {
+        retained.push(unknown_retained_root(boot.path()));
+        return;
+    };
+    let Ok(children) = Dir::read_from(directory.as_ref()) else {
+        retained.push(unknown_retained_root(boot.path()));
+        return;
+    };
+    let mut assignment_ids = Vec::new();
+    for child in children {
+        let Ok(child) = child else {
+            retained.push(unknown_retained_root(boot.path()));
+            return;
+        };
+        let Ok(assignment_id) = std::str::from_utf8(child.file_name().to_bytes()) else {
+            continue;
+        };
+        if valid_assignment_id(assignment_id) {
+            assignment_ids.push(assignment_id.to_owned());
+        }
+    }
+    for assignment_id in assignment_ids {
+        let assignment_path = boot.path().join(&assignment_id);
+        let Ok(mut assignment_tree) = OwnedTree::capture_child(boot, assignment_path.clone())
+        else {
+            retained.push(unknown_retained_root(&assignment_path));
+            continue;
+        };
+        let Some(marker) = assignment_tree.directory().ok().and_then(|directory| {
+            MarkerProof::capture(Arc::clone(directory), ASSIGNMENT_MARKER).ok()
+        }) else {
+            retained.push(unknown_retained_root(&assignment_path));
+            continue;
+        };
+        assignment_tree.install_marker(marker);
+        let Ok(record) = assignment_tree
+            .directory()
+            .and_then(|directory| read_attempt_record_at(directory.as_ref()))
+        else {
+            retained.push(unknown_retained_root(&assignment_path));
+            continue;
+        };
+        let workspace_path = assignment_path.join("workspace");
+        let Ok(workspace_tree) = OwnedTree::capture_child(&assignment_tree, workspace_path.clone())
+        else {
+            retained.push(unknown_retained_root(&assignment_path));
+            continue;
+        };
+        if record.assignment_id != assignment_id
+            || !matches!(assignment_tree.validate(false), Ok(TreePresence::Present))
+            || !matches!(
+                workspace_tree.validate_linked_directory(),
+                Ok(TreePresence::Present)
+            )
+        {
+            retained.push(unknown_retained_root(&assignment_path));
+            continue;
+        }
+        retained.push(RetainedWorkspace {
+            assignment_id: Some(record.assignment_id),
+            run_id: Some(record.run_id),
+            attempt_id: Some(record.attempt_id),
+            path: workspace_path,
+            reason: record.disposition,
+        });
+    }
+    if retained.len() == initial_count {
+        retained.push(unknown_retained_root(boot.path()));
+    }
+}
+
+fn unknown_retained_root(path: &Path) -> RetainedWorkspace {
+    RetainedWorkspace {
+        assignment_id: None,
+        run_id: None,
+        attempt_id: None,
+        path: path.to_owned(),
+        reason: RetentionReason::OutcomeUnknown,
+    }
+}
+
 pub(super) struct WorkRootLease {
     boot_tree: OwnedTree,
     engine: CleanupEngine,
     cancellation: Arc<CleanupCancellation>,
+    retained: Arc<AtomicBool>,
+    startup_retained: Vec<RetainedWorkspace>,
+    workspace_release_spawner: Arc<dyn WorkspaceReleaseSpawner>,
     _authority: WorkRootAuthority,
 }
 
@@ -1354,23 +1330,12 @@ impl WorkRootLease {
             serialized: Arc::new(Mutex::new(())),
         };
 
-        if let Some(proof) = CleanupAuthorityProof::load(&authority)
-            .map_err(|()| WorkRootError::InvalidCleanupAuthority)?
-        {
-            let tree =
-                OwnedTree::recover(&authority.shared.directory_lock, work_root, &proof.record)
-                    .map_err(|()| WorkRootError::InvalidCleanupAuthority)?;
-            classify_startup_cleanup(
-                engine.resume(&tree, proof),
-                WorkRootError::InvalidCleanupAuthority,
-            )?;
-        }
-
         filesystem.hook.before_child_enumeration();
         let children = fs::read_dir(work_root)
             .map_err(|_| WorkRootError::UnsafeWorkRoot)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| WorkRootError::UnsafeWorkRoot)?;
+        let mut startup_retained = Vec::new();
         for child in children {
             let name = child.file_name();
             if name == LOCK_FILE_NAME {
@@ -1386,18 +1351,20 @@ impl WorkRootLease {
                 continue;
             }
             let path = work_root.join(name);
-            let mut tree = OwnedTree::capture_root(&authority.shared.directory_lock, path)
-                .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?;
-            let marker = MarkerProof::capture(
-                Arc::clone(
-                    tree.directory()
-                        .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?,
-                ),
-                BOOT_MARKER,
-            )
-            .map_err(|()| WorkRootError::AmbiguousOwnedRoot)?;
+            let tree = OwnedTree::capture_root(&authority.shared.directory_lock, path.clone());
+            let Some(mut tree) = tree.ok() else {
+                startup_retained.push(unknown_retained_root(&path));
+                continue;
+            };
+            let marker = tree.directory().ok().and_then(|directory| {
+                MarkerProof::capture(Arc::clone(directory), BOOT_MARKER).ok()
+            });
+            let Some(marker) = marker else {
+                startup_retained.push(unknown_retained_root(&path));
+                continue;
+            };
             tree.install_marker(marker);
-            classify_startup_cleanup(engine.remove(&tree), WorkRootError::AmbiguousOwnedRoot)?;
+            discover_retained_workspaces(&tree, &mut startup_retained);
         }
 
         authority
@@ -1414,17 +1381,22 @@ impl WorkRootLease {
             boot_tree,
             engine,
             cancellation,
+            retained: Arc::new(AtomicBool::new(false)),
+            startup_retained,
+            workspace_release_spawner: filesystem.workspace_release_spawner,
             _authority: authority,
         }))
     }
 
-    pub(super) fn create_assignment(
+    pub(super) fn create_assignment_for_attempt(
         &self,
         assignment_id: &str,
+        run_id: &str,
+        attempt_id: &str,
+        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
     ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
-        assignment_id
-            .parse::<crate::runner_protocol::generated::AssignmentId>()
-            .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+        let attempt_record = AttemptRecord::new(assignment_id, run_id, attempt_id)
+            .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
         let assignment_path = self.boot_tree.path.join(assignment_id);
         create_private_directory(&assignment_path)
             .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
@@ -1434,17 +1406,19 @@ impl WorkRootLease {
         let assignment_marker = create_marker(&assignment_tree, ASSIGNMENT_MARKER)
             .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
         assignment_tree.install_marker(assignment_marker.clone());
+        if create_attempt_record(&assignment_tree, &attempt_record).is_err() {
+            return Err(assignment_creation_failure(
+                self.engine.remove(&assignment_tree),
+            ));
+        }
         let private_path = assignment_path.join("private");
         let workspace_path = assignment_path.join("workspace");
         if create_private_directory(&private_path).is_err()
             || create_private_directory(&workspace_path).is_err()
         {
-            return Err(match self.engine.remove(&assignment_tree) {
-                CleanupResult::Released => AssignmentRootCreationError::Unavailable,
-                CleanupResult::Quarantined(_) | CleanupResult::Preempted => {
-                    AssignmentRootCreationError::CleanupFailed
-                }
-            });
+            return Err(assignment_creation_failure(
+                self.engine.remove(&assignment_tree),
+            ));
         }
         let workspace_tree = match OwnedTree::capture_child(&assignment_tree, workspace_path) {
             Ok(mut tree) => {
@@ -1452,12 +1426,9 @@ impl WorkRootLease {
                 tree
             }
             Err(()) => {
-                return Err(match self.engine.remove(&assignment_tree) {
-                    CleanupResult::Released => AssignmentRootCreationError::Unavailable,
-                    CleanupResult::Quarantined(_) | CleanupResult::Preempted => {
-                        AssignmentRootCreationError::CleanupFailed
-                    }
-                });
+                return Err(assignment_creation_failure(
+                    self.engine.remove(&assignment_tree),
+                ));
             }
         };
         Ok(AssignmentRoot {
@@ -1466,7 +1437,11 @@ impl WorkRootLease {
             private: PrivateStaging { path: private_path },
             workspace: WorkspaceLease::new(workspace_tree, self.engine.clone()),
             workflow_git: None,
+            attempt_record,
+            recorder,
+            retained: Arc::clone(&self.retained),
             engine: self.engine.clone(),
+            workspace_release_spawner: Arc::clone(&self.workspace_release_spawner),
             workspace_release: Arc::new(AssignmentReleaseState {
                 started: AtomicBool::new(false),
                 completion: ReleaseCompletion::new(),
@@ -1478,9 +1453,26 @@ impl WorkRootLease {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn create_assignment(
+        &self,
+        assignment_id: &str,
+    ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
+        self.create_assignment_for_attempt(
+            assignment_id,
+            "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+            None,
+        )
+    }
+
     pub(super) fn release_boot_root_pending(&self) -> PendingRelease {
         let completion = ReleaseCompletion::new();
         let pending = completion.pending();
+        if self.retained.load(Ordering::Acquire) {
+            completion.complete(CleanupResult::Retained);
+            return pending;
+        }
         let worker_completion = completion.clone();
         let tree = self.boot_tree.clone();
         let engine = self.engine.clone();
@@ -1503,23 +1495,22 @@ impl WorkRootLease {
         self.cancellation.cancel();
     }
 
+    pub(super) fn startup_retained(&self) -> &[RetainedWorkspace] {
+        &self.startup_retained
+    }
+
     #[cfg(test)]
     pub(super) fn boot_path(&self) -> &Path {
         &self.boot_tree.path
     }
 }
 
-fn classify_startup_cleanup(
-    result: CleanupResult,
-    safety_error: WorkRootError,
-) -> Result<(), WorkRootError> {
+fn assignment_creation_failure(result: CleanupResult) -> AssignmentRootCreationError {
     match result {
-        CleanupResult::Released => Ok(()),
-        CleanupResult::Quarantined(CleanupFailure::Safety) => Err(safety_error),
-        CleanupResult::Quarantined(
-            CleanupFailure::OrdinaryRemovalExhausted | CleanupFailure::Quiescence,
-        )
-        | CleanupResult::Preempted => Err(WorkRootError::StaleRootCleanupFailed),
+        CleanupResult::Released => AssignmentRootCreationError::Unavailable,
+        CleanupResult::Retained | CleanupResult::Quarantined(_) | CleanupResult::Preempted => {
+            AssignmentRootCreationError::CleanupFailed
+        }
     }
 }
 
@@ -1614,6 +1605,148 @@ fn create_marker(parent: &OwnedTree, contents: &'static [u8]) -> Result<MarkerPr
     MarkerProof::capture(directory, contents)
 }
 
+fn create_attempt_record(tree: &OwnedTree, record: &AttemptRecord) -> Result<(), ()> {
+    let directory = tree.directory()?;
+    let descriptor = openat(
+        directory.as_ref(),
+        ATTEMPT_RECORD_NAME,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| ())?;
+    write_private_record(
+        File::from(descriptor),
+        &record.encode(),
+        MAXIMUM_ATTEMPT_RECORD_BYTES,
+    )?;
+    sync_directory(directory.as_ref())
+}
+
+fn retain_attempt_record(
+    tree: &OwnedTree,
+    record: &AttemptRecord,
+    reason: RetentionReason,
+) -> Result<(), ()> {
+    if !matches!(tree.validate(false)?, TreePresence::Present)
+        || read_attempt_record_at(tree.directory()?.as_ref())? != *record
+    {
+        return Err(());
+    }
+    let mut retained = record.clone();
+    retained.disposition = reason;
+    let contents = retained.encode();
+    let directory = tree.directory()?;
+    let (staging_name, _file) = create_record_staging(
+        directory.as_ref(),
+        ATTEMPT_RECORD_STAGING_PREFIX,
+        &contents,
+        MAXIMUM_ATTEMPT_RECORD_BYTES,
+    )?;
+    renameat_with(
+        directory.as_ref(),
+        &staging_name,
+        directory.as_ref(),
+        ATTEMPT_RECORD_NAME,
+        RenameFlags::empty(),
+    )
+    .map_err(|_| ())?;
+    sync_directory(directory.as_ref())
+}
+
+fn create_record_staging(
+    directory: &OwnedFd,
+    prefix: &str,
+    contents: &[u8],
+    maximum_bytes: u64,
+) -> Result<(String, File), ()> {
+    for _ in 0..8 {
+        let mut identity = [0_u8; 16];
+        getrandom::fill(&mut identity).map_err(|_| ())?;
+        let name = format!(
+            "{prefix}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identity)
+        );
+        match openat(
+            directory,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(descriptor) => {
+                let file = File::from(descriptor);
+                write_private_record(file.try_clone().map_err(|_| ())?, contents, maximum_bytes)?;
+                return Ok((name, file));
+            }
+            Err(Errno::EXIST) => {}
+            Err(_) => return Err(()),
+        }
+    }
+    Err(())
+}
+
+fn write_private_record(mut file: File, contents: &[u8], maximum_bytes: u64) -> Result<(), ()> {
+    if u64::try_from(contents.len()).map_err(|_| ())? > maximum_bytes {
+        return Err(());
+    }
+    file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))
+        .and_then(|()| file.write_all(contents))
+        .and_then(|()| file.sync_all())
+        .map_err(|_| ())
+}
+
+fn read_attempt_record_at(directory: &OwnedFd) -> Result<AttemptRecord, ()> {
+    let contents =
+        read_private_record_at(directory, ATTEMPT_RECORD_NAME, MAXIMUM_ATTEMPT_RECORD_BYTES)?;
+    AttemptRecord::decode(&contents)
+}
+
+fn read_private_record_at(
+    directory: &OwnedFd,
+    name: &str,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, ()> {
+    let (descriptor, metadata) =
+        owned_tree::open_regular_file_at(directory, name).map_err(|_| ())?;
+    if !safe_private_file_stat(&metadata) {
+        return Err(());
+    }
+    let mut contents = Vec::new();
+    std::io::Read::by_ref(&mut File::from(descriptor))
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut contents)
+        .map_err(|_| ())?;
+    if u64::try_from(contents.len()).map_err(|_| ())? > maximum_bytes {
+        return Err(());
+    }
+    Ok(contents)
+}
+
+fn read_private_record(path: &Path, maximum_bytes: u64) -> Result<(Metadata, Vec<u8>), ()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW_FLAG)
+        .open(path)
+        .map_err(|_| ())?;
+    set_close_on_exec(&file)?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    let linked = fs::symlink_metadata(path).map_err(|_| ())?;
+    if !safe_private_file(&metadata)
+        || linked.dev() != metadata.dev()
+        || linked.ino() != metadata.ino()
+    {
+        return Err(());
+    }
+    let mut contents = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut contents)
+        .map_err(|_| ())?;
+    if u64::try_from(contents.len()).map_err(|_| ())? > maximum_bytes {
+        return Err(());
+    }
+    Ok((metadata, contents))
+}
+
 #[derive(Clone)]
 pub(super) struct WorkspaceLease {
     state: Arc<WorkspaceLeaseState>,
@@ -1667,6 +1800,42 @@ impl WorkspaceLease {
                 .complete(CleanupResult::Quarantined(CleanupFailure::Safety));
         }
         pending
+    }
+
+    fn retain_pending(&self) -> PendingRelease {
+        let pending = self.state.completion.pending();
+        let mut release = self
+            .state
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !release.started {
+            release.started = true;
+            drop(release.tree.take());
+            self.state.completion.complete(CleanupResult::Retained);
+        }
+        pending
+    }
+
+    fn retain_and_complete(self) -> CleanupResult {
+        let completion = self.state.completion.clone();
+        let pending = completion.pending();
+        let mut release = self
+            .state
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if release.started {
+            drop(release);
+            drop(self);
+            return pending.wait();
+        }
+        release.started = true;
+        drop(release.tree.take());
+        drop(release);
+        drop(self);
+        completion.complete(CleanupResult::Retained);
+        CleanupResult::Retained
     }
 
     fn claim_release(&self, quiescence: ProcessQuiescence) -> (PendingRelease, Option<OwnedTree>) {
@@ -1734,7 +1903,11 @@ pub(super) struct AssignmentRoot {
     pub(super) private: PrivateStaging,
     pub(super) workspace: WorkspaceLease,
     workflow_git: Option<WorkflowGitAuthority>,
+    attempt_record: AttemptRecord,
+    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    retained: Arc<AtomicBool>,
     engine: CleanupEngine,
+    workspace_release_spawner: Arc<dyn WorkspaceReleaseSpawner>,
     workspace_release: Arc<AssignmentReleaseState>,
     release: Arc<AssignmentReleaseState>,
 }
@@ -1751,6 +1924,7 @@ impl AssignmentRoot {
     pub(super) fn release_workspace_pending(
         &self,
         quiescence: ProcessQuiescence,
+        disposition: WorkspaceDisposition,
     ) -> PendingRelease {
         let pending = self.workspace_release.completion.pending();
         if self
@@ -1762,30 +1936,81 @@ impl AssignmentRoot {
             return pending;
         }
         let authority = self.workflow_git.clone();
+        let worker_authority = authority.clone();
         let workspace = self.workspace.clone();
         let completion = self.workspace_release.completion.clone();
         let worker_completion = completion.clone();
-        if std::thread::Builder::new()
-            .name("runner-workspace-boundary-release".to_owned())
-            .spawn(move || {
-                if let Some(authority) = authority {
-                    let report = authority.teardown(quiescence);
-                    if !report.local_state_destroyed {
-                        worker_completion
-                            .complete(CleanupResult::Quarantined(CleanupFailure::Safety));
-                        return;
+        let assignment_tree = self.assignment_tree.clone();
+        let attempt_record = self.attempt_record.clone();
+        let recorder = self.recorder.clone();
+        let retained = Arc::clone(&self.retained);
+        if self
+            .workspace_release_spawner
+            .spawn(Box::new(move || {
+                let report = worker_authority
+                    .map_or_else(WorkflowGitTeardownReport::no_issuance, |authority| {
+                        authority.teardown(quiescence)
+                    });
+                let disposition = effective_disposition(disposition, quiescence, &report);
+                let result = match disposition {
+                    WorkspaceDisposition::Remove => {
+                        let result = workspace.release_pending(quiescence).wait();
+                        drop(workspace);
+                        result
                     }
-                }
-                worker_completion.complete(workspace.release_pending(quiescence).wait());
-            })
+                    WorkspaceDisposition::Retain(reason) => {
+                        retained.store(true, Ordering::Release);
+                        let recorded =
+                            retain_attempt_record(&assignment_tree, &attempt_record, reason)
+                                .is_ok();
+                        record_retention(
+                            recorder.as_ref(),
+                            &attempt_record,
+                            workspace.path(),
+                            reason,
+                            quiescence,
+                            &report,
+                            recorded,
+                        );
+                        workspace.retain_and_complete()
+                    }
+                };
+                drop(assignment_tree);
+                worker_completion.complete(result);
+            }))
             .is_err()
         {
-            completion.complete(CleanupResult::Quarantined(CleanupFailure::Safety));
+            self.retained.store(true, Ordering::Release);
+            let report = authority
+                .map_or_else(WorkflowGitTeardownReport::no_issuance, |authority| {
+                    authority.teardown(quiescence)
+                });
+            let reason = match effective_disposition(disposition, quiescence, &report) {
+                WorkspaceDisposition::Retain(reason) => reason,
+                WorkspaceDisposition::Remove => RetentionReason::ReleaseWorkerUnavailable,
+            };
+            let recorded =
+                retain_attempt_record(&self.assignment_tree, &self.attempt_record, reason).is_ok();
+            record_retention(
+                self.recorder.as_ref(),
+                &self.attempt_record,
+                self.workspace.path(),
+                reason,
+                quiescence,
+                &report,
+                recorded,
+            );
+            self.workspace.retain_pending();
+            completion.complete(CleanupResult::Retained);
         }
         pending
     }
 
-    pub(super) fn release_pending(&self, quiescence: ProcessQuiescence) -> PendingRelease {
+    pub(super) fn release_pending(
+        &self,
+        quiescence: ProcessQuiescence,
+        disposition: WorkspaceDisposition,
+    ) -> PendingRelease {
         let pending = self.release.completion.pending();
         if self
             .release
@@ -1795,7 +2020,7 @@ impl AssignmentRoot {
         {
             return pending;
         }
-        let workspace = self.release_workspace_pending(quiescence);
+        let workspace = self.release_workspace_pending(quiescence, disposition);
         let assignment_tree = self.assignment_tree.clone();
         let engine = self.engine.clone();
         let completion = self.release.completion.clone();
@@ -1805,8 +2030,11 @@ impl AssignmentRoot {
             .spawn(move || {
                 let result = match workspace.wait() {
                     CleanupResult::Released => engine.remove(&assignment_tree),
+                    CleanupResult::Retained => CleanupResult::Retained,
                     failure => failure,
                 };
+                drop(engine);
+                drop(assignment_tree);
                 worker_completion.complete(result);
             })
             .is_err()
@@ -1815,6 +2043,78 @@ impl AssignmentRoot {
         }
         pending
     }
+}
+
+fn effective_disposition(
+    disposition: WorkspaceDisposition,
+    quiescence: ProcessQuiescence,
+    credentials: &WorkflowGitTeardownReport,
+) -> WorkspaceDisposition {
+    match disposition {
+        WorkspaceDisposition::Retain(reason) => WorkspaceDisposition::Retain(reason),
+        WorkspaceDisposition::Remove if quiescence == ProcessQuiescence::Failed => {
+            WorkspaceDisposition::Retain(RetentionReason::ProcessStopFailed)
+        }
+        WorkspaceDisposition::Remove if !credentials.succeeded() => {
+            WorkspaceDisposition::Retain(RetentionReason::CredentialTeardownFailed)
+        }
+        WorkspaceDisposition::Remove => WorkspaceDisposition::Remove,
+    }
+}
+
+fn record_retention(
+    recorder: Option<&Arc<crate::runner::telemetry::Recorder>>,
+    attempt: &AttemptRecord,
+    path: PathBuf,
+    reason: RetentionReason,
+    quiescence: ProcessQuiescence,
+    credentials: &WorkflowGitTeardownReport,
+    disposition_recorded: bool,
+) {
+    let Some(recorder) = recorder else {
+        return;
+    };
+    recorder.record(
+        "runner.workspace_retained",
+        [
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::ASSIGNMENT_ID,
+                attempt.assignment_id.clone(),
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::RUN_ID,
+                attempt.run_id.clone(),
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::ATTEMPT_ID,
+                attempt.attempt_id.clone(),
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::WORKSPACE_PATH,
+                path.to_string_lossy().into_owned(),
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::RETENTION_REASON,
+                reason.as_str(),
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::OWNED_PROCESSES_STOPPED,
+                quiescence == ProcessQuiescence::Proven,
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::RUNNER_CREDENTIALS_REMOVED,
+                credentials.local_state_destroyed,
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::RUNNER_CREDENTIALS_REVOKED,
+                credentials.revocation_succeeded(),
+            ),
+            opentelemetry::KeyValue::new(
+                crate::runner::telemetry::attribute::RETENTION_RECORDED,
+                disposition_recorded,
+            ),
+        ],
+    );
 }
 
 struct CompletionState {
@@ -1905,9 +2205,8 @@ impl PendingRelease {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::os::unix::fs::symlink;
-    use std::os::unix::process::ExitStatusExt as _;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1916,11 +2215,6 @@ mod tests {
     const BOOT_A: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abc";
     const BOOT_B: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abd";
     const ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
-    const TERMINATION_FIXTURE_ROOT: &str = "SCHERZO_CLEANUP_TERMINATION_FIXTURE_ROOT";
-    const AUTHORITY_PUBLICATION_FIXTURE_ROOT: &str =
-        "SCHERZO_CLEANUP_AUTHORITY_PUBLICATION_FIXTURE_ROOT";
-    const TERMINATION_FIXTURE_STATUS: i32 = 86;
-    const TERMINATION_REMOVED_DESCENDANT: &str = "removed-before-termination";
 
     #[derive(Clone, Copy)]
     enum RemovalOutcome {
@@ -1979,16 +2273,6 @@ mod tests {
         }
     }
 
-    struct ProcessTerminatingRemover;
-
-    impl TreeRemover for ProcessTerminatingRemover {
-        fn remove_tree(&self, tree: &OwnedTree) -> io::Result<()> {
-            fs::remove_file(tree.path().join(OWNERSHIP_MARKER_NAME))?;
-            fs::remove_file(tree.path().join(TERMINATION_REMOVED_DESCENDANT))?;
-            std::process::exit(TERMINATION_FIXTURE_STATUS);
-        }
-    }
-
     struct ReplacingRemover {
         calls: AtomicUsize,
     }
@@ -2022,6 +2306,14 @@ mod tests {
                 b"unproven replacement",
             )?;
             SystemTreeRemover.remove_tree(tree)
+        }
+    }
+
+    struct RejectingWorkspaceReleaseSpawner;
+
+    impl WorkspaceReleaseSpawner for RejectingWorkspaceReleaseSpawner {
+        fn spawn(&self, _task: Box<dyn FnOnce() + Send + 'static>) -> io::Result<()> {
+            Err(io::Error::other("injected workspace release spawn failure"))
         }
     }
 
@@ -2094,22 +2386,6 @@ mod tests {
     impl WorkRootHook for CountingHook {
         fn before_child_enumeration(&self) {
             self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    struct ControlledCleanupIdentityStore(Mutex<[u8; CLEANUP_IDENTITY_BYTES]>);
-
-    impl CleanupIdentityStore for ControlledCleanupIdentityStore {
-        fn read(&self, _directory: &OwnedFd) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
-            Ok(Some(*self.0.lock().unwrap()))
-        }
-
-        fn create(
-            &self,
-            _directory: &OwnedFd,
-            _identity: &[u8; CLEANUP_IDENTITY_BYTES],
-        ) -> Result<(), ()> {
-            Err(())
         }
     }
 
@@ -2259,41 +2535,26 @@ mod tests {
     }
 
     #[test]
-    fn startup_removes_only_exactly_marked_stale_boot_roots() {
+    fn startup_retains_old_boots_and_creates_a_fresh_root() {
         let root = private_work_root();
         {
             let first = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
             fs::write(first.boot_path().join("stale"), b"owned").unwrap();
         }
         let second = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
-        assert!(!root.path().join(BOOT_A).exists());
+        assert_eq!(
+            fs::read(root.path().join(BOOT_A).join("stale")).unwrap(),
+            b"owned"
+        );
+        assert_eq!(
+            second.startup_retained(),
+            &[unknown_retained_root(&root.path().join(BOOT_A))]
+        );
         assert!(second.boot_path().exists());
-
-        let ambiguous = private_work_root();
-        let legacy = ambiguous.path().join(BOOT_A);
-        create_private_directory(&legacy).unwrap();
-        fs::write(legacy.join("unchanged"), b"legacy").unwrap();
-        assert_eq!(
-            WorkRootLease::acquire(ambiguous.path(), BOOT_B)
-                .err()
-                .unwrap(),
-            WorkRootError::AmbiguousOwnedRoot
-        );
-        assert_eq!(fs::read(legacy.join("unchanged")).unwrap(), b"legacy");
-
-        let linked = private_work_root();
-        let target = linked.path().join("operator-target");
-        create_private_directory(&target).unwrap();
-        symlink(&target, linked.path().join(BOOT_A)).unwrap();
-        assert_eq!(
-            WorkRootLease::acquire(linked.path(), BOOT_B).err().unwrap(),
-            WorkRootError::AmbiguousOwnedRoot
-        );
-        assert!(target.exists());
     }
 
     #[test]
-    fn unsafe_lock_and_marker_shapes_fail_without_recursive_mutation() {
+    fn unsafe_lock_fails_while_unknown_old_boot_shapes_are_retained() {
         let unsafe_lock = private_work_root();
         let lock_target = unsafe_lock.path().join("operator-lock-target");
         fs::write(&lock_target, b"operator").unwrap();
@@ -2327,21 +2588,18 @@ mod tests {
                 }
                 _ => panic!("unknown owned-root fixture"),
             }
-            assert_eq!(
-                WorkRootLease::acquire(root.path(), BOOT_B).err().unwrap(),
-                WorkRootError::AmbiguousOwnedRoot
-            );
+            let current = WorkRootLease::acquire(root.path(), BOOT_B).unwrap();
+            assert_eq!(current.startup_retained(), &[unknown_retained_root(&boot)]);
             assert_eq!(fs::read(&unchanged).unwrap(), b"owned");
         }
 
         let non_directory_root = private_work_root();
         let recognized_file = non_directory_root.path().join(BOOT_A);
         fs::write(&recognized_file, b"not-a-root").unwrap();
+        let current = WorkRootLease::acquire(non_directory_root.path(), BOOT_B).unwrap();
         assert_eq!(
-            WorkRootLease::acquire(non_directory_root.path(), BOOT_B)
-                .err()
-                .unwrap(),
-            WorkRootError::AmbiguousOwnedRoot
+            current.startup_retained(),
+            &[unknown_retained_root(&recognized_file)]
         );
         assert_eq!(fs::read(recognized_file).unwrap(), b"not-a-root");
     }
@@ -2424,7 +2682,8 @@ mod tests {
         .unwrap();
         let assignment = failed.create_assignment(ASSIGNMENT).unwrap();
         let assignment_path = assignment.execution.parent().unwrap().to_owned();
-        let pending = assignment.release_pending(ProcessQuiescence::Proven);
+        let pending =
+            assignment.release_pending(ProcessQuiescence::Proven, WorkspaceDisposition::Remove);
         assert_eq!(
             pending.wait(),
             CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
@@ -2434,302 +2693,213 @@ mod tests {
     }
 
     #[test]
-    fn process_termination_after_partial_cleanup_recovers_in_a_fresh_process() {
+    fn retained_attempt_survives_restart_with_identity_and_original_bytes() {
         let root = private_work_root();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runner::service::workspace::tests::cleanup_termination_process",
-                "--ignored",
-            ])
-            .env(TERMINATION_FIXTURE_ROOT, root.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert_eq!(status.code(), Some(TERMINATION_FIXTURE_STATUS));
-
-        let boot_path = root.path().join(BOOT_A);
-        assert!(!boot_path.join(OWNERSHIP_MARKER_NAME).exists());
-        assert!(!boot_path.join(TERMINATION_REMOVED_DESCENDANT).exists());
-        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-
-        let recovered = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
-        assert!(!boot_path.exists());
-        assert!(!root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-        assert_eq!(recovered.boot_path(), root.path().join(BOOT_B));
-    }
-
-    #[test]
-    #[ignore = "subprocess fixture invoked only by the termination recovery test"]
-    fn cleanup_termination_process() {
-        let root = std::env::var_os(TERMINATION_FIXTURE_ROOT)
-            .map(PathBuf::from)
-            .expect("termination fixture root is required");
-        let owner = WorkRootLease::acquire_with(
-            &root,
-            BOOT_A,
-            filesystem(
-                Arc::new(ProcessTerminatingRemover),
-                Arc::new(RecordingSleeper::default()),
-                Arc::new(NoopWorkRootHook),
-            ),
-        )
-        .unwrap();
-        fs::write(
-            owner.boot_path().join(TERMINATION_REMOVED_DESCENDANT),
-            b"owned",
-        )
-        .unwrap();
-        let result = owner.release_boot_root_pending().wait();
-        panic!("termination fixture unexpectedly completed with {result:?}");
-    }
-
-    #[test]
-    fn process_termination_during_authority_publication_recovers_in_a_fresh_process() {
-        let root = private_work_root();
-        let stale = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
-        let stale_boot = stale.boot_path().to_owned();
-        drop(stale);
-
-        let current_exe = std::env::current_exe().unwrap();
-        let status = Command::new("sh")
-            .args([
-                "-c",
-                "ulimit -f 0; exec \"$0\" \"$@\"",
-                current_exe.to_str().unwrap(),
-                "--exact",
-                "runner::service::workspace::tests::cleanup_authority_publication_process",
-                "--ignored",
-            ])
-            .env(AUTHORITY_PUBLICATION_FIXTURE_ROOT, root.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert_eq!(status.signal(), Some(libc::SIGXFSZ));
-        assert!(stale_boot.join(OWNERSHIP_MARKER_NAME).exists());
-        assert!(!root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-
-        let recovered = WorkRootLease::acquire_for_test(root.path(), BOOT_B);
-        assert!(recovered.is_ok());
-    }
-
-    #[test]
-    #[ignore = "subprocess fixture invoked only by the authority publication recovery test"]
-    fn cleanup_authority_publication_process() {
-        let root = std::env::var_os(AUTHORITY_PUBLICATION_FIXTURE_ROOT)
-            .map(PathBuf::from)
-            .expect("authority publication fixture root is required");
-        let _result = WorkRootLease::acquire_for_test(&root, BOOT_B);
-        panic!("authority publication fixture unexpectedly completed");
-    }
-
-    #[test]
-    fn persistent_recovery_retains_authority_and_never_creates_a_new_boot() {
-        let root = private_work_root();
-        let first_remover = ScriptedRemover::new([
-            RemovalOutcome::Partial,
-            RemovalOutcome::Error,
-            RemovalOutcome::Error,
-            RemovalOutcome::Error,
-            RemovalOutcome::Error,
-            RemovalOutcome::Error,
-        ]);
-        let first = WorkRootLease::acquire_with(
-            root.path(),
-            BOOT_A,
-            filesystem(
-                first_remover,
-                Arc::new(RecordingSleeper::default()),
-                Arc::new(NoopWorkRootHook),
-            ),
-        )
-        .unwrap();
-        let stale_boot = first.boot_path().to_owned();
-        fs::write(stale_boot.join("removed-before-failure"), b"owned").unwrap();
-        assert_eq!(
-            first.release_boot_root_pending().wait(),
-            CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
-        );
-        assert!(!stale_boot.join(OWNERSHIP_MARKER_NAME).exists());
-        assert!(
-            first
-                .boot_tree
-                .read_cleanup_identity(first.engine.cleanup_identity.as_ref())
-                .unwrap()
-                .is_some()
-        );
-        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-        drop(first);
-
-        let persistent_remover = ScriptedRemover::new([RemovalOutcome::Error; 6]);
-        assert_eq!(
-            WorkRootLease::acquire_with(
-                root.path(),
-                BOOT_B,
-                filesystem(
-                    persistent_remover.clone(),
-                    Arc::new(RecordingSleeper::default()),
-                    Arc::new(NoopWorkRootHook),
-                ),
-            )
-            .err()
-            .unwrap(),
-            WorkRootError::StaleRootCleanupFailed
-        );
-        assert_eq!(persistent_remover.calls.load(Ordering::Relaxed), 6);
-        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-        assert!(!root.path().join(BOOT_B).exists());
-
-        let recovered = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
-        assert!(!stale_boot.exists());
-        assert!(!root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-        assert_eq!(recovered.boot_path(), root.path().join(BOOT_B));
-    }
-
-    #[test]
-    fn recovery_rejects_a_same_contents_replacement_marker() {
-        let root = private_work_root();
-        let failed_remover = ScriptedRemover::new([RemovalOutcome::Error; 6]);
-        let first = WorkRootLease::acquire_with(
-            root.path(),
-            BOOT_A,
-            filesystem(
-                failed_remover,
-                Arc::new(RecordingSleeper::default()),
-                Arc::new(NoopWorkRootHook),
-            ),
-        )
-        .unwrap();
-        let stale_boot = first.boot_path().to_owned();
-        let marker_path = stale_boot.join(OWNERSHIP_MARKER_NAME);
-        let original_marker = File::open(&marker_path).unwrap();
-        let sentinel = stale_boot.join("operator-sentinel");
-        fs::write(&sentinel, b"do-not-remove").unwrap();
-        assert_eq!(
-            first.release_boot_root_pending().wait(),
-            CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
-        );
-        drop(first);
-
-        fs::remove_file(&marker_path).unwrap();
-        let mut replacement = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&marker_path)
-            .unwrap();
-        replacement.write_all(BOOT_MARKER).unwrap();
-        replacement
-            .set_permissions(Permissions::from_mode(0o600))
-            .unwrap();
-        replacement.sync_all().unwrap();
-
-        let recovery_remover = ScriptedRemover::new([]);
-        let recovered = WorkRootLease::acquire_with(
-            root.path(),
-            BOOT_B,
-            filesystem(
-                recovery_remover.clone(),
-                Arc::new(RecordingSleeper::default()),
-                Arc::new(NoopWorkRootHook),
-            ),
-        );
+        let remover = ScriptedRemover::new([]);
+        let first = owner_with_remover(root.path(), remover.clone());
+        let assignment = first.create_assignment(ASSIGNMENT).unwrap();
+        let workspace = assignment.workspace.path();
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::write(workspace.join(".git/HEAD"), b"ref: refs/heads/retained\n").unwrap();
+        fs::write(workspace.join("tracked"), b"dirty tracked\n").unwrap();
+        fs::write(workspace.join("untracked"), b"untracked bytes\n").unwrap();
+        fs::write(workspace.join("ignored.cache"), b"ignored bytes\n").unwrap();
+        fs::create_dir(workspace.join("build")).unwrap();
+        fs::write(workspace.join("build/output"), b"build output\n").unwrap();
 
         assert_eq!(
-            recovered.err().unwrap(),
-            WorkRootError::InvalidCleanupAuthority
-        );
-        assert_eq!(recovery_remover.calls.load(Ordering::Relaxed), 0);
-        assert_eq!(fs::read(sentinel).unwrap(), b"do-not-remove");
-        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-        drop(original_marker);
-    }
-
-    #[test]
-    fn recovery_rejects_authority_or_marker_tampering_and_path_replacement() {
-        for mutation in ["authority", "identity", "marker", "replacement"] {
-            let root = private_work_root();
-            let cleanup_identity = Arc::new(ControlledCleanupIdentityStore(Mutex::new(
-                [3_u8; CLEANUP_IDENTITY_BYTES],
-            )));
-            let failed_remover = ScriptedRemover::new([RemovalOutcome::Error; 6]);
-            let first = WorkRootLease::acquire_with(
-                root.path(),
-                BOOT_A,
-                WorkspaceFilesystem::injected_with_cleanup_identity(
-                    failed_remover,
-                    Arc::new(RecordingSleeper::default()),
-                    Arc::new(NoopWorkRootHook),
-                    cleanup_identity.clone(),
-                ),
-            )
-            .unwrap();
-            let stale_boot = first.boot_path().to_owned();
-            let sentinel = stale_boot.join("operator-sentinel");
-            let external_sentinel = root.path().join("operator-external-sentinel");
-            fs::write(&sentinel, b"do-not-remove").unwrap();
-            fs::write(&external_sentinel, b"outside-authority").unwrap();
-            assert!(matches!(
-                first.release_boot_root_pending().wait(),
-                CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
-            ));
-            drop(first);
-
-            match mutation {
-                "authority" => {
-                    fs::write(
-                        root.path().join(CLEANUP_AUTHORITY_NAME),
-                        b"changed-authority\n",
-                    )
-                    .unwrap();
-                }
-                "identity" => {
-                    *cleanup_identity.0.lock().unwrap() = [7_u8; CLEANUP_IDENTITY_BYTES];
-                }
-                "marker" => {
-                    fs::write(stale_boot.join(OWNERSHIP_MARKER_NAME), b"changed-owner\n").unwrap();
-                }
-                "replacement" => {
-                    fs::remove_dir_all(&stale_boot).unwrap();
-                    create_private_directory(&stale_boot).unwrap();
-                    fs::write(&sentinel, b"replacement").unwrap();
-                    *cleanup_identity.0.lock().unwrap() = [8_u8; CLEANUP_IDENTITY_BYTES];
-                }
-                _ => panic!("unknown recovery mutation"),
-            }
-            let recovery_remover = ScriptedRemover::new([]);
-            assert_eq!(
-                WorkRootLease::acquire_with(
-                    root.path(),
-                    BOOT_B,
-                    WorkspaceFilesystem::injected_with_cleanup_identity(
-                        recovery_remover.clone(),
-                        Arc::new(RecordingSleeper::default()),
-                        Arc::new(NoopWorkRootHook),
-                        cleanup_identity.clone(),
-                    ),
+            assignment
+                .release_pending(
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Failed),
                 )
-                .err()
-                .unwrap_or_else(|| panic!("{mutation} mutation was accepted")),
-                WorkRootError::InvalidCleanupAuthority
-            );
-            assert_eq!(recovery_remover.calls.load(Ordering::Relaxed), 0);
-            assert_eq!(
-                fs::read(&sentinel).unwrap(),
-                if mutation == "replacement" {
-                    b"replacement".as_slice()
-                } else {
-                    b"do-not-remove".as_slice()
-                }
-            );
-            assert_eq!(fs::read(external_sentinel).unwrap(), b"outside-authority");
-            assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
-            assert!(!root.path().join(BOOT_B).exists());
-        }
+                .wait(),
+            CleanupResult::Retained
+        );
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            first.release_boot_root_pending().wait(),
+            CleanupResult::Retained
+        );
+        drop(assignment);
+        drop(first);
+
+        let second = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
+        assert_eq!(
+            fs::read(workspace.join("tracked")).unwrap(),
+            b"dirty tracked\n"
+        );
+        assert_eq!(
+            fs::read(workspace.join("untracked")).unwrap(),
+            b"untracked bytes\n"
+        );
+        assert_eq!(
+            fs::read(workspace.join("ignored.cache")).unwrap(),
+            b"ignored bytes\n"
+        );
+        assert_eq!(
+            fs::read(workspace.join("build/output")).unwrap(),
+            b"build output\n"
+        );
+        assert_eq!(
+            fs::read(workspace.join(".git/HEAD")).unwrap(),
+            b"ref: refs/heads/retained\n"
+        );
+        assert_eq!(
+            second.startup_retained(),
+            &[RetainedWorkspace {
+                assignment_id: Some(ASSIGNMENT.to_owned()),
+                run_id: Some("run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
+                attempt_id: Some("atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
+                path: workspace,
+                reason: RetentionReason::Failed,
+            }]
+        );
+    }
+
+    #[test]
+    fn release_worker_spawn_failure_still_tears_down_runner_credentials() {
+        let root = private_work_root();
+        let filesystem = WorkspaceFilesystem::testing()
+            .with_workspace_release_spawner(Arc::new(RejectingWorkspaceReleaseSpawner));
+        let owner = WorkRootLease::acquire_with(root.path(), BOOT_A, filesystem).unwrap();
+        let (recorder, capture) = crate::runner::telemetry::test_recorder(BOOT_A);
+        let mut assignment = owner
+            .create_assignment_for_attempt(
+                ASSIGNMENT,
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                Some(recorder),
+            )
+            .unwrap();
+        let workspace = assignment.workspace.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let environment = crate::execution::workflow::admission::EnvironmentSnapshot::new([(
+            "PATH",
+            std::env::var_os("PATH").unwrap(),
+        )]);
+        let cancellation = crate::execution::workflow::artifact::CaptureCancellation::default();
+        let authority = super::super::workflow_git::WorkflowGitAuthority::install(
+            super::super::workflow_git::WorkflowGitInstall {
+                broker: super::super::source::test_support::unavailable_source_broker(),
+                assignment_id: ASSIGNMENT,
+                origin: Arc::from("https://github.example/acme/private.git"),
+                workspace: &workspace,
+                private_root: assignment.private.path(),
+                environment: &environment,
+                helper_executable: &std::env::current_exe().unwrap(),
+                clock: Arc::new(super::super::TokioSleeper),
+                recorder: None,
+                cancellation: &cancellation,
+            },
+        )
+        .unwrap();
+        let helper = assignment.private.path().join("workflow-git-credential");
+        assert!(helper.exists());
+        assignment.install_workflow_git(authority);
+
+        assert_eq!(
+            assignment
+                .release_workspace_pending(ProcessQuiescence::Proven, WorkspaceDisposition::Remove)
+                .wait(),
+            CleanupResult::Retained
+        );
+
+        assert!(!helper.exists());
+        assert!(workspace.exists());
+        let event = capture
+            .records()
+            .into_iter()
+            .find(|event| event["event.name"] == "runner.workspace_retained")
+            .expect("retention diagnostic");
+        assert_eq!(
+            event["scherzo.workspace.retention_reason"],
+            "release_worker_unavailable"
+        );
+        assert_eq!(event["scherzo.teardown.runner_credentials_removed"], true);
+        assert_eq!(event["scherzo.teardown.runner_credentials_revoked"], true);
+    }
+
+    #[test]
+    fn startup_does_not_trust_an_attempt_record_through_an_assignment_symlink() {
+        let root = private_work_root();
+        let external = private_work_root();
+        let first = WorkRootLease::acquire(root.path(), BOOT_A).unwrap();
+        let external_owner = WorkRootLease::acquire(external.path(), BOOT_A).unwrap();
+        let external_assignment = external_owner
+            .create_assignment_for_attempt(
+                ASSIGNMENT,
+                "run_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+                None,
+            )
+            .unwrap();
+        let external_assignment_path = external_assignment.execution.parent().unwrap();
+        let assignment_path = first.boot_path().join(ASSIGNMENT);
+        symlink(external_assignment_path, &assignment_path).unwrap();
+        drop(first);
+
+        let second = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
+
+        assert_eq!(
+            second.startup_retained(),
+            &[unknown_retained_root(&assignment_path)],
+            "a symlinked assignment is not a confined owned tree and must not borrow another attempt's identity",
+        );
+        assert!(assignment_path.is_symlink());
+        assert!(external_assignment_path.join(ATTEMPT_RECORD_NAME).exists());
+    }
+
+    #[test]
+    fn process_stop_failure_retains_without_invoking_the_remover() {
+        let root = private_work_root();
+        let remover = ScriptedRemover::new([]);
+        let owner = owner_with_remover(root.path(), remover.clone());
+        let (recorder, capture) = crate::runner::telemetry::test_recorder(BOOT_A);
+        let assignment = owner
+            .create_assignment_for_attempt(
+                ASSIGNMENT,
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                Some(recorder),
+            )
+            .unwrap();
+        fs::write(assignment.workspace.path().join("owned"), b"retained").unwrap();
+        let workspace = assignment.workspace.path();
+
+        assert_eq!(
+            assignment
+                .release_pending(ProcessQuiescence::Failed, WorkspaceDisposition::Remove,)
+                .wait(),
+            CleanupResult::Retained
+        );
+        assert_eq!(remover.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fs::read(workspace.join("owned")).unwrap(), b"retained");
+        let event = capture
+            .records()
+            .into_iter()
+            .find(|event| event["event.name"] == "runner.workspace_retained")
+            .expect("retention diagnostic");
+        assert_eq!(event["scherzo.assignment.id"], ASSIGNMENT);
+        assert_eq!(event["scherzo.run.id"], "run_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert_eq!(
+            event["scherzo.attempt.id"],
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
+        );
+        assert_eq!(
+            event["scherzo.workspace.path"],
+            workspace.to_string_lossy().as_ref()
+        );
+        assert_eq!(event["scherzo.teardown.owned_processes_stopped"], false);
+        assert_eq!(event["scherzo.teardown.runner_credentials_removed"], true);
+        assert_eq!(event["scherzo.teardown.runner_credentials_revoked"], true);
     }
 
     #[test]
@@ -2750,7 +2920,12 @@ mod tests {
             fs::read(boot_path.join("replacement-sentinel")).unwrap(),
             b"unproven replacement"
         );
-        assert!(root.path().join(CLEANUP_AUTHORITY_NAME).exists());
+        assert!(fs::read_dir(root.path()).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(CLEANUP_AUTHORITY_PREFIX))
+        }));
     }
 
     #[test]
@@ -2791,7 +2966,9 @@ mod tests {
         let assignment = owner.create_assignment(ASSIGNMENT).unwrap();
 
         assert_eq!(
-            assignment.release_pending(ProcessQuiescence::Proven).wait(),
+            assignment
+                .release_pending(ProcessQuiescence::Proven, WorkspaceDisposition::Remove)
+                .wait(),
             CleanupResult::Quarantined(CleanupFailure::Safety)
         );
         assert!(assignment_path.exists());
@@ -2832,7 +3009,9 @@ mod tests {
         }
 
         assert_eq!(
-            assignment.release_pending(ProcessQuiescence::Proven).wait(),
+            assignment
+                .release_pending(ProcessQuiescence::Proven, WorkspaceDisposition::Remove)
+                .wait(),
             CleanupResult::Released
         );
         assert!(!assignment_path.exists());
