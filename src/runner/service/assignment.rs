@@ -291,6 +291,69 @@ impl AssignmentDecision {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenewalDisposition {
+    Applied,
+    ReplayApplied,
+    ReplayRejected,
+    UnknownAssignment,
+    NotRunning,
+    CancellationStarted,
+    StaleSequence,
+    MissingBasis,
+}
+
+impl RenewalDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::ReplayApplied => "replay_applied",
+            Self::ReplayRejected => "replay_rejected",
+            Self::UnknownAssignment => "unknown_assignment",
+            Self::NotRunning => "not_running",
+            Self::CancellationStarted => "cancellation_started",
+            Self::StaleSequence => "stale_sequence",
+            Self::MissingBasis => "missing_basis",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RenewalDecision {
+    disposition: RenewalDisposition,
+    cancellation_headroom_ms: Option<i64>,
+    request_age_ms: Option<i64>,
+}
+
+impl RenewalDecision {
+    fn untimed(disposition: RenewalDisposition) -> Self {
+        Self {
+            disposition,
+            cancellation_headroom_ms: None,
+            request_age_ms: None,
+        }
+    }
+
+    pub(super) fn record(&self, event: &TelemetryEvent) {
+        use crate::runner::telemetry::attribute;
+        event.set(opentelemetry::KeyValue::new(
+            attribute::LEASE_DISPOSITION,
+            self.disposition.as_str(),
+        ));
+        for (key, value) in [
+            (
+                attribute::LEASE_CANCELLATION_HEADROOM_MS,
+                self.cancellation_headroom_ms,
+            ),
+            (attribute::LEASE_REQUEST_AGE_MS, self.request_age_ms),
+        ] {
+            if let Some(value) = value {
+                event.set(opentelemetry::KeyValue::new(key, value));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ExecutionReport {
     AssignmentInterrupted {
@@ -1103,7 +1166,13 @@ impl LeaseAuthority {
         let local_expiry = basis.checked_add(lease_duration)?;
         let force_stop_start = local_expiry.checked_sub(fencing_margin)?;
         let cancellation_start = force_stop_start.checked_sub(cancellation_grace)?;
-        let renewal_request = cancellation_start.checked_sub(renewal_delivery_budget)?;
+        // The advertised delivery budget is a minimum, not a scheduling target.
+        // Aim for 30 seconds of headroom, but keep at least half a short authority
+        // window before requesting again unless the policy requires an earlier request.
+        let cancellation_window = cancellation_start.checked_duration_since(basis)?;
+        let renewal_lead =
+            renewal_delivery_budget.max(Duration::from_secs(30).min(cancellation_window / 2));
+        let renewal_request = cancellation_start.checked_sub(renewal_lead)?;
         let force_stop_end = force_stop_start.checked_add(force_stop_reap_budget)?;
         Ok(Self {
             sequence,
@@ -2062,7 +2131,7 @@ impl AssignmentManager {
     pub(super) fn handle_renewal(
         &mut self,
         renewal: AssignmentRenewal,
-    ) -> Result<(), AssignmentManagerFailure> {
+    ) -> Result<RenewalDecision, AssignmentManagerFailure> {
         self.drain_events();
         if self.decisions.iter().any(|decision| {
             decision.offer.effect_id == renewal.effect_id
@@ -2073,14 +2142,20 @@ impl AssignmentManager {
         }) {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
-        if let Some(known) = self.decisions.iter().find_map(|decision| {
+        if let Some((known, disposition)) = self.decisions.iter().find_map(|decision| {
             decision
                 .renewals
                 .get(&renewal.effect_id)
-                .or_else(|| decision.rejected_renewals.get(&renewal.effect_id))
+                .map(|known| (known, RenewalDisposition::ReplayApplied))
+                .or_else(|| {
+                    decision
+                        .rejected_renewals
+                        .get(&renewal.effect_id)
+                        .map(|known| (known, RenewalDisposition::ReplayRejected))
+                })
         }) {
             return if known == &renewal {
-                Ok(())
+                Ok(RenewalDecision::untimed(disposition))
             } else {
                 Err(AssignmentManagerFailure::ConflictingOffer)
             };
@@ -2090,7 +2165,9 @@ impl AssignmentManager {
             .iter()
             .position(|decision| decision.offer.assignment_id == renewal.assignment_id)
         else {
-            return Ok(());
+            return Ok(RenewalDecision::untimed(
+                RenewalDisposition::UnknownAssignment,
+            ));
         };
         let decision = &self.decisions[index];
         if decision.offer.run_id != renewal.run_id
@@ -2116,10 +2193,10 @@ impl AssignmentManager {
             self.decisions[index]
                 .rejected_renewals
                 .insert(renewal.effect_id.clone(), renewal);
-            return Ok(());
+            return Ok(RenewalDecision::untimed(RenewalDisposition::NotRunning));
         }
         let Some(LocalSlot::Running(running)) = &self.slot else {
-            return Ok(());
+            return Ok(RenewalDecision::untimed(RenewalDisposition::NotRunning));
         };
         let now = match self.lease_clock.now() {
             Ok(now) => now,
@@ -2130,18 +2207,43 @@ impl AssignmentManager {
             Ok(ordering) => ordering,
             Err(_) => return Err(self.fail_lease_clock()),
         };
+        // These local monotonic durations diagnose queueing and deadline pressure;
+        // unavailable telemetry must not alter the authority decision.
+        let milliseconds =
+            |duration: Duration| crate::runner::telemetry::integer_u128(duration.as_millis());
+        let cancellation_headroom_ms = match cancellation_order {
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => authority
+                .cancellation_start
+                .checked_duration_since(now)
+                .ok()
+                .map(milliseconds),
+            std::cmp::Ordering::Greater => now
+                .checked_duration_since(authority.cancellation_start)
+                .ok()
+                .map(|duration| -milliseconds(duration)),
+        };
+        let request_age_ms = running
+            .causal_lease
+            .basis(renewal.lease.sequence)
+            .and_then(|basis| now.checked_duration_since(basis).ok())
+            .map(milliseconds);
+        let timed = |disposition| RenewalDecision {
+            disposition,
+            cancellation_headroom_ms,
+            request_age_ms,
+        };
         let cancellation_started = authority.revoked
             || running.cancellation.is_cancelled()
             || cancellation_order != std::cmp::Ordering::Less;
         if cancellation_started {
             let Some(LocalSlot::Running(running)) = &mut self.slot else {
-                return Ok(());
+                return Ok(timed(RenewalDisposition::NotRunning));
             };
             revoke_authority(running);
-            return Ok(());
+            return Ok(timed(RenewalDisposition::CancellationStarted));
         }
         if renewal.lease.sequence <= running.current_grant.sequence {
-            return Ok(());
+            return Ok(timed(RenewalDisposition::StaleSequence));
         }
         let expected_sequence = running
             .current_grant
@@ -2165,7 +2267,7 @@ impl AssignmentManager {
                 self.decisions[index]
                     .rejected_renewals
                     .insert(renewal.effect_id.clone(), renewal);
-                return Ok(());
+                return Ok(timed(RenewalDisposition::MissingBasis));
             }
             Err(GrantValidationFailure::Arithmetic) => {
                 return Err(self.fail_lease_clock());
@@ -2180,14 +2282,14 @@ impl AssignmentManager {
         }
 
         let Some(LocalSlot::Running(running)) = &mut self.slot else {
-            return Ok(());
+            return Ok(timed(RenewalDisposition::NotRunning));
         };
         running.current_grant = renewal.lease.clone();
         running.authority_updates.send_replace(next_authority);
         self.decisions[index]
             .renewals
             .insert(renewal.effect_id.clone(), renewal);
-        Ok(())
+        Ok(timed(RenewalDisposition::Applied))
     }
 
     pub(super) fn handle_release(
@@ -6294,6 +6396,86 @@ steps:
         .collect()
     }
 
+    #[test]
+    fn renewal_headroom_preserves_fencing_and_short_policy_windows() {
+        let (clock, _control, _waits) = controlled_lease_clock();
+        let basis = clock.now().unwrap();
+        for (grace, budget, lead_ms) in [
+            (0, 5, 30_000),
+            (30, 5, 30_000),
+            (270, 5, 19_500),
+            (300, 5, 5_000),
+            (300, 8, 8_000),
+        ] {
+            let mut policy = policy();
+            policy.renewal_delivery_budget_milliseconds = budget * 1000;
+            let authority =
+                LeaseAuthority::derive(1, basis, &policy, Duration::from_secs(grace)).unwrap();
+            let offsets = authority_offsets(&authority);
+            let lead = Duration::from_millis(lead_ms);
+            assert_eq!(
+                offsets,
+                vec![
+                    Duration::from_secs(309 - grace) - lead,
+                    Duration::from_secs(309 - grace),
+                    Duration::from_secs(309),
+                    Duration::from_secs(314),
+                    Duration::from_secs(320),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_renewal_is_applied_before_cancellation_and_reports_real_headroom() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let (clock, control, _waits) = controlled_lease_clock();
+        manager.lease_clock = clock;
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let job = execution_job(&mut manager, &offered);
+        let original = job.authority_updates.borrow().clone();
+        control.advance(
+            original
+                .renewal_request
+                .checked_duration_since(manager.lease_clock.now().unwrap())
+                .unwrap(),
+        );
+        let Some(LocalSlot::Running(running)) = &manager.slot else {
+            panic!("expected running assignment")
+        };
+        running
+            .causal_lease
+            .request_renewal(
+                1,
+                &offered.assignment_id,
+                &offered.attempt_id,
+                &manager.lease_clock,
+                &manager.outbox,
+            )
+            .unwrap();
+        control.advance(Duration::from_secs(20));
+        let renewal = renewal_for(&offered);
+        let decision = manager.handle_renewal(renewal.clone()).unwrap();
+        assert_eq!(decision.disposition, RenewalDisposition::Applied);
+        assert_eq!(decision.cancellation_headroom_ms, Some(10_000));
+        assert_eq!(decision.request_age_ms, Some(20_000));
+        assert_eq!(job.authority_updates.borrow().sequence, 2);
+        assert_eq!(
+            manager.handle_renewal(renewal).unwrap().disposition,
+            RenewalDisposition::ReplayApplied
+        );
+        let (recorder, capture) = crate::runner::telemetry::test_recorder("renewal-test");
+        let event = recorder.start("runner.effect_acknowledgement", []);
+        decision.record(&event);
+        event.finish(TelemetryOutcome::Success);
+        let event = capture.event("runner.effect_acknowledgement");
+        assert_eq!(event["scherzo.lease.disposition"], "applied");
+        assert_eq!(event["scherzo.lease.cancellation_headroom_ms"], 10_000);
+        assert_eq!(event["scherzo.lease.request_age_ms"], 20_000);
+    }
+
     #[tokio::test]
     async fn causal_acceptance_basis() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
@@ -6320,7 +6502,7 @@ steps:
         assert_eq!(
             authority_offsets(&authority),
             vec![
-                Duration::from_secs(303),
+                Duration::from_secs(278),
                 Duration::from_secs(308),
                 Duration::from_secs(309),
                 Duration::from_secs(314),
@@ -6720,7 +6902,7 @@ steps:
 
         let (renewal_duration, _renewal_release) =
             with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
-        assert_eq!(renewal_duration, Duration::from_secs(303));
+        assert_eq!(renewal_duration, Duration::from_secs(278));
         let notification = manager.notification();
         with_watchdog(async {
             loop {
@@ -6743,7 +6925,7 @@ steps:
 
         let (artifact_duration, _artifact_release) =
             with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
-        assert_eq!(artifact_duration, Duration::from_secs(303));
+        assert_eq!(artifact_duration, Duration::from_secs(278));
 
         let (delivery_duration, _delivery_release) =
             with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
@@ -6862,10 +7044,9 @@ steps:
             .expect("runner did not schedule a lease timer")
             .expect("lease timer channel closed");
 
-        // Cancellation starts after 308 seconds. The welcomed five-second renewal
-        // delivery budget requires a renewal request no later than second 303.
+        // Cancellation starts after 308 seconds; target 30 seconds of renewal headroom.
         assert!(
-            duration <= Duration::from_secs(303),
+            duration <= Duration::from_secs(278),
             "first lease timer was scheduled at {duration:?}"
         );
     }
@@ -6875,10 +7056,10 @@ steps:
         let (_temporary, mut manager, mut sleep_requests, _offered, workspace) =
             controlled_running_fixture().await;
 
-        lease_wait_request(&mut sleep_requests, Duration::from_secs(303))
+        lease_wait_request(&mut sleep_requests, Duration::from_secs(278))
             .await
             .release();
-        lease_wait_request(&mut sleep_requests, Duration::from_secs(5))
+        lease_wait_request(&mut sleep_requests, Duration::from_secs(30))
             .await
             .release();
 
@@ -6965,7 +7146,16 @@ steps:
         let _job = execution_job(&mut manager, &offered);
 
         control.advance(Duration::from_secs(308));
-        manager.handle_renewal(renewal_for(&offered)).unwrap();
+        let decision = manager.handle_renewal(renewal_for(&offered)).unwrap();
+        assert_eq!(
+            decision.disposition,
+            RenewalDisposition::CancellationStarted
+        );
+        assert_eq!(decision.cancellation_headroom_ms, Some(0));
+        control.advance(Duration::from_secs(2));
+        let late = manager.handle_renewal(renewal_for(&offered)).unwrap();
+        assert_eq!(late.disposition, RenewalDisposition::CancellationStarted);
+        assert_eq!(late.cancellation_headroom_ms, Some(-2000));
 
         let running = match &manager.slot {
             Some(LocalSlot::Running(running)) => running,
@@ -6988,7 +7178,7 @@ steps:
             controlled_running_fixture().await;
 
         let (duration, release) = with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
-        assert_eq!(duration, Duration::from_secs(303));
+        assert_eq!(duration, Duration::from_secs(278));
         release.release();
         let notification = manager.notification();
         let requested = with_watchdog(async {
@@ -7027,7 +7217,7 @@ steps:
         let (duration, _release) = with_watchdog(async {
             loop {
                 let request = sleep_requests.recv().await?;
-                if request.0 != Duration::from_secs(5) {
+                if request.0 != Duration::from_secs(30) {
                     break Some(request);
                 }
             }
@@ -7035,7 +7225,7 @@ steps:
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(duration, Duration::from_secs(303));
+        assert_eq!(duration, Duration::from_secs(278));
 
         let mut gap = renewal_for(&offered);
         gap.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned();

@@ -50,7 +50,6 @@ impl LeaseInstant {
         })
     }
 
-    #[cfg(test)]
     pub(super) fn checked_duration_since(self, earlier: Self) -> Result<Duration, LeaseClockError> {
         self.require_same_domain(earlier)?;
         let nanoseconds = self

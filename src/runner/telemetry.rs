@@ -22,6 +22,11 @@ pub(crate) mod attribute {
     pub(crate) const EFFECT_ACKNOWLEDGEMENTS_CONFIRMED: &str =
         "scherzo.runner.effect_acknowledgements_confirmed";
     pub(crate) const EFFECT_ID: &str = "scherzo.effect.id";
+    pub(crate) const LEASE_DISPOSITION: &str = "scherzo.lease.disposition";
+    pub(crate) const LEASE_DECISION_DELAY_MS: &str = "scherzo.lease.decision_delay_ms";
+    pub(crate) const LEASE_CANCELLATION_HEADROOM_MS: &str =
+        "scherzo.lease.cancellation_headroom_ms";
+    pub(crate) const LEASE_REQUEST_AGE_MS: &str = "scherzo.lease.request_age_ms";
     pub(crate) const EFFECTS_RECEIVED: &str = "scherzo.runner.effects_received";
     pub(crate) const ERROR_TYPE: &str = "error.type";
     pub(crate) const FAILURE_KIND: &str = "scherzo.connection.failure_kind";
@@ -463,6 +468,10 @@ impl Event {
         self.inner.context.span().set_attribute(attribute);
     }
 
+    pub(crate) fn elapsed_milliseconds(&self) -> i64 {
+        integer_u128(crate::timing::elapsed(self.inner.started_at).as_millis())
+    }
+
     pub(crate) fn finish(&self, outcome: Outcome) {
         let (event, prior_dropped_count) = {
             let mut state = self
@@ -480,8 +489,7 @@ impl Event {
                 OUTCOME.to_owned(),
                 Value::String(outcome.as_str().to_owned()),
             );
-            let duration_ms =
-                integer_u128(crate::timing::elapsed(self.inner.started_at).as_millis());
+            let duration_ms = self.elapsed_milliseconds();
             state
                 .fields
                 .insert(DURATION_MS.to_owned(), Value::Number(duration_ms.into()));

@@ -1384,6 +1384,16 @@ impl BufferedEffect {
                 KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
             ],
         );
+        if let CloudFrame::AssignmentLeaseRenewed { lease, .. } = &frame {
+            event.set(KeyValue::new(
+                telemetry::attribute::PROTOCOL_LEASE_SEQUENCE,
+                telemetry::integer(lease.sequence),
+            ));
+            event.set(KeyValue::new(
+                telemetry::attribute::LEASE_DISPOSITION,
+                "not_processed",
+            ));
+        }
         progress.effects_received = match progress.incremented(progress.effects_received) {
             Ok(count) => count,
             Err(error) => {
@@ -2383,7 +2393,24 @@ where
             }
             AssignmentManagerEffect::Start(start) => manager.handle_start(start),
             AssignmentManagerEffect::Renewal(renewal) => {
-                manager.handle_renewal(renewal).map(|_| None)
+                let result = manager.handle_renewal(renewal);
+                event.set(KeyValue::new(
+                    telemetry::attribute::LEASE_DECISION_DELAY_MS,
+                    event.elapsed_milliseconds(),
+                ));
+                match result {
+                    Ok(decision) => {
+                        decision.record(&event);
+                        Ok(None)
+                    }
+                    Err(failure) => {
+                        event.set(KeyValue::new(
+                            telemetry::attribute::LEASE_DISPOSITION,
+                            "error",
+                        ));
+                        Err(failure)
+                    }
+                }
             }
             AssignmentManagerEffect::Release {
                 assignment_id,
@@ -3224,6 +3251,49 @@ mod tests {
             .expect("window fixture timed out");
         result.expect("window fixture connection failed");
         assert_eq!(next_sequence, 35);
+    }
+
+    #[tokio::test]
+    async fn renewal_receipt_success_does_not_claim_authority_was_applied() {
+        let context =
+            EstablishedTestContext::with_endpoint("ws://127.0.0.1:9444/v1/runner/connect");
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            outbound.recv().await.unwrap();
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            inbound.send(Message::Text(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-lease-renewed.json"
+                ))
+                .into(),
+            ));
+            let receipt = outbound.recv().await.unwrap();
+            let receipt: serde_json::Value =
+                serde_json::from_str(receipt.to_text().unwrap()).unwrap();
+            assert_eq!(receipt["type"], "effect_acknowledged");
+            inbound.send(observation_acknowledgement(
+                receipt["messageId"].as_str().unwrap(),
+                receipt["sequence"].as_u64().unwrap(),
+            ));
+            inbound.send(Message::Close(None));
+        };
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .unwrap();
+        result.unwrap();
+        let event = context.capture.event("runner.effect_acknowledgement");
+        assert_eq!(event["scherzo.outcome"], "success");
+        assert_eq!(event["scherzo.lease.disposition"], "unknown_assignment");
+        assert!(event["scherzo.lease.decision_delay_ms"].as_u64().is_some());
+        assert!(
+            event
+                .get("scherzo.lease.cancellation_headroom_ms")
+                .is_none()
+        );
     }
 
     #[tokio::test]
