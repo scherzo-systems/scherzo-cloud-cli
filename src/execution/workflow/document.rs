@@ -22,6 +22,7 @@ pub(crate) struct WorkflowDocument {
 pub(crate) enum InputDeclaration {
     Text,
     Json { schema: Option<String> },
+    File { media_type: Option<String> },
     Attachments,
 }
 

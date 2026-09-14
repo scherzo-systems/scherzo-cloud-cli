@@ -11,8 +11,8 @@ use std::time::Duration;
 use super::*;
 use crate::execution::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedInput, ResolvedInputs,
-    ResolvedJsonInput, admit_workflow,
+    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedFile, ResolvedInput,
+    ResolvedInputs, ResolvedJsonInput, admit_workflow,
 };
 use crate::execution::workflow::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
@@ -453,6 +453,47 @@ fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() 
     assert_eq!(state.attempts[0].progress.steps[1].id, "second");
 
     drop(run);
+}
+
+#[test]
+fn singular_file_input_is_retained_and_reused_for_retry() {
+    let fixture = AdmittedFixture::from_source_with_inputs(
+        "schemaVersion: 1\ninputs:\n  payload: {kind: file, mediaType: application/octet-stream}\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command: {argv: [\"true\"]}\n",
+        ResolvedInputs::new(BTreeMap::from([(
+            "payload".to_owned(),
+            ResolvedInput::File(ResolvedFile::new(
+                Arc::from("application/octet-stream"),
+                Arc::from([0_u8, 0xff, 7]),
+            )),
+        )])),
+        1024,
+    );
+    let run_path = fixture.run_path("retained-file");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(run_path.join("workflow/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["inputs"]["payload"]["kind"], "file");
+    assert_eq!(
+        manifest["inputs"]["payload"]["mediaType"],
+        "application/octet-stream"
+    );
+    assert_eq!(manifest["inputs"]["payload"]["relativeFile"], "files/0002");
+    assert_eq!(
+        fs::read(run_path.join("workflow/files/0002")).unwrap(),
+        [0_u8, 0xff, 7]
+    );
+
+    settle_as_workflow_failed(&initial);
+    drop(initial);
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed File-input attempt should be retryable");
+    };
+    let Some(ResolvedInput::File(file)) = pending.execution_specification().1.get("payload") else {
+        panic!("retained File input is missing");
+    };
+    assert_eq!(file.media_type(), "application/octet-stream");
+    assert_eq!(file.bytes(), [0_u8, 0xff, 7]);
 }
 
 #[test]
@@ -1794,9 +1835,9 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
 #[test]
 fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
     let prefix = "a/b;x=";
-    let control_count = 128 - prefix.chars().count();
-    let media_type = format!("{prefix}{}", "\u{1}".repeat(control_count));
-    let source_media_type = format!("{prefix}{}", "\\u0001".repeat(control_count));
+    let value_count = 128 - prefix.chars().count();
+    let media_type = format!("{prefix}{}", "\u{1f600}".repeat(value_count));
+    let source_media_type = media_type.clone();
     let mut source = format!(
         "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      payload:\n        kind: file\n        from: path\n        path: payload.bin\n        mediaType: \"{source_media_type}\"\nexports:\n"
     );

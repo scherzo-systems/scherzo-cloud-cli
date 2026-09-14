@@ -1392,6 +1392,80 @@ fn json_input_admission_preserves_null_and_applies_the_retained_schema() {
 }
 
 #[test]
+fn file_input_admission_preserves_exact_media_type_without_sniffing_for_local_and_runner() {
+    let constrained = WorkflowFixture::new(
+        "schemaVersion: 1\ninputs:\n  payload: {kind: file, mediaType: application/octet-stream}\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    );
+    let input = |media_type: &'static str| {
+        ResolvedInputs::new(BTreeMap::from([(
+            "payload".to_owned(),
+            ResolvedInput::File(ResolvedFile::new(
+                Arc::from(media_type),
+                Arc::from(b"\x89PNG\r\n\x1a\nexact-bytes".as_slice()),
+            )),
+        )]))
+    };
+    let local = admit_workflow(
+        constrained.resolve(),
+        input("application/octet-stream"),
+        constrained.context(1, Duration::from_secs(1)),
+    )
+    .unwrap();
+    let runner = admit_runner_workflow(
+        constrained.resolve(),
+        input("application/octet-stream"),
+        constrained.context(1, Duration::from_secs(1)),
+    )
+    .unwrap();
+    for admitted in [local, runner] {
+        let Some(ResolvedInput::File(file)) = admitted.inputs().get("payload") else {
+            panic!("admitted singular File is missing");
+        };
+        assert_eq!(file.media_type(), "application/octet-stream");
+        assert_eq!(file.bytes(), b"\x89PNG\r\n\x1a\nexact-bytes");
+    }
+    for media_type in [
+        "Application/octet-stream",
+        "application/octet-stream; version=1",
+    ] {
+        assert_failure(
+            admit_workflow(
+                constrained.resolve(),
+                input(media_type),
+                constrained.context(1, Duration::from_secs(1)),
+            ),
+            AdmissionFailureKind::InputMediaTypeMismatch,
+            AdmissionLocation::Input {
+                name: "payload".to_owned(),
+            },
+        );
+    }
+
+    let unconstrained = WorkflowFixture::new(
+        "schemaVersion: 1\ninputs:\n  payload: {kind: file}\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    );
+    assert!(
+        admit_runner_workflow(
+            unconstrained.resolve(),
+            input("image/png"),
+            unconstrained.context(1, Duration::from_secs(1)),
+        )
+        .is_ok()
+    );
+    assert_failure(
+        admit_workflow(
+            unconstrained.resolve(),
+            input("not a media type"),
+            unconstrained.context(1, Duration::from_secs(1)),
+        ),
+        AdmissionFailureKind::InvalidFileMediaType,
+        AdmissionLocation::Input {
+            name: "payload".to_owned(),
+        },
+    );
+}
+
+#[test]
 fn admission_rejects_invalid_attachment_media_type() {
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
     let inputs = text_and_attachments_inputs(

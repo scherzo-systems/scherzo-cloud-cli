@@ -279,6 +279,38 @@ fn materializes_every_value_kind_with_exact_canonical_layout_and_private_copies(
 }
 
 #[test]
+fn materializes_singular_root_file_as_one_scalar_value() {
+    let fixture = Fixture::new(1, 4, 1024, 4096);
+    let file = ResolvedFile::new(
+        Arc::from("application/octet-stream"),
+        Arc::from([0_u8, 0xff, 7]),
+    );
+    let view = fixture
+        .inputs
+        .materialize(
+            &BTreeMap::from([("payload".to_owned(), InputValue::File(&file))]),
+            &fixture.artifacts,
+        )
+        .unwrap();
+    assert_eq!(
+        relative_tree(view.path()),
+        ["manifest.json", "values/payload"]
+    );
+    assert_eq!(
+        fs::read(view.path().join("values/payload")).unwrap(),
+        [0, 0xff, 7]
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(view.path().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["inputs"]["payload"]["kind"], "file");
+    assert_eq!(
+        manifest["inputs"]["payload"]["mediaType"],
+        "application/octet-stream"
+    );
+    assert_eq!(manifest["inputs"]["payload"]["path"], "values/payload");
+}
+
+#[test]
 fn canonical_json_bytes_are_materialized_without_reserialization() {
     let fixture = Fixture::new(1, 8, 1024, 2048);
     let exact = br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#;

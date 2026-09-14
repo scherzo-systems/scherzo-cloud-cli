@@ -533,7 +533,9 @@ impl RuntimeDefinition {
             .iter()
             .filter_map(|(name, input)| match input {
                 ResolvedInput::Text(value) => Some((name.clone(), Arc::clone(value))),
-                ResolvedInput::Json(_) | ResolvedInput::Attachments(_) => None,
+                ResolvedInput::Json(_) | ResolvedInput::File(_) | ResolvedInput::Attachments(_) => {
+                    None
+                }
             })
             .collect();
         definition.json_inputs = admitted
@@ -542,7 +544,9 @@ impl RuntimeDefinition {
             .iter()
             .filter_map(|(name, input)| match input {
                 ResolvedInput::Json(value) => Some((name.clone(), value.value_arc())),
-                ResolvedInput::Text(_) | ResolvedInput::Attachments(_) => None,
+                ResolvedInput::Text(_) | ResolvedInput::File(_) | ResolvedInput::Attachments(_) => {
+                    None
+                }
             })
             .collect();
         definition

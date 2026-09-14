@@ -10,8 +10,8 @@ Full language reference: <https://docs.scherzo.dev/reference/workflow-v1.md>
 
 Raw schema: <https://docs.scherzo.dev/schemas/workflow-v1.schema.json>
 
-This concise, version-aligned reference is embedded in `scherzo-cloud`. It covers
-Workflow V1 authoring and definition validation, not execution or repository changes.
+Embedded in `scherzo-cloud`: Workflow V1 authoring and validation, not execution or
+repository changes.
 
 ## Authoring loop
 
@@ -53,7 +53,7 @@ Workflow V1 authoring and definition validation, not execution or repository cha
 | --- | --- | --- |
 | `schemaVersion` | yes | Integer `1`. |
 | `description` | no | Human metadata with no execution effect. |
-| `inputs` | no | Named Text, JSON, and attachment declarations; JSON may name a schema. |
+| `inputs` | no | Named Text, JSON, File, or attachments; optional JSON schema or exact File media type. |
 | `agentProfiles` | no | Workflow-local harness configurations. |
 | `steps` | yes | At least one ordinary `cmd` or `agent` node. |
 | `finalizers` | no | Nodes considered after the ordinary phase. |
@@ -155,15 +155,17 @@ inputs:
 
 | Reference | Type and availability |
 | --- | --- |
-| `inputs.<name>` | The exact required declared Text or attachment-collection value. |
+| `inputs.<name>` | The exact required declared Text, JSON, File, or attachment-collection value. |
 | `outputs.<node>.<output>` | The declared output's exact type. |
 | `finalization.context` | Engine-owned JSON; finalizer command input or agent attachment only. |
 
-Ordinary nodes may reference inputs and ordinary outputs; finalizers may also reference
-finalizer outputs and `finalization.context`. Inputs add no edge. Conditions admit Text,
-not collections. All declarations are required; empty values must be explicit. This
-release accepts only `text` and `attachments`; root JSON/File declarations are invalid.
-Exports accept only outputs. V1 never converts types.
+Nodes reference inputs and ordinary outputs; finalizers may also reference finalizer
+outputs and `finalization.context`. Inputs add no edges. Conditions admit only Text/JSON
+values. All inputs are required, including explicit empties. Files require a supplied
+valid media type. Its parameter separators are only space or tab, and parameter values
+permit Unicode but not `;`, U+0000 through U+001F, or U+007F. A declared `mediaType`
+matches exactly—no normalization, inference, wildcards, or sniffing. Exports reference
+only outputs. Types never convert.
 
 ## Agent profiles
 
@@ -180,15 +182,12 @@ Each config is closed. Do not guess a model, translate effort values between har
 or add a fallback. Every agent node starts a fresh harness process, session, and
 conversation.
 
-For `claude_code`, Scherzo temporarily creates session-specific transcript and resource
-symlinks under the effective `CLAUDE_CONFIG_DIR` project-history directory
-(`$HOME/.claude` when the variable is unset), creating project directories as needed. It
-never replaces an existing session entry. After the Claude Code process and its
-descendants quiesce, Scherzo removes each link only when it is still the exact link
-Scherzo created; this identity check preserves an entry changed by another process, and
-empty project directories may remain. If Claude Code writes no nonempty transcript
-through the link, the run emits a `Claude Code native transcript capture missing`
-warning. The retained transcript is diagnostic only.
+For `claude_code`, session-specific transcript/resource symlinks live under
+`CLAUDE_CONFIG_DIR` (default `$HOME/.claude`) in project-history directories created
+as needed. Existing session entries are never replaced. After process-tree quiescence,
+only unchanged Scherzo-created links are removed; empty directories may remain.
+Missing or empty transcripts emit the `Claude Code native transcript capture missing`
+warning. Retained transcripts are diagnostic only.
 
 ```yaml
 inputs:

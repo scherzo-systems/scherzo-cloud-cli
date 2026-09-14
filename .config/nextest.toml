@@ -8,6 +8,12 @@ retries = 0
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# Pi adapter unit tests also launch process trees; share the process-capacity limit
+# without widening their cancellation deadlines or the default slow-test backstop.
+filter = "test(execution::workflow::pi_json_v1::adapter_tests)"
+test-group = "external-process"
+
+[[profile.default.overrides]]
 # Integration tests orchestrate external processes and receive a 120-second backstop.
 filter = "kind(test)"
 test-group = "external-process"

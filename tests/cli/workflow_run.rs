@@ -1071,6 +1071,96 @@ finalizers:
 }
 
 #[test]
+fn current_cli_black_box_accepts_all_seven_named_input_acquisition_forms() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+inputs:
+  inlineText: {kind: text}
+  fileText: {kind: text}
+  inlineJson: {kind: json}
+  fileJson: {kind: json}
+  payload: {kind: file, mediaType: application/octet-stream}
+  evidence: {kind: attachments}
+  emptyEvidence: {kind: attachments}
+steps:
+  inspect:
+    kind: cmd
+    inputs:
+      inlineText: {ref: inputs.inlineText}
+      fileText: {ref: inputs.fileText}
+      inlineJson: {ref: inputs.inlineJson}
+      fileJson: {ref: inputs.fileJson}
+      payload: {ref: inputs.payload}
+      evidence: {ref: inputs.evidence}
+      emptyEvidence: {ref: inputs.emptyEvidence}
+    command:
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          test "$(cat "$SCHERZO_STEP_INPUTS/values/inlineText")" = inline-text
+          test "$(cat "$SCHERZO_STEP_INPUTS/values/fileText")" = file-text
+          test "$(cat "$SCHERZO_STEP_INPUTS/values/inlineJson")" = '{"inline":true}'
+          test "$(cat "$SCHERZO_STEP_INPUTS/values/fileJson")" = '{"from":"file"}'
+          test "$(cat "$SCHERZO_STEP_INPUTS/values/payload")" = file-payload
+          test "$(cat "$SCHERZO_STEP_INPUTS/collections/evidence/000000")" = attachment
+          set -- "$SCHERZO_STEP_INPUTS/collections/emptyEvidence"/*
+          test "$1" = "$SCHERZO_STEP_INPUTS/collections/emptyEvidence/*"
+"#,
+    );
+    let text_path = bundle._temporary.path().join("input.txt");
+    let json_path = bundle._temporary.path().join("input.json");
+    let file_path = bundle._temporary.path().join("payload.bin");
+    let attachment_path = bundle._temporary.path().join("attachment.txt");
+    fs::write(&text_path, b"file-text").unwrap();
+    fs::write(&json_path, br#"{ "from": "file" }"#).unwrap();
+    fs::write(&file_path, b"file-payload").unwrap();
+    fs::write(&attachment_path, b"attachment").unwrap();
+
+    let destination = bundle.result("all-seven-input-forms");
+    let mut args = bundle.args(&destination);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-text".to_owned(),
+            "inlineText".to_owned(),
+            "inline-text".to_owned(),
+            "--input-text-file".to_owned(),
+            "fileText".to_owned(),
+            text_path.to_string_lossy().into_owned(),
+            "--input-json".to_owned(),
+            "inlineJson".to_owned(),
+            r#"{ "inline": true }"#.to_owned(),
+            "--input-json-file".to_owned(),
+            "fileJson".to_owned(),
+            json_path.to_string_lossy().into_owned(),
+            "--input-file".to_owned(),
+            "payload".to_owned(),
+            "application/octet-stream".to_owned(),
+            file_path.to_string_lossy().into_owned(),
+            "--input-attachment".to_owned(),
+            "evidence".to_owned(),
+            "text/plain".to_owned(),
+            attachment_path.to_string_lossy().into_owned(),
+            "--input-attachments-empty".to_owned(),
+            "emptyEvidence".to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let output = run(&args);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["result"]["steps"][0]["state"], "succeeded");
+}
+
+#[test]
 fn advisory_failure_keeps_truthful_state_and_returns_success() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1

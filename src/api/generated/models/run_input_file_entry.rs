@@ -17,20 +17,40 @@ use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OrganizationMembershipHistoryList {
-    #[serde(rename = "items")]
-    pub items: Vec<models::OrganizationMembershipHistoryEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+pub struct RunInputFileEntry {
+    #[serde(skip)]
+    pub kind: Kind,
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
+    #[serde(rename = "sizeBytes")]
+    pub size_bytes: i64,
+    #[serde(rename = "sha256")]
+    pub sha256: String,
 }
 
-impl OrganizationMembershipHistoryList {
+impl RunInputFileEntry {
     pub fn new(
-        items: Vec<models::OrganizationMembershipHistoryEntry>,
-    ) -> OrganizationMembershipHistoryList {
-        OrganizationMembershipHistoryList {
-            items,
-            next_cursor: None,
+        kind: Kind,
+        media_type: String,
+        size_bytes: i64,
+        sha256: String,
+    ) -> RunInputFileEntry {
+        RunInputFileEntry {
+            kind,
+            media_type,
+            size_bytes,
+            sha256,
         }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Kind {
+    #[serde(rename = "file")]
+    File,
+}
+
+impl Default for Kind {
+    fn default() -> Kind {
+        Self::File
     }
 }

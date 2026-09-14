@@ -16,6 +16,40 @@ fn canonical_valid_fixture() -> Vec<u8> {
 }
 
 #[test]
+fn media_type_parameters_use_horizontal_separators_and_control_free_unicode_values() {
+    for valid in [
+        "application/octet-stream;version=1",
+        "application/octet-stream ; version=1",
+        "application/octet-stream\t;\tversion=1",
+        "application/octet-stream ;\tversion=雪",
+    ] {
+        assert!(is_valid_media_type(valid), "valid media type: {valid:?}");
+    }
+
+    for control in (0..=0x1f).chain([0x7f]) {
+        let control = char::from_u32(control).unwrap();
+        let invalid = format!("application/octet-stream;version=one{control}two");
+        assert!(
+            !is_valid_media_type(&invalid),
+            "media type with U+{:04X} in a parameter value accepted",
+            u32::from(control)
+        );
+    }
+
+    for invalid in [
+        "application/octet-stream\n;version=1",
+        "application/octet-stream\r;version=1",
+        "application/octet-stream\u{000b};version=1",
+        "application/octet-stream\u{000c};version=1",
+    ] {
+        assert!(
+            !is_valid_media_type(invalid),
+            "media type with a non-horizontal separator accepted: {invalid:?}"
+        );
+    }
+}
+
+#[test]
 fn canonical_workflow_decodes_into_the_complete_execution_document() {
     let workflow = decode(&canonical_valid_fixture()).unwrap();
 

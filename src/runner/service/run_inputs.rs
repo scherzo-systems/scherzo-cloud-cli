@@ -17,7 +17,7 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 
 use crate::execution::workflow::admission::{
-    ResolvedAttachment, ResolvedInput, ResolvedInputs, ResolvedJsonInput,
+    ResolvedAttachment, ResolvedFile, ResolvedInput, ResolvedInputs, ResolvedJsonInput,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::runner::credential::Credential;
@@ -132,6 +132,13 @@ enum ManifestInput {
         sha256: String,
     },
     Json {
+        #[serde(rename = "sizeBytes")]
+        size_bytes: u64,
+        sha256: String,
+    },
+    File {
+        #[serde(rename = "mediaType")]
+        media_type: String,
         #[serde(rename = "sizeBytes")]
         size_bytes: u64,
         sha256: String,
@@ -615,6 +622,19 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
                 }
                 aggregate = add_manifest_bytes(aggregate, *size_bytes)?;
             }
+            ManifestInput::File {
+                media_type,
+                size_bytes,
+                sha256,
+            } => {
+                if *size_bytes > MAXIMUM_ATTACHMENT_BYTES
+                    || !crate::execution::workflow::is_valid_media_type(media_type)
+                    || !crate::execution::workflow::is_lowercase_hex(sha256, 64)
+                {
+                    return Err(RunInputFailure::ManifestMismatch);
+                }
+                aggregate = add_manifest_bytes(aggregate, *size_bytes)?;
+            }
             ManifestInput::Attachments { items } => {
                 attachment_count = attachment_count
                     .checked_add(items.len())
@@ -667,6 +687,21 @@ fn canonical_manifest(manifest: &ManifestV1) -> Result<String, RunInputFailure> 
                     canonical,
                     "{{\"kind\":\"json\",\"sha256\":{},\"sizeBytes\":{size_bytes}}}",
                     serde_json::to_string(sha256).map_err(|_| RunInputFailure::ManifestMismatch)?,
+                )
+                .map_err(|_| RunInputFailure::ManifestMismatch)?;
+            }
+            ManifestInput::File {
+                media_type,
+                size_bytes,
+                sha256,
+            } => {
+                write!(
+                    canonical,
+                    "{{\"kind\":\"file\",\"mediaType\":{},\"sha256\":{},\"sizeBytes\":{size_bytes}}}",
+                    serde_json::to_string(media_type)
+                        .map_err(|_| RunInputFailure::ManifestMismatch)?,
+                    serde_json::to_string(sha256)
+                        .map_err(|_| RunInputFailure::ManifestMismatch)?,
                 )
                 .map_err(|_| RunInputFailure::ManifestMismatch)?;
             }
@@ -723,6 +758,17 @@ fn logical_members(manifest: &ManifestV1) -> Result<Vec<LogicalMember>, RunInput
             ManifestInput::Json { size_bytes, sha256 } => members.push(LogicalMember {
                 member_id: format!("inputs/{name}"),
                 media_type: JSON_MEDIA_TYPE.to_owned(),
+                size_bytes: *size_bytes,
+                sha256: sha256.clone(),
+                final_name: format!("member-{:06}", members.len()),
+            }),
+            ManifestInput::File {
+                media_type,
+                size_bytes,
+                sha256,
+            } => members.push(LogicalMember {
+                member_id: format!("inputs/{name}"),
+                media_type: media_type.clone(),
                 size_bytes: *size_bytes,
                 sha256: sha256.clone(),
                 final_name: format!("member-{:06}", members.len()),
@@ -870,6 +916,17 @@ fn construct_inputs(
                         .map_err(|_| RunInputFailure::JsonInvalid)?,
                 )
             }
+            ManifestInput::File { media_type, .. } => {
+                let path = completed
+                    .get(completed_index)
+                    .ok_or(RunInputFailure::EnvironmentUnavailable)?;
+                completed_index += 1;
+                let bytes = fs::read(path).map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
+                ResolvedInput::File(ResolvedFile::new(
+                    Arc::from(media_type.as_str()),
+                    Arc::from(bytes),
+                ))
+            }
             ManifestInput::Attachments { items } => {
                 let mut attachments = Vec::with_capacity(items.len());
                 for attachment in items {
@@ -981,6 +1038,7 @@ fn exact_manifest_shape(value: &Value) -> bool {
     value["inputs"].as_object().is_some_and(|inputs| {
         inputs.values().all(|input| match input["kind"].as_str() {
             Some("text" | "json") => exact_object(input, &["kind", "sizeBytes", "sha256"]),
+            Some("file") => exact_object(input, &["kind", "mediaType", "sizeBytes", "sha256"]),
             Some("attachments") => {
                 exact_object(input, &["kind", "items"])
                     && input["items"].as_array().is_some_and(|items| {
@@ -1439,8 +1497,9 @@ mod tests {
     }
 
     #[test]
-    fn verifies_manifest_before_download_and_preserves_empty_text_and_collection_order() {
+    fn verifies_manifest_before_download_and_preserves_file_and_collection_order() {
         let empty = Vec::new();
+        let file = vec![0_u8, 0xff, 7];
         let second = b"second".to_vec();
         let first = b"first".to_vec();
         let manifest = ManifestV1 {
@@ -1452,6 +1511,25 @@ mod tests {
                         size_bytes: 0,
                         sha256: lowercase_hex_bytes(digest(&SHA256, &empty).as_ref()),
                     },
+                ),
+                (
+                    "settings".to_owned(),
+                    ManifestInput::Json {
+                        size_bytes: 4,
+                        sha256: lowercase_hex_bytes(digest(&SHA256, b"null").as_ref()),
+                    },
+                ),
+                (
+                    "payload".to_owned(),
+                    ManifestInput::File {
+                        media_type: "application/octet-stream".to_owned(),
+                        size_bytes: u64::try_from(file.len()).unwrap(),
+                        sha256: lowercase_hex_bytes(digest(&SHA256, &file).as_ref()),
+                    },
+                ),
+                (
+                    "emptyEvidence".to_owned(),
+                    ManifestInput::Attachments { items: Vec::new() },
                 ),
                 (
                     "evidence".to_owned(),
@@ -1476,10 +1554,30 @@ mod tests {
                 ),
             ]),
         };
-        let (broker, projection) = broker_for(manifest, vec![second.clone(), first.clone(), empty]);
+        let (broker, projection) = broker_for(
+            manifest,
+            vec![
+                second.clone(),
+                first.clone(),
+                file.clone(),
+                empty,
+                b"null".to_vec(),
+            ],
+        );
         let private = tempfile::tempdir().unwrap();
         let inputs = materialize_projection(&broker, &projection, private.path()).unwrap();
         assert_eq!(text_value(&inputs, "request"), "");
+        let Some(ResolvedInput::File(payload)) = inputs.get("payload") else {
+            panic!("named File input is missing");
+        };
+        assert_eq!(payload.media_type(), "application/octet-stream");
+        assert_eq!(payload.bytes(), file);
+        let Some(ResolvedInput::Json(settings)) = inputs.get("settings") else {
+            panic!("named JSON input is missing");
+        };
+        assert_eq!(settings.source(), b"null");
+        assert!(settings.value().is_null());
+        assert!(attachment_values(&inputs, "emptyEvidence").is_empty());
         let attachments = attachment_values(&inputs, "evidence");
         assert_eq!(attachments[0].bytes(), second);
         assert_eq!(attachments[1].bytes(), first);
@@ -1488,7 +1586,7 @@ mod tests {
             Some("reverse-upload-two")
         );
         assert_eq!(*broker.manifest_calls.lock().unwrap(), 1);
-        assert_eq!(broker.download_calls.lock().unwrap().len(), 3);
+        assert_eq!(broker.download_calls.lock().unwrap().len(), 5);
 
         let staging = fs::read_dir(private.path())
             .unwrap()
@@ -1501,10 +1599,16 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             names,
-            ["member-000000", "member-000001", "member-000002"]
-                .into_iter()
-                .map(std::ffi::OsString::from)
-                .collect()
+            [
+                "member-000000",
+                "member-000001",
+                "member-000002",
+                "member-000003",
+                "member-000004",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect()
         );
         assert!(!staging[0].join("reverse-upload-one").exists());
         for name in names {

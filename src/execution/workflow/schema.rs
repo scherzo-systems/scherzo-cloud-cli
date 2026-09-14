@@ -34,6 +34,11 @@ enum InputDeclarationDto {
     Text,
     #[serde(rename = "json")]
     Json { schema: Option<String> },
+    #[serde(rename = "file")]
+    File {
+        #[serde(rename = "mediaType")]
+        media_type: Option<String>,
+    },
     #[serde(rename = "attachments")]
     Attachments,
 }
@@ -347,6 +352,9 @@ impl WorkflowDto {
                 let declaration = match declaration {
                     InputDeclarationDto::Text => InputDeclaration::Text,
                     InputDeclarationDto::Json { schema } => InputDeclaration::Json { schema },
+                    InputDeclarationDto::File { media_type } => {
+                        InputDeclaration::File { media_type }
+                    }
                     InputDeclarationDto::Attachments => InputDeclaration::Attachments,
                 };
                 (name, declaration)

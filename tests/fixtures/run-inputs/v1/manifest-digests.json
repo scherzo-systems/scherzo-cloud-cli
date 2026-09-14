@@ -32,6 +32,22 @@
       "sha256": "5783ea899e00cab824646ccec768c64a9fef5f7bfe421bb44e633d62ee2a630f"
     },
     {
+      "name": "present-empty-file",
+      "manifest": {
+        "schemaVersion": 1,
+        "inputs": {
+          "payload": {
+            "kind": "file",
+            "mediaType": "application/octet-stream",
+            "sizeBytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      },
+      "canonical": "{\"inputs\":{\"payload\":{\"kind\":\"file\",\"mediaType\":\"application/octet-stream\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"sizeBytes\":0}},\"schemaVersion\":1}",
+      "sha256": "6eaf8bb151ad131454d6a86edeab2d2b995462a98fbff681e3731b2dfbf656b1"
+    },
+    {
       "name": "zero-object-empty-collection",
       "manifest": {
         "schemaVersion": 1,

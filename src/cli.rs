@@ -43,8 +43,11 @@ mod version;
 mod workflow;
 
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Deref;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -74,6 +77,41 @@ struct JsonInlineInput {
         help = "Supply one required named JSON value"
     )]
     input_json: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct FileInput {
+    #[arg(
+        long,
+        value_names = ["NAME", "MEDIA_TYPE", "PATH"],
+        num_args = 3,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named File value with an explicit media type (maximum 64 MiB)"
+    )]
+    input_file: Vec<OsString>,
+}
+
+#[derive(Debug)]
+enum OpenRegularFileError {
+    Open(io::Error),
+    Metadata(io::Error),
+    NotRegular,
+}
+
+fn open_regular_file_nonblocking(path: &Path) -> Result<File, OpenRegularFileError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(OpenRegularFileError::Open)?;
+    if !file
+        .metadata()
+        .map_err(OpenRegularFileError::Metadata)?
+        .is_file()
+    {
+        return Err(OpenRegularFileError::NotRegular);
+    }
+    Ok(file)
 }
 
 #[derive(Clone, Debug)]

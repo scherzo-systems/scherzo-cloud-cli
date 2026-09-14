@@ -169,6 +169,21 @@ fn create_args_with_text_input<'a>(
     create_args_with_scalar_input("--input-text-file", input_name, input_file, json)
 }
 
+fn create_args_with_file_input<'a>(
+    input_name: &'a str,
+    media_type: &'a str,
+    input_file: &'a str,
+    json: bool,
+) -> Vec<&'a str> {
+    let mut args: Vec<&'a str> = create_args(json);
+    let insertion = args.len() - 1;
+    args.splice(
+        insertion..insertion,
+        ["--input-file", input_name, media_type, input_file],
+    );
+    args
+}
+
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     let observed = digest(&SHA256, bytes);
     let mut sha256 = [0_u8; 32];
@@ -186,6 +201,16 @@ fn hex_digest(bytes: &[u8]) -> String {
 fn scalar_manifest_digest(bytes: &[u8], kind: &str) -> String {
     let canonical = format!(
         "{{\"inputs\":{{\"request\":{{\"kind\":\"{kind}\",\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
+        hex_digest(bytes),
+        bytes.len()
+    );
+    hex_digest(canonical.as_bytes())
+}
+
+fn file_manifest_digest(bytes: &[u8], media_type: &str) -> String {
+    let canonical = format!(
+        "{{\"inputs\":{{\"request\":{{\"kind\":\"file\",\"mediaType\":{},\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
+        serde_json::to_string(media_type).unwrap(),
         hex_digest(bytes),
         bytes.len()
     );
@@ -234,6 +259,18 @@ fn scalar_input_set_body(
     body
 }
 
+fn file_input_set_body(
+    bytes: &[u8],
+    media_type: &str,
+    state: &str,
+    uploaded: bool,
+) -> serde_json::Value {
+    let mut body = scalar_input_set_body(bytes, "file", state, uploaded, false);
+    body["manifest"]["inputs"]["request"]["mediaType"] = serde_json::json!(media_type);
+    body["manifestDigest"]["value"] = serde_json::json!(file_manifest_digest(bytes, media_type));
+    body
+}
+
 fn create_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> Vec<u8> {
     http_response_with_headers(
         "201 Created",
@@ -246,6 +283,21 @@ fn create_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) ->
             ),
         ],
         &serde_json::to_vec(&scalar_input_set_body(bytes, kind, "open", false, replayed)).unwrap(),
+    )
+}
+
+fn create_file_input_set_response(bytes: &[u8], media_type: &str) -> Vec<u8> {
+    http_response_with_headers(
+        "201 Created",
+        Some("application/json"),
+        &[
+            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+            (
+                "Location",
+                "/v1/organizations/acme-research/run-input-sets/ris_01k0z6r1w8f4jy2m7q9v3x5abc",
+            ),
+        ],
+        &serde_json::to_vec(&file_input_set_body(bytes, media_type, "open", false)).unwrap(),
     )
 }
 
@@ -278,6 +330,15 @@ fn scalar_upload_capability_response(bytes: &[u8], media_type: &str, url: &str) 
 
 fn upload_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
     scalar_upload_capability_response(bytes, "text/plain; charset=utf-8", url)
+}
+
+fn seal_file_input_set_response(bytes: &[u8], media_type: &str) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &serde_json::to_vec(&file_input_set_body(bytes, media_type, "sealed", true)).unwrap(),
+    )
 }
 
 fn seal_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> Vec<u8> {
@@ -611,6 +672,103 @@ fn run_create_stages_named_json_sources_without_rewriting_bytes() {
 }
 
 #[test]
+fn run_create_stages_named_file_with_exact_media_type_and_bytes() {
+    let input_bytes = *b"exact file bytes";
+    let media_type = "application/octet-stream; version=1";
+    let input_directory = tempfile::tempdir().unwrap();
+    let input_path = input_directory.path().join("request.bin");
+    fs::write(&input_path, input_bytes).unwrap();
+    let input_path = input_path.to_str().unwrap();
+    let storage = OneShotServer::respond("204 No Content", None, b"");
+    let signed_url = format!(
+        "{}/private/request?signature=unique-file-capability-sentinel",
+        storage.api_url
+    );
+    let (server, _credential_directory, credential_path) = prepared_run(vec![
+        create_file_input_set_response(&input_bytes, media_type),
+        scalar_upload_capability_response(&input_bytes, media_type, &signed_url),
+        seal_file_input_set_response(&input_bytes, media_type),
+        acceptance_response(false),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &create_args_with_file_input("request", media_type, input_path, true),
+        &environment,
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_no_secret_output(&output, &[TOKEN, "unique-file-capability-sentinel"]);
+    let requests = server.finish();
+    assert_eq!(
+        request_body(&requests[0]),
+        serde_json::json!({
+            "projectId": PROJECT_ID,
+            "schemaVersion": 1,
+            "inputs": {
+                "request": {
+                    "kind": "file",
+                    "mediaType": media_type,
+                    "sizeBytes": input_bytes.len(),
+                    "sha256": hex_digest(&input_bytes)
+                }
+            }
+        })
+    );
+    assert_eq!(
+        request_body(&requests[1]),
+        serde_json::json!({"members": ["inputs/request"]})
+    );
+    assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
+
+    let upload = storage.finish();
+    assert_eq!(
+        upload.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+        input_bytes
+    );
+    assert_eq!(header_value(&upload, "content-type"), media_type);
+}
+
+#[test]
+fn named_file_parameter_controls_stop_before_cloud_input_set_allocation() {
+    let input_directory = tempfile::tempdir().unwrap();
+    let input_path = input_directory.path().join("request.bin");
+    fs::write(&input_path, b"private file input").unwrap();
+    let input_path = input_path.to_str().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture(&credential_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+    let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
+
+    for control in ['\u{000b}', '\u{000c}', '\u{007f}'] {
+        let media_type = format!("application/octet-stream;version=one{control}two");
+        let output = run_with_env(
+            &create_args_with_file_input("request", &media_type, input_path, true),
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let failure: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(failure["outcome"], "invalid_input");
+        assert_no_secret_output(&output, &[TOKEN, "private file input"]);
+    }
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[test]
 fn invalid_json_and_scalar_binding_conflicts_stop_before_cloud_access() {
     let input_directory = tempfile::tempdir().unwrap();
     let text_path = input_directory.path().join("request.txt");
@@ -635,6 +793,13 @@ fn invalid_json_and_scalar_binding_conflicts_stop_before_cloud_access() {
     );
     assert_eq!(malformed.status.code(), Some(1));
     assert_no_secret_output(&malformed, &[TOKEN, "secret"]);
+
+    let malformed_file = run_with_env(
+        &create_args_with_file_input("request", "not a media type", text_path, true),
+        &environment,
+    );
+    assert_eq!(malformed_file.status.code(), Some(1));
+    assert_no_secret_output(&malformed_file, &[TOKEN, "private text input"]);
 
     let mut conflicting = create_args_with_text_input("request", text_path, true);
     let insertion = conflicting.len() - 1;

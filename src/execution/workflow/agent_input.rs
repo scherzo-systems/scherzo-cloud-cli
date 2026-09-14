@@ -1141,9 +1141,10 @@ fn resolve_text<'a>(
             value_type: WorkflowValueType::Text,
         } => match admitted.inputs().get(name) {
             Some(ResolvedInput::Text(text)) => Ok(text),
-            Some(ResolvedInput::Json(_)) | Some(ResolvedInput::Attachments(_)) | None => {
-                Err(start_error(AgentInputStartFailure::InputsUnavailable))
-            }
+            Some(ResolvedInput::Json(_))
+            | Some(ResolvedInput::File(_))
+            | Some(ResolvedInput::Attachments(_))
+            | None => Err(start_error(AgentInputStartFailure::InputsUnavailable)),
         },
         ValidatedMessageSource::Reference {
             source: ResolvedValueSource::Output(source),
@@ -1160,6 +1161,23 @@ fn resolve_text<'a>(
             Err(start_error(AgentInputStartFailure::InputsUnavailable))
         }
     }
+}
+
+fn push_named_input_attachment<'a>(
+    name: &str,
+    payload: PlannedAttachment<'a>,
+    media_type: Arc<str>,
+    budget: &mut AttachmentBudget,
+    attachments: &mut Vec<PlannedAgentAttachment<'a>>,
+) -> Result<(), AgentInputMaterializationError> {
+    budget.push(
+        PlannedAgentAttachment {
+            payload,
+            media_type,
+            diagnostic_source_name: Some(Arc::from(format!("inputs.{name}"))),
+        },
+        attachments,
+    )
 }
 
 fn resolve_attachments<'a>(
@@ -1189,12 +1207,26 @@ fn resolve_attachments<'a>(
             let Some(ResolvedInput::Json(json)) = admitted.inputs().get(name) else {
                 return Err(start_error(AgentInputStartFailure::InputsUnavailable));
             };
-            budget.push(
-                PlannedAgentAttachment {
-                    payload: PlannedAttachment::CanonicalJson(json.canonical()),
-                    media_type: Arc::from("application/json"),
-                    diagnostic_source_name: Some(Arc::from(format!("inputs.{name}"))),
-                },
+            push_named_input_attachment(
+                name,
+                PlannedAttachment::CanonicalJson(json.canonical()),
+                Arc::from("application/json"),
+                budget,
+                attachments,
+            )?;
+        }
+        ValidatedMessageSource::Reference {
+            source: ResolvedValueSource::Input(name),
+            value_type: WorkflowValueType::File,
+        } => {
+            let Some(ResolvedInput::File(file)) = admitted.inputs().get(name) else {
+                return Err(start_error(AgentInputStartFailure::InputsUnavailable));
+            };
+            push_named_input_attachment(
+                name,
+                PlannedAttachment::Bytes(file.bytes()),
+                Arc::from(file.media_type()),
+                budget,
                 attachments,
             )?;
         }

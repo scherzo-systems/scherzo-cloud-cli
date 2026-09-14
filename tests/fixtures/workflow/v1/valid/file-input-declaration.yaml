@@ -1,0 +1,17 @@
+schemaVersion: 1
+inputs:
+  source:
+    kind: file
+    mediaType: text/plain
+  unconstrained:
+    kind: file
+steps:
+  consume:
+    kind: cmd
+    inputs:
+      source:
+        ref: inputs.source
+      unconstrained:
+        ref: inputs.unconstrained
+    command:
+      argv: ["true"]

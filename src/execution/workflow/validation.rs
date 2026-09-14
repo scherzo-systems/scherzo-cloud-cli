@@ -141,6 +141,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
             let value_type = match declaration {
                 InputDeclaration::Text => WorkflowValueType::Text,
                 InputDeclaration::Json { .. } => WorkflowValueType::Json,
+                InputDeclaration::File { .. } => WorkflowValueType::File,
                 InputDeclaration::Attachments => WorkflowValueType::AttachmentCollection,
             };
             (name.clone(), value_type)
@@ -155,6 +156,20 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
             } => Some((name.clone(), schema.clone())),
             InputDeclaration::Text
             | InputDeclaration::Json { schema: None }
+            | InputDeclaration::File { .. }
+            | InputDeclaration::Attachments => None,
+        })
+        .collect();
+    let input_file_media_types = document
+        .inputs
+        .iter()
+        .filter_map(|(name, declaration)| match declaration {
+            InputDeclaration::File {
+                media_type: Some(media_type),
+            } => Some((name.clone(), media_type.clone())),
+            InputDeclaration::Text
+            | InputDeclaration::Json { .. }
+            | InputDeclaration::File { media_type: None }
             | InputDeclaration::Attachments => None,
         })
         .collect();
@@ -216,6 +231,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         exports,
         required_inputs,
         input_json_schema_paths,
+        input_file_media_types,
     })
 }
 

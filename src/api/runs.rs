@@ -21,6 +21,9 @@ use super::problem::{
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+// A 64 MiB File needs a larger transfer budget than metadata requests. Storage
+// still enforces the signed capability's expiry; this does not renew authority.
+const STORAGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CREATE_ATTEMPTS: usize = 2;
 const TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
 const INPUT_JSON_MEDIA_TYPE: &str = "application/json";
@@ -41,6 +44,7 @@ pub(crate) struct CreateRunInput<'a> {
 pub(crate) enum NamedScalarInputKind {
     Text,
     Json,
+    File,
 }
 
 impl NamedScalarInputKind {
@@ -48,13 +52,15 @@ impl NamedScalarInputKind {
         match self {
             Self::Text => "text",
             Self::Json => "json",
+            Self::File => "file",
         }
     }
 
-    const fn media_type(self) -> &'static str {
+    pub(crate) const fn default_media_type(self) -> Option<&'static str> {
         match self {
-            Self::Text => TEXT_MEDIA_TYPE,
-            Self::Json => INPUT_JSON_MEDIA_TYPE,
+            Self::Text => Some(TEXT_MEDIA_TYPE),
+            Self::Json => Some(INPUT_JSON_MEDIA_TYPE),
+            Self::File => None,
         }
     }
 }
@@ -63,6 +69,7 @@ impl NamedScalarInputKind {
 pub(crate) struct NamedScalarInputMetadata {
     pub(crate) name: String,
     pub(crate) kind: NamedScalarInputKind,
+    pub(crate) media_type: String,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: [u8; 32],
 }
@@ -178,6 +185,14 @@ impl<'a> RunApi<'a> {
             NamedScalarInputKind::Json => {
                 models::RunInputManifestEntry::Json(Box::new(models::RunInputJsonEntry::new(
                     models::run_input_json_entry::Kind::Json,
+                    size_bytes,
+                    sha256,
+                )))
+            }
+            NamedScalarInputKind::File => {
+                models::RunInputManifestEntry::File(Box::new(models::RunInputFileEntry::new(
+                    models::run_input_file_entry::Kind::File,
+                    metadata.media_type.clone(),
                     size_bytes,
                     sha256,
                 )))
@@ -404,7 +419,7 @@ impl<'a> RunApi<'a> {
         );
         let status =
             self.storage_transport
-                .signed_storage_put(&capability.url, headers, bytes, REQUEST_TIMEOUT)
+                .signed_storage_put(&capability.url, headers, bytes, STORAGE_UPLOAD_TIMEOUT)
                 .map_err(|error| match error {
                     SignedStorageRequestError::Build
                     | SignedStorageRequestError::InvalidRequest => RunFailure::protocol(false),
@@ -574,6 +589,12 @@ fn validate_scalar_input_set(
                     && u64::try_from(json.size_bytes).ok() == Some(metadata.size_bytes)
                     && json.sha256 == expected_scalar_sha256
             }
+            (NamedScalarInputKind::File, models::RunInputManifestEntry::File(file)) => {
+                file.kind == models::run_input_file_entry::Kind::File
+                    && file.media_type == metadata.media_type
+                    && u64::try_from(file.size_bytes).ok() == Some(metadata.size_bytes)
+                    && file.sha256 == expected_scalar_sha256
+            }
             (_, _) => false,
         })
         && set.manifest_digest.algorithm
@@ -632,7 +653,7 @@ fn validate_scalar_upload_capability(
         base64::engine::general_purpose::STANDARD.encode(input_set.metadata.sha256);
     let headers = member.required_headers;
     if headers.content_length != expected_content_length
-        || headers.content_type != input_set.metadata.kind.media_type()
+        || headers.content_type != input_set.metadata.media_type
         || headers.if_none_match != models::run_input_upload_required_headers::IfNoneMatch::Star
         || headers.x_amz_checksum_sha256 != expected_checksum
     {
@@ -670,10 +691,19 @@ fn require_private_no_store(response: &ReceivedResponse) -> Result<(), RunFailur
 }
 
 fn scalar_manifest_digest(metadata: &NamedScalarInputMetadata) -> [u8; 32] {
+    let media_type = if metadata.kind == NamedScalarInputKind::File {
+        format!(
+            ",\"mediaType\":{}",
+            serde_json::to_string(&metadata.media_type).unwrap_or_default()
+        )
+    } else {
+        String::new()
+    };
     let canonical = format!(
-        "{{\"inputs\":{{\"{}\":{{\"kind\":\"{}\",\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
+        "{{\"inputs\":{{\"{}\":{{\"kind\":\"{}\"{},\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
         metadata.name,
         metadata.kind.as_str(),
+        media_type,
         lowercase_hex_digest(metadata.sha256),
         metadata.size_bytes
     );
@@ -699,6 +729,79 @@ fn lowercase_hex_digest(digest: [u8; 32]) -> String {
         encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_file_media_type_mismatch_problem() {
+        let response = ReceivedResponse {
+            status: StatusCode::CONFLICT,
+            content_type: Some(HeaderValue::from_static(PROBLEM_MEDIA_TYPE)),
+            idempotency_keys: Vec::new(),
+            locations: Vec::new(),
+            cache_controls: Vec::new(),
+            body: serde_json::to_vec(&serde_json::json!({
+                "type": "https://api.scherzo.dev/problems/run-input-bindings-invalid",
+                "title": "Run Input bindings invalid",
+                "status": 409,
+                "diagnostic": {
+                    "code": "input_media_type_mismatch",
+                    "input": "payload"
+                }
+            }))
+            .unwrap(),
+        };
+
+        assert_eq!(
+            classify_failure(&response, RunOperation::Create),
+            RunFailure::Conflict
+        );
+    }
+
+    #[test]
+    fn validates_singular_file_input_set_projection() {
+        let bytes = [0_u8, 0xff, 7, b'\n'];
+        let media_type = "application/octet-stream; version=1";
+        let metadata = NamedScalarInputMetadata {
+            name: "request".to_owned(),
+            kind: NamedScalarInputKind::File,
+            media_type: media_type.to_owned(),
+            size_bytes: u64::try_from(bytes.len()).unwrap(),
+            sha256: digest_bytes(&bytes),
+        };
+        let set: models::RunInputSet = serde_json::from_value(serde_json::json!({
+            "id": "ris_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "boundsProfile": 1,
+            "manifest": {"schemaVersion": 1, "inputs": {"request": {
+                "kind": "file", "mediaType": media_type,
+                "sizeBytes": bytes.len(), "sha256": lowercase_hex_digest(metadata.sha256)
+            }}},
+            "manifestDigest": {"algorithm": "sha256", "value": lowercase_hex_digest(scalar_manifest_digest(&metadata))},
+            "inputCount": 1,
+            "attachmentCount": 0,
+            "aggregateSizeBytes": bytes.len(),
+            "state": "open",
+            "createdAt": "2026-08-24T01:00:00Z",
+            "openDeadlineAt": "2026-08-25T01:00:00Z",
+            "members": [{"memberId": "inputs/request", "uploadConfirmed": false}],
+            "replayed": false
+        })).unwrap();
+        assert!(
+            validate_scalar_input_set(
+                set,
+                "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                &metadata,
+                scalar_manifest_digest(&metadata),
+                ExpectedInputSetState::Open,
+            )
+            .is_ok()
+        );
+    }
 }
 
 fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {

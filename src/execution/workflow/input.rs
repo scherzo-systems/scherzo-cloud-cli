@@ -11,7 +11,7 @@ use rustix::fs::{AtFlags, Mode, chmodat, mkdirat, unlinkat};
 use rustix::io::Errno;
 use serde::Serialize;
 
-use super::admission::{AdmittedExecutionContext, ResolvedAttachment};
+use super::admission::{AdmittedExecutionContext, ResolvedAttachment, ResolvedFile};
 use super::artifact::{ArtifactReadFailure, ArtifactStaging};
 use super::execution_root::{AdmittedExecutionRoot, open_directory};
 #[cfg(test)]
@@ -132,6 +132,7 @@ impl std::error::Error for InputPreparationFailure {}
 
 pub(crate) enum InputValue<'a> {
     Text(&'a str),
+    File(&'a ResolvedFile),
     Attachments(&'a [ResolvedAttachment]),
     CanonicalJson(&'a [u8]),
     Captured {
@@ -461,6 +462,16 @@ impl InputStaging {
                         ManifestInput::scalar("text", "text/plain; charset=utf-8", relative_path),
                     );
                 }
+                InputValue::File(file) => {
+                    ensure_directory(&values_root, &mut values_created)?;
+                    let relative_path = format!("values/{input_identity}");
+                    write_bytes_read_only(&root.join(&relative_path), file.bytes())
+                        .map_err(|_| staging_for_input(input_identity))?;
+                    manifest_inputs.insert(
+                        input_identity.clone(),
+                        ManifestInput::scalar("file", file.media_type(), relative_path),
+                    );
+                }
                 InputValue::Attachments(attachments) => {
                     ensure_directory(&collections_root, &mut collections_created)?;
                     let relative_directory = format!("collections/{input_identity}");
@@ -691,6 +702,13 @@ impl MaterializationPlan {
                     staging,
                     &mut total_bytes,
                     byte_length(text.as_bytes(), input_identity)?,
+                    input_identity,
+                    None,
+                )?,
+                InputValue::File(file) => add_payload_size(
+                    staging,
+                    &mut total_bytes,
+                    byte_length(file.bytes(), input_identity)?,
                     input_identity,
                     None,
                 )?,

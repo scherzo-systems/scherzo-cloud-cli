@@ -22,6 +22,8 @@ Options:
           Supply one required named JSON value
       --input-json-file <NAME> <PATH>
           Supply one required named JSON value from a regular file, or - for standard input
+      --input-file <NAME> <MEDIA_TYPE> <PATH>
+          Supply one required named File value with an explicit media type (maximum 64 MiB)
       --input-attachment <NAME> <MEDIA_TYPE> <PATH>
           Append an immutable member to a named attachment collection
       --input-attachments-empty <NAME>

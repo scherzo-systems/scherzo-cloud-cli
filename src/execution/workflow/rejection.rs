@@ -739,9 +739,17 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
             "input_schema_mismatch",
             "Supply a JSON value that satisfies this workflow input schema.",
         )),
+        AdmissionFailureKind::InvalidFileMediaType => Some((
+            "invalid_file_media_type",
+            "Supply a syntactically valid media type for this File input.",
+        )),
         AdmissionFailureKind::InvalidAttachmentMediaType => Some((
             "invalid_attachment_media_type",
             "Supply a syntactically valid media type for this attachment.",
+        )),
+        AdmissionFailureKind::InputMediaTypeMismatch => Some((
+            "input_media_type_mismatch",
+            "Supply the exact media type declared for this File input.",
         )),
         AdmissionFailureKind::AgentStepRuntimeUnsupported => Some((
             "agent_step_runtime_unsupported",

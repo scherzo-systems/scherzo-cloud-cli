@@ -1991,6 +1991,7 @@ where
                             Some(ResolvedInput::Json(json)) => {
                                 InputValue::CanonicalJson(json.canonical())
                             }
+                            Some(ResolvedInput::File(file)) => InputValue::File(file),
                             Some(ResolvedInput::Attachments(attachments)) => {
                                 InputValue::Attachments(attachments)
                             }

@@ -756,11 +756,12 @@ steps:
 }
 
 #[test]
-fn named_text_conditions_are_phase_valid_and_collections_are_rejected() {
+fn named_text_conditions_are_phase_valid_and_non_text_inputs_are_rejected() {
     let source = "schemaVersion: 1
 inputs:
   request: {kind: text}
   evidence: {kind: attachments}
+  payload: {kind: file}
 steps:
   ordinary:
     kind: cmd
@@ -792,33 +793,35 @@ finalizers:
             Some(&ResolvedValueSource::Input("request".to_owned()))
         );
     }
-    for (node, location) in [
-        (
-            "ordinary",
-            ValidationLocation::StepCondition {
-                step: "ordinary".to_owned(),
-            },
-        ),
-        (
-            "finish",
-            ValidationLocation::FinalizerCondition {
-                finalizer: "finish".to_owned(),
-            },
-        ),
-    ] {
-        let mut invalid = source.to_owned();
-        let start = invalid.find(&format!("  {node}:")).unwrap();
-        let relative = invalid[start..].find("ref: inputs.request").unwrap();
-        let offset = start + relative;
-        invalid.replace_range(
-            offset..offset + "ref: inputs.request".len(),
-            "ref: inputs.evidence",
-        );
-        assert_failure(
-            &invalid,
-            ValidationFailureKind::InvalidConditionReference,
-            location,
-        );
+    for rejected_input in ["evidence", "payload"] {
+        for (node, location) in [
+            (
+                "ordinary",
+                ValidationLocation::StepCondition {
+                    step: "ordinary".to_owned(),
+                },
+            ),
+            (
+                "finish",
+                ValidationLocation::FinalizerCondition {
+                    finalizer: "finish".to_owned(),
+                },
+            ),
+        ] {
+            let mut invalid = source.to_owned();
+            let start = invalid.find(&format!("  {node}:")).unwrap();
+            let relative = invalid[start..].find("ref: inputs.request").unwrap();
+            let offset = start + relative;
+            invalid.replace_range(
+                offset..offset + "ref: inputs.request".len(),
+                &format!("ref: inputs.{rejected_input}"),
+            );
+            assert_failure(
+                &invalid,
+                ValidationFailureKind::InvalidConditionReference,
+                location,
+            );
+        }
     }
 }
 

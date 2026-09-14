@@ -189,6 +189,12 @@ enum ManifestInputV1 {
         #[serde(flatten)]
         file: ManifestFileV1,
     },
+    File {
+        #[serde(rename = "mediaType")]
+        media_type: String,
+        #[serde(flatten)]
+        file: ManifestFileV1,
+    },
     Attachments {
         items: Vec<ManifestAttachmentV1>,
     },
@@ -1752,6 +1758,15 @@ fn retain_execution_specification(
                     file: retain_file(files, ordinal, json.source())?,
                 }
             }
+            ResolvedInput::File(value) => {
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                ManifestInputV1::File {
+                    media_type: value.media_type().to_owned(),
+                    file: retain_file(files, ordinal, value.bytes())?,
+                }
+            }
             ResolvedInput::Attachments(attachments) => {
                 let mut items = Vec::with_capacity(attachments.len());
                 for attachment in attachments.iter() {
@@ -3166,6 +3181,22 @@ pub(super) fn load_retained_execution_with_budget(
                     ResolvedInput::Text(text)
                 }
             }
+            ManifestInputV1::File { media_type, file } => {
+                if file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES
+                    || !super::is_valid_media_type(media_type)
+                {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                ResolvedInput::File(super::admission::ResolvedFile::new(
+                    Arc::<str>::from(media_type.as_str()),
+                    Arc::<[u8]>::from(read_file(file)?),
+                ))
+            }
             ManifestInputV1::Attachments { items } => {
                 attachment_count = attachment_count
                     .checked_add(items.len())
@@ -3210,6 +3241,9 @@ pub(super) fn load_retained_execution_with_budget(
                     super::validated::WorkflowValueType::Json,
                     Some(ResolvedInput::Json(_))
                 ) | (
+                    super::validated::WorkflowValueType::File,
+                    Some(ResolvedInput::File(_))
+                ) | (
                     super::validated::WorkflowValueType::AttachmentCollection,
                     Some(ResolvedInput::Attachments(_))
                 )
@@ -3230,7 +3264,9 @@ fn retained_manifest_file_count(
 ) -> Result<u64, LocalRunDirectoryError> {
     let input_files = manifest.inputs.values().try_fold(0_usize, |count, input| {
         count.checked_add(match input {
-            ManifestInputV1::Text { .. } | ManifestInputV1::Json { .. } => 1,
+            ManifestInputV1::Text { .. }
+            | ManifestInputV1::Json { .. }
+            | ManifestInputV1::File { .. } => 1,
             ManifestInputV1::Attachments { items } => items.len(),
         })
     });
@@ -4244,6 +4280,19 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
         match input {
             ManifestInputV1::Text { file } | ManifestInputV1::Json { file } => {
                 if file.size_bytes > MAXIMUM_RETAINED_TEXT_BYTES {
+                    return Err(LocalRunDirectoryError::SerializationUnavailable);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                retained_files.push(file);
+            }
+            ManifestInputV1::File { media_type, file } => {
+                if file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES
+                    || !super::is_valid_media_type(media_type)
+                {
                     return Err(LocalRunDirectoryError::SerializationUnavailable);
                 }
                 account_retained_bytes(

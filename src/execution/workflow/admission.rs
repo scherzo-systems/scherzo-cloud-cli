@@ -459,6 +459,35 @@ async fn poll_watch_change<T: Clone>(
 }
 
 #[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ResolvedFile {
+    media_type: Arc<str>,
+    bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for ResolvedFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedFile(<redacted>)")
+    }
+}
+
+impl ResolvedFile {
+    // A singular File deliberately remains a distinct value type from attachment members.
+    // jscpd:ignore-start
+    pub(crate) fn new(media_type: Arc<str>, bytes: Arc<[u8]>) -> Self {
+        Self { media_type, bytes }
+    }
+
+    pub(crate) fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    // jscpd:ignore-end
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ResolvedAttachment {
     media_type: Arc<str>,
     bytes: Arc<[u8]>,
@@ -577,6 +606,7 @@ impl std::fmt::Debug for ResolvedJsonInput {
 pub(crate) enum ResolvedInput {
     Text(Arc<str>),
     Json(ResolvedJsonInput),
+    File(ResolvedFile),
     Attachments(Arc<[ResolvedAttachment]>),
 }
 
@@ -1241,7 +1271,9 @@ pub(crate) enum AdmissionFailureKind {
     UnexpectedInput,
     InputKindMismatch,
     InputSchemaMismatch,
+    InvalidFileMediaType,
     InvalidAttachmentMediaType,
+    InputMediaTypeMismatch,
     AgentStepRuntimeUnsupported,
     ExecutionRootUnavailable,
     ExecutionRootNotDirectory,
@@ -1418,6 +1450,25 @@ fn admit_workflow_for(
             }
             (Some(super::validated::WorkflowValueType::Text), Some(ResolvedInput::Text(_))) => {}
             (Some(super::validated::WorkflowValueType::Json), Some(ResolvedInput::Json(_))) => {}
+            (Some(super::validated::WorkflowValueType::File), Some(ResolvedInput::File(file))) => {
+                if !super::is_valid_media_type(file.media_type()) {
+                    return Err(AdmissionFailure::new(
+                        AdmissionFailureKind::InvalidFileMediaType,
+                        AdmissionLocation::Input { name: name.clone() },
+                    ));
+                }
+                if workflow
+                    .definition
+                    .input_file_media_types
+                    .get(name)
+                    .is_some_and(|required| required != file.media_type())
+                {
+                    return Err(AdmissionFailure::new(
+                        AdmissionFailureKind::InputMediaTypeMismatch,
+                        AdmissionLocation::Input { name: name.clone() },
+                    ));
+                }
+            }
             (
                 Some(super::validated::WorkflowValueType::AttachmentCollection),
                 Some(ResolvedInput::Attachments(attachments)),

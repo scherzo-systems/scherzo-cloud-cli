@@ -89,7 +89,7 @@ enum WorkflowCommand {
     #[command(about = retry::ABOUT, after_help = retry::AFTER_HELP)]
     Retry(retry::Command),
     #[command(about = run::ABOUT, after_help = run::AFTER_HELP)]
-    Run(run::Command),
+    Run(Box<run::Command>),
     #[command(about = schema::ABOUT, after_help = schema::AFTER_HELP)]
     Schema(schema::Command),
     #[command(about = status::ABOUT)]

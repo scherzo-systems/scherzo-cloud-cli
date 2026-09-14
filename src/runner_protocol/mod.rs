@@ -1947,6 +1947,29 @@ mod tests {
     }
 
     #[test]
+    fn generated_artifact_media_type_uses_the_canonical_parameter_grammar() {
+        for valid in [
+            "application/octet-stream;version=1",
+            "application/octet-stream ; version=1",
+            "application/octet-stream\t;\tversion=1",
+            "application/octet-stream ;\tversion=雪",
+        ] {
+            assert!(
+                valid.parse::<generated::ArtifactMediaType>().is_ok(),
+                "valid media type: {valid:?}"
+            );
+        }
+        for control in ['\u{000b}', '\u{000c}', '\u{007f}'] {
+            let invalid = format!("application/octet-stream;version=one{control}two");
+            assert!(
+                invalid.parse::<generated::ArtifactMediaType>().is_err(),
+                "media type with U+{:04X} in a parameter value accepted",
+                u32::from(control)
+            );
+        }
+    }
+
+    #[test]
     fn decode_cloud_frame_rejects_runner_directed_frames() {
         assert!(matches!(
             decode_cloud_frame(VALID_FIXTURES[0]),

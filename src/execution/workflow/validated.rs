@@ -48,6 +48,7 @@ pub(crate) struct ValidatedWorkflow {
     pub(crate) exports: BTreeMap<String, ResolvedOutputSource>,
     pub(crate) required_inputs: RequiredInputs,
     pub(crate) input_json_schema_paths: BTreeMap<String, String>,
+    pub(crate) input_file_media_types: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
