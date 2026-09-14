@@ -34,10 +34,12 @@ fi
 # The exported source has no parent wrapper. Retain only values required by its
 # test contract and the exact Devenv binary used by nested boundary tests.
 keep_variables=(
+  CARGO_BUILD_JOBS
   CARGO_TARGET_DIR
   CI
   DEVENV_TUI
   HOME
+  RUSTC_WRAPPER
   SCHERZO_STRICT_DEVENV_BINARY
 )
 printf -v keep_list '%s,' "${keep_variables[@]}"

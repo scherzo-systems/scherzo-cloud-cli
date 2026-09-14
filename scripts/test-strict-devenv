@@ -23,7 +23,9 @@ chmod +x "$ambient_directory/$ambient_command"
 # The single-quoted program is evaluated by the clean child shell.
 # shellcheck disable=SC2016
 if ! PATH="$ambient_directory:$PATH" \
+  CARGO_BUILD_JOBS=1 \
   CARGO_TARGET_DIR="$cargo_target" \
+  RUSTC_WRAPPER="$ambient_directory/$ambient_command" \
   DEVENV_TUI=false \
   SCHERZO_CLI_STRICT_DEVENV_TEST_MARKER="$marker_value" \
   "$boundary" shell -- bash -c '
@@ -33,6 +35,8 @@ if ! PATH="$ambient_directory:$PATH" \
     ambient_command=$3
     diagnostic=$4
     [[ ${CARGO_TARGET_DIR:-} == "$expected_target" ]]
+    [[ ${CARGO_BUILD_JOBS:-} == 1 ]]
+    [[ ${RUSTC_WRAPPER:-} == "$ambient_directory/$ambient_command" ]]
     [[ ${DEVENV_TUI:-} == false ]]
     [[ -z ${SCHERZO_CLI_STRICT_DEVENV_TEST_MARKER+x} ]]
     [[ :$PATH: != *":$ambient_directory:"* ]]
