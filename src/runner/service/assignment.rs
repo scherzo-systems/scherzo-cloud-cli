@@ -435,7 +435,24 @@ pub(super) enum ArtifactRequest {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ArtifactRequestKind {
+    RegisterCarrier,
+    ConfirmCarrier,
+    RegisterResult,
+    ConfirmResult,
+}
+
 impl ArtifactRequest {
+    fn kind(&self) -> ArtifactRequestKind {
+        match self {
+            Self::RegisterCarrier { .. } => ArtifactRequestKind::RegisterCarrier,
+            Self::ConfirmCarrier { .. } => ArtifactRequestKind::ConfirmCarrier,
+            Self::RegisterResult { .. } => ArtifactRequestKind::RegisterResult,
+            Self::ConfirmResult { .. } => ArtifactRequestKind::ConfirmResult,
+        }
+    }
+
     fn assignment_id(&self) -> &str {
         match self {
             Self::RegisterCarrier { assignment_id, .. }
@@ -612,9 +629,12 @@ pub(super) struct PendingAssignmentObservation {
 }
 
 impl PendingAssignmentObservation {
-    pub(super) fn artifact_delivery_id(&self) -> Option<u64> {
+    pub(super) fn artifact_request(&self) -> Option<(u64, ArtifactRequestKind)> {
         match &self.observation {
-            AssignmentObservation::Artifact { delivery_id, .. } => Some(*delivery_id),
+            AssignmentObservation::Artifact {
+                delivery_id,
+                request,
+            } => Some((*delivery_id, request.kind())),
             _ => None,
         }
     }
@@ -1049,6 +1069,17 @@ enum GrantValidationFailure {
 }
 
 impl LeaseAuthority {
+    pub(super) fn permits_artifact_delivery(
+        &self,
+        now: LeaseInstant,
+    ) -> Result<bool, LeaseClockError> {
+        Ok(!self.revoked
+            && matches!(
+                now.checked_cmp(self.local_expiry)?,
+                std::cmp::Ordering::Less
+            ))
+    }
+
     fn derive(
         sequence: u64,
         basis: LeaseInstant,
@@ -2309,9 +2340,10 @@ impl AssignmentManager {
         delivery_id: u64,
         response: ArtifactCloudResponse,
     ) -> Result<(), ArtifactDeliveryProtocolFailure> {
-        self.outbox.acknowledge(observation_id);
         self.artifact_delivery
-            .handle_response(delivery_id, response)
+            .handle_response(delivery_id, response)?;
+        self.outbox.acknowledge(observation_id);
+        Ok(())
     }
 
     pub(super) fn finish_transport(&mut self) {
@@ -6858,12 +6890,12 @@ steps:
                 let pending = manager.pending_observations(&BTreeSet::new(), 100);
                 if let Some(artifact) = pending
                     .iter()
-                    .find(|entry| entry.artifact_delivery_id().is_some())
+                    .find(|entry| entry.artifact_request().is_some())
                 {
                     manager
                         .handle_artifact_response(
                             artifact.id,
-                            artifact.artifact_delivery_id().unwrap(),
+                            artifact.artifact_request().unwrap().0,
                             ArtifactCloudResponse::ResultRegistration(
                                 ArtifactResultRegistrationResponse {
                                     request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc"

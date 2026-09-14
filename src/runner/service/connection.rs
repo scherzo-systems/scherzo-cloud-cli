@@ -19,9 +19,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 
 use crate::runner::service::artifact_delivery::ArtifactCloudResponse;
 use crate::runner::service::assignment::{
-    AssignmentManager, AssignmentManagerFailure, AssignmentOffer, AssignmentPrepare,
-    AssignmentRenewal, AssignmentStart, PendingAssignmentObservation, RetainedObservationFrame,
-    WelcomePolicyFailure,
+    ArtifactRequestKind, AssignmentManager, AssignmentManagerFailure, AssignmentOffer,
+    AssignmentPrepare, AssignmentRenewal, AssignmentStart, PendingAssignmentObservation,
+    RetainedObservationFrame, WelcomePolicyFailure,
 };
 use crate::runner::service::config::Config;
 use crate::runner::service::control::LiveStatus;
@@ -1303,8 +1303,14 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingObservationKind {
     EffectReceipt,
-    AssignmentObservation { id: u64 },
-    ArtifactObservation { id: u64, delivery_id: u64 },
+    AssignmentObservation {
+        id: u64,
+    },
+    ArtifactObservation {
+        id: u64,
+        delivery_id: u64,
+        request_kind: ArtifactRequestKind,
+    },
 }
 
 struct PendingObservation {
@@ -2188,9 +2194,17 @@ fn handle_artifact_cloud_response(
         .iter()
         .find(|pending| pending.message_id == *request_message_id)
         .ok_or(ConnectionCause::UnexpectedGatewayFrame)?;
-    let PendingObservationKind::ArtifactObservation { id, delivery_id } = pending.kind else {
+    let PendingObservationKind::ArtifactObservation {
+        id,
+        delivery_id,
+        request_kind,
+    } = pending.kind
+    else {
         return Err(ConnectionCause::UnexpectedGatewayFrame);
     };
+    if request_kind != response.request_kind() {
+        return Err(ConnectionCause::UnexpectedGatewayFrame);
+    }
     assignment_manager
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2455,10 +2469,11 @@ where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
     // jscpd:ignore-end
-    let kind = match pending.artifact_delivery_id() {
-        Some(delivery_id) => PendingObservationKind::ArtifactObservation {
+    let kind = match pending.artifact_request() {
+        Some((delivery_id, request_kind)) => PendingObservationKind::ArtifactObservation {
             id: pending.id,
             delivery_id,
+            request_kind,
         },
         None => PendingObservationKind::AssignmentObservation { id: pending.id },
     };
@@ -2637,6 +2652,7 @@ pub(crate) fn opening_hello(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, VecDeque};
     use std::fs::{self, File};
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -2661,13 +2677,16 @@ mod tests {
     use super::{
         ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
         ConnectionProgress, FailureKind, FrameSource, OBSERVATION_WINDOW, OpeningHello,
-        ProtocolLog, RUNNER_PROTOCOL_EVENT_NAME, close_locally, close_outcome, opening_hello, run,
+        PendingObservation, PendingObservationKind, ProtocolLog, RUNNER_PROTOCOL_EVENT_NAME,
+        close_locally, close_outcome, handle_artifact_cloud_response, opening_hello, run,
         run_established,
     };
     use crate::runner::credential::test_credential;
-    use crate::runner::service::artifact_delivery::{ArtifactDeliverySpec, ArtifactUploadBody};
+    use crate::runner::service::artifact_delivery::{
+        ArtifactCloudResponse, ArtifactDeliverySpec, ArtifactUploadBody,
+    };
     use crate::runner::service::assignment::{
-        AssignmentManager, AssignmentOffer, AssignmentRootPreparer,
+        ArtifactRequestKind, AssignmentManager, AssignmentOffer, AssignmentRootPreparer,
         test_support::{
             artifact_delivery, enqueue_finalization_terminal, enqueue_lease_clock_failure_report,
             enqueue_transitions, install_root_preparer, manager as manager_fixture,
@@ -3538,11 +3557,125 @@ mod tests {
     #[tokio::test]
     async fn artifact_delivery_puts_directly_and_confirms_success_and_precondition_replay() {
         for upload_status in [200, 412] {
-            run_artifact_delivery_case(upload_status).await;
+            run_artifact_delivery_case(upload_status, None).await;
         }
     }
 
-    async fn run_artifact_delivery_case(upload_status: u16) {
+    #[tokio::test]
+    async fn cancelled_artifact_response_preserves_connection() {
+        for kind in [
+            ArtifactRequestKind::RegisterCarrier,
+            ArtifactRequestKind::ConfirmCarrier,
+        ] {
+            run_artifact_delivery_case(200, Some(kind)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_delivery_still_requires_exact_request_and_response_kind() {
+        use crate::runner_protocol::{
+            ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse,
+        };
+        let context =
+            EstablishedTestContext::with_endpoint("ws://127.0.0.1:9444/v1/runner/connect");
+        let broker = artifact_delivery(&context.assignment_manager.lock().unwrap());
+        let mut completion = broker
+            .start(ArtifactDeliverySpec::result(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+                Arc::from(&b"{}"[..]),
+            ))
+            .unwrap();
+        let pending = context
+            .assignment_manager
+            .lock()
+            .unwrap()
+            .pending_observations(&BTreeSet::new(), 1)
+            .pop()
+            .unwrap();
+        let (delivery_id, request_kind) = pending.artifact_request().unwrap();
+        let mut in_flight = VecDeque::from([PendingObservation {
+            message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            sequence: 2,
+            kind: PendingObservationKind::ArtifactObservation {
+                id: pending.id,
+                delivery_id,
+                request_kind,
+            },
+        }]);
+        broker.cancel_assignment("asn_01k0z6r1w8f4jy2m7q9v3x5abh");
+        assert_eq!(
+            completion.try_recv(),
+            Ok(crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome::AuthorityLost)
+        );
+        let response = |request_message_id: &str| {
+            ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
+                request_message_id: request_message_id.to_owned(),
+                outcome: ArtifactResultRegistrationOutcome::Retryable,
+            })
+        };
+        assert_eq!(
+            handle_artifact_cloud_response(
+                &context.assignment_manager,
+                &in_flight,
+                response("rmsg_01k0z6r1w8f4jy2m7q9v3x5abd")
+            ),
+            Err(ConnectionCause::UnexpectedGatewayFrame)
+        );
+        // A correct message ID cannot substitute a carrier/result or register/confirm reply.
+        for wrong_kind in [
+            ArtifactRequestKind::RegisterCarrier,
+            ArtifactRequestKind::ConfirmResult,
+        ] {
+            in_flight[0].kind = PendingObservationKind::ArtifactObservation {
+                id: pending.id,
+                delivery_id,
+                request_kind: wrong_kind,
+            };
+            assert_eq!(
+                handle_artifact_cloud_response(
+                    &context.assignment_manager,
+                    &in_flight,
+                    response(&in_flight[0].message_id)
+                ),
+                Err(ConnectionCause::UnexpectedGatewayFrame)
+            );
+        }
+        assert_eq!(
+            context
+                .assignment_manager
+                .lock()
+                .unwrap()
+                .pending_observations(&BTreeSet::new(), 10)
+                .len(),
+            1
+        );
+        in_flight[0].kind = PendingObservationKind::ArtifactObservation {
+            id: pending.id,
+            delivery_id,
+            request_kind,
+        };
+        handle_artifact_cloud_response(
+            &context.assignment_manager,
+            &in_flight,
+            response(&in_flight[0].message_id),
+        )
+        .unwrap();
+        assert!(
+            context
+                .assignment_manager
+                .lock()
+                .unwrap()
+                .pending_observations(&BTreeSet::new(), 10)
+                .is_empty()
+        );
+    }
+
+    async fn run_artifact_delivery_case(
+        upload_status: u16,
+        cancel_at: Option<ArtifactRequestKind>,
+    ) {
+        let cancel_registration = cancel_at == Some(ArtifactRequestKind::RegisterCarrier);
         const ASSIGNMENT_ID: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abh";
         const ATTEMPT_ID: &str = "atm_01k0z6r1w8f4jy2m7q9v3x5abk";
         const ARTIFACT_SET_ID: &str = "ats_01k0z6r1w8f4jy2m7q9v3x5ac0";
@@ -3599,6 +3732,9 @@ mod tests {
             );
             let registration_message_id = registration["messageId"].as_str().unwrap();
             let registration_sequence = registration["sequence"].as_u64().unwrap();
+            if cancel_registration {
+                broker.cancel_assignment(ASSIGNMENT_ID);
+            }
             inbound.send(Message::Text(
                 json!({
                     "protocolVersion": 1,
@@ -3632,6 +3768,14 @@ mod tests {
                 registration_sequence,
             ));
 
+            if cancel_registration {
+                assert_eq!(
+                    completion.await.unwrap(),
+                    crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome::AuthorityLost
+                );
+                inbound.send(Message::Close(None));
+                return;
+            }
             let uploaded = accept_artifact_put(&listener, upload_status).await;
             assert_eq!(uploaded, bytes);
             let confirmation = outbound.recv().await.expect("artifact confirmation");
@@ -3642,6 +3786,9 @@ mod tests {
             assert_eq!(confirmation["payload"]["carrierId"], CARRIER_ID);
             let confirmation_message_id = confirmation["messageId"].as_str().unwrap();
             let confirmation_sequence = confirmation["sequence"].as_u64().unwrap();
+            if cancel_at == Some(ArtifactRequestKind::ConfirmCarrier) {
+                broker.cancel_assignment(ASSIGNMENT_ID);
+            }
             inbound.send(Message::Text(
                 json!({
                     "protocolVersion": 1,
@@ -3664,10 +3811,13 @@ mod tests {
                 confirmation_message_id,
                 confirmation_sequence,
             ));
-            assert!(matches!(
-                completion.await.unwrap(),
-                crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome::Delivered { .. }
-            ));
+            use crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome;
+            let outcome = completion.await.unwrap();
+            if cancel_at.is_some() {
+                assert_eq!(outcome, ArtifactDeliveryOutcome::AuthorityLost);
+            } else {
+                assert!(matches!(outcome, ArtifactDeliveryOutcome::Delivered { .. }));
+            }
             inbound.send(Message::Close(None));
         };
 
@@ -3675,7 +3825,7 @@ mod tests {
             .await
             .expect("artifact delivery fixture timed out");
         result.expect("artifact delivery connection failed");
-        assert_eq!(next_sequence, 4);
+        assert_eq!(next_sequence, if cancel_registration { 3 } else { 4 });
     }
 
     async fn accept_artifact_put(listener: &tokio::net::TcpListener, status: u16) -> Vec<u8> {

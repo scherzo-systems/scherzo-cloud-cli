@@ -13,7 +13,9 @@ use ring::digest::{SHA256, digest};
 use tokio::sync::{mpsc, oneshot};
 
 use super::Sleeper;
-use super::assignment::{ArtifactRequest, AssignmentObservation, ObservationOutbox, OutboxFailure};
+use super::assignment::{
+    ArtifactRequest, ArtifactRequestKind, AssignmentObservation, ObservationOutbox, OutboxFailure,
+};
 use super::backoff::Backoff;
 use crate::execution::workflow::artifact::{ArtifactStaging, StagedCarrier};
 use crate::execution::workflow::publication::{CloudCarrierBody, CloudResultCarrier};
@@ -168,6 +170,17 @@ pub(super) enum ArtifactCloudResponse {
     ResultConfirmation(ArtifactResultConfirmationResponse),
 }
 
+impl ArtifactCloudResponse {
+    pub(super) fn request_kind(&self) -> ArtifactRequestKind {
+        match self {
+            Self::CarrierRegistration(_) => ArtifactRequestKind::RegisterCarrier,
+            Self::CarrierConfirmation(_) => ArtifactRequestKind::ConfirmCarrier,
+            Self::ResultRegistration(_) => ArtifactRequestKind::RegisterResult,
+            Self::ResultConfirmation(_) => ArtifactRequestKind::ConfirmResult,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ArtifactDeliveryBroker {
     state: Arc<Mutex<ArtifactDeliveryState>>,
@@ -288,10 +301,15 @@ impl ArtifactDeliveryBroker {
         response: ArtifactCloudResponse,
     ) -> Result<(), ArtifactDeliveryProtocolFailure> {
         let mut state = self.lock();
-        let delivery = state
-            .deliveries
-            .get_mut(&delivery_id)
-            .ok_or(ArtifactDeliveryProtocolFailure)?;
+        // The connection has correlated the response to an in-flight request and
+        // checked its kind. A retired delivery must not be revived by that reply.
+        // Use the allocation watermark rather than retaining cancellation tombstones.
+        if delivery_id == 0 || delivery_id >= state.next_id {
+            return Err(ArtifactDeliveryProtocolFailure);
+        }
+        let Some(delivery) = state.deliveries.get_mut(&delivery_id) else {
+            return Ok(());
+        };
         let mut upload = None;
         let mut retry = None;
         let mut completion = None;
@@ -1196,6 +1214,34 @@ mod tests {
         })
         .await
         .expect("registration was not re-enqueued after released backoff");
+    }
+
+    #[tokio::test]
+    async fn retired_delivery_responses_do_not_restart_retries_or_accept_unallocated_ids() {
+        let outbox = ObservationOutbox::new();
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (broker, mut completion) = start_result_delivery(&outbox, sleeper);
+        broker.cancel_assignment("asn_01k0z6r1w8f4jy2m7q9v3x5abh");
+        assert_eq!(
+            completion.try_recv(),
+            Ok(ArtifactDeliveryOutcome::AuthorityLost)
+        );
+        let response = || {
+            ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
+                request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                outcome: ArtifactResultRegistrationOutcome::Retryable,
+            })
+        };
+        for unknown in [0, 2, u64::MAX] {
+            assert_eq!(
+                broker.handle_response(unknown, response()),
+                Err(ArtifactDeliveryProtocolFailure)
+            );
+        }
+        broker.handle_response(1, response()).unwrap();
+        assert!(broker.lock().deliveries.is_empty());
+        // Only the original request remains; the retired response schedules no retry.
+        assert_eq!(outbox.pending(&BTreeSet::new(), 10).len(), 1);
     }
 
     #[test]

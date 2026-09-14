@@ -1130,6 +1130,13 @@ impl ExecutionJob {
         assignment_id: &str,
         delivery: ArtifactDeliverySpec,
     ) -> Result<ArtifactDeliveryOutcome, LeaseClockError> {
+        if !self
+            .authority_updates
+            .borrow()
+            .permits_artifact_delivery(self.lease_clock.now()?)?
+        {
+            return Ok(ArtifactDeliveryOutcome::AuthorityLost);
+        }
         let Ok(mut completion) = self.artifact_delivery.start(delivery) else {
             return Ok(internal_delivery_failure("registration"));
         };
@@ -1137,12 +1144,7 @@ impl ExecutionJob {
         loop {
             let authority = authority_updates.borrow_and_update().clone();
             let now = self.lease_clock.now()?;
-            if authority.revoked
-                || !matches!(
-                    now.checked_cmp(authority.local_expiry)?,
-                    std::cmp::Ordering::Less
-                )
-            {
+            if !authority.permits_artifact_delivery(now)? {
                 self.artifact_delivery.cancel_assignment(assignment_id);
                 return Ok(ArtifactDeliveryOutcome::AuthorityLost);
             }
