@@ -1218,7 +1218,7 @@ the captured inherited `PATH`, fresh temporary Pi state and working-directory pa
 the required isolation controls. Retaining `PATH` lets an environment-based launcher
 resolve its interpreter without allowing another `pi` selection. It admits
 canonical stable versions in the range `>=0.84.2 <0.86.0`; the repository qualifies
-exact Pi 0.85.0. The capability probe accepts both the 0.84.2
+exact Pi 0.85.1. The capability probe accepts both the 0.84.2
 `pi [options] [@files...] [messages...]` usage line and the 0.84.3+
 `pi [options] [--] [@files...] [messages...]` line, while still requiring the JSON
 event, custom-session-directory, extension, system-prompt append, and

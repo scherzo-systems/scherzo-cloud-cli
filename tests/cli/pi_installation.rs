@@ -174,7 +174,7 @@ fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
 fn conformance_executable() -> Option<PathBuf> {
     std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
-        .filter(|path| path.to_string_lossy().ends_with("-pi-0.85.0/bin/pi"))
+        .filter(|path| path.to_string_lossy().ends_with("-pi-0.85.1/bin/pi"))
 }
 
 fn report_code(output: &std::process::Output) -> String {
@@ -190,7 +190,7 @@ fn assert_invalid_runner_gateway(output: &std::process::Output) {
 
 #[test]
 fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
-    let fixture = PiFixture::new("0.85.0", COMPLETE_HELP, true);
+    let fixture = PiFixture::new("0.85.1", COMPLETE_HELP, true);
     let first_agent_directory = tempfile::tempdir().expect("first Pi agent directory");
     let second_agent_directory = tempfile::tempdir().expect("second Pi agent directory");
     let first_settings = br#"{"defaultProjectTrust":"never"}"#;
@@ -232,7 +232,7 @@ fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
     assert_eq!(reports[0], reports[1]);
     assert_eq!(reports[0]["checks"][0]["id"], PI_CHECK_ID);
     assert_eq!(reports[0]["checks"][0]["status"], "pass");
-    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.85.0");
+    assert_eq!(reports[0]["checks"][0]["details"]["version"], "0.85.1");
     assert_eq!(reports[0]["checks"][0]["details"]["profile"], "PiJsonV1");
     assert_eq!(
         reports[0]["checks"][0]["details"]["supportedRange"],
@@ -623,7 +623,7 @@ fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
 
     assert_eq!(reports[0], reports[1]);
     let details = &reports[0]["checks"][0]["details"];
-    assert_eq!(details["version"], "0.85.0");
+    assert_eq!(details["version"], "0.85.1");
     assert_eq!(details["profile"], "PiJsonV1");
     assert_eq!(details["supportedRange"], ">=0.84.2 <0.86.0");
     assert_eq!(details["capabilities"], REQUIRED_CAPABILITIES);

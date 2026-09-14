@@ -87,7 +87,7 @@ only so an environment-based launcher can resolve its interpreter; they never us
 select another harness candidate.
 
 Pi maps canonical stable versions in `>=0.84.2 <0.86.0` into
-`ValidatedPiInstallation`; the repository separately qualifies exact release `0.85.0`.
+`ValidatedPiInstallation`; the repository separately qualifies exact release `0.85.1`.
 Claude Code maps canonical stable versions in
 `>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
 qualifies exact release `2.1.260`. Codex maps stable `>=0.147.0 <0.154.0`
