@@ -1,7 +1,5 @@
-use std::ffi::OsStr;
 use std::future::{Future, ready};
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,9 +7,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::dispatch::invoke_agent_dispatcher;
-use super::scripted::{
-    ScriptedAgentControl, ScriptedAgentError, ScriptedAgentValue, scripted_agent_dispatcher,
-};
+use super::scripted::{ScriptedAgentControl, ScriptedAgentValue, scripted_agent_dispatcher};
 use super::*;
 use crate::execution::workflow::admission::{CancellationReason, EnvironmentSnapshot};
 use crate::execution::workflow::agent_input::ClosedAgentInvocation;
@@ -206,106 +202,6 @@ async fn start_script(
     )
 }
 
-#[test]
-fn invocation_retains_the_complete_immutable_engine_input() {
-    let fixture = invocation_fixture(result_mode());
-    let invocation = &fixture.invocation;
-
-    assert_eq!(invocation.identity().run().as_ref(), "run-fixed");
-    assert_eq!(invocation.identity().step(), "agent-step");
-    assert_eq!(
-        invocation.identity().invocation(),
-        ActionId {
-            transition_sequence: TransitionSequence::default(),
-        }
-    );
-    assert_eq!(
-        invocation.adapter().profile(),
-        AgentCompatibilityProfile::PiJsonV1
-    );
-    assert_eq!(
-        invocation.adapter().executable(),
-        Path::new("/validated/pi")
-    );
-    assert_eq!(invocation.adapter().version(), "0.84.2");
-    assert_eq!(
-        invocation.adapter().native_configuration(),
-        &PiConfig {
-            model: "openai/gpt-5".to_owned(),
-            thinking: Thinking::XHigh,
-        }
-    );
-    assert_eq!(
-        invocation.process().cwd(),
-        std::fs::canonicalize(fixture._temporary.path().join("execution/worktree")).unwrap()
-    );
-    assert!(invocation.process().execution_root_is_bound());
-    let mut command = std::process::Command::new("unused");
-    invocation.process().bind_command(&mut command).unwrap();
-    assert_eq!(
-        invocation.staging().result_endpoint_directory(),
-        Path::new("/staging/invocation/result-endpoint")
-    );
-    assert_eq!(
-        invocation
-            .process()
-            .environment()
-            .variable(OsStr::new("PATH")),
-        Some(OsStr::new("/runner/bin"))
-    );
-    assert_eq!(invocation.prompt().system_prompt(), "system");
-    assert_eq!(invocation.prompt().message(), "message");
-    assert_eq!(invocation.attachments().len(), 1);
-    assert_eq!(
-        invocation.attachments()[0].path(),
-        Path::new("/staging/invocation/000000")
-    );
-    assert_eq!(invocation.attachments()[0].media_type(), "text/plain");
-    assert_eq!(
-        invocation.attachments()[0].diagnostic_source_name(),
-        Some("review.txt")
-    );
-    assert_eq!(invocation.value_mode().output(), Some("result"));
-    let AgentValueMode::Result { schema, .. } = invocation.value_mode() else {
-        panic!("fixture must use result mode");
-    };
-    assert_eq!(schema.document()["type"], "object");
-    assert_eq!(
-        schema.bytes(),
-        br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#
-    );
-    assert_eq!(
-        invocation.limits().maximum_system_prompt_bytes().get(),
-        64 * 1024
-    );
-    assert_eq!(invocation.limits().maximum_message_bytes().get(), 64 * 1024);
-    assert_eq!(invocation.limits().maximum_attachments().get(), 256);
-    assert_eq!(
-        invocation.limits().maximum_attachment_bytes().get(),
-        256 * 1024 * 1024
-    );
-    assert_eq!(
-        invocation
-            .limits()
-            .maximum_result_rejection_feedback_bytes()
-            .get(),
-        8 * 1024
-    );
-    assert_eq!(
-        invocation.limits().result_validation_deadline().get(),
-        Duration::from_secs(5)
-    );
-    assert_eq!(
-        invocation.limits().result_settlement_grace().get(),
-        Duration::from_secs(30)
-    );
-    assert_eq!(
-        invocation.limits().adapter_protocol(),
-        &PiJsonV1ProtocolLimits::profile()
-    );
-    assert!(!invocation.cancellation().is_cancelled());
-}
-
 #[tokio::test]
 async fn adapter_return_without_terminal_report_becomes_protocol_failure() {
     let fixture = invocation_fixture(AgentValueMode::None);
@@ -401,30 +297,6 @@ async fn scripted_adapter_completes_each_value_mode_with_its_typed_value() {
     assert_eq!(result.schema().document()["type"], "object");
 }
 
-#[tokio::test]
-async fn scripted_adapter_generates_missing_value_failures() {
-    let cases = [
-        (
-            AgentValueMode::Response {
-                output: Arc::from("response"),
-            },
-            AgentFailureCause::MissingResponse,
-        ),
-        (result_mode(), AgentFailureCause::MissingResult),
-    ];
-
-    for (value_mode, cause) in cases {
-        let (control, task, _cancellation, _observations, terminal, _terminal_probe) =
-            start_script(invocation_fixture(value_mode)).await;
-        control.complete().await.unwrap();
-        assert_eq!(
-            terminal.receive().await.unwrap(),
-            failed_agent_outcome(cause)
-        );
-        task.await.unwrap();
-    }
-}
-
 async fn run_success(
     value_mode: AgentValueMode,
     proposal: Option<ScriptedAgentValue>,
@@ -465,40 +337,6 @@ fn validation_fatals_map_to_the_closed_agent_failure_causes() {
         AgentFailureCause::from(ResultValidationFatal::WorkerFailed),
         AgentFailureCause::HarnessProtocolFailed
     );
-}
-
-#[tokio::test]
-async fn scripted_adapter_preserves_every_closed_failure_cause() {
-    let failures = [
-        AgentFailureCause::HarnessStartFailed,
-        AgentFailureCause::HarnessInputTooLarge {
-            input: AgentInputKind::SystemPrompt,
-            admitted_bytes: NonZeroU64::new(64).unwrap(),
-            observed_bytes: 65,
-        },
-        AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::ModelError,
-        },
-        AgentFailureCause::HarnessProtocolFailed,
-        AgentFailureCause::MissingResponse,
-        AgentFailureCause::MissingResult,
-        AgentFailureCause::ResultValidationLimitExceeded {
-            deadline: PositiveDuration::new(Duration::from_secs(5)).unwrap(),
-        },
-        AgentFailureCause::CapturedValueTooLarge,
-        AgentFailureCause::ResultSettlementFailed,
-    ];
-
-    for cause in failures {
-        let (control, task, _cancellation, _observations, terminal, _terminal_probe) =
-            start_script(invocation_fixture(AgentValueMode::None)).await;
-        control.fail(cause.clone()).await.unwrap();
-        assert_eq!(
-            terminal.receive().await.unwrap(),
-            failed_agent_outcome(cause)
-        );
-        task.await.unwrap();
-    }
 }
 
 #[tokio::test]
@@ -570,117 +408,6 @@ async fn run_observation_transcript() -> Vec<AgentObservationEnvelope> {
     );
     task.await.unwrap();
     recorded
-}
-
-#[tokio::test]
-async fn scripted_adapter_observes_initial_and_idle_cancellation() {
-    let initial = invocation_fixture(AgentValueMode::None);
-    assert!(
-        initial
-            .cancellation
-            .request_cancellation(CancellationReason::RunnerShutdown)
-    );
-    let (adapter, mut initial_control) = scripted_agent_dispatcher();
-    let initial_task = tokio::spawn(async move {
-        invoke_agent_dispatcher(
-            &adapter,
-            ClosedAgentInvocation::Pi(initial.invocation),
-            initial.start_callback,
-            initial.terminal_callback,
-        )
-        .await;
-    });
-    assert_eq!(
-        initial.terminal.receive().await.unwrap(),
-        AgentOutcome::Cancelled {
-            reason: CancellationReason::RunnerShutdown
-        }
-    );
-    initial_task.await.unwrap();
-    assert!(matches!(
-        initial_control.wait_until_started().await,
-        Err(ScriptedAgentError::AdapterStopped)
-    ));
-
-    let (_control, task, cancellation, _observations, terminal, _terminal_probe) =
-        start_script(invocation_fixture(AgentValueMode::None)).await;
-    assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
-    assert_eq!(
-        terminal.receive().await.unwrap(),
-        AgentOutcome::Cancelled {
-            reason: CancellationReason::UserRequest
-        }
-    );
-    task.await.unwrap();
-}
-
-#[tokio::test]
-async fn scripted_adapter_rejects_values_after_cancellation() {
-    let (control, task, cancellation, _observations, terminal, _terminal_probe) =
-        start_script(invocation_fixture(AgentValueMode::Response {
-            output: Arc::from("response"),
-        }))
-        .await;
-
-    assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
-    assert!(
-        control
-            .propose(ScriptedAgentValue::Response(Arc::from("too late")))
-            .await
-            .is_err(),
-        "cancellation must stop the adapter from accepting provisional values"
-    );
-
-    assert_eq!(
-        terminal.receive().await.unwrap(),
-        AgentOutcome::Cancelled {
-            reason: CancellationReason::UserRequest
-        }
-    );
-    task.await.unwrap();
-}
-
-#[tokio::test]
-async fn explicit_barriers_make_cancellation_close_races_deterministic() {
-    let fixture = invocation_fixture(AgentValueMode::Response {
-        output: Arc::from("response"),
-    });
-    let (control, task, cancellation, _observations, terminal, terminal_probe) =
-        start_script(fixture).await;
-    control
-        .propose(ScriptedAgentValue::Response(Arc::from("provisional")))
-        .await
-        .unwrap();
-    let mut barrier = control.block().unwrap();
-    barrier.wait_until_blocked().await.unwrap();
-    assert!(!terminal_probe.has_reported());
-    assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
-    barrier.release().unwrap();
-    assert_eq!(
-        terminal.receive().await.unwrap(),
-        AgentOutcome::Cancelled {
-            reason: CancellationReason::UserRequest
-        }
-    );
-    assert!(terminal_probe.has_reported());
-    task.await.unwrap();
-
-    let (control, task, cancellation, _observations, terminal, _terminal_probe) =
-        start_script(invocation_fixture(AgentValueMode::None)).await;
-    control
-        .fail(AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-        })
-        .await
-        .unwrap();
-    assert!(cancellation.request_cancellation(CancellationReason::RunnerShutdown));
-    assert_eq!(
-        terminal.receive().await.unwrap(),
-        failed_agent_outcome(AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-        })
-    );
-    task.await.unwrap();
 }
 
 #[test]

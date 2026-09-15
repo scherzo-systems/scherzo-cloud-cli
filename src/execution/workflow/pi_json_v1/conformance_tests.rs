@@ -252,19 +252,19 @@ struct RealPiFixture {
 }
 
 impl RealPiFixture {
-    fn new(value_mode: AgentValueMode, retry: bool, hold_settlement: bool) -> Option<Self> {
+    fn new(value_mode: AgentValueMode, retry: bool, hold_settlement: bool) -> Self {
         Self::new_with_options(value_mode, retry, hold_settlement, false, 600_000, false)
     }
 
-    fn with_immediate_retry(value_mode: AgentValueMode) -> Option<Self> {
+    fn with_immediate_retry(value_mode: AgentValueMode) -> Self {
         Self::new_with_options(value_mode, true, false, false, 0, false)
     }
 
-    fn with_threshold_compaction(value_mode: AgentValueMode) -> Option<Self> {
+    fn with_threshold_compaction(value_mode: AgentValueMode) -> Self {
         Self::new_with_options(value_mode, false, false, true, 600_000, false)
     }
 
-    fn with_bash_only_tools(value_mode: AgentValueMode) -> Option<Self> {
+    fn with_bash_only_tools(value_mode: AgentValueMode) -> Self {
         Self::new_with_options(value_mode, false, false, false, 600_000, true)
     }
 
@@ -275,8 +275,8 @@ impl RealPiFixture {
         force_compaction: bool,
         retry_base_delay_ms: u64,
         bash_only_tools: bool,
-    ) -> Option<Self> {
-        let executable = conformance_executable()?;
+    ) -> Self {
+        let executable = require_conformance_executable();
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
         let project_directory = execution_root.join("worktree");
@@ -466,7 +466,7 @@ impl RealPiFixture {
             },
         );
         let process_control = invocation.process_control().clone();
-        Some(Self {
+        Self {
             _temporary: temporary,
             invocation: Some(invocation),
             cancellation,
@@ -482,7 +482,7 @@ impl RealPiFixture {
             attachment_contents,
             session_directory,
             session_metadata,
-        })
+        }
     }
 
     fn assert_configuration_unchanged(&self) {
@@ -883,18 +883,18 @@ fn retained_assistant_tool_call(
 async fn run_terminal_case(
     value_mode: AgentValueMode,
     response: Value,
-) -> Option<(RealPiFixture, AgentOutcome)> {
-    let fixture = RealPiFixture::new(value_mode, false, false)?;
+) -> (RealPiFixture, AgentOutcome) {
+    let fixture = RealPiFixture::new(value_mode, false, false);
     let mut running = RunningRealPi::launch(fixture);
     running.release_startup().await;
     let request = running.fixture.controller.next("model").await;
     request.release(response);
     running.await_started().await;
-    Some(running.finish().await)
+    running.finish().await
 }
 
 async fn launch_result_case() -> (RunningRealPi, ControlledRequest, String) {
-    let fixture = RealPiFixture::new(result_mode(), false, false).unwrap();
+    let fixture = RealPiFixture::new(result_mode(), false, false);
     let mut running = RunningRealPi::launch(fixture);
     running.release_startup().await;
     let first = running.fixture.controller.next("model").await;
@@ -975,8 +975,7 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
             },
             false,
             false,
-        )
-        .unwrap();
+        );
         let mut running = RunningRealPi::launch(fixture);
         let startup = running.release_startup().await;
         assert_eq!(startup["projectTrusted"], true);
@@ -1086,8 +1085,7 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
             },
             false,
             false,
-        )
-        .unwrap();
+        );
         let mut repeated = RunningRealPi::launch(repeated);
         let repeated_startup = repeated.release_startup().await;
         let repeated_model = repeated.fixture.controller.next("model").await;
@@ -1127,7 +1125,7 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
 async fn pinned_real_pi_02_bash_only_skills_and_tool_cwd_conform() {
     let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
-        let fixture = RealPiFixture::with_bash_only_tools(AgentValueMode::None).unwrap();
+        let fixture = RealPiFixture::with_bash_only_tools(AgentValueMode::None);
         let mut running = RunningRealPi::launch(fixture);
         let startup = running.release_startup().await;
         assert_eq!(startup["projectTrusted"], true);
@@ -1226,7 +1224,7 @@ async fn pinned_real_pi_03_no_value_and_typed_terminal_failures_conform() {
             ),
         ];
         for (value_mode, response, expected) in cases {
-            let (fixture, outcome) = run_terminal_case(value_mode, response).await.unwrap();
+            let (fixture, outcome) = run_terminal_case(value_mode, response).await;
             assert_eq!(outcome, expected);
             fixture.assert_configuration_unchanged();
             fixture.controller.shutdown().await;
@@ -1329,7 +1327,7 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
 async fn pinned_real_pi_04_accepted_result_cancels_threshold_compaction() {
     let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
-        let fixture = RealPiFixture::with_threshold_compaction(result_mode()).unwrap();
+        let fixture = RealPiFixture::with_threshold_compaction(result_mode());
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let model_request = running.fixture.controller.next("model").await;
@@ -1409,7 +1407,7 @@ async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement
         const SECOND_REASONING_SUMMARY: &str = "Submitting one nested result call.";
         const FINALIZED_THINKING: &str =
             "Provider finalized the reasoning for the nested result call.";
-        let fixture = RealPiFixture::new(streamed_nested_result_mode(), false, false).unwrap();
+        let fixture = RealPiFixture::new(streamed_nested_result_mode(), false, false);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let model_request = running.fixture.controller.next("model").await;
@@ -1552,7 +1550,7 @@ async fn pinned_real_pi_04_tolerates_thinking_end_snapshot_disagreement() {
         const STREAMED_THINKING: &str = "An observational reasoning summary.";
         const FINALIZED_THINKING: &str = "The provider-finalized thinking snapshot.";
         const MISMATCHED_EVENT_CONTENT: &str = "A different thinking-end event snapshot.";
-        let fixture = RealPiFixture::new(AgentValueMode::None, false, false).unwrap();
+        let fixture = RealPiFixture::new(AgentValueMode::None, false, false);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         running.await_started().await;
@@ -1620,7 +1618,7 @@ async fn pinned_real_pi_04_tolerates_thinking_end_snapshot_disagreement() {
 async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
     let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
-        let fixture = RealPiFixture::with_immediate_retry(result_mode()).unwrap();
+        let fixture = RealPiFixture::with_immediate_retry(result_mode());
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let interrupted = running.fixture.controller.next("model").await;
@@ -1848,7 +1846,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
         // Keep each controlled request alive until cancellation settles so controller EOF
         // cannot race the process interrupt and manufacture a different terminal phase.
         // Model phase: the provider request itself is the barrier.
-        let fixture = RealPiFixture::new(AgentValueMode::None, false, false).unwrap();
+        let fixture = RealPiFixture::new(AgentValueMode::None, false, false);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let blocked_model = running.fixture.controller.next("model").await;
@@ -1859,7 +1857,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
         fixture.controller.shutdown().await;
 
         // Tool phase: Pi must abort the exact in-flight extension tool.
-        let fixture = RealPiFixture::new(AgentValueMode::None, false, false).unwrap();
+        let fixture = RealPiFixture::new(AgentValueMode::None, false, false);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let model = running.fixture.controller.next("model").await;
@@ -1874,7 +1872,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
         fixture.controller.shutdown().await;
 
         // Retry phase: cancellation wins after the native retry milestone and before its timer.
-        let fixture = RealPiFixture::new(AgentValueMode::None, true, false).unwrap();
+        let fixture = RealPiFixture::new(AgentValueMode::None, true, false);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let model = running.fixture.controller.next("model").await;
@@ -1899,7 +1897,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
         fixture.controller.shutdown().await;
 
         // Validation phase: the worker barrier proves cancellation stops validation and Pi.
-        let fixture = RealPiFixture::new(result_mode(), false, false).unwrap();
+        let fixture = RealPiFixture::new(result_mode(), false, false);
         let (reached, mut validation_reached) = mpsc::unbounded_channel();
         let mut running = launch_with_blocking_validation(
             fixture,
@@ -1918,7 +1916,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
         fixture.controller.shutdown().await;
 
         // Settlement phase: a Valid terminating result is provisional while shutdown is held.
-        let fixture = RealPiFixture::new(result_mode(), false, true).unwrap();
+        let fixture = RealPiFixture::new(result_mode(), false, true);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let model = running.fixture.controller.next("model").await;
@@ -1957,8 +1955,12 @@ fn stubborn_descendant_process_fixture() {
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_06_cancellation_kills_a_stubborn_process_group_descendant() {
     let _executable = require_conformance_executable();
+    // Pi, rather than this test process, spawns the stubborn fixture. Adopt that
+    // descendant when Pi exits so the process-group probe can reap it itself.
+    #[cfg(target_os = "linux")]
+    nix::sys::prctl::set_child_subreaper(true).unwrap();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
-        let fixture = RealPiFixture::new(AgentValueMode::None, false, false).unwrap();
+        let fixture = RealPiFixture::new(AgentValueMode::None, false, false);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
         let model = running.fixture.controller.next("model").await;

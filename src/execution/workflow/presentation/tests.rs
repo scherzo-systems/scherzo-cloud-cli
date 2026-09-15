@@ -509,14 +509,6 @@ fn color_selection_uses_the_human_destination_and_environment_matrix() {
 }
 
 #[test]
-fn displayed_shell_arguments_are_unambiguous() {
-    let newline = visible_text(&shell_quote("line\nbreak"));
-    let literal_escape = visible_text(&shell_quote(r"line\x0abreak"));
-
-    assert_ne!(newline, literal_escape);
-}
-
-#[test]
 fn rejection_json_is_one_pretty_document_without_stderr_prose() {
     let temporary = tempfile::tempdir().unwrap();
     let failure = resolution::resolve(

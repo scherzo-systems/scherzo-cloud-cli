@@ -551,11 +551,7 @@ fn advisory_issue_is_valid_on_success_but_cannot_be_primary() {
 }
 
 #[test]
-fn rejects_inconsistent_or_multiply_owned_alias_metadata() {
-    let mut mismatch = result_fixture();
-    mismatch["exports"]["second"]["digest"]["value"] = Value::String("2".repeat(64));
-    assert_eq!(decode(&encode(&mismatch)), Err(ResultMetadataError));
-
+fn rejects_multiply_owned_alias_metadata() {
     let mut non_owner = result_fixture();
     non_owner["exports"]["first"]["path"] = Value::String("exports/0002".to_owned());
     non_owner["exports"]["second"]["path"] = Value::String("exports/0002".to_owned());

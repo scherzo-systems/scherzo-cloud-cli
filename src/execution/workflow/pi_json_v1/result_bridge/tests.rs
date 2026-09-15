@@ -622,86 +622,61 @@ async fn socket_accepts_one_exact_bounded_request_and_returns_one_response() {
 }
 
 #[tokio::test]
-async fn delayed_second_frame_on_one_connection_is_fatal() {
+async fn delayed_second_frames_return_framed_fatal() {
     let temporary = tempfile::tempdir().unwrap();
     let first = request_bytes("call-first", "scherzo_result_fixed", json!({"answer": 1}));
-    let second = request_bytes("call-second", "scherzo_result_fixed", json!({"answer": 2}));
-    let (listener, socket_address, socket_path, alias_directory) =
-        bind_test_socket(temporary.path(), "socket-delayed-second-frame");
-    let mut server = ResultSocketServer::start(
-        listener,
-        NonZeroU64::new(1024).unwrap(),
-        receive_deadline(),
-        TestClock::Pending,
-    );
-    let mut client = UnixStream::connect(socket_address).await.unwrap();
-    client.write_all(&framed(&first)).await.unwrap();
-
-    let ResultSocketEvent::Request(incoming) = server.receive().await else {
-        panic!("the first request must reach validation");
-    };
-    client.write_all(&framed(&second)).await.unwrap();
-    // The protocol failure is allowed to discard the validator's pending success.
-    let _ = incoming.respond(ValidatePiResultV1Response::valid()).await;
-
-    let mut response = Vec::new();
-    let read = client.read_to_end(&mut response).await;
-    server.shutdown().await.unwrap();
-    remove_materialized_file(&socket_path).unwrap();
-    remove_socket_alias(&alias_directory, &alias_directory.join(SOCKET_ALIAS_NAME)).unwrap();
-
-    assert!(
-        read.is_ok(),
-        "a delayed second request must receive Fatal instead of a connection reset: {read:?}"
-    );
-    assert!(response.len() >= 4);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&response[4..]).unwrap(),
-        json!({"kind": "Fatal", "cause": CHANNEL_FAILURE_CAUSE}),
-        "a second request queued before the first response must invalidate the connection"
-    );
-}
-
-#[tokio::test]
-async fn delayed_oversized_second_frame_returns_framed_fatal() {
-    let temporary = tempfile::tempdir().unwrap();
-    let first = request_bytes("call-first", "scherzo_result_fixed", json!({"answer": 1}));
-    let second = request_bytes(
-        "call-second",
-        "scherzo_result_fixed",
-        json!({"answer": "x".repeat(4096)}),
-    );
+    let second_frames = [
+        (
+            "delayed second request",
+            request_bytes("call-second", "scherzo_result_fixed", json!({"answer": 2})),
+        ),
+        (
+            "delayed oversized request",
+            request_bytes(
+                "call-second",
+                "scherzo_result_fixed",
+                json!({"answer": "x".repeat(4096)}),
+            ),
+        ),
+    ];
     let maximum = NonZeroU64::new(1024).unwrap();
     assert!(u64::try_from(first.len()).unwrap() <= maximum.get());
-    assert!(u64::try_from(second.len()).unwrap() > maximum.get());
+    assert!(u64::try_from(second_frames[1].1.len()).unwrap() > maximum.get());
     let (listener, socket_address, socket_path, alias_directory) =
-        bind_test_socket(temporary.path(), "socket-delayed-oversized-second-frame");
+        bind_test_socket(temporary.path(), "socket-delayed-second-frames");
     let mut server =
         ResultSocketServer::start(listener, maximum, receive_deadline(), TestClock::Pending);
-    let mut client = UnixStream::connect(socket_address).await.unwrap();
-    client.write_all(&framed(&first)).await.unwrap();
 
-    let ResultSocketEvent::Request(incoming) = server.receive().await else {
-        panic!("the first request must reach validation");
-    };
-    client.write_all(&framed(&second)).await.unwrap();
-    let _ = incoming.respond(ValidatePiResultV1Response::valid()).await;
+    for (description, second) in second_frames {
+        let mut client = UnixStream::connect(&socket_address).await.unwrap();
+        client.write_all(&framed(&first)).await.unwrap();
 
-    let mut response = Vec::new();
-    let read = client.read_to_end(&mut response).await;
+        let ResultSocketEvent::Request(incoming) = server.receive().await else {
+            panic!("the first request must reach validation");
+        };
+        client.write_all(&framed(&second)).await.unwrap();
+        // The protocol failure is allowed to discard the validator's pending success.
+        let _ = incoming.respond(ValidatePiResultV1Response::valid()).await;
+
+        let mut response = Vec::new();
+        let read = client.read_to_end(&mut response).await;
+        assert!(
+            read.is_ok(),
+            "a {description} must receive Fatal instead of a connection reset: {read:?}"
+        );
+        assert!(response.len() >= 4);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response[4..]).unwrap(),
+            json!({"kind": "Fatal", "cause": CHANNEL_FAILURE_CAUSE}),
+            "a second request queued before the first response must invalidate the connection"
+        );
+        // Drain this connection's failure before starting the next table case.
+        let _ = server.receive().await;
+    }
+
     server.shutdown().await.unwrap();
     remove_materialized_file(&socket_path).unwrap();
     remove_socket_alias(&alias_directory, &alias_directory.join(SOCKET_ALIAS_NAME)).unwrap();
-
-    assert!(
-        read.is_ok(),
-        "a delayed oversized request must receive Fatal instead of a connection reset: {read:?}"
-    );
-    assert!(response.len() >= 4);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&response[4..]).unwrap(),
-        json!({"kind": "Fatal", "cause": CHANNEL_FAILURE_CAUSE})
-    );
 }
 
 #[tokio::test]

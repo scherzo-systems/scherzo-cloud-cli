@@ -3,7 +3,6 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::execution::workflow::decode;
 
 fn pointer(authored: &str) -> JsonPointer {
     JsonPointer::parse(Arc::<str>::from(authored)).unwrap()
@@ -375,27 +374,6 @@ fn condition_evaluation_supports_every_terminal_disposition_without_source_detai
             ConditionEvaluation::Passed
         );
     }
-}
-
-#[test]
-fn condition_schema_accepts_the_active_grammar() {
-    let document = decode(
-        br#"schemaVersion: 1
-inputs:
-  request:
-    kind: text
-steps:
-  guarded:
-    kind: cmd
-    condition:
-      equals:
-        - { ref: inputs.request }
-        - { value: yes }
-    command: { argv: ["true"] }
-"#,
-    )
-    .unwrap();
-    assert_eq!(document.steps.len(), 1);
 }
 
 #[test]

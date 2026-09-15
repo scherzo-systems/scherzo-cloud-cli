@@ -132,11 +132,6 @@ impl AgentProcessContext {
         self.cwd.protocol_path()
     }
 
-    #[cfg(test)]
-    pub(super) fn execution_root_is_bound(&self) -> bool {
-        self.cwd.validate_execution_root()
-    }
-
     pub(super) fn bind_command(
         &self,
         command: &mut Command,

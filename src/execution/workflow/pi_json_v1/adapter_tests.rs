@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::future::{Future, pending, ready};
 use std::io::{Read as _, Write as _};
@@ -1421,7 +1421,7 @@ fn nul_values(bytes: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn thinking_finalization_transcript(streamed_suffix: &str, finalized_thinking: &str) -> Vec<u8> {
+fn thinking_finalization_transcript(cases: &[(&str, &str)]) -> Vec<u8> {
     let usage = json!({
         "input": 1,
         "output": 1,
@@ -1443,60 +1443,72 @@ fn thinking_finalization_transcript(streamed_suffix: &str, finalized_thinking: &
         })
     };
     let empty = message(json!([]), "pending");
-    let completed = message(
-        json!([
-            {"type": "thinking", "thinking": finalized_thinking},
-            {"type": "text", "text": EXPECTED_RESPONSE}
-        ]),
-        "stop",
-    );
-    let events = [
+    let mut completed_content = Vec::new();
+    let mut updates = Vec::new();
+    for (content_index, (streamed_suffix, finalized_thinking)) in cases.iter().enumerate() {
+        completed_content.push(json!({
+            "type": "thinking",
+            "thinking": finalized_thinking
+        }));
+        updates.extend([
+            json!({
+                "type": "message_update",
+                "usage": &usage,
+                "assistantMessageEvent": {
+                    "type": "thinking_start",
+                    "contentIndex": content_index
+                }
+            }),
+            json!({
+                "type": "message_update",
+                "usage": &usage,
+                "assistantMessageEvent": {
+                    "type": "thinking_delta",
+                    "contentIndex": content_index,
+                    "delta": STREAMED_THINKING
+                }
+            }),
+            json!({
+                "type": "message_update",
+                "usage": &usage,
+                "assistantMessageEvent": {
+                    "type": "thinking_delta",
+                    "contentIndex": content_index,
+                    "delta": streamed_suffix
+                }
+            }),
+            json!({
+                "type": "message_update",
+                "usage": &usage,
+                "assistantMessageEvent": {
+                    "type": "thinking_end",
+                    "contentIndex": content_index,
+                    "content": finalized_thinking
+                }
+            }),
+        ]);
+    }
+    let text_index = completed_content.len();
+    completed_content.push(json!({"type": "text", "text": EXPECTED_RESPONSE}));
+    let completed = message(Value::Array(completed_content), "stop");
+    let mut events = vec![
         json!({"type": "agent_start"}),
         json!({"type": "turn_start"}),
         json!({"type": "message_start", "message": &empty}),
+    ];
+    events.extend(updates);
+    events.extend([
         json!({
             "type": "message_update",
             "usage": &usage,
-            "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}
-        }),
-        json!({
-            "type": "message_update",
-            "usage": &usage,
-            "assistantMessageEvent": {
-                "type": "thinking_delta",
-                "contentIndex": 0,
-                "delta": STREAMED_THINKING
-            }
-        }),
-        json!({
-            "type": "message_update",
-            "usage": &usage,
-            "assistantMessageEvent": {
-                "type": "thinking_delta",
-                "contentIndex": 0,
-                "delta": streamed_suffix
-            }
-        }),
-        json!({
-            "type": "message_update",
-            "usage": &usage,
-            "assistantMessageEvent": {
-                "type": "thinking_end",
-                "contentIndex": 0,
-                "content": finalized_thinking
-            }
-        }),
-        json!({
-            "type": "message_update",
-            "usage": &usage,
-            "assistantMessageEvent": {"type": "text_start", "contentIndex": 1}
+            "assistantMessageEvent": {"type": "text_start", "contentIndex": text_index}
         }),
         json!({
             "type": "message_update",
             "usage": &usage,
             "assistantMessageEvent": {
                 "type": "text_delta",
-                "contentIndex": 1,
+                "contentIndex": text_index,
                 "delta": EXPECTED_RESPONSE
             }
         }),
@@ -1505,7 +1517,7 @@ fn thinking_finalization_transcript(streamed_suffix: &str, finalized_thinking: &
             "usage": &usage,
             "assistantMessageEvent": {
                 "type": "text_end",
-                "contentIndex": 1,
+                "contentIndex": text_index,
                 "content": EXPECTED_RESPONSE
             }
         }),
@@ -1513,7 +1525,7 @@ fn thinking_finalization_transcript(streamed_suffix: &str, finalized_thinking: &
         json!({"type": "turn_end", "message": &completed, "toolResults": []}),
         json!({"type": "agent_end", "messages": [&completed], "willRetry": false}),
         json!({"type": "agent_settled"}),
-    ];
+    ]);
     let mut transcript = Vec::new();
     for event in events {
         serde_json::to_writer(&mut transcript, &event).unwrap();
@@ -1522,10 +1534,7 @@ fn thinking_finalization_transcript(streamed_suffix: &str, finalized_thinking: &
     transcript
 }
 
-fn thinking_finalization_fixture(
-    streamed_suffix: &str,
-    finalized_thinking: &str,
-) -> ProcessFixture {
+fn thinking_finalization_fixture(cases: &[(&str, &str)]) -> ProcessFixture {
     let fixture = ProcessFixture::new_with_value_mode(
         "transcript",
         "system".to_owned(),
@@ -1536,14 +1545,15 @@ fn thinking_finalization_fixture(
     );
     fs::write(
         &fixture.phase_transcript,
-        thinking_finalization_transcript(streamed_suffix, finalized_thinking),
+        thinking_finalization_transcript(cases),
     )
     .unwrap();
     fixture
 }
 
 fn authority_rejection_fixture() -> (ProcessFixture, PathBuf) {
-    let fixture = thinking_finalization_fixture("\n\n", "**Reading package-lock.json contents**");
+    let fixture =
+        thinking_finalization_fixture(&[("\n\n", "**Reading package-lock.json contents**")]);
     let transcript = fs::read_to_string(&fixture.phase_transcript).unwrap();
     let mut events = transcript
         .lines()
@@ -1822,45 +1832,17 @@ async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agen
 }
 
 #[tokio::test]
-async fn thinking_end_may_remove_trailing_line_breaks_before_response_completion() {
+async fn thinking_end_accepts_line_break_removal_and_provider_rewrites() {
     with_watchdog(async {
-        for streamed_suffix in ["\n\n", "\r\n"] {
-            let run = run_success(thinking_finalization_fixture(
-                streamed_suffix,
-                STREAMED_THINKING,
-            ))
-            .await;
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = run.outcome
-            else {
-                panic!("trailing thinking line-break normalization must complete");
-            };
-            assert_eq!(response.as_str(), EXPECTED_RESPONSE);
-            let reasoning = run
-                .observations
-                .iter()
-                .filter_map(|observation| match observation.observation() {
-                    AgentObservation::Reasoning { text } => Some(text.as_ref()),
-                    _ => None,
-                })
-                .collect::<String>();
-            assert_eq!(reasoning, format!("{STREAMED_THINKING}{streamed_suffix}"));
-        }
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn thinking_end_accepts_provider_finalization_rewrite() {
-    with_watchdog(async {
-        let streamed_suffix = "\n\n";
-        let run = run_success(thinking_finalization_fixture(
-            streamed_suffix,
-            "**Importing path for test support**",
-        ))
-        .await;
+        let cases = [
+            ("\n\n", STREAMED_THINKING),
+            ("\r\n", STREAMED_THINKING),
+            ("\n\n", "**Importing path for test support**"),
+        ];
+        let run = run_success(thinking_finalization_fixture(&cases)).await;
         let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = run.outcome
         else {
-            panic!("provider-finalized thinking rewrite must complete");
+            panic!("thinking finalization normalization must complete");
         };
         assert_eq!(response.as_str(), EXPECTED_RESPONSE);
         let reasoning = run
@@ -1871,7 +1853,11 @@ async fn thinking_end_accepts_provider_finalization_rewrite() {
                 _ => None,
             })
             .collect::<String>();
-        assert_eq!(reasoning, format!("{STREAMED_THINKING}{streamed_suffix}"));
+        let expected = cases
+            .iter()
+            .map(|(streamed_suffix, _)| format!("{STREAMED_THINKING}{streamed_suffix}"))
+            .collect::<String>();
+        assert_eq!(reasoning, expected);
     })
     .await;
 }
@@ -2739,23 +2725,4 @@ fn in_group_descendant_process() {
     loop {
         std::thread::park();
     }
-}
-
-#[test]
-fn fake_fixture_uses_no_ambient_pi() {
-    let fixture = ProcessFixture::new("success", "system".to_owned(), "message".to_owned());
-    assert_ne!(fixture.invocation.adapter().executable(), Path::new("pi"));
-    assert!(fixture.invocation.adapter().executable().is_absolute());
-    assert_eq!(
-        fixture.invocation.adapter().executable(),
-        fixture._temporary.path().join("pi-0.84.2-fake")
-    );
-    assert_eq!(
-        fixture
-            .invocation
-            .process()
-            .environment()
-            .variable(OsStr::new("PI_MODEL")),
-        None
-    );
 }

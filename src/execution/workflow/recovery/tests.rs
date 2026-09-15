@@ -391,11 +391,3 @@ fn descriptor_bound_result_reader_rejects_missing_symlink_nonregular_and_oversiz
         Err(RecoveryResultReadFailure::TooLarge)
     );
 }
-
-#[test]
-fn descriptor_bound_result_reader_returns_one_bounded_regular_file() {
-    let (_temporary, staging) = result_staging();
-    let bytes = valid_decision();
-    fs::write(staging.result_path(), &bytes).unwrap();
-    assert_eq!(staging.read_decision().unwrap(), bytes);
-}

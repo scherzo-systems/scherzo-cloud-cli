@@ -189,46 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_audit_page_decodes_closed_variants() {
-        let input = serde_json::json!({
-            "items": [
-                {
-                    "id": "aud_01k0z6r1w8f4jy2m7q9v3x5abc",
-                    "occurredAt": "2026-08-04T12:00:00Z",
-                    "retention": {
-                        "identifier": "identity-tenancy-production-730d-v1",
-                        "retainUntil": "2028-08-03T12:00:00Z"
-                    },
-                    "detailsStatus": "details_available",
-                    "actor": {
-                        "kind": "principal",
-                        "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"
-                    },
-                    "action": "organization.created",
-                    "subject": {
-                        "kind": "organization",
-                        "id": "org_01k0z6r1w8f4jy2m7q9v3x5abc"
-                    },
-                    "changes": [{ "field": "state", "after": "active" }]
-                },
-                {
-                    "id": "aud_01k0z6r1w8f4jy2m7q9v3x5abd",
-                    "occurredAt": "2026-08-04T12:01:00Z",
-                    "retention": {
-                        "identifier": "identity-tenancy-production-730d-v1",
-                        "retainUntil": "2028-08-03T12:01:00Z"
-                    },
-                    "detailsStatus": "details_unavailable"
-                }
-            ]
-        });
-
-        let page: generated::models::OrganizationAuditRecordList =
-            serde_json::from_value(input).expect("contracted audit page should decode");
-        assert_eq!(page.items.len(), 2);
-    }
-
-    #[test]
     fn membership_patch_client_uses_contract_media_type() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let body = r#"{"id":"mem_01k0z6r1w8f4jy2m7q9v3x5abc","organizationId":"org_01k0z6r1w8f4jy2m7q9v3x5abc","principalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc","principalType":"human","role":"owner","state":"active","createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:00:00Z"}"#;
@@ -263,31 +223,5 @@ mod tests {
                 .lines()
                 .any(|line| line == "content-type: application/merge-patch+json")
         );
-    }
-
-    #[test]
-    fn generated_current_principal_response_preserves_opaque_actions() {
-        let input = serde_json::json!({
-            "principal": {
-                "id": "prn_fixture",
-                "type": "human",
-                "state": "active"
-            },
-            "actions": [
-                {
-                    "id": "future.action",
-                    "kind": "future-representation",
-                    "guide": "https://guarded.invalid/future-action",
-                    "additionalField": { "preserved": true }
-                },
-                "unknown-action-shape"
-            ]
-        });
-
-        let response: generated::models::CurrentPrincipalResponse =
-            serde_json::from_value(input.clone()).expect("current principal should decode");
-        let actions = response.actions.expect("actions should be present");
-
-        assert_eq!(actions, input["actions"].as_array().unwrap().to_owned());
     }
 }

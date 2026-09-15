@@ -1414,7 +1414,7 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
         admitted.execution(),
         &CaptureCancellation::default(),
         wrapper,
-        Duration::from_secs(1),
+        Duration::from_millis(50),
     )
     .unwrap();
     fs::write(repository.join("change.txt"), b"change\n").unwrap();
@@ -1431,7 +1431,7 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
         timeout.command.as_ref(),
         "git pack-objects --stdout --revs --no-sparse --no-use-bitmap-index --window=0 --depth=0"
     );
-    assert_eq!(timeout.limit, Duration::from_secs(1));
+    assert_eq!(timeout.limit, Duration::from_millis(50));
     assert_eq!(artifacts.git_reservation_usage(), (0, 0));
 }
 
