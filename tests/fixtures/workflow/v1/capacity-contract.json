@@ -1,0 +1,450 @@
+{
+  "schemaVersion": 1,
+  "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
+  "sourceDigestAlgorithm": "sha256",
+  "transitionBounds": {
+    "general": {
+      "minimum": 1,
+      "maximumWithoutFinalizers": 1283,
+      "maximumWithFinalizers": 1286
+    },
+    "selected": {
+      "minimum": 1,
+      "maximumWithoutFinalizers": 1027,
+      "maximumWithFinalizers": 1030
+    }
+  },
+  "commonBounds": {
+    "maximumInvocations": {
+      "minimum": 1,
+      "maximum": 488
+    },
+    "maximumRetainedBytesPerInvocation": {
+      "minimum": 1,
+      "maximum": 4194304
+    },
+    "diagnosticRetentionBytes": {
+      "minimum": "maximumRetainedBytesPerInvocation",
+      "maximum": 134217728
+    },
+    "nativeSessionRetentionBytes": {
+      "minimum": "maximumRetainedBytesPerInvocation",
+      "maximum": 67108864
+    },
+    "aggregateRetentionBytes": {
+      "formula": "diagnosticRetentionBytes + nativeSessionRetentionBytes",
+      "maximum": 201326592
+    }
+  },
+  "formulas": {
+    "runnerObservationReserve": 64,
+    "runnerOrdinaryFrameBytes": 262144,
+    "portableResultStructureOverheadBytes": 364209496
+  },
+  "variants": {
+    "ordinary": {
+      "appliesWhen": "conditionTransitionCount == 0",
+      "aggregateConditionTransitionBytes": {
+        "exact": 0
+      },
+      "terminalResultStructureBytes": {
+        "exact": 67108864
+      },
+      "portableResultBytes": {
+        "exact": 202027692
+      },
+      "encodedOutboxBytes": {
+        "formula": "(selectedMaximumTransitions + runnerObservationReserve) * runnerOrdinaryFrameBytes + terminalResultStructureBytes - runnerOrdinaryFrameBytes",
+        "maximum": 353632256
+      }
+    },
+    "conditional": {
+      "appliesWhen": "conditionTransitionCount >= 1",
+      "conditionTransitionCount": {
+        "minimum": 1,
+        "maximum": 256
+      },
+      "aggregateConditionTransitionBytes": {
+        "minimum": 1,
+        "maximum": 268435456
+      },
+      "terminalResultStructureBytes": {
+        "formula": "aggregateConditionTransitionBytes * 2",
+        "minimum": 2,
+        "maximum": 536870912
+      },
+      "portableResultBytes": {
+        "formula": "terminalResultStructureBytes + portableResultStructureOverheadBytes",
+        "minimum": 364209498,
+        "maximum": 901080408
+      },
+      "encodedOutboxBytes": {
+        "formula": "(selectedMaximumTransitions + runnerObservationReserve - conditionTransitionCount - 1) * runnerOrdinaryFrameBytes + aggregateConditionTransitionBytes + terminalResultStructureBytes",
+        "minimum": 3,
+        "maximum": 1024720896
+      }
+    }
+  },
+  "conformanceCases": [
+    {
+      "name": "ordinary-one-step",
+      "admit": true,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "ordinary-common-ceilings",
+      "admit": true,
+      "capacity": {
+        "generalMaximumTransitions": 1286,
+        "selectedMaximumTransitions": 1030,
+        "maximumInvocations": 488,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 134217728,
+        "nativeSessionRetentionBytes": 67108864,
+        "aggregateRetentionBytes": 201326592,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 353632256
+      }
+    },
+    {
+      "name": "small-conditional-reproduction",
+      "admit": true,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 364277238,
+        "encodedOutboxBytes": 18189549
+      }
+    },
+    {
+      "name": "conditional-minimum-bounds",
+      "admit": true,
+      "capacity": {
+        "generalMaximumTransitions": 1,
+        "selectedMaximumTransitions": 1,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 1,
+        "diagnosticRetentionBytes": 1,
+        "nativeSessionRetentionBytes": 1,
+        "aggregateRetentionBytes": 2,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 1,
+        "terminalResultStructureBytes": 2,
+        "portableResultBytes": 364209498,
+        "encodedOutboxBytes": 16515075
+      }
+    },
+    {
+      "name": "conditional-maximum-bounds",
+      "admit": true,
+      "capacity": {
+        "generalMaximumTransitions": 1286,
+        "selectedMaximumTransitions": 1030,
+        "maximumInvocations": 488,
+        "maximumRetainedBytesPerInvocation": 1,
+        "diagnosticRetentionBytes": 134217728,
+        "nativeSessionRetentionBytes": 67108864,
+        "aggregateRetentionBytes": 201326592,
+        "conditionTransitionCount": 256,
+        "aggregateConditionTransitionBytes": 268435456,
+        "terminalResultStructureBytes": 536870912,
+        "portableResultBytes": 901080408,
+        "encodedOutboxBytes": 1024720896
+      }
+    },
+    {
+      "name": "general-transition-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 1287,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "selected-transition-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 1031,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 353894400
+      }
+    },
+    {
+      "name": "invocation-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 489,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "per-invocation-retention-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194305,
+        "diagnosticRetentionBytes": 8388610,
+        "nativeSessionRetentionBytes": 4194305,
+        "aggregateRetentionBytes": 12582915,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "diagnostic-retention-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 1,
+        "diagnosticRetentionBytes": 134217729,
+        "nativeSessionRetentionBytes": 1,
+        "aggregateRetentionBytes": 134217730,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "native-session-retention-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 1,
+        "diagnosticRetentionBytes": 1,
+        "nativeSessionRetentionBytes": 67108865,
+        "aggregateRetentionBytes": 67108866,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "aggregate-retention-formula-mismatch",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582913,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "ordinary-terminal-uses-conditional-size",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458944
+      }
+    },
+    {
+      "name": "ordinary-outbox-formula-mismatch",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 0,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 67108864,
+        "portableResultBytes": 202027692,
+        "encodedOutboxBytes": 85458945
+      }
+    },
+    {
+      "name": "conditional-zero-aggregate",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 0,
+        "terminalResultStructureBytes": 0,
+        "portableResultBytes": 364209496,
+        "encodedOutboxBytes": 18087936
+      }
+    },
+    {
+      "name": "conditional-count-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 1286,
+        "selectedMaximumTransitions": 1030,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 257,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 364277238,
+        "encodedOutboxBytes": 219253997
+      }
+    },
+    {
+      "name": "conditional-terminal-formula-mismatch",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67743,
+        "portableResultBytes": 364277239,
+        "encodedOutboxBytes": 18189550
+      }
+    },
+    {
+      "name": "conditional-portable-formula-mismatch",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 364277239,
+        "encodedOutboxBytes": 18189549
+      }
+    },
+    {
+      "name": "conditional-outbox-formula-mismatch",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 364277238,
+        "encodedOutboxBytes": 18189550
+      }
+    },
+    {
+      "name": "conditional-capacity-ceiling-exceeded",
+      "admit": false,
+      "capacity": {
+        "generalMaximumTransitions": 1286,
+        "selectedMaximumTransitions": 1030,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 256,
+        "aggregateConditionTransitionBytes": 268435457,
+        "terminalResultStructureBytes": 536870914,
+        "portableResultBytes": 901080410,
+        "encodedOutboxBytes": 1024720899
+      }
+    }
+  ]
+}

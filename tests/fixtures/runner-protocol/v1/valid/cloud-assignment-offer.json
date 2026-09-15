@@ -48,11 +48,11 @@
         "diagnosticRetentionBytes": 8388608,
         "nativeSessionRetentionBytes": 4194304,
         "aggregateRetentionBytes": 12582912,
-        "conditionTransitionCount": 0,
-        "aggregateConditionTransitionBytes": 0,
-        "terminalResultStructureBytes": 67108864,
-        "portableResultBytes": 202027692,
-        "encodedOutboxBytes": 85458944
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 364277238,
+        "encodedOutboxBytes": 18189549
       },
       "runInputs": null
     },

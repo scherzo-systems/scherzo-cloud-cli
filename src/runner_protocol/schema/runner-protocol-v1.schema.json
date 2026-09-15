@@ -305,7 +305,7 @@
         },
         "terminalResultStructureBytes": {
           "type": "integer",
-          "minimum": 67108864,
+          "minimum": 2,
           "maximum": 536870912
         },
         "portableResultBytes": {
@@ -315,7 +315,7 @@
         },
         "encodedOutboxBytes": {
           "type": "integer",
-          "minimum": 83886080,
+          "minimum": 3,
           "maximum": 1024720896
         }
       },
