@@ -20,13 +20,13 @@ If you inspect or modify a local copy, run the canonical check from the reposito
 ./scripts/check
 ```
 
-Use Devenv 2.3, matching the executable pinned in `.github/workflows/check.yml`.
+Use Devenv 2.3.1, matching the executable pinned in `.github/workflows/check.yml`.
 Devenv 2.2.2's embedded Nix evaluator can intermittently fail with invalid store paths
 on fresh Linux installations; upgrading only the external Nix executable does not fix
 that evaluator. To run with the exact CI version without changing your profile:
 
 ```sh
-nix shell github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 \
+nix shell github:cachix/devenv/2418e1b43797c44de5166176622c8d8fa0149871 \
   --command ./scripts/check
 ```
 
