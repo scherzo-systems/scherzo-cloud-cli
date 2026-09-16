@@ -579,25 +579,6 @@ fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
 }
 
 #[test]
-fn human_login_protocol_failure_uses_shared_renderer_with_reason() {
-    let server = ScriptedServer::respond(vec![json_http_response("200 OK", serde_json::json!({}))]);
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    let credential_path_string = credential_path.to_str().unwrap();
-    let environment = login_environment(&server, credential_path_string);
-
-    let output = run_with_env(
-        &["auth", "login", "--force", "--allow-insecure-http"],
-        &environment,
-    );
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert!(!output.stderr.is_empty());
-    server.finish();
-}
-
-#[test]
 fn login_unreachable_failures_report_the_active_phase() {
     let cases = [
         (

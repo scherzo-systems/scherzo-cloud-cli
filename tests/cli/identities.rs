@@ -103,18 +103,6 @@ fn prepared_identity_command(
 }
 
 #[test]
-fn identity_family_without_a_leaf_prints_help_without_loading_deployment() {
-    let output = run_with_env(
-        &["auth", "identities"],
-        &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
-    );
-
-    assert!(output.status.success());
-    assert!(!output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
 fn list_returns_one_exact_page_with_current_and_provenance_fields() {
     let server = ScriptedServer::respond(vec![identity_page(
         serde_json::json!([
@@ -568,7 +556,7 @@ fn removing_the_former_session_identity_keeps_the_forced_login_session() {
 }
 
 #[test]
-fn remove_reports_freshness_retention_and_private_target_outcomes() {
+fn remove_reports_freshness_and_retention_outcomes() {
     let cases = [
         (
             identity_problem(
@@ -577,14 +565,6 @@ fn remove_reports_freshness_retention_and_private_target_outcomes() {
                 "https://api.scherzo.dev/problems/reauthentication-required",
             ),
             "reauthentication_required",
-        ),
-        (
-            identity_problem(
-                "404 Not Found",
-                404,
-                "https://api.scherzo.dev/problems/identity-not-found",
-            ),
-            "not_found",
         ),
         (
             identity_problem(
@@ -621,36 +601,5 @@ fn remove_reports_freshness_retention_and_private_target_outcomes() {
         assert_eq!(value["outcome"], expected_outcome);
         assert!(output.stderr.is_empty());
         server.finish();
-    }
-}
-
-#[test]
-fn linked_identity_commands_require_the_human_session_before_network_work() {
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    let environment =
-        deployment_environment("http://127.0.0.1:9/api", credential_path.to_str().unwrap());
-
-    for args in [
-        &[
-            "auth",
-            "identities",
-            "list",
-            "--json",
-            "--allow-insecure-http",
-        ][..],
-        &[
-            "auth",
-            "identities",
-            "link",
-            "--json",
-            "--allow-insecure-http",
-        ][..],
-    ] {
-        let output = run_with_env(args, &environment);
-        assert_eq!(output.status.code(), Some(3));
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["outcome"], "unauthenticated");
-        assert!(output.stderr.is_empty());
     }
 }

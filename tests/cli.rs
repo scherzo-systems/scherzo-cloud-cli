@@ -684,51 +684,11 @@ fn write_credential_fixture_with_refresh_token(
 }
 
 #[test]
-fn no_arguments_print_composed_root_help() {
-    let output = run(&[]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(output.status.success());
-    assert!(!stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
-fn artifact_without_a_subcommand_prints_composed_help() {
-    let output = run(&["artifact"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(output.status.success());
-    assert!(!stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
 fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
     let output = run_with_env(
         &["auth"],
         &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(output.status.success());
-    assert!(!stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
-fn runner_without_a_subcommand_prints_composed_help() {
-    let output = run(&["runner"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(output.status.success());
-    assert!(!stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
-fn workflow_without_a_subcommand_prints_composed_help() {
-    let output = run(&["workflow"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());

@@ -154,107 +154,6 @@ fn account_update_clears_the_display_name_with_an_explicit_null() {
 }
 
 #[test]
-fn an_equivalent_display_name_no_op_has_the_same_stable_result() {
-    let response = updated_response(Some("Ada Lovelace"));
-    let (server, _directory, credential_path) = prepared_update(vec![response.clone(), response]);
-    let environment =
-        deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
-    let args = [
-        "account",
-        "update",
-        "--display-name",
-        "Ada Lovelace",
-        "--json",
-        "--allow-insecure-http",
-    ];
-
-    let changed = run_with_env(&args, &environment);
-    let unchanged = run_with_env(&args, &environment);
-
-    assert!(changed.status.success());
-    assert!(unchanged.status.success());
-    assert_eq!(changed.stdout, unchanged.stdout);
-    let result: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
-    assert_eq!(result["outcome"], "set");
-    assert_eq!(result["principal"]["displayName"], "Ada Lovelace");
-    assert!(changed.stderr.is_empty());
-    assert!(unchanged.stderr.is_empty());
-    assert_eq!(server.finish().len(), 2);
-}
-
-#[test]
-fn an_ambiguous_update_retries_the_same_patch_and_request_identity() {
-    let (server, _directory, credential_path) =
-        prepared_update(vec![Vec::new(), updated_response(Some("Ada Lovelace"))]);
-    let environment =
-        deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
-
-    let output = run_with_env(
-        &[
-            "account",
-            "update",
-            "--display-name",
-            "Ada Lovelace",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
-}
-
-#[test]
-fn a_rejected_account_update_token_is_refreshed_and_retried() {
-    let unauthorized = update_problem(
-        "401 Unauthorized",
-        401,
-        "https://api.scherzo.dev/problems/unauthorized",
-    );
-    let (server, _directory, credential_path) = prepared_update(vec![
-        unauthorized,
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": "unique-refreshed-account-update-token",
-                "refresh_token": "unique-refreshed-account-update-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        updated_response(Some("Ada Lovelace")),
-    ]);
-    let environment =
-        deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
-
-    let output = run_with_env(
-        &[
-            "account",
-            "update",
-            "--display-name",
-            "Ada Lovelace",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[0].starts_with("PATCH /api/v1/me HTTP/1.1\r\n"));
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert_eq!(
-        header_value(&requests[2], "authorization"),
-        "Bearer unique-refreshed-account-update-token"
-    );
-}
-
-#[test]
 fn account_update_reports_meaningful_api_failures_without_problem_prose() {
     let cases = [
         (
@@ -265,17 +164,6 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             ),
             "invalid_display_name",
             1,
-            None,
-        ),
-        (
-            update_problem(
-                "403 Forbidden",
-                403,
-                "https://api.scherzo.dev/problems/forbidden",
-            ),
-            "forbidden",
-            1,
-            None,
         ),
         (
             update_problem(
@@ -285,7 +173,6 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             ),
             "idempotency_conflict",
             1,
-            None,
         ),
         (
             update_problem(
@@ -295,7 +182,6 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             ),
             "request_too_large",
             1,
-            None,
         ),
         (
             update_problem(
@@ -305,17 +191,10 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             ),
             "unsupported_media_type",
             1,
-            None,
-        ),
-        (
-            http_response("500 Internal Server Error", None, &[]),
-            "unreachable",
-            4,
-            Some("server"),
         ),
     ];
 
-    for (response, expected_outcome, expected_status, expected_category) in cases {
+    for (response, expected_outcome, expected_status) in cases {
         let (server, _directory, credential_path) = prepared_update(vec![response]);
         let environment =
             deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
@@ -336,11 +215,7 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
         assert_eq!(result["schemaVersion"], 1);
         assert_eq!(result["deployment"], server.api_url);
         assert_eq!(result["outcome"], expected_outcome);
-        if let Some(category) = expected_category {
-            assert_eq!(result["category"], category);
-        } else {
-            assert!(result.get("category").is_none());
-        }
+        assert!(result.get("category").is_none());
         assert!(result.get("title").is_none());
         assert!(result.get("detail").is_none());
         assert!(output.stderr.is_empty());

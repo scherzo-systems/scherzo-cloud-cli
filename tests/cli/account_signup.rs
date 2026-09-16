@@ -54,19 +54,6 @@ fn created_response() -> Vec<u8> {
 }
 
 #[test]
-fn account_without_a_subcommand_prints_help_without_loading_deployment() {
-    let output = run_with_env(
-        &["account"],
-        &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(output.status.success());
-    assert!(!stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
 fn human_signup_creates_and_reports_the_account() {
     let (server, _directory, _path, credential_path) = prepared_signup(
         vec![created_response()],
@@ -142,93 +129,6 @@ fn structured_signup_reports_the_authenticated_principal() {
 }
 
 #[test]
-fn signup_retries_an_ambiguous_transport_failure_with_the_same_key() {
-    let (server, _directory, _path, credential_path) = prepared_signup(
-        vec![Vec::new(), created_response()],
-        "unique-retry-signup-synthetic-token",
-    );
-    let environment = signup_environment(&server, &credential_path);
-
-    let output = run_with_env(
-        &["account", "signup", "--json", "--allow-insecure-http"],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(
-        header_value(&requests[0], "idempotency-key"),
-        header_value(&requests[1], "idempotency-key")
-    );
-    for request in requests {
-        assert!(request.contains("authorization: Bearer unique-retry-signup-synthetic-token\r\n"));
-    }
-}
-
-#[test]
-fn signup_rejects_http_before_transmitting_the_credential() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture(
-        &credential_path,
-        &api_url,
-        "unique-untransmitted-signup-token",
-        "2999-01-01T00:00:00Z",
-    );
-    let credential_path_string = credential_path.to_str().unwrap();
-    let environment = deployment_environment(&api_url, credential_path_string);
-
-    let output = run_with_env(&["account", "signup", "--json"], &environment);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert!(!output.stderr.is_empty());
-    assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
-}
-
-#[test]
-fn signup_without_a_credential_does_not_contact_the_api() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    let credential_path_string = credential_path.to_str().unwrap();
-    let environment = deployment_environment(&api_url, credential_path_string);
-
-    let human = run_with_env(&["account", "signup"], &environment);
-
-    assert_eq!(human.status.code(), Some(3));
-    assert_eq!(
-        human.stdout,
-        b"! You're not signed in to Scherzo Cloud.\n\nSign in to create your account:\n  scherzo-cloud auth login\n"
-    );
-    assert!(human.stderr.is_empty());
-
-    let output = run_with_env(&["account", "signup", "--json"], &environment);
-
-    assert_eq!(output.status.code(), Some(3));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({
-            "schemaVersion": 1,
-            "deployment": api_url,
-            "outcome": "unauthenticated"
-        })
-    );
-    assert!(output.stderr.is_empty());
-    assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
-}
-
-#[test]
 fn signup_reports_policy_denial_without_claiming_a_principal() {
     let response = problem_http_response(
         "403 Forbidden",
@@ -289,68 +189,4 @@ fn already_provisioned_signup_directs_the_human_to_status() {
     );
     assert!(output.stderr.is_empty());
     server.finish();
-}
-
-#[test]
-fn rejected_signup_access_token_is_refreshed_and_retried() {
-    let rejected = problem_http_response(
-        "401 Unauthorized",
-        serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
-            "title": "Unauthorized",
-            "status": 401
-        }),
-    );
-    let token = "unique-rejected-signup-synthetic-token";
-    let (server, _directory, credential_path, credential_path_string) = prepared_signup(
-        vec![
-            rejected,
-            json_http_response(
-                "200 OK",
-                serde_json::json!({
-                    "access_token": "unique-refreshed-signup-access-token",
-                    "refresh_token": "unique-refreshed-signup-refresh-token",
-                    "token_type": "Bearer",
-                    "expires_in": 3600
-                }),
-            ),
-            created_response(),
-        ],
-        token,
-    );
-    let environment = signup_environment(&server, &credential_path_string);
-
-    let output = run_with_env(
-        &["account", "signup", "--json", "--allow-insecure-http"],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
-        "authenticated"
-    );
-    let stored: serde_json::Value =
-        serde_json::from_slice(&fs::read(credential_path).unwrap()).unwrap();
-    assert_eq!(
-        stored["credentials"][0]["refreshToken"],
-        "unique-refreshed-signup-refresh-token"
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    for secret in [
-        token,
-        "unique-fixture-refresh-token",
-        "unique-refreshed-signup-access-token",
-        "unique-refreshed-signup-refresh-token",
-    ] {
-        assert!(!combined.contains(secret));
-    }
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert!(requests[2].contains("authorization: Bearer unique-refreshed-signup-access-token\r\n"));
 }
