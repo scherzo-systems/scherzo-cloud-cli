@@ -1410,13 +1410,18 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
             ("BLOCKER", blocker.as_os_str()),
         ],
     );
-    let capture = GitCaptureContext::admit_with_program(
+    let mut capture = GitCaptureContext::admit_with_program(
         admitted.execution(),
         &CaptureCancellation::default(),
         wrapper,
-        Duration::from_millis(50),
+        GIT_COMMAND_TIMEOUT,
     )
     .unwrap();
+    // Admission is setup, not the timeout under test. Capture also runs real Git
+    // preflight commands before the deliberately blocked pack-objects command,
+    // so allow scheduling headroom without relying on a sleep to trigger failure.
+    let capture_timeout = Duration::from_secs(5);
+    capture.command_timeout = capture_timeout;
     fs::write(repository.join("change.txt"), b"change\n").unwrap();
     git(&repository, &["add", "change.txt"]);
     git(&repository, &["commit", "--quiet", "-m", "change"]);
@@ -1431,7 +1436,7 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
         timeout.command.as_ref(),
         "git pack-objects --stdout --revs --no-sparse --no-use-bitmap-index --window=0 --depth=0"
     );
-    assert_eq!(timeout.limit, Duration::from_millis(50));
+    assert_eq!(timeout.limit, capture_timeout);
     assert_eq!(artifacts.git_reservation_usage(), (0, 0));
 }
 
