@@ -1,23 +1,15 @@
 ```console
-$ scherzo-cloud run create --help
-Create a Scherzo Cloud run
+$ scherzo-cloud run input-set create --help
+Create an open immutable Run Input Set
 
-Usage: scherzo-cloud run create [OPTIONS] --project-id <PROJECT> --workflow-path <WORKFLOW> <ORGANIZATION>
+Usage: scherzo-cloud run input-set create [OPTIONS] --project-id <PROJECT> <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
 
 Options:
       --project-id <PROJECT>
-          Exact Project ID
-      --workflow-path <WORKFLOW>
-          Canonical repository-relative workflow path
-      --source-branch <SOURCE_BRANCH>
-          Exact source branch (the project default when omitted)
-      --display-name <DISPLAY_NAME>
-          Set the run display name
-      --input-set-id <INPUT_SET>
-          Consume an existing sealed Run Input Set without restaging
+          Cloud project identifier
       --input-text <NAME> <TEXT>
           Supply one required named Text value
       --input-text-file <NAME> <PATH>
@@ -32,10 +24,10 @@ Options:
           Append an immutable member to a named attachment collection
       --input-attachments-empty <NAME>
           Supply a present named attachment collection with no members
-      --json
-          Print the run result as JSON
       --allow-insecure-http
           Allow this command's Scherzo Cloud requests over insecure HTTP connections
+      --json
+          Write one JSON result to standard output
   -h, --help
           Print help
 

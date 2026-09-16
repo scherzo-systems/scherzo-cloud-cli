@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud run input-set upload --help
+Upload selected members to an open Run Input Set
+
+Usage: scherzo-cloud run input-set upload [OPTIONS] --member-file <MEMBER> <PATH> <ORGANIZATION> <INPUT_SET>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <INPUT_SET>     Exact Run Input Set ID
+
+Options:
+      --member-file <MEMBER> <PATH>  Upload a regular file as one exact logical member
+      --allow-insecure-http          Allow this command's Scherzo Cloud requests over insecure HTTP connections
+      --json                         Write one JSON result to standard output
+  -h, --help                         Print help
+
+```

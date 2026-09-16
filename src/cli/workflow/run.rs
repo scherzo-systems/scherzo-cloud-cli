@@ -110,55 +110,8 @@ pub(super) struct Command {
     )]
     run_dir: PathBuf,
 
-    #[arg(
-        long,
-        value_names = ["NAME", "TEXT"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        help = "Supply one required named Text value"
-    )]
-    input_text: Vec<OsString>,
-
-    #[arg(
-        long,
-        value_names = ["NAME", "PATH"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        help = "Supply one required named Text value from a regular file, or - for standard input"
-    )]
-    input_text_file: Vec<OsString>,
-
     #[command(flatten)]
-    json_inline: super::super::JsonInlineInput,
-
-    #[arg(
-        long,
-        value_names = ["NAME", "PATH"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        help = "Supply one required named JSON value from a regular file, or - for standard input"
-    )]
-    input_json_file: Vec<OsString>,
-
-    #[command(flatten)]
-    file_input: super::super::FileInput,
-
-    #[arg(
-        long,
-        value_names = ["NAME", "MEDIA_TYPE", "PATH"],
-        num_args = 3,
-        action = clap::ArgAction::Append,
-        help = "Append an immutable member to a named attachment collection"
-    )]
-    input_attachment: Vec<OsString>,
-
-    #[arg(
-        long,
-        value_name = "NAME",
-        action = clap::ArgAction::Append,
-        help = "Supply a present named attachment collection with no members"
-    )]
-    input_attachments_empty: Vec<String>,
+    inputs: super::super::NamedInputArgs,
 
     #[arg(
         long,
@@ -271,13 +224,13 @@ impl Command {
 
     fn input_plan(&self) -> anyhow::Result<InputPlan> {
         plan_inputs(
-            &self.input_text,
-            &self.input_text_file,
-            &self.json_inline.input_json,
-            &self.input_json_file,
-            &self.file_input.input_file,
-            &self.input_attachment,
-            &self.input_attachments_empty,
+            &self.inputs.input_text,
+            &self.inputs.input_text_file,
+            &self.inputs.input_json,
+            &self.inputs.input_json_file,
+            &self.inputs.input_file,
+            &self.inputs.input_attachment,
+            &self.inputs.input_attachments_empty,
         )
     }
 
@@ -2473,17 +2426,15 @@ mod tests {
                 execution_root: PathBuf::from("execution"),
             },
             run_dir: PathBuf::from("run"),
-            input_text: Vec::new(),
-            input_text_file: Vec::new(),
-            json_inline: super::super::super::JsonInlineInput {
+            inputs: super::super::super::NamedInputArgs {
+                input_text: Vec::new(),
+                input_text_file: Vec::new(),
                 input_json: Vec::new(),
-            },
-            input_json_file: Vec::new(),
-            file_input: super::super::super::FileInput {
+                input_json_file: Vec::new(),
                 input_file: Vec::new(),
+                input_attachment: Vec::new(),
+                input_attachments_empty: Vec::new(),
             },
-            input_attachment: Vec::new(),
-            input_attachments_empty: Vec::new(),
             max_parallel: 2,
             presentation: super::super::PresentationOptions {
                 plain: false,

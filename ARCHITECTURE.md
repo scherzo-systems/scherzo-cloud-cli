@@ -58,6 +58,13 @@ availability, load either credential type, make a network request, or enter Runn
 Serve connectivity. Bare `scherzo-cloud workflow` prints composed help rather than
 selecting a workflow or inferring a source boundary.
 
+The pure lexical and JSON decoding rules shared by Workflow V1 inputs and Cloud Run
+Input manifests live in `src/workflow_contract.rs` and its children. The public API,
+command, runner, and execution components may depend on this leaf for duplicate-aware
+strict JSON decoding, input identifiers, diagnostic display names, media types, and
+hexadecimal digests; the leaf owns no transport, credentials, acquisition bytes, or
+execution state.
+
 ## Runner diagnostics
 
 `src/cli/runner/doctor.rs` is a typed Clap adapter: it parses runner-doctor arguments

@@ -3,7 +3,6 @@
 // jscpd:ignore-start
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, anyhow};
 use clap::Args;
@@ -36,19 +35,20 @@ impl Command {
     // This leaf owns artifact-specific arguments while the shared helper owns signal behavior.
     // jscpd:ignore-start
     pub(super) fn execute(self) -> super::super::CommandResult {
-        super::super::execute_read_only_with_signals(
-            "artifact validation",
-            move |cancelled, completed| self.execute_blocking(cancelled, completed),
-        )
+        super::super::execute_read_only_with_signals("artifact validation", move |control| {
+            self.execute_blocking(control)
+        })
     }
     // jscpd:ignore-end
 
     fn execute_blocking(
         &self,
-        cancelled: &AtomicBool,
-        completed: &AtomicBool,
+        control: &super::super::OperationControl<()>,
     ) -> super::super::CommandResult {
-        let validation = match validate_portable_artifact_set(&self.artifact_directory, cancelled) {
+        let validation = match validate_portable_artifact_set(
+            &self.artifact_directory,
+            control.cancellation(),
+        ) {
             Ok(validation) => validation,
             Err(PortableArtifactValidationFailure::Interrupted) => {
                 return Ok(OutcomeClass::Interrupted.exit_code());
@@ -64,7 +64,7 @@ impl Command {
                     .into());
             }
         };
-        if cancelled.load(Ordering::Acquire) {
+        if control.is_cancelled() {
             return Ok(OutcomeClass::Interrupted.exit_code());
         }
         if !self.json
@@ -88,13 +88,14 @@ impl Command {
         } else {
             ExitCode::GeneralFailure
         };
-        if self.json {
-            write_json(&validation).context("write artifact validation output")?;
-        } else {
-            write_human(&validation).context("write artifact validation output")?;
-        }
-        completed.store(true, Ordering::Release);
-        Ok(exit)
+        super::super::complete_read_only_output(control, || {
+            if self.json {
+                write_json(&validation).context("write artifact validation output")?;
+            } else {
+                write_human(&validation).context("write artifact validation output")?;
+            }
+            Ok(exit)
+        })
     }
 }
 

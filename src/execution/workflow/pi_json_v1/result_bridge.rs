@@ -24,7 +24,7 @@ use crate::execution::workflow::agent::{
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::result_validation::{decode_uri_fragment, join_pointer};
 use crate::execution::workflow::schema_common::lowercase_hex;
-use crate::execution::workflow::strict_json;
+use crate::workflow_contract::strict_json;
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const RESOURCE_ID_PREFIX: &str = "https://schemas.scherzo.invalid/workflow-result/";

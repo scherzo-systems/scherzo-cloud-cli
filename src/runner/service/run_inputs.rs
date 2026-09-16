@@ -362,7 +362,7 @@ impl HttpRunInputBroker {
             .await?
             {}
             ensure_current(cancellation, deadline)?;
-            crate::execution::workflow::parse_strict_json(&encoded)
+            crate::workflow_contract::strict_json::from_slice(&encoded)
                 .map_err(|_| BrokerFailure::InvalidResponse)
         })
     }
@@ -644,7 +644,9 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
                     if attachment.index != index
                         || attachment.size_bytes > MAXIMUM_ATTACHMENT_BYTES
                         || !crate::execution::workflow::is_lowercase_hex(&attachment.sha256, 64)
-                        || !valid_display_name(attachment.display_name.as_deref())
+                        || !crate::execution::workflow::is_valid_input_display_name(
+                            attachment.display_name.as_deref(),
+                        )
                         || !crate::execution::workflow::is_valid_media_type(&attachment.media_type)
                     {
                         return Err(RunInputFailure::ManifestMismatch);
@@ -1059,16 +1061,6 @@ fn exact_manifest_shape(value: &Value) -> bool {
 fn exact_object(value: &Value, names: &[&str]) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == names.len() && names.iter().all(|name| object.contains_key(*name))
-    })
-}
-
-fn valid_display_name(value: Option<&str>) -> bool {
-    value.is_none_or(|value| {
-        !matches!(value, "" | "." | "..")
-            && value.chars().count() <= 255
-            && value
-                .chars()
-                .all(|character| !character.is_control() && character != '/' && character != '\\')
     })
 }
 

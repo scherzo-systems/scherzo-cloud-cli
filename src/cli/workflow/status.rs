@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, anyhow};
 use clap::Args;
@@ -19,7 +18,7 @@ use crate::execution::workflow::presentation::{
     styled_terminal_text as styled,
 };
 use crate::execution::workflow::publication::WorkflowResultV1;
-use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
 
@@ -44,33 +43,31 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
-        super::super::execute_read_only_with_signals(
-            "workflow status",
-            move |cancelled, completed| self.execute_blocking(cancelled, completed),
-        )
+        super::super::execute_read_only_with_signals("workflow status", move |control| {
+            self.execute_blocking(control)
+        })
     }
 
     fn execute_blocking(
         &self,
-        cancelled: &AtomicBool,
-        completed: &AtomicBool,
+        control: &super::super::OperationControl<()>,
     ) -> super::super::CommandResult {
         reconcile_current_result_publication(&self.run.run_dir);
         let snapshot = read_local_run_status(&self.run.run_dir);
-        if cancelled.load(Ordering::Acquire) {
-            return Ok(OutcomeClass::Interrupted.exit_code());
-        }
-        let exit = if self.presentation.json {
-            render_json(snapshot).context("write workflow status output")?
-        } else {
-            let snapshot = snapshot
-                .map_err(|error| anyhow!(error.code.message()))
-                .with_context(|| format!("inspect workflow run {}", self.run.run_dir.display()))?;
-            let color = self.plain_color_enabled();
-            render_plain(&snapshot, color).context("write workflow status output")?
-        };
-        completed.store(true, Ordering::Release);
-        Ok(exit)
+        super::super::complete_read_only_output(control, || {
+            let exit = if self.presentation.json {
+                render_json(snapshot).context("write workflow status output")?
+            } else {
+                let snapshot = snapshot
+                    .map_err(|error| anyhow!(error.code.message()))
+                    .with_context(|| {
+                        format!("inspect workflow run {}", self.run.run_dir.display())
+                    })?;
+                let color = self.plain_color_enabled();
+                render_plain(&snapshot, color).context("write workflow status output")?
+            };
+            Ok(exit)
+        })
     }
 
     fn plain_color_enabled(&self) -> bool {

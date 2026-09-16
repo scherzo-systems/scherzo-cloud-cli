@@ -24,6 +24,7 @@ mod runner_protocol;
 mod test_support;
 mod timing;
 mod tls;
+mod workflow_contract;
 
 use std::env;
 

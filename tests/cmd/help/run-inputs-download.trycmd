@@ -1,0 +1,18 @@
+```console
+$ scherzo-cloud run inputs download --help
+Download and verify retained input members atomically
+
+Usage: scherzo-cloud run inputs download [OPTIONS] --output <DIRECTORY> <ORGANIZATION> <RUN>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <RUN>           Exact Run ID
+
+Options:
+      --output <DIRECTORY>   New destination directory for logical input member paths
+      --member <MEMBER>      Download one exact logical member (repeat to select more)
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+      --json                 Write one JSON result to standard output
+  -h, --help                 Print help
+
+```

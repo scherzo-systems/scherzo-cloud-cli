@@ -3,6 +3,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -13,9 +14,9 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use reqwest::header::HeaderMap;
+use reqwest::header::{CONTENT_LENGTH, HeaderMap};
 use reqwest::{Client, Url};
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use super::generated::apis;
 use super::http_util;
@@ -36,6 +37,43 @@ impl HttpTransportPolicy {
 pub(crate) enum HttpEndpointError {
     Invalid,
     InsecureHttp,
+}
+
+#[derive(Clone)]
+pub(crate) struct HttpCancellation {
+    cancelled: Arc<AtomicBool>,
+    changed: tokio::sync::watch::Sender<bool>,
+}
+
+impl HttpCancellation {
+    pub(crate) fn new() -> Self {
+        let (changed, _) = tokio::sync::watch::channel(false);
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            changed,
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.changed.send_replace(true);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        let mut changed = self.changed.subscribe();
+        if *changed.borrow() {
+            return;
+        }
+        while changed.changed().await.is_ok() {
+            if *changed.borrow() {
+                return;
+            }
+        }
+    }
 }
 
 pub(crate) struct HttpClient {
@@ -142,6 +180,82 @@ impl HttpClient {
             )),
         }
     }
+
+    pub(super) fn signed_storage_get(
+        &self,
+        url: &Url,
+        maximum_bytes: u64,
+        timeout: Duration,
+        cancellation: &HttpCancellation,
+    ) -> Result<SignedStorageDownload, SignedStorageGetError> {
+        if !self.transport_policy.permits(url) {
+            return Err(SignedStorageGetError::InvalidRequest);
+        }
+        let request = self.client.get(url.clone());
+        match self.run(timeout, async {
+            let mut response = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Err(SignedStorageGetError::Interrupted);
+                }
+                response = request.send() => response.map_err(|error| {
+                    SignedStorageGetError::Unreachable(super::classify_reqwest_error(&error))
+                })?,
+            };
+            let status = response.status();
+            if status.is_server_error() {
+                return Err(SignedStorageGetError::Server);
+            }
+            if status != StatusCode::OK {
+                return Err(SignedStorageGetError::Rejected);
+            }
+            let content_length = response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            if content_length.is_some_and(|length| length > maximum_bytes) {
+                return Err(SignedStorageGetError::TooLarge);
+            }
+            let mut bytes = Zeroizing::new(Vec::with_capacity(
+                content_length
+                    .and_then(|length| usize::try_from(length).ok())
+                    .unwrap_or(0),
+            ));
+            loop {
+                let chunk = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(SignedStorageGetError::Interrupted);
+                    }
+                    chunk = response.chunk() => chunk.map_err(|error| {
+                        SignedStorageGetError::Unreachable(super::classify_reqwest_error(&error))
+                    })?,
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                if u64::try_from(bytes.len())
+                    .ok()
+                    .and_then(|length| length.checked_add(u64::try_from(chunk.len()).ok()?))
+                    .is_none_or(|length| length > maximum_bytes)
+                {
+                    return Err(SignedStorageGetError::TooLarge);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(SignedStorageDownload {
+                status,
+                content_length,
+                bytes,
+            })
+        }) {
+            Ok(result) => result,
+            Err(_) => Err(SignedStorageGetError::Unreachable(
+                super::UnreachableCategory::Timeout,
+            )),
+        }
+    }
 }
 
 impl Drop for HttpClient {
@@ -157,6 +271,22 @@ pub(super) enum SignedStorageRequestError {
     Build,
     InvalidRequest,
     Unreachable(super::UnreachableCategory),
+}
+
+pub(super) struct SignedStorageDownload {
+    pub(super) status: StatusCode,
+    pub(super) content_length: Option<u64>,
+    pub(super) bytes: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub(super) enum SignedStorageGetError {
+    InvalidRequest,
+    Unreachable(super::UnreachableCategory),
+    Interrupted,
+    TooLarge,
+    Rejected,
+    Server,
 }
 
 fn blocking_client_builder(

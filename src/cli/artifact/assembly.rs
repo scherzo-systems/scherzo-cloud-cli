@@ -5,9 +5,6 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use rustix::fs::{RenameFlags, renameat_with};
-use rustix::io::Errno;
-
 use crate::api::{
     ArtifactApiError, ArtifactCapabilityMember, ArtifactInventoryPage, ArtifactMember,
     ArtifactSource,
@@ -122,31 +119,16 @@ fn assemble_artifact_set_with_clock(
     }
     sync_staged_directory(staging.path())?;
 
-    let staging_path = staging.keep();
-    let staging_name = staging_path
-        .file_name()
-        .ok_or(ArtifactAssemblyError::CommitUnavailable)?;
-    let parent_file = File::open(&parent).map_err(|_| ArtifactAssemblyError::CommitUnavailable)?;
-    match renameat_with(
-        &parent_file,
-        staging_name,
-        &parent_file,
-        destination_name,
-        RenameFlags::NOREPLACE,
-    ) {
+    match super::super::atomic_directory::commit_noreplace(staging, &parent, destination_name) {
         Ok(()) => {}
-        Err(Errno::EXIST | Errno::NOTEMPTY) => {
-            let _ = std::fs::remove_dir_all(&staging_path);
+        Err(super::super::atomic_directory::CommitError::DestinationExists) => {
             return Err(ArtifactAssemblyError::DestinationExists);
         }
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&staging_path);
-            return Err(ArtifactAssemblyError::CommitUnavailable);
-        }
+        Err(
+            super::super::atomic_directory::CommitError::Unavailable
+            | super::super::atomic_directory::CommitError::DurabilityUnconfirmed,
+        ) => return Err(ArtifactAssemblyError::CommitUnavailable),
     }
-    parent_file
-        .sync_all()
-        .map_err(|_| ArtifactAssemblyError::CommitUnavailable)?;
     Ok(AssembledArtifact {
         artifact_set_id: inventory.artifact_set_id,
         member_count: inventory.member_count,

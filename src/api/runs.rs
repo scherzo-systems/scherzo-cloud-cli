@@ -1,18 +1,14 @@
 use std::fmt;
 use std::time::Duration;
 
-use base64::Engine as _;
 use reqwest::blocking::Response;
-use reqwest::header::{
-    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, IF_NONE_MATCH, LOCATION,
-};
+use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION};
 use reqwest::{Method, StatusCode, Url};
-use ring::digest::{SHA256, digest};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::generated::{apis, models};
-use super::http_client::{HttpClient, SignedStorageRequestError, generated_configuration};
+use super::http_client::{HttpClient, generated_configuration};
 use super::http_util::{self, BoundedBodyError};
 use super::problem::{
     self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
@@ -21,12 +17,7 @@ use super::problem::{
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-// A 64 MiB File needs a larger transfer budget than metadata requests. Storage
-// still enforces the signed capability's expiry; this does not renew authority.
-const STORAGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CREATE_ATTEMPTS: usize = 2;
-const TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
-const INPUT_JSON_MEDIA_TYPE: &str = "application/json";
 
 pub(crate) type Run = models::Run;
 pub(crate) type RunState = models::run::State;
@@ -40,77 +31,10 @@ pub(crate) struct CreateRunInput<'a> {
     pub(crate) input_set_id: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NamedScalarInputKind {
-    Text,
-    Json,
-    File,
-}
-
-impl NamedScalarInputKind {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-            Self::File => "file",
-        }
-    }
-
-    pub(crate) const fn default_media_type(self) -> Option<&'static str> {
-        match self {
-            Self::Text => Some(TEXT_MEDIA_TYPE),
-            Self::Json => Some(INPUT_JSON_MEDIA_TYPE),
-            Self::File => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NamedScalarInputMetadata {
-    pub(crate) name: String,
-    pub(crate) kind: NamedScalarInputKind,
-    pub(crate) media_type: String,
-    pub(crate) size_bytes: u64,
-    pub(crate) sha256: [u8; 32],
-}
-
-pub(crate) struct ScalarInputSet {
-    id: String,
-    project_id: String,
-    metadata: NamedScalarInputMetadata,
-    manifest_sha256: [u8; 32],
-    open_deadline_at: OffsetDateTime,
-}
-
-impl ScalarInputSet {
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl fmt::Debug for ScalarInputSet {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ScalarInputSet([redacted])")
-    }
-}
-
-struct ScalarUploadCapability {
-    url: Url,
-    content_length: String,
-    content_type: String,
-    checksum_sha256: String,
-}
-
-impl fmt::Debug for ScalarUploadCapability {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ScalarUploadCapability([redacted])")
-    }
-}
-
 pub(crate) struct RunApi<'a> {
-    configuration: apis::configuration::Configuration,
-    storage_transport: &'a HttpClient,
-    transport_policy: HttpTransportPolicy,
+    pub(super) configuration: apis::configuration::Configuration,
+    pub(super) storage_transport: &'a HttpClient,
+    pub(super) transport_policy: HttpTransportPolicy,
 }
 
 impl<'a> RunApi<'a> {
@@ -146,6 +70,7 @@ impl<'a> RunApi<'a> {
         organization: &str,
         idempotency_key: &str,
         input: CreateRunInput<'_>,
+        begin_dispatch: impl Fn() -> bool,
     ) -> Result<RunCreationAcceptance, RunFailure> {
         let mut request = models::CreateRunRequest::new(
             input.project_id.to_owned(),
@@ -155,185 +80,24 @@ impl<'a> RunApi<'a> {
         request.display_name = input.display_name.map(str::to_owned);
         request.input_set_id = input.input_set_id.map(|id| Some(id.to_owned()));
         let endpoint = self.collection_endpoint(organization);
-        let response =
-            self.send_api_request(StatusCode::ACCEPTED, Some(idempotency_key), || {
+        let response = self.send_api_request(
+            StatusCode::ACCEPTED,
+            Some(idempotency_key),
+            begin_dispatch,
+            || {
                 self.request(Method::POST, &endpoint)
                     .header("Idempotency-Key", idempotency_key)
                     .json(&request)
-            })?;
+            },
+        )?;
         decode_create_response(response, organization, idempotency_key)
     }
 
-    pub(crate) fn create_scalar_input_set(
-        &self,
-        organization: &str,
-        idempotency_key: &str,
-        project_id: &str,
-        metadata: &NamedScalarInputMetadata,
-    ) -> Result<ScalarInputSet, RunFailure> {
-        let size_bytes =
-            i64::try_from(metadata.size_bytes).map_err(|_| RunFailure::InvalidInput)?;
-        let sha256 = lowercase_hex_digest(metadata.sha256);
-        let entry = match metadata.kind {
-            NamedScalarInputKind::Text => {
-                models::RunInputManifestEntry::Text(Box::new(models::RunInputTextEntry::new(
-                    models::run_input_text_entry::Kind::Text,
-                    size_bytes,
-                    sha256,
-                )))
-            }
-            NamedScalarInputKind::Json => {
-                models::RunInputManifestEntry::Json(Box::new(models::RunInputJsonEntry::new(
-                    models::run_input_json_entry::Kind::Json,
-                    size_bytes,
-                    sha256,
-                )))
-            }
-            NamedScalarInputKind::File => {
-                models::RunInputManifestEntry::File(Box::new(models::RunInputFileEntry::new(
-                    models::run_input_file_entry::Kind::File,
-                    metadata.media_type.clone(),
-                    size_bytes,
-                    sha256,
-                )))
-            }
-        };
-        let request = models::CreateRunInputSetRequest::new(
-            project_id.to_owned(),
-            1,
-            std::collections::HashMap::from([(metadata.name.clone(), entry)]),
-        );
-        let body = serde_json::to_vec(&request).map_err(|_| RunFailure::protocol(false))?;
-        let response = self.input_api_request(InputApiRequest {
-            organization,
-            input_set_id: None,
-            operation: InputOperation::Create,
-            idempotency_key: Some(idempotency_key),
-            body: Some(body),
-        })?;
-        let set: models::RunInputSet =
-            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        let manifest_sha256 = scalar_manifest_digest(metadata);
-        let set = validate_scalar_input_set(
-            set,
-            project_id,
-            metadata,
-            manifest_sha256,
-            ExpectedInputSetState::Open,
-        )?;
-        let expected_location = format!(
-            "/v1/organizations/{}/run-input-sets/{}",
-            apis::urlencode(organization),
-            apis::urlencode(&set.id)
-        );
-        require_exact_header(response.locations.iter(), &expected_location)?;
-        let open_deadline_at =
-            parse_timestamp(&set.open_deadline_at).ok_or_else(|| RunFailure::protocol(false))?;
-        Ok(ScalarInputSet {
-            id: set.id,
-            project_id: project_id.to_owned(),
-            metadata: metadata.clone(),
-            manifest_sha256,
-            open_deadline_at,
-        })
-    }
-
-    pub(crate) fn issue_and_upload_scalar(
-        &self,
-        organization: &str,
-        input_set: &ScalarInputSet,
-        bytes: &[u8],
-    ) -> Result<(), RunFailure> {
-        if u64::try_from(bytes.len()).ok() != Some(input_set.metadata.size_bytes)
-            || digest_bytes(bytes) != input_set.metadata.sha256
-        {
-            return Err(RunFailure::InvalidInput);
-        }
-        let body = serde_json::to_vec(&models::RunInputUploadCapabilityRequest::new(vec![
-            scalar_member_id(&input_set.metadata.name),
-        ]))
-        .map_err(|_| RunFailure::protocol(false))?;
-        let response = self.input_api_request(InputApiRequest {
-            organization,
-            input_set_id: Some(&input_set.id),
-            operation: InputOperation::IssueUpload,
-            idempotency_key: None,
-            body: Some(body),
-        })?;
-        require_private_no_store(&response)?;
-        let issued: models::RunInputUploadCapabilityResponse =
-            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        let capability =
-            validate_scalar_upload_capability(issued, input_set, self.transport_policy)?;
-        self.upload_scalar(&capability, bytes)
-    }
-
-    pub(crate) fn seal_scalar_input_set(
-        &self,
-        organization: &str,
-        idempotency_key: &str,
-        input_set: &ScalarInputSet,
-    ) -> Result<(), RunFailure> {
-        let response = self.input_api_request(InputApiRequest {
-            organization,
-            input_set_id: Some(&input_set.id),
-            operation: InputOperation::Seal,
-            idempotency_key: Some(idempotency_key),
-            body: None,
-        })?;
-        let set: models::RunInputSet =
-            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        let set = validate_scalar_input_set(
-            set,
-            &input_set.project_id,
-            &input_set.metadata,
-            input_set.manifest_sha256,
-            ExpectedInputSetState::Sealed,
-        )?;
-        if set.id != input_set.id {
-            return Err(RunFailure::protocol(false));
-        }
-        Ok(())
-    }
-
-    fn input_api_request(
-        &self,
-        request: InputApiRequest<'_>,
-    ) -> Result<ReceivedResponse, RunFailure> {
-        let endpoint = input_endpoint(
-            &self.configuration.base_path,
-            request.organization,
-            request.input_set_id,
-            request.operation,
-        )?;
-        let response = self.send_api_request(
-            request.operation.success_status(),
-            request.idempotency_key,
-            || {
-                let mut builder = self.request(Method::POST, &endpoint);
-                if let Some(idempotency_key) = request.idempotency_key {
-                    builder = builder.header("Idempotency-Key", idempotency_key);
-                }
-                if let Some(body) = &request.body {
-                    builder = builder
-                        .header(CONTENT_TYPE, JSON_MEDIA_TYPE)
-                        .body(body.clone());
-                }
-                builder
-            },
-        )?;
-        if response.status == request.operation.success_status() {
-            require_media_type(&response, JSON_MEDIA_TYPE, false)?;
-            Ok(response)
-        } else {
-            Err(classify_failure(&response, RunOperation::InputMutation))
-        }
-    }
-
-    fn send_api_request(
+    pub(super) fn send_api_request(
         &self,
         success_status: StatusCode,
         idempotency_key: Option<&str>,
+        begin_dispatch: impl Fn() -> bool,
         mut build: impl FnMut() -> reqwest::blocking::RequestBuilder,
     ) -> Result<ReceivedResponse, RunFailure> {
         let attempts = if idempotency_key.is_some() {
@@ -343,6 +107,9 @@ impl<'a> RunApi<'a> {
         };
         let mut last_transport_failure = UnreachableCategory::Connection;
         for attempt in 0..attempts {
+            if !begin_dispatch() {
+                return Err(RunFailure::Interrupted);
+            }
             let response = match build().send() {
                 Ok(response) => response,
                 Err(error) => {
@@ -395,53 +162,6 @@ impl<'a> RunApi<'a> {
         Err(RunFailure::Unreachable(last_transport_failure))
     }
 
-    fn upload_scalar(
-        &self,
-        capability: &ScalarUploadCapability,
-        bytes: &[u8],
-    ) -> Result<(), RunFailure> {
-        let mut headers = HeaderMap::with_capacity(4);
-        headers.insert(
-            CONTENT_LENGTH,
-            HeaderValue::from_str(&capability.content_length)
-                .map_err(|_| RunFailure::protocol(false))?,
-        );
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_str(&capability.content_type)
-                .map_err(|_| RunFailure::protocol(false))?,
-        );
-        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
-        headers.insert(
-            "x-amz-checksum-sha256",
-            HeaderValue::from_str(&capability.checksum_sha256)
-                .map_err(|_| RunFailure::protocol(false))?,
-        );
-        let status =
-            self.storage_transport
-                .signed_storage_put(&capability.url, headers, bytes, STORAGE_UPLOAD_TIMEOUT)
-                .map_err(|error| match error {
-                    SignedStorageRequestError::Build
-                    | SignedStorageRequestError::InvalidRequest => RunFailure::protocol(false),
-                    SignedStorageRequestError::Unreachable(category) => {
-                        RunFailure::Unreachable(category)
-                    }
-                })?;
-        if status == StatusCode::PRECONDITION_FAILED {
-            return Ok(());
-        }
-        if status.is_server_error() {
-            return Err(RunFailure::Unreachable(UnreachableCategory::Server));
-        }
-        if !matches!(
-            status,
-            StatusCode::OK | StatusCode::CREATED | StatusCode::NO_CONTENT
-        ) {
-            return Err(RunFailure::InputUploadRejected);
-        }
-        Ok(())
-    }
-
     pub(crate) fn get(&self, organization: &str, run_id: &str) -> Result<Run, RunFailure> {
         let endpoint = format!(
             "{}/{}",
@@ -477,7 +197,11 @@ impl<'a> RunApi<'a> {
         )
     }
 
-    fn request(&self, method: Method, endpoint: &str) -> reqwest::blocking::RequestBuilder {
+    pub(super) fn request(
+        &self,
+        method: Method,
+        endpoint: &str,
+    ) -> reqwest::blocking::RequestBuilder {
         let mut request = self
             .configuration
             .client
@@ -499,315 +223,6 @@ impl Drop for RunApi<'_> {
     }
 }
 
-struct InputApiRequest<'a> {
-    organization: &'a str,
-    input_set_id: Option<&'a str>,
-    operation: InputOperation,
-    idempotency_key: Option<&'a str>,
-    body: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Copy)]
-enum InputOperation {
-    Create,
-    IssueUpload,
-    Seal,
-}
-
-impl InputOperation {
-    const fn success_status(self) -> StatusCode {
-        match self {
-            Self::Create => StatusCode::CREATED,
-            Self::IssueUpload | Self::Seal => StatusCode::OK,
-        }
-    }
-}
-
-fn input_endpoint(
-    base_path: &str,
-    organization: &str,
-    input_set_id: Option<&str>,
-    operation: InputOperation,
-) -> Result<String, RunFailure> {
-    let mut endpoint = format!(
-        "{}/v1/organizations/{}/run-input-sets",
-        base_path.trim_end_matches('/'),
-        apis::urlencode(organization)
-    );
-    match operation {
-        InputOperation::Create if input_set_id.is_none() => {}
-        InputOperation::IssueUpload | InputOperation::Seal => {
-            let input_set_id = input_set_id.ok_or_else(|| RunFailure::protocol(false))?;
-            endpoint.push('/');
-            endpoint.push_str(&apis::urlencode(input_set_id));
-            endpoint.push_str(match operation {
-                InputOperation::IssueUpload => "/upload-capabilities",
-                InputOperation::Seal => "/seal",
-                InputOperation::Create => return Err(RunFailure::protocol(false)),
-            });
-        }
-        InputOperation::Create => return Err(RunFailure::protocol(false)),
-    }
-    Ok(endpoint)
-}
-
-#[derive(Clone, Copy)]
-enum ExpectedInputSetState {
-    Open,
-    Sealed,
-}
-
-fn validate_scalar_input_set(
-    set: models::RunInputSet,
-    project_id: &str,
-    metadata: &NamedScalarInputMetadata,
-    manifest_sha256: [u8; 32],
-    expected_state: ExpectedInputSetState,
-) -> Result<models::RunInputSet, RunFailure> {
-    let scalar = set.manifest.inputs.get(&metadata.name);
-    let mut members = set.members.iter();
-    let scalar_status = members.next();
-    let created_at = parse_timestamp(&set.created_at);
-    let open_deadline_at = parse_timestamp(&set.open_deadline_at);
-    let expected_scalar_sha256 = lowercase_hex_digest(metadata.sha256);
-    let expected_manifest_sha256 = lowercase_hex_digest(manifest_sha256);
-    let expected_member_id = scalar_member_id(&metadata.name);
-    let immutable_valid = crate::public_id::valid_typed_id(&set.id, "ris_")
-        && crate::public_id::valid_typed_id(&set.organization_id, "org_")
-        && set.project_id == project_id
-        && set.bounds_profile == 1
-        && set.manifest.schema_version == 1
-        && set.manifest.inputs.len() == 1
-        && scalar.is_some_and(|entry| match (metadata.kind, entry) {
-            (NamedScalarInputKind::Text, models::RunInputManifestEntry::Text(text)) => {
-                text.kind == models::run_input_text_entry::Kind::Text
-                    && u64::try_from(text.size_bytes).ok() == Some(metadata.size_bytes)
-                    && text.sha256 == expected_scalar_sha256
-            }
-            (NamedScalarInputKind::Json, models::RunInputManifestEntry::Json(json)) => {
-                json.kind == models::run_input_json_entry::Kind::Json
-                    && u64::try_from(json.size_bytes).ok() == Some(metadata.size_bytes)
-                    && json.sha256 == expected_scalar_sha256
-            }
-            (NamedScalarInputKind::File, models::RunInputManifestEntry::File(file)) => {
-                file.kind == models::run_input_file_entry::Kind::File
-                    && file.media_type == metadata.media_type
-                    && u64::try_from(file.size_bytes).ok() == Some(metadata.size_bytes)
-                    && file.sha256 == expected_scalar_sha256
-            }
-            (_, _) => false,
-        })
-        && set.manifest_digest.algorithm
-            == models::run_input_digest::Algorithm::RunInputDigestAlgorithmSha256
-        && set.manifest_digest.value == expected_manifest_sha256
-        && set.input_count == 1
-        && set.attachment_count == 0
-        && u64::try_from(set.aggregate_size_bytes).ok() == Some(metadata.size_bytes)
-        && scalar_status.is_some_and(|member| member.member_id == expected_member_id)
-        && members.next().is_none()
-        && created_at
-            .zip(open_deadline_at)
-            .is_some_and(|(created, deadline)| created < deadline);
-    let state_valid = match expected_state {
-        ExpectedInputSetState::Open => {
-            set.state == models::run_input_set::State::Open
-                && set.sealed_at.is_none()
-                && set.sealed_deadline_at.is_none()
-                && scalar_status.is_some_and(|member| !member.upload_confirmed)
-        }
-        ExpectedInputSetState::Sealed => {
-            let sealed_at = set.sealed_at.as_deref().and_then(parse_timestamp);
-            let sealed_deadline_at = set.sealed_deadline_at.as_deref().and_then(parse_timestamp);
-            set.state == models::run_input_set::State::Sealed
-                && scalar_status.is_some_and(|member| member.upload_confirmed)
-                && sealed_at
-                    .zip(sealed_deadline_at)
-                    .is_some_and(|(sealed, deadline)| sealed < deadline)
-        }
-    };
-    if immutable_valid && state_valid {
-        Ok(set)
-    } else {
-        Err(RunFailure::protocol(false))
-    }
-}
-
-fn validate_scalar_upload_capability(
-    issued: models::RunInputUploadCapabilityResponse,
-    input_set: &ScalarInputSet,
-    transport_policy: HttpTransportPolicy,
-) -> Result<ScalarUploadCapability, RunFailure> {
-    if issued.input_set_id != input_set.id
-        || parse_timestamp(&issued.capability_expires_at)
-            .is_none_or(|expires_at| expires_at > input_set.open_deadline_at)
-    {
-        return Err(RunFailure::protocol(false));
-    }
-    let mut members = issued.members.into_iter();
-    let member = members.next().ok_or_else(|| RunFailure::protocol(false))?;
-    if members.next().is_some() || member.member_id != scalar_member_id(&input_set.metadata.name) {
-        return Err(RunFailure::protocol(false));
-    }
-    let expected_content_length = input_set.metadata.size_bytes.to_string();
-    let expected_checksum =
-        base64::engine::general_purpose::STANDARD.encode(input_set.metadata.sha256);
-    let headers = member.required_headers;
-    if headers.content_length != expected_content_length
-        || headers.content_type != input_set.metadata.media_type
-        || headers.if_none_match != models::run_input_upload_required_headers::IfNoneMatch::Star
-        || headers.x_amz_checksum_sha256 != expected_checksum
-    {
-        return Err(RunFailure::protocol(false));
-    }
-    let url = Url::parse(&member.url).map_err(|_| RunFailure::protocol(false))?;
-    if !transport_policy.permits(&url)
-        || url.username() != ""
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || url.query().is_none()
-    {
-        return Err(RunFailure::protocol(false));
-    }
-    Ok(ScalarUploadCapability {
-        url,
-        content_length: headers.content_length,
-        content_type: headers.content_type,
-        checksum_sha256: headers.x_amz_checksum_sha256,
-    })
-}
-
-fn require_private_no_store(response: &ReceivedResponse) -> Result<(), RunFailure> {
-    let mut values = response.cache_controls.iter();
-    let valid = values
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("private, no-store"))
-        && values.next().is_none();
-    if valid {
-        Ok(())
-    } else {
-        Err(RunFailure::protocol(false))
-    }
-}
-
-fn scalar_manifest_digest(metadata: &NamedScalarInputMetadata) -> [u8; 32] {
-    let media_type = if metadata.kind == NamedScalarInputKind::File {
-        format!(
-            ",\"mediaType\":{}",
-            serde_json::to_string(&metadata.media_type).unwrap_or_default()
-        )
-    } else {
-        String::new()
-    };
-    let canonical = format!(
-        "{{\"inputs\":{{\"{}\":{{\"kind\":\"{}\"{},\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
-        metadata.name,
-        metadata.kind.as_str(),
-        media_type,
-        lowercase_hex_digest(metadata.sha256),
-        metadata.size_bytes
-    );
-    digest_bytes(canonical.as_bytes())
-}
-
-fn scalar_member_id(name: &str) -> String {
-    format!("inputs/{name}")
-}
-
-fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
-    let digest = digest(&SHA256, bytes);
-    let mut result = [0_u8; 32];
-    result.copy_from_slice(digest.as_ref());
-    result
-}
-
-fn lowercase_hex_digest(digest: [u8; 32]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_file_media_type_mismatch_problem() {
-        let response = ReceivedResponse {
-            status: StatusCode::CONFLICT,
-            content_type: Some(HeaderValue::from_static(PROBLEM_MEDIA_TYPE)),
-            idempotency_keys: Vec::new(),
-            locations: Vec::new(),
-            cache_controls: Vec::new(),
-            body: serde_json::to_vec(&serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/run-input-bindings-invalid",
-                "title": "Run Input bindings invalid",
-                "status": 409,
-                "diagnostic": {
-                    "code": "input_media_type_mismatch",
-                    "input": "payload"
-                }
-            }))
-            .unwrap(),
-        };
-
-        assert_eq!(
-            classify_failure(&response, RunOperation::Create),
-            RunFailure::Conflict
-        );
-    }
-
-    #[test]
-    fn validates_singular_file_input_set_projection() {
-        let bytes = [0_u8, 0xff, 7, b'\n'];
-        let media_type = "application/octet-stream; version=1";
-        let metadata = NamedScalarInputMetadata {
-            name: "request".to_owned(),
-            kind: NamedScalarInputKind::File,
-            media_type: media_type.to_owned(),
-            size_bytes: u64::try_from(bytes.len()).unwrap(),
-            sha256: digest_bytes(&bytes),
-        };
-        let set: models::RunInputSet = serde_json::from_value(serde_json::json!({
-            "id": "ris_01k0z6r1w8f4jy2m7q9v3x5abc",
-            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
-            "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
-            "boundsProfile": 1,
-            "manifest": {"schemaVersion": 1, "inputs": {"request": {
-                "kind": "file", "mediaType": media_type,
-                "sizeBytes": bytes.len(), "sha256": lowercase_hex_digest(metadata.sha256)
-            }}},
-            "manifestDigest": {"algorithm": "sha256", "value": lowercase_hex_digest(scalar_manifest_digest(&metadata))},
-            "inputCount": 1,
-            "attachmentCount": 0,
-            "aggregateSizeBytes": bytes.len(),
-            "state": "open",
-            "createdAt": "2026-08-24T01:00:00Z",
-            "openDeadlineAt": "2026-08-25T01:00:00Z",
-            "members": [{"memberId": "inputs/request", "uploadConfirmed": false}],
-            "replayed": false
-        })).unwrap();
-        assert!(
-            validate_scalar_input_set(
-                set,
-                "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
-                &metadata,
-                scalar_manifest_digest(&metadata),
-                ExpectedInputSetState::Open,
-            )
-            .is_ok()
-        );
-    }
-}
-
-fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
-    OffsetDateTime::parse(value, &Rfc3339).ok()
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunFailure {
     Unauthenticated,
@@ -815,8 +230,11 @@ pub(crate) enum RunFailure {
     InvalidInput,
     NotFound,
     Conflict,
+    Gone,
     Unreachable(UnreachableCategory),
     InputUploadRejected,
+    InputDownloadRejected,
+    Interrupted,
     Protocol { credential_rejected: bool },
 }
 
@@ -842,20 +260,20 @@ impl RunFailure {
         )
     }
 
-    fn protocol(credential_rejected: bool) -> Self {
+    pub(super) fn protocol(credential_rejected: bool) -> Self {
         Self::Protocol {
             credential_rejected,
         }
     }
 }
 
-struct ReceivedResponse {
-    status: StatusCode,
-    content_type: Option<HeaderValue>,
-    idempotency_keys: Vec<HeaderValue>,
-    locations: Vec<HeaderValue>,
-    cache_controls: Vec<HeaderValue>,
-    body: Vec<u8>,
+pub(super) struct ReceivedResponse {
+    pub(super) status: StatusCode,
+    pub(super) content_type: Option<HeaderValue>,
+    pub(super) idempotency_keys: Vec<HeaderValue>,
+    pub(super) locations: Vec<HeaderValue>,
+    pub(super) cache_controls: Vec<HeaderValue>,
+    pub(super) body: Vec<u8>,
 }
 
 enum ReceiveError {
@@ -934,17 +352,17 @@ fn decode_get_response(
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum RunOperation {
+pub(super) enum RunOperation {
     Create,
     Get,
-    InputMutation,
+    Input,
 }
 
-fn classify_failure(response: &ReceivedResponse, operation: RunOperation) -> RunFailure {
+pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperation) -> RunFailure {
     match response.status {
         StatusCode::BAD_REQUEST => validated_problem_failure(
             response,
-            (operation != RunOperation::InputMutation).then_some(BAD_REQUEST),
+            (operation != RunOperation::Input).then_some(BAD_REQUEST),
             RunFailure::InvalidInput,
             false,
         ),
@@ -960,19 +378,14 @@ fn classify_failure(response: &ReceivedResponse, operation: RunOperation) -> Run
         StatusCode::NOT_FOUND => {
             validated_problem_failure(response, Some(NOT_FOUND), RunFailure::NotFound, false)
         }
-        StatusCode::CONFLICT | StatusCode::GONE
-            if matches!(
-                operation,
-                RunOperation::Create | RunOperation::InputMutation
-            ) =>
-        {
+        StatusCode::CONFLICT if matches!(operation, RunOperation::Create | RunOperation::Input) => {
             validated_problem_failure(response, None, RunFailure::Conflict, false)
         }
+        StatusCode::GONE if matches!(operation, RunOperation::Create | RunOperation::Input) => {
+            validated_problem_failure(response, None, RunFailure::Gone, false)
+        }
         StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE
-            if matches!(
-                operation,
-                RunOperation::Create | RunOperation::InputMutation
-            ) =>
+            if matches!(operation, RunOperation::Create | RunOperation::Input) =>
         {
             validated_problem_failure(response, None, RunFailure::InvalidInput, false)
         }
@@ -1048,7 +461,7 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
     }
 }
 
-fn require_exact_header<'a>(
+pub(super) fn require_exact_header<'a>(
     mut values: impl Iterator<Item = &'a HeaderValue>,
     expected: &str,
 ) -> Result<(), RunFailure> {
@@ -1076,7 +489,7 @@ fn require_problem_type(
     }
 }
 
-fn require_media_type(
+pub(super) fn require_media_type(
     response: &ReceivedResponse,
     expected: &str,
     credential_rejected: bool,

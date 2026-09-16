@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud run inputs show --help
+Show the retained input inventory for a run
+
+Usage: scherzo-cloud run inputs show [OPTIONS] <ORGANIZATION> <RUN>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <RUN>           Exact Run ID
+
+Options:
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+      --json                 Write one JSON result to standard output
+  -h, --help                 Print help
+
+```

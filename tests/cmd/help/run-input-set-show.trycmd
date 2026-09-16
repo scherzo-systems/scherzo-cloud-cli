@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud run input-set show --help
+Show a Run Input Set and its manifest
+
+Usage: scherzo-cloud run input-set show [OPTIONS] <ORGANIZATION> <INPUT_SET>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <INPUT_SET>     Exact Run Input Set ID
+
+Options:
+      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
+      --json                 Write one JSON result to standard output
+  -h, --help                 Print help
+
+```

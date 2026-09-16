@@ -30,6 +30,7 @@ pub(super) use impl_organization_human_credential_outcome;
 
 mod account;
 mod artifact;
+mod atomic_directory;
 mod auth;
 mod deletion;
 mod github;
@@ -49,8 +50,8 @@ use std::ops::Deref;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -68,7 +69,25 @@ use crate::human_auth::session::{self, RequiredOperation};
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
 #[derive(Debug, Args)]
-struct JsonInlineInput {
+struct NamedInputArgs {
+    #[arg(
+        long,
+        value_names = ["NAME", "TEXT"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named Text value"
+    )]
+    input_text: Vec<OsString>,
+
+    #[arg(
+        long,
+        value_names = ["NAME", "PATH"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named Text value from a regular file, or - for standard input"
+    )]
+    input_text_file: Vec<OsString>,
+
     #[arg(
         long,
         value_names = ["NAME", "JSON"],
@@ -77,10 +96,16 @@ struct JsonInlineInput {
         help = "Supply one required named JSON value"
     )]
     input_json: Vec<OsString>,
-}
 
-#[derive(Debug, Args)]
-struct FileInput {
+    #[arg(
+        long,
+        value_names = ["NAME", "PATH"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        help = "Supply one required named JSON value from a regular file, or - for standard input"
+    )]
+    input_json_file: Vec<OsString>,
+
     #[arg(
         long,
         value_names = ["NAME", "MEDIA_TYPE", "PATH"],
@@ -89,6 +114,35 @@ struct FileInput {
         help = "Supply one required named File value with an explicit media type (maximum 64 MiB)"
     )]
     input_file: Vec<OsString>,
+
+    #[arg(
+        long,
+        value_names = ["NAME", "MEDIA_TYPE", "PATH"],
+        num_args = 3,
+        action = clap::ArgAction::Append,
+        help = "Append an immutable member to a named attachment collection"
+    )]
+    input_attachment: Vec<OsString>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        action = clap::ArgAction::Append,
+        help = "Supply a present named attachment collection with no members"
+    )]
+    input_attachments_empty: Vec<String>,
+}
+
+impl NamedInputArgs {
+    fn is_empty(&self) -> bool {
+        self.input_text.is_empty()
+            && self.input_text_file.is_empty()
+            && self.input_json.is_empty()
+            && self.input_json_file.is_empty()
+            && self.input_file.is_empty()
+            && self.input_attachment.is_empty()
+            && self.input_attachments_empty.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -457,17 +511,16 @@ impl ProcessSignals {
 
 fn execute_read_only_with_signals(
     context: &'static str,
-    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
+    operation: impl FnOnce(&OperationControl<()>) -> CommandResult + Send + 'static,
 ) -> CommandResult {
-    execute_blocking_with_signals(context, operation, Ok)
+    execute_mutation_with_signals(context, (), operation, |signal, _| Ok(signal))
 }
 
 fn execute_cancellable_with_signals(
     context: &'static str,
     operation: impl FnOnce(&Cancellation) -> CommandResult + Send + 'static,
 ) -> CommandResult {
-    let runtime = blocking_signal_runtime(context)?;
-    let result = runtime.block_on(async move {
+    run_blocking_signal_runtime(context, async move {
         let mut signals = ProcessSignals::install(context)?;
         let cancellation = Cancellation::new();
         let operation_cancellation = cancellation.clone();
@@ -484,17 +537,40 @@ fn execute_cancellable_with_signals(
             }
             result = &mut running => finish_read_only_operation(context, result),
         }
-    });
-    runtime.shutdown_timeout(Duration::ZERO);
-    result
+    })
 }
 
-fn execute_mutation_with_signals(
+fn execute_cancellable_mutation_with_signals(
     context: &'static str,
-    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
-    incomplete_signal: impl FnOnce(ExitCode) -> CommandResult + 'static,
+    operation: impl FnOnce(&crate::api::HttpCancellation, &OperationControl<()>) -> CommandResult
+    + Send
+    + 'static,
+    interrupt_operation: impl FnOnce() -> bool + 'static,
+    incomplete_signal: impl FnOnce(ExitCode, bool) -> CommandResult + 'static,
 ) -> CommandResult {
-    execute_blocking_with_signals(context, operation, incomplete_signal)
+    run_blocking_signal_runtime(context, async move {
+        let mut signals = ProcessSignals::install(context)?;
+        let cancellation = crate::api::HttpCancellation::new();
+        let control = Arc::new(OperationControl::new(()));
+        let operation_cancellation = cancellation.clone();
+        let operation_control = Arc::clone(&control);
+        let mut running = tokio::task::spawn_blocking(move || {
+            operation(&operation_cancellation, &operation_control)
+        });
+        tokio::select! {
+            biased;
+            signal = signals.recv() => match control.claim_signal() {
+                Some(_) => {
+                    cancellation.cancel();
+                    let commitment_unknown = interrupt_operation();
+                    finish_read_only_operation(context, running.await)?;
+                    incomplete_signal(signal, commitment_unknown)
+                }
+                None => finish_read_only_operation(context, running.await),
+            },
+            result = &mut running => finish_read_only_operation(context, result),
+        }
+    })
 }
 
 // A terminal result and a local stop compete for one output claim so timeout/signal
@@ -561,71 +637,265 @@ fn blocking_signal_runtime(context: &str) -> anyhow::Result<tokio::runtime::Runt
         .with_context(|| format!("start {context} runtime"))
 }
 
+fn run_blocking_signal_runtime(
+    context: &str,
+    operation: impl std::future::Future<Output = CommandResult>,
+) -> CommandResult {
+    let runtime = blocking_signal_runtime(context)?;
+    let result = runtime.block_on(operation);
+    runtime.shutdown_timeout(Duration::ZERO);
+    result
+}
+
+fn spawn_controlled_blocking<C>(
+    control: Arc<C>,
+    operation: impl FnOnce(&C) -> CommandResult + Send + 'static,
+) -> tokio::task::JoinHandle<CommandResult>
+where
+    C: Send + Sync + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(&control))
+}
+
+async fn finish_stopped_operation(
+    context: &str,
+    running: &mut tokio::task::JoinHandle<CommandResult>,
+    stopped: Option<CommandResult>,
+) -> CommandResult {
+    match stopped {
+        Some(result) => result,
+        None => finish_read_only_operation(context, running.await),
+    }
+}
+
 fn execute_observation_with_signals_and_timeout(
     context: &'static str,
     timeout: Option<Duration>,
     operation: impl FnOnce(&BlockingObservationControl) -> CommandResult + Send + 'static,
     timed_out: impl FnOnce() -> CommandResult + 'static,
 ) -> CommandResult {
-    let runtime = blocking_signal_runtime(context)?;
-    let result = runtime.block_on(async move {
+    run_blocking_signal_runtime(context, async move {
         let mut signals = ProcessSignals::install(context)?;
         let control = Arc::new(BlockingObservationControl::new());
-        let operation_control = Arc::clone(&control);
-        let mut running = tokio::task::spawn_blocking(move || operation(&operation_control));
+        let mut running = spawn_controlled_blocking(Arc::clone(&control), operation);
         tokio::select! {
             biased;
             signal = signals.recv() => {
-                if control.stop() {
-                    Ok(signal)
-                } else {
-                    finish_read_only_operation(context, running.await)
-                }
+                let stopped = control.stop().then(|| Ok(signal));
+                finish_stopped_operation(context, &mut running, stopped).await
             }
             () = (ObservationTimeout { duration: timeout }).wait() => {
-                if control.stop() {
-                    timed_out()
-                } else {
-                    finish_read_only_operation(context, running.await)
-                }
+                let stopped = control.stop().then(timed_out);
+                finish_stopped_operation(context, &mut running, stopped).await
             }
             result = &mut running => finish_read_only_operation(context, result),
         }
-    });
-    runtime.shutdown_timeout(Duration::ZERO);
-    result
+    })
 }
 
-fn execute_blocking_with_signals(
-    context: &'static str,
-    operation: impl FnOnce(&AtomicBool, &AtomicBool) -> CommandResult + Send + 'static,
-    incomplete_signal: impl FnOnce(ExitCode) -> CommandResult + 'static,
+// Dispatch, recovery, and output ownership are linearized by one state lock. Mutations claim
+// Completion before rendering so a signal cannot add a second receipt. Read-only commands enter
+// ReadOnlyOutput instead: a signal may abandon a blocked writer until output finishes and claims
+// Completion. The lock is released before requests, joins, rendering, and callbacks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationOwner {
+    Active,
+    ReadOnlyOutput,
+    Completion,
+    Signal,
+}
+
+struct OperationState<R> {
+    owner: OperationOwner,
+    dispatched: bool,
+    recovery: R,
+}
+
+struct OperationControl<R> {
+    // A derived cooperative-stop notification for CPU-bound helpers. It is set only while
+    // transitioning the authoritative state to Signal and never grants dispatch/output authority.
+    cooperative_stop: AtomicBool,
+    state: Mutex<OperationState<R>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignalSnapshot<R> {
+    dispatched: bool,
+    recovery: R,
+}
+
+fn report_dispatched_signal<R>(
+    signal: ExitCode,
+    snapshot: SignalSnapshot<R>,
+    report: impl FnOnce(R) -> CommandResult,
 ) -> CommandResult {
-    let runtime = blocking_signal_runtime(context)?;
-    let result = runtime.block_on(async move {
+    if snapshot.dispatched {
+        report(snapshot.recovery)
+    } else {
+        Ok(signal)
+    }
+}
+
+impl<R> OperationControl<R> {
+    fn new(recovery: R) -> Self {
+        Self {
+            cooperative_stop: AtomicBool::new(false),
+            state: Mutex::new(OperationState {
+                owner: OperationOwner::Active,
+                dispatched: false,
+                recovery,
+            }),
+        }
+    }
+
+    fn cancellation(&self) -> &AtomicBool {
+        &self.cooperative_stop
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cooperative_stop.load(Ordering::Acquire)
+    }
+
+    fn lock_owned_state(
+        &self,
+        expected_owner: OperationOwner,
+    ) -> Option<std::sync::MutexGuard<'_, OperationState<R>>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.owner == expected_owner).then_some(state)
+    }
+
+    fn begin_dispatch(&self) -> bool {
+        let Some(mut state) = self.lock_owned_state(OperationOwner::Active) else {
+            return false;
+        };
+        state.dispatched = true;
+        true
+    }
+
+    fn begin_dispatch_with_recovery(&self, recovery: R) -> bool {
+        let Some(mut state) = self.lock_owned_state(OperationOwner::Active) else {
+            return false;
+        };
+        state.recovery = recovery;
+        state.dispatched = true;
+        true
+    }
+
+    fn update_recovery(&self, recovery: R) -> bool {
+        let Some(mut state) = self.lock_owned_state(OperationOwner::Active) else {
+            return false;
+        };
+        state.recovery = recovery;
+        true
+    }
+
+    fn recovery(&self) -> R
+    where
+        R: Clone,
+    {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovery
+            .clone()
+    }
+
+    fn transition_owner(&self, from: OperationOwner, to: OperationOwner) -> bool {
+        let Some(mut state) = self.lock_owned_state(from) else {
+            return false;
+        };
+        state.owner = to;
+        true
+    }
+
+    fn begin_completion(&self) -> bool {
+        self.transition_owner(OperationOwner::Active, OperationOwner::Completion)
+    }
+
+    fn begin_read_only_output(&self) -> bool {
+        self.transition_owner(OperationOwner::Active, OperationOwner::ReadOnlyOutput)
+    }
+
+    fn finish_read_only_output(&self) -> bool {
+        self.transition_owner(OperationOwner::ReadOnlyOutput, OperationOwner::Completion)
+    }
+
+    fn claim_signal(&self) -> Option<SignalSnapshot<R>>
+    where
+        R: Clone,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(
+            state.owner,
+            OperationOwner::Active | OperationOwner::ReadOnlyOutput
+        ) {
+            return None;
+        }
+        state.owner = OperationOwner::Signal;
+        self.cooperative_stop.store(true, Ordering::Release);
+        Some(SignalSnapshot {
+            dispatched: state.dispatched,
+            recovery: state.recovery.clone(),
+        })
+    }
+}
+
+fn complete_operation<R>(
+    control: &OperationControl<R>,
+    output: impl FnOnce() -> CommandResult,
+) -> CommandResult {
+    if control.begin_completion() {
+        output()
+    } else {
+        Ok(ExitCode::GeneralFailure)
+    }
+}
+
+fn complete_read_only_output<R>(
+    control: &OperationControl<R>,
+    output: impl FnOnce() -> CommandResult,
+) -> CommandResult {
+    if !control.begin_read_only_output() {
+        return Ok(ExitCode::GeneralFailure);
+    }
+    let result = output();
+    if control.finish_read_only_output() {
+        result
+    } else {
+        Ok(ExitCode::GeneralFailure)
+    }
+}
+
+fn execute_mutation_with_signals<R>(
+    context: &'static str,
+    recovery: R,
+    operation: impl FnOnce(&OperationControl<R>) -> CommandResult + Send + 'static,
+    incomplete_signal: impl FnOnce(ExitCode, SignalSnapshot<R>) -> CommandResult + 'static,
+) -> CommandResult
+where
+    R: Clone + Send + 'static,
+{
+    run_blocking_signal_runtime(context, async move {
         let mut signals = ProcessSignals::install(context)?;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let completed = Arc::new(AtomicBool::new(false));
-        let operation_cancelled = Arc::clone(&cancelled);
-        let operation_completed = Arc::clone(&completed);
-        let mut running = tokio::task::spawn_blocking(move || {
-            operation(&operation_cancelled, &operation_completed)
-        });
+        let control = Arc::new(OperationControl::new(recovery));
+        let mut running = spawn_controlled_blocking(Arc::clone(&control), operation);
         tokio::select! {
             biased;
             signal = signals.recv() => {
-                cancelled.store(true, Ordering::Release);
-                if completed.load(Ordering::Acquire) {
-                    finish_read_only_operation(context, running.await)
-                } else {
-                    incomplete_signal(signal)
-                }
+                let stopped = control
+                    .claim_signal()
+                    .map(|snapshot| incomplete_signal(signal, snapshot));
+                finish_stopped_operation(context, &mut running, stopped).await
             }
             result = &mut running => finish_read_only_operation(context, result),
         }
-    });
-    runtime.shutdown_timeout(Duration::ZERO);
-    result
+    })
 }
 
 fn finish_read_only_operation(
@@ -760,6 +1030,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
+    use std::sync::{Arc, Barrier, Mutex};
 
     use clap::CommandFactory;
     use serde_json::Value;
@@ -767,6 +1038,81 @@ mod tests {
     use super::{Cli, parse, unreachable_outcome_class};
     use crate::api::UnreachableCategory;
     use crate::exit_code::{ExitCode, OutcomeClass};
+
+    #[test]
+    fn completion_and_cancellation_each_win_one_controlled_output_race() {
+        for signal_wins in [true, false] {
+            let control = Arc::new(super::OperationControl::new(()));
+            let at_boundary = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let documents = Arc::new(Mutex::new(Vec::new()));
+
+            let worker_control = Arc::clone(&control);
+            let worker_boundary = Arc::clone(&at_boundary);
+            let worker_release = Arc::clone(&release);
+            let worker_documents = Arc::clone(&documents);
+            let worker = std::thread::spawn(move || {
+                if signal_wins {
+                    worker_boundary.wait();
+                    worker_release.wait();
+                }
+                super::complete_operation(&worker_control, || {
+                    if !signal_wins {
+                        worker_boundary.wait();
+                        worker_release.wait();
+                    }
+                    worker_documents.lock().unwrap().push(
+                        serde_json::to_vec(&serde_json::json!({"outcome": "completed"})).unwrap(),
+                    );
+                    Ok(ExitCode::Success)
+                })
+                .unwrap_or_else(|failure| panic!("{}", failure.error()))
+            });
+
+            at_boundary.wait();
+            let exit = if control.claim_signal().is_some() {
+                documents.lock().unwrap().push(
+                    serde_json::to_vec(&serde_json::json!({"outcome": "interrupted"})).unwrap(),
+                );
+                ExitCode::Interrupted
+            } else {
+                ExitCode::Success
+            };
+            release.wait();
+            let worker_exit = worker.join().unwrap();
+
+            let documents = documents.lock().unwrap();
+            assert_eq!(documents.len(), 1);
+            let document: Value = serde_json::from_slice(&documents[0]).unwrap();
+            if signal_wins {
+                assert_eq!(exit, ExitCode::Interrupted);
+                assert_eq!(worker_exit, ExitCode::GeneralFailure);
+                assert_eq!(document["outcome"], "interrupted");
+            } else {
+                assert_eq!(exit, ExitCode::Success);
+                assert_eq!(worker_exit, ExitCode::Success);
+                assert_eq!(document["outcome"], "completed");
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_completion_preserves_output_failures() {
+        let mutation = super::OperationControl::new(());
+        let result = super::complete_operation(&mutation, || {
+            mutation.recovery();
+            Err(anyhow::anyhow!("fixture mutation output failure").into())
+        });
+        assert!(result.is_err());
+        assert!(mutation.claim_signal().is_none());
+
+        let read_only = super::OperationControl::new(());
+        let result = super::complete_read_only_output(&read_only, || {
+            Err(anyhow::anyhow!("fixture read-only output failure").into())
+        });
+        assert!(result.is_err());
+        assert!(read_only.claim_signal().is_none());
+    }
 
     #[test]
     #[ignore = "launched only as the nested assignment workflow fixture"]
@@ -993,6 +1339,16 @@ mod tests {
             "project show",
             "run",
             "run create",
+            "run input-set",
+            "run input-set create",
+            "run input-set delete",
+            "run input-set seal",
+            "run input-set show",
+            "run input-set upload",
+            "run inputs",
+            "run inputs delete",
+            "run inputs download",
+            "run inputs show",
             "run show",
             "run wait",
             "runner",

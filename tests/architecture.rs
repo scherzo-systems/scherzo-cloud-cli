@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 /// `ARCHITECTURE.md` in the same change when the prose no longer matches.
 fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     let entries: &[(&str, &[&str])] = &[
-        ("api", &["public_id", "tls", "timing"]),
+        ("api", &["public_id", "tls", "timing", "workflow_contract"]),
         (
             "cli",
             &[
@@ -58,13 +58,21 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "public_id",
                 "runner",
                 "timing",
+                "workflow_contract",
             ],
         ),
         ("build_info", &[]),
         ("error", &["exit_code"]),
         (
             "execution",
-            &["build_info", "exit_code", "process", "public_id", "timing"],
+            &[
+                "build_info",
+                "exit_code",
+                "process",
+                "public_id",
+                "timing",
+                "workflow_contract",
+            ],
         ),
         ("exit_code", &[]),
         ("human_auth", &["api", "timing"]),
@@ -82,6 +90,7 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "runner_protocol",
                 "timing",
                 "tls",
+                "workflow_contract",
             ],
         ),
         // The runner protocol module is a leaf: DTOs and codecs only.
@@ -90,6 +99,7 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("test_support", &[]),
         ("timing", &[]),
         ("tls", &[]),
+        ("workflow_contract", &[]),
     ];
     entries
         .iter()

@@ -12,6 +12,7 @@ mod organizations;
 mod problem;
 mod profile;
 mod projects;
+mod run_inputs;
 mod runners;
 mod runs;
 mod signup;
@@ -49,7 +50,9 @@ pub(crate) use github::{
     GitHubAccountType, GitHubApi, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };
-pub(crate) use http_client::{HttpClient, HttpEndpointError, HttpTransportPolicy};
+pub(crate) use http_client::{
+    HttpCancellation, HttpClient, HttpEndpointError, HttpTransportPolicy,
+};
 pub(crate) use human_principal::HumanPrincipal;
 pub(crate) use identities::{
     CommonIdentityFailure, IdentityApiError, LinkIdentityOutcome, ListIdentitiesOutcome,
@@ -88,15 +91,18 @@ pub(crate) use projects::{
     GitHubRepositoryList as ProjectGitHubRepositoryList, Project, ProjectApi, ProjectFailure,
     ProjectList, ProjectReadinessBlocker, ProjectRepository,
 };
+pub(crate) use run_inputs::{
+    InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,
+    RetainedRunInputs, RunInputManifest, RunInputObjectMetadata, RunInputSet, RunInputUpload,
+    RunInputUploadOutcome, capability_batches, digest_bytes, input_set_is_open,
+    input_set_state_name, retained_manifest, transfer_capability_batch,
+};
 pub(crate) use runners::{
     RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,
     RunnerCredentialStoredState, RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList,
     RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
-pub(crate) use runs::{
-    CreateRunInput, NamedScalarInputKind, NamedScalarInputMetadata, Run, RunApi,
-    RunCreationAcceptance, RunFailure, RunState, ScalarInputSet,
-};
+pub(crate) use runs::{CreateRunInput, Run, RunApi, RunCreationAcceptance, RunFailure, RunState};
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations

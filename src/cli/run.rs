@@ -1,19 +1,12 @@
-use std::ffi::OsString;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
-use ring::digest::{SHA256, digest};
 use serde::Serialize;
-use zeroize::Zeroizing;
 
 use crate::api::{
-    CreateRunInput, HttpClient, HttpTransportPolicy, NamedScalarInputKind,
-    NamedScalarInputMetadata, Run, RunApi, RunFailure, RunState, ScalarInputSet,
+    CreateRunInput, HttpClient, HttpTransportPolicy, Run, RunApi, RunFailure, RunState,
 };
 use crate::execution::workflow::presentation::visible_text;
 use crate::exit_code::{ExitCode, OutcomeClass};
@@ -22,12 +15,14 @@ use crate::human_auth::session::{self, RequiredOperation};
 
 use super::OrganizationRef;
 
+mod acquisition;
+mod input_set;
+mod inputs;
+
 pub(super) const ABOUT: &str = "Work with Scherzo Cloud runs";
 const NAME: &str = "run";
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES: usize = 2;
-const MAXIMUM_TEXT_JSON_INPUT_BYTES: usize = 1024 * 1024;
-const MAXIMUM_FILE_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -39,6 +34,10 @@ pub(super) struct Command {
 enum RunCommand {
     #[command(about = "Create a Scherzo Cloud run")]
     Create(CreateCommand),
+    #[command(about = input_set::ABOUT)]
+    InputSet(input_set::Command),
+    #[command(about = inputs::ABOUT)]
+    Inputs(inputs::Command),
     #[command(about = "Show a Scherzo Cloud run")]
     Show(ShowCommand),
     #[command(about = "Wait for a Scherzo Cloud run")]
@@ -52,6 +51,15 @@ struct RunOptions {
 
     #[command(flatten)]
     http: super::HttpOptions,
+}
+
+#[derive(Debug, Args)]
+struct CloudInputOptions {
+    #[command(flatten)]
+    http: super::HttpOptions,
+
+    #[arg(long, help = "Write one JSON result to standard output")]
+    json: bool,
 }
 
 // This leaf keeps its API identities explicit; sharing Clap fields with runner-pool
@@ -88,27 +96,23 @@ struct CreateCommand {
 
     #[arg(
         long,
-        value_names = ["NAME", "PATH"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        help = "Supply one required named Text value from a regular UTF-8 file (maximum 1 MiB)"
+        value_name = "INPUT_SET",
+        value_parser = parse_input_set_id,
+        conflicts_with_all = [
+            "input_text",
+            "input_text_file",
+            "input_json",
+            "input_json_file",
+            "input_file",
+            "input_attachment",
+            "input_attachments_empty"
+        ],
+        help = "Consume an existing sealed Run Input Set without restaging"
     )]
-    input_text_file: Vec<OsString>,
+    input_set_id: Option<String>,
 
     #[command(flatten)]
-    json_inline: super::JsonInlineInput,
-
-    #[arg(
-        long,
-        value_names = ["NAME", "PATH"],
-        num_args = 2,
-        action = clap::ArgAction::Append,
-        help = "Supply one required named JSON value from a regular UTF-8 file (maximum 1 MiB)"
-    )]
-    input_json_file: Vec<OsString>,
-
-    #[command(flatten)]
-    file_input: super::FileInput,
+    inputs: super::NamedInputArgs,
 
     #[command(flatten)]
     options: RunOptions,
@@ -159,6 +163,8 @@ impl Command {
                 "configure Scherzo Cloud run creation",
                 |command, deployment| command.execute(deployment.clone()),
             ),
+            Some(RunCommand::InputSet(command)) => command.execute(),
+            Some(RunCommand::Inputs(command)) => command.execute(),
             Some(RunCommand::Show(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
@@ -175,219 +181,170 @@ impl Command {
     }
 }
 
-struct CreateDispatchState {
-    dispatched: AtomicBool,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreateInputSetOwnership {
+    Explicit(String),
+    Allocated(String),
 }
 
-struct PreparedScalarInput {
-    bytes: Zeroizing<Vec<u8>>,
-    metadata: NamedScalarInputMetadata,
-}
-
-#[derive(Debug)]
-enum ScalarInputFailure {
-    InvalidArguments,
-    InvalidName {
-        kind: NamedScalarInputKind,
-    },
-    Read {
-        kind: NamedScalarInputKind,
-        path: PathBuf,
-        source: io::Error,
-    },
-    NotRegular {
-        kind: NamedScalarInputKind,
-        path: PathBuf,
-    },
-    TooLarge {
-        kind: NamedScalarInputKind,
-        path: Option<PathBuf>,
-    },
-    InvalidUtf8 {
-        path: PathBuf,
-    },
-    InvalidJson {
-        path: Option<PathBuf>,
-    },
-    InvalidMediaType,
-}
-
-fn prepare_scalar_input(
-    text_file: &[OsString],
-    json_inline: &[OsString],
-    json_file: &[OsString],
-    file: &[OsString],
-) -> Result<Option<PreparedScalarInput>, ScalarInputFailure> {
-    let supplied_sources = [text_file, json_inline, json_file, file]
-        .into_iter()
-        .filter(|values| !values.is_empty())
-        .count();
-    if supplied_sources == 0 {
-        return Ok(None);
-    }
-    if supplied_sources != 1 {
-        return Err(ScalarInputFailure::InvalidArguments);
-    }
-    let (kind, values, inline, media_type) = if !text_file.is_empty() {
-        (NamedScalarInputKind::Text, text_file, false, None)
-    } else if !json_inline.is_empty() {
-        (NamedScalarInputKind::Json, json_inline, true, None)
-    } else if !json_file.is_empty() {
-        (NamedScalarInputKind::Json, json_file, false, None)
-    } else {
-        (NamedScalarInputKind::File, file, false, file.get(1))
-    };
-    let expected_arguments = if kind == NamedScalarInputKind::File {
-        3
-    } else {
-        2
-    };
-    if values.len() != expected_arguments {
-        return Err(ScalarInputFailure::InvalidArguments);
-    }
-    let media_type = match media_type {
-        Some(value) => value
-            .to_str()
-            .filter(|value| crate::execution::workflow::is_valid_media_type(value))
-            .ok_or(ScalarInputFailure::InvalidMediaType)?,
-        None => kind
-            .default_media_type()
-            .ok_or(ScalarInputFailure::InvalidArguments)?,
-    };
-    let name = values[0]
-        .to_str()
-        .filter(|name| valid_input_name(name))
-        .ok_or(ScalarInputFailure::InvalidName { kind })?;
-    let (bytes, path) = if inline {
-        let source = values[1]
-            .to_str()
-            .ok_or(ScalarInputFailure::InvalidJson { path: None })?;
-        (Zeroizing::new(source.as_bytes().to_vec()), None)
-    } else {
-        let path = Path::new(if kind == NamedScalarInputKind::File {
-            &values[2]
-        } else {
-            &values[1]
-        });
-        let mut file = super::open_regular_file_nonblocking(path).map_err(|error| match error {
-            super::OpenRegularFileError::Open(source)
-            | super::OpenRegularFileError::Metadata(source) => ScalarInputFailure::Read {
-                kind,
-                path: path.to_owned(),
-                source,
-            },
-            super::OpenRegularFileError::NotRegular => ScalarInputFailure::NotRegular {
-                kind,
-                path: path.to_owned(),
-            },
-        })?;
-        let maximum_bytes = if kind == NamedScalarInputKind::File {
-            MAXIMUM_FILE_INPUT_BYTES
-        } else {
-            MAXIMUM_TEXT_JSON_INPUT_BYTES
-        };
-        let mut bytes = Zeroizing::new(Vec::with_capacity(maximum_bytes.min(64 * 1024)));
-        Read::by_ref(&mut file)
-            .take(u64::try_from(maximum_bytes).unwrap_or(u64::MAX) + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|source| ScalarInputFailure::Read {
-                kind,
-                path: path.to_owned(),
-                source,
-            })?;
-        (bytes, Some(path.to_owned()))
-    };
-    let maximum_bytes = if kind == NamedScalarInputKind::File {
-        MAXIMUM_FILE_INPUT_BYTES
-    } else {
-        MAXIMUM_TEXT_JSON_INPUT_BYTES
-    };
-    if bytes.len() > maximum_bytes {
-        return Err(ScalarInputFailure::TooLarge { kind, path });
-    }
-    match kind {
-        NamedScalarInputKind::Text if std::str::from_utf8(&bytes).is_err() => {
-            return Err(ScalarInputFailure::InvalidUtf8 {
-                path: path.ok_or(ScalarInputFailure::InvalidArguments)?,
-            });
+impl CreateInputSetOwnership {
+    fn id(&self) -> &str {
+        match self {
+            Self::Explicit(input_set_id) | Self::Allocated(input_set_id) => input_set_id,
         }
-        NamedScalarInputKind::Json
-            if crate::execution::workflow::parse_strict_json(&bytes).is_err() =>
-        {
-            return Err(ScalarInputFailure::InvalidJson { path });
-        }
-        NamedScalarInputKind::Text | NamedScalarInputKind::Json | NamedScalarInputKind::File => {}
     }
-    let observed = digest(&SHA256, &bytes);
-    let mut sha256 = [0_u8; 32];
-    sha256.copy_from_slice(observed.as_ref());
-    let size_bytes =
-        u64::try_from(bytes.len()).map_err(|_| ScalarInputFailure::TooLarge { kind, path })?;
-    Ok(Some(PreparedScalarInput {
-        bytes,
-        metadata: NamedScalarInputMetadata {
-            name: name.to_owned(),
-            kind,
-            media_type: media_type.to_owned(),
-            size_bytes,
-            sha256,
-        },
-    }))
 }
 
-fn valid_input_name(value: &str) -> bool {
-    (1..=64).contains(&value.len())
-        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        && value.as_bytes()[1..].iter().all(u8::is_ascii_alphanumeric)
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreateRecoveryState {
+    BeforeRunDispatch(Option<CreateInputSetOwnership>),
+    InputSetAllocationDispatched,
+    RunDispatched(Option<CreateInputSetOwnership>),
+}
+
+impl CreateRecoveryState {
+    fn new(explicit_input_set_id: Option<&str>) -> Self {
+        Self::BeforeRunDispatch(
+            explicit_input_set_id
+                .map(|input_set_id| CreateInputSetOwnership::Explicit(input_set_id.to_owned())),
+        )
+    }
+
+    fn input_set_allocation_dispatched() -> Self {
+        Self::InputSetAllocationDispatched
+    }
+
+    fn allocated_input_set(input_set_id: &str) -> Self {
+        Self::BeforeRunDispatch(Some(CreateInputSetOwnership::Allocated(
+            input_set_id.to_owned(),
+        )))
+    }
+
+    fn run_dispatched(&self) -> Self {
+        match self {
+            Self::BeforeRunDispatch(input_set) | Self::RunDispatched(input_set) => {
+                Self::RunDispatched(input_set.clone())
+            }
+            Self::InputSetAllocationDispatched => Self::RunDispatched(None),
+        }
+    }
+
+    fn input_set_id(&self) -> Option<&str> {
+        match self {
+            Self::BeforeRunDispatch(Some(input_set)) | Self::RunDispatched(Some(input_set)) => {
+                Some(input_set.id())
+            }
+            Self::BeforeRunDispatch(None)
+            | Self::InputSetAllocationDispatched
+            | Self::RunDispatched(None) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreateSignalRecovery {
+    None,
+    InputSetUnknown,
+    InputSet(String),
+    Run(Option<String>),
+}
+
+fn create_signal_recovery(
+    snapshot: super::SignalSnapshot<CreateRecoveryState>,
+) -> CreateSignalRecovery {
+    if !snapshot.dispatched {
+        return CreateSignalRecovery::None;
+    }
+    match snapshot.recovery {
+        CreateRecoveryState::InputSetAllocationDispatched => CreateSignalRecovery::InputSetUnknown,
+        CreateRecoveryState::BeforeRunDispatch(Some(CreateInputSetOwnership::Allocated(
+            input_set_id,
+        ))) => CreateSignalRecovery::InputSet(input_set_id),
+        CreateRecoveryState::BeforeRunDispatch(_) => CreateSignalRecovery::None,
+        CreateRecoveryState::RunDispatched(input_set) => {
+            CreateSignalRecovery::Run(input_set.map(|input_set| input_set.id().to_owned()))
+        }
+    }
+}
+
+fn finish_operation<R>(
+    control: &super::OperationControl<R>,
+    write_result: impl FnOnce() -> anyhow::Result<ExitCode>,
+) -> super::CommandResult {
+    super::complete_operation(control, || write_result().map_err(Into::into))
+}
+
+fn write_api_outcome<T>(
+    result: Result<T, RunFailure>,
+    write_success: impl FnOnce(T) -> anyhow::Result<()>,
+    write_failure: impl FnOnce(&RunFailure) -> anyhow::Result<ExitCode>,
+) -> anyhow::Result<ExitCode> {
+    match result {
+        Ok(value) => {
+            write_success(value)?;
+            Ok(ExitCode::Success)
+        }
+        Err(failure) => write_failure(&failure),
+    }
 }
 
 fn finish_create(
     deployment: &Deployment,
     organization: &str,
+    input_set_id: Option<&str>,
     result: Result<crate::api::RunCreationAcceptance, RunFailure>,
     json: bool,
-    cancelled: &AtomicBool,
-    completed: &AtomicBool,
+    control: &super::OperationControl<CreateRecoveryState>,
 ) -> super::CommandResult {
-    if cancelled.load(Ordering::Acquire) {
-        return Ok(ExitCode::GeneralFailure);
-    }
-    completed.store(true, Ordering::Release);
-    write_create(
-        deployment.fingerprint().api_url(),
-        organization,
-        result,
-        json,
-    )
-    .map_err(Into::into)
+    finish_operation(control, || {
+        write_create(
+            deployment.fingerprint().api_url(),
+            organization,
+            input_set_id,
+            result,
+            json,
+        )
+    })
 }
 
 impl CreateCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
-        let state = Arc::new(CreateDispatchState {
-            dispatched: AtomicBool::new(false),
-        });
-        let operation_state = Arc::clone(&state);
-        let signal_state = Arc::clone(&state);
+        let recovery = CreateRecoveryState::new(self.input_set_id.as_deref());
         let signal_deployment = deployment.clone();
         let signal_organization = self.organization.clone();
         let signal_json = self.options.json;
         super::execute_mutation_with_signals(
             "Cloud run creation",
-            move |cancelled, completed| {
-                self.execute_blocking(&deployment, &operation_state, cancelled, completed)
-            },
-            move |signal| {
-                if !signal_state.dispatched.load(Ordering::Acquire) {
-                    return Ok(signal);
-                }
-                write_create_unknown(
+            recovery,
+            move |control| self.execute_blocking(&deployment, control),
+            move |signal, snapshot| match create_signal_recovery(snapshot) {
+                CreateSignalRecovery::Run(input_set_id) => write_create_unknown(
                     signal_deployment.fingerprint().api_url(),
                     &signal_organization,
+                    input_set_id.as_deref(),
                     signal_json,
                     signal,
                 )
-                .map_err(Into::into)
+                .map_err(Into::into),
+                CreateSignalRecovery::InputSetUnknown => write_resource_mutation_unknown(
+                    "Run Input Set creation",
+                    signal_deployment.fingerprint().api_url(),
+                    &signal_organization,
+                    "input set",
+                    None,
+                    signal_json,
+                    signal,
+                )
+                .map_err(Into::into),
+                CreateSignalRecovery::InputSet(input_set_id) => write_input_set_recovery(
+                    signal_deployment.fingerprint().api_url(),
+                    &signal_organization,
+                    &input_set_id,
+                    signal_json,
+                    signal,
+                )
+                .map_err(Into::into),
+                CreateSignalRecovery::None => Ok(signal),
             },
         )
     }
@@ -395,116 +352,64 @@ impl CreateCommand {
     fn execute_blocking(
         self,
         deployment: &Deployment,
-        state: &CreateDispatchState,
-        cancelled: &AtomicBool,
-        completed: &AtomicBool,
+        control: &super::OperationControl<CreateRecoveryState>,
     ) -> super::CommandResult {
-        let scalar_input = match prepare_scalar_input(
-            &self.input_text_file,
-            &self.json_inline.input_json,
-            &self.input_json_file,
-            &self.file_input.input_file,
-        ) {
-            Ok(scalar_input) => scalar_input,
-            Err(error) => {
-                if cancelled.load(Ordering::Acquire) {
-                    return Ok(ExitCode::GeneralFailure);
+        let acquired = if self.inputs.is_empty() {
+            None
+        } else {
+            match acquisition::acquire(&self.inputs) {
+                Ok(acquired) => Some(acquired),
+                Err(error) => {
+                    return finish_operation(control, || {
+                        write_input_acquisition_failure(
+                            deployment.fingerprint().api_url(),
+                            &self.organization,
+                            &error,
+                            self.options.json,
+                        )
+                    });
                 }
-                completed.store(true, Ordering::Release);
-                return write_scalar_input_failure(
-                    deployment.fingerprint().api_url(),
-                    &self.organization,
-                    &error,
-                    self.options.json,
-                )
-                .map_err(Into::into);
             }
         };
         let run_idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate Cloud run request identity")?;
-        if cancelled.load(Ordering::Acquire) {
+        if control.is_cancelled() {
             return Ok(ExitCode::GeneralFailure);
         }
 
-        let input_set = if let Some(scalar_input) = scalar_input.as_ref() {
-            let create_key = crate::idempotency::generate_idempotency_key()
-                .context("generate Run Input Set request identity")?;
-            let seal_key = crate::idempotency::generate_idempotency_key()
-                .context("generate Run Input Set seal identity")?;
-            let created = with_api(deployment, self.options.http.transport_policy(), |api| {
-                api.create_scalar_input_set(
-                    &self.organization,
-                    &create_key,
-                    &self.project_id,
-                    &scalar_input.metadata,
-                )
-            })?;
-            let input_set = match created {
-                Ok(input_set) => input_set,
+        let input_set_id = if let Some(acquired) = acquired.as_ref() {
+            let staged = input_set::stage_and_seal(
+                deployment,
+                self.options.http.transport_policy(),
+                &self.organization,
+                &self.project_id,
+                acquired,
+                control,
+            )?;
+            match staged {
+                Ok(sealed) => sealed.id,
                 Err(failure) => {
+                    let recovery = control.recovery();
                     return finish_create(
                         deployment,
                         &self.organization,
+                        recovery.input_set_id(),
                         Err(failure),
                         self.options.json,
-                        cancelled,
-                        completed,
-                    );
-                }
-            };
-            if cancelled.load(Ordering::Acquire) {
-                return Ok(ExitCode::GeneralFailure);
-            }
-
-            let uploaded = with_api(deployment, self.options.http.transport_policy(), |api| {
-                api.issue_and_upload_scalar(&self.organization, &input_set, &scalar_input.bytes)
-            })?;
-            if let Err(failure) = uploaded {
-                let ambiguous_upload = matches!(
-                    failure,
-                    RunFailure::Unreachable(
-                        crate::api::UnreachableCategory::Connection
-                            | crate::api::UnreachableCategory::Timeout
-                    )
-                );
-                if !ambiguous_upload {
-                    return finish_create(
-                        deployment,
-                        &self.organization,
-                        Err(failure),
-                        self.options.json,
-                        cancelled,
-                        completed,
+                        control,
                     );
                 }
             }
-            if cancelled.load(Ordering::Acquire) {
-                return Ok(ExitCode::GeneralFailure);
-            }
-
-            let sealed = with_api(deployment, self.options.http.transport_policy(), |api| {
-                api.seal_scalar_input_set(&self.organization, &seal_key, &input_set)
-            })?;
-            if let Err(failure) = sealed {
-                return finish_create(
-                    deployment,
-                    &self.organization,
-                    Err(failure),
-                    self.options.json,
-                    cancelled,
-                    completed,
-                );
-            }
-            Some(input_set)
         } else {
-            None
+            self.input_set_id.clone().unwrap_or_default()
         };
-        if cancelled.load(Ordering::Acquire) {
+        let input_set_id = (!input_set_id.is_empty()).then_some(input_set_id);
+        if control.is_cancelled() {
             return Ok(ExitCode::GeneralFailure);
         }
 
+        let dispatch_recovery = control.recovery().run_dispatched();
         let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            state.dispatched.store(true, Ordering::Release);
             api.create(
                 &self.organization,
                 &run_idempotency_key,
@@ -513,49 +418,47 @@ impl CreateCommand {
                     workflow_path: &self.workflow_path,
                     source_branch: self.source_branch.as_deref(),
                     display_name: self.display_name.as_deref(),
-                    input_set_id: input_set.as_ref().map(ScalarInputSet::id),
+                    input_set_id: input_set_id.as_deref(),
                 },
+                || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
             )
         })?;
         finish_create(
             deployment,
             &self.organization,
+            input_set_id.as_deref(),
             result,
             self.options.json,
-            cancelled,
-            completed,
+            control,
         )
     }
 }
 
 impl ShowCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
-        super::execute_read_only_with_signals("Cloud run show", move |cancelled, completed| {
-            self.execute_blocking(&deployment, cancelled, completed)
+        super::execute_read_only_with_signals("Cloud run show", move |control| {
+            self.execute_blocking(&deployment, control)
         })
     }
 
     fn execute_blocking(
         self,
         deployment: &Deployment,
-        cancelled: &AtomicBool,
-        completed: &AtomicBool,
+        control: &super::OperationControl<()>,
     ) -> super::CommandResult {
         let result = with_api(deployment, self.options.http.transport_policy(), |api| {
             api.get(&self.run.organization, &self.run.run_id)
         })?;
-        if cancelled.load(Ordering::Acquire) {
-            return Ok(ExitCode::GeneralFailure);
-        }
-        completed.store(true, Ordering::Release);
-        write_show(
-            deployment.fingerprint().api_url(),
-            &self.run.organization,
-            &self.run.run_id,
-            result,
-            self.options.json,
-        )
-        .map_err(Into::into)
+        super::complete_read_only_output(control, || {
+            write_show(
+                deployment.fingerprint().api_url(),
+                &self.run.organization,
+                &self.run.run_id,
+                result,
+                self.options.json,
+            )
+            .map_err(Into::into)
+        })
     }
 }
 
@@ -784,6 +687,17 @@ const fn terminal_run_state(state: RunState) -> Option<TerminalRunState> {
     }
 }
 
+fn parse_input_set_id(value: &str) -> Result<String, String> {
+    if crate::public_id::valid_typed_id(value, "ris_") {
+        Ok(value.to_owned())
+    } else {
+        Err(
+            "must be an exact Run Input Set ID (ris_ followed by 26 lowercase ULID characters)"
+                .to_owned(),
+        )
+    }
+}
+
 fn parse_wait_timeout(value: &str) -> Result<Duration, String> {
     let (quantity, milliseconds) = if let Some(quantity) = value.strip_suffix("ms") {
         (quantity, 1)
@@ -847,18 +761,10 @@ fn with_api<T>(
     }
 }
 
-fn scalar_kind_name(kind: NamedScalarInputKind) -> &'static str {
-    match kind {
-        NamedScalarInputKind::Text => "Text",
-        NamedScalarInputKind::Json => "JSON",
-        NamedScalarInputKind::File => "File",
-    }
-}
-
-fn write_scalar_input_failure(
+fn write_input_acquisition_failure(
     deployment: &str,
     organization: &str,
-    failure: &ScalarInputFailure,
+    failure: &acquisition::InputAcquisitionFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     if json {
@@ -868,72 +774,14 @@ fn write_scalar_input_failure(
             outcome: "invalid_input",
             organization_ref: organization,
             run_id: None,
+            input_set_id: None,
             category: None,
         })?;
     } else {
-        let diagnostic = match failure {
-            ScalarInputFailure::InvalidArguments => {
-                "error: run creation accepts at most one named Text, JSON, or File input".to_owned()
-            }
-            ScalarInputFailure::InvalidName { kind } => format!(
-                "error: named {} input has an invalid Workflow V1 name",
-                scalar_kind_name(*kind)
-            ),
-            ScalarInputFailure::Read { kind, path, source } => format!(
-                "error: read named {} input file {}: {source}",
-                scalar_kind_name(*kind),
-                visible_text(&path.to_string_lossy())
-            ),
-            ScalarInputFailure::NotRegular { kind, path } => format!(
-                "error: named {} input source is not a regular file: {}",
-                scalar_kind_name(*kind),
-                visible_text(&path.to_string_lossy())
-            ),
-            ScalarInputFailure::TooLarge { kind, path } => path.as_ref().map_or_else(
-                || {
-                    format!(
-                        "error: named {} input exceeds {}",
-                        scalar_kind_name(*kind),
-                        if *kind == NamedScalarInputKind::File {
-                            "64 MiB"
-                        } else {
-                            "1 MiB"
-                        }
-                    )
-                },
-                |path| {
-                    format!(
-                        "error: named {} input file exceeds {}: {}",
-                        scalar_kind_name(*kind),
-                        if *kind == NamedScalarInputKind::File {
-                            "64 MiB"
-                        } else {
-                            "1 MiB"
-                        },
-                        visible_text(&path.to_string_lossy())
-                    )
-                },
-            ),
-            ScalarInputFailure::InvalidUtf8 { path } => format!(
-                "error: named Text input file is not valid UTF-8: {}",
-                visible_text(&path.to_string_lossy())
-            ),
-            ScalarInputFailure::InvalidJson { path } => path.as_ref().map_or_else(
-                || "error: named JSON input is not strict JSON".to_owned(),
-                |path| {
-                    format!(
-                        "error: named JSON input file is not strict JSON: {}",
-                        visible_text(&path.to_string_lossy())
-                    )
-                },
-            ),
-            ScalarInputFailure::InvalidMediaType => {
-                "error: named File input media type is invalid".to_owned()
-            }
-        };
         writeln!(
             io::stderr().lock(),
-            "{diagnostic}\n\nChoose one valid name and one valid Text, strict JSON, or explicitly typed File source within its size limit, then try again."
+            "error: acquire Cloud run inputs: {}\n\nCorrect the named input sources and limits, then try again.",
+            visible_text(&failure.to_string())
         )?;
     }
     Ok(ExitCode::GeneralFailure)
@@ -942,6 +790,7 @@ fn write_scalar_input_failure(
 fn write_create(
     deployment: &str,
     organization: &str,
+    input_set_id: Option<&str>,
     result: Result<crate::api::RunCreationAcceptance, RunFailure>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -954,6 +803,7 @@ fn write_create(
                     outcome: "accepted",
                     organization_ref: organization,
                     run_id: &acceptance.run_id,
+                    input_set_id,
                     replayed: acceptance.replayed,
                 })?;
             } else {
@@ -966,12 +816,22 @@ fn write_create(
                     "replayed: {}",
                     if acceptance.replayed { "yes" } else { "no" }
                 )?;
+                if let Some(input_set_id) = input_set_id {
+                    writeln!(stdout, "input set: {input_set_id}")?;
+                }
                 writeln!(stdout, "organization: {organization}")?;
                 writeln!(stdout, "deployment: {deployment}")?;
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, organization, None, &failure, json),
+        Err(failure) => write_failure_with_input_set(
+            deployment,
+            organization,
+            None,
+            input_set_id,
+            &failure,
+            json,
+        ),
     }
 }
 
@@ -1171,6 +1031,17 @@ fn write_failure(
     failure: &RunFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
+    write_failure_with_input_set(deployment, organization, run_id, None, failure, json)
+}
+
+fn write_failure_with_input_set(
+    deployment: &str,
+    organization: &str,
+    run_id: Option<&str>,
+    input_set_id: Option<&str>,
+    failure: &RunFailure,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, class) = match failure {
         RunFailure::Unauthenticated => (
             "unauthenticated",
@@ -1199,7 +1070,13 @@ fn write_failure(
         RunFailure::Conflict => (
             "conflict",
             None,
-            "error: Cloud run request conflicts with current state\n\nCheck project readiness and source availability, then try again.".to_owned(),
+            "error: Cloud run request conflicts with current state\n\nCheck the resource state and try again.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        RunFailure::Gone => (
+            "gone",
+            None,
+            "error: Cloud run input content is no longer available\n\nStart a new input set or run instead.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         RunFailure::Unreachable(category) => (
@@ -1211,8 +1088,20 @@ fn write_failure(
         RunFailure::InputUploadRejected => (
             "conflict",
             None,
-            "error: Cloud run input upload was not accepted\n\nCheck network access and create the run again.".to_owned(),
+            "error: Cloud run input upload was not accepted\n\nInspect the input set and upload the selected member again.".to_owned(),
             OutcomeClass::GeneralFailure,
+        ),
+        RunFailure::InputDownloadRejected => (
+            "integrity_mismatch",
+            None,
+            "error: retained input download did not match its manifest\n\nNo downloaded result was committed. Try again later.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        RunFailure::Interrupted => (
+            "interrupted",
+            None,
+            "error: retained input operation was interrupted\n\nRun the command again to start with fresh capabilities.".to_owned(),
+            OutcomeClass::Interrupted,
         ),
         RunFailure::Protocol { .. } => (
             "invalid_response",
@@ -1228,8 +1117,14 @@ fn write_failure(
             outcome,
             organization_ref: organization,
             run_id,
+            input_set_id,
             category,
         })?;
+    } else if let Some(input_set_id) = input_set_id {
+        writeln!(
+            io::stderr().lock(),
+            "{human}\n\ninput set: {input_set_id}\n\nContinue explicitly with `scherzo-cloud run input-set show` before creating another set."
+        )?;
     } else {
         writeln!(io::stderr().lock(), "{human}")?;
     }
@@ -1239,6 +1134,7 @@ fn write_failure(
 fn write_create_unknown(
     deployment: &str,
     organization: &str,
+    input_set_id: Option<&str>,
     json: bool,
     exit_code: ExitCode,
 ) -> anyhow::Result<ExitCode> {
@@ -1248,12 +1144,70 @@ fn write_create_unknown(
             deployment,
             outcome: "unknown",
             organization_ref: organization,
+            input_set_id,
             commitment: "unknown",
         })?;
     } else {
         writeln!(
             io::stderr().lock(),
-            "error: run acceptance is unknown after interruption\n\norganization: {organization}\ncommitment: unknown\n\nThe CLI cannot safely determine whether the run was accepted. Inspect the deployment before creating another run."
+            "error: run acceptance is unknown after interruption\n\norganization: {organization}\ninput set: {}\ncommitment: unknown\n\nThe CLI cannot safely determine whether the run was accepted. Inspect the deployment before creating another run.",
+            input_set_id.unwrap_or("none")
+        )?;
+    }
+    Ok(exit_code)
+}
+
+fn write_input_set_recovery(
+    deployment: &str,
+    organization: &str,
+    input_set_id: &str,
+    json: bool,
+    exit_code: ExitCode,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_json(&InputSetRecoveryResult {
+            schema_version: 1,
+            deployment,
+            outcome: "input_set_incomplete",
+            organization_ref: organization,
+            input_set_id,
+        })?;
+    } else {
+        writeln!(
+            io::stderr().lock(),
+            "error: Run Input Set preparation was interrupted\n\ninput set: {input_set_id}\norganization: {organization}\n\nInspect and resume this input set explicitly before creating another set."
+        )?;
+    }
+    Ok(exit_code)
+}
+
+fn write_resource_mutation_unknown(
+    operation: &str,
+    deployment: &str,
+    organization: &str,
+    resource_kind: &str,
+    resource_id: Option<&str>,
+    json: bool,
+    exit_code: ExitCode,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_json(&UnknownResourceMutationResult {
+            schema_version: 1,
+            deployment,
+            outcome: "unknown",
+            organization_ref: organization,
+            operation,
+            resource_kind,
+            resource_id,
+            commitment: "unknown",
+        })?;
+    } else {
+        let resource = resource_id
+            .map(|resource_id| format!("\n{resource_kind}: {resource_id}"))
+            .unwrap_or_default();
+        writeln!(
+            io::stderr().lock(),
+            "error: {operation} is unconfirmed after interruption\n{resource}\norganization: {organization}\ncommitment: unknown\n\nInspect the resource before repeating this operation."
         )?;
     }
     Ok(exit_code)
@@ -1274,6 +1228,8 @@ struct CreateResult<'a> {
     outcome: &'static str,
     organization_ref: &'a str,
     run_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_set_id: Option<&'a str>,
     replayed: bool,
 }
 
@@ -1315,6 +1271,8 @@ struct FailureResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    input_set_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'a str>,
 }
 
@@ -1325,19 +1283,49 @@ struct UnknownCreateResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     organization_ref: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_set_id: Option<&'a str>,
+    commitment: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputSetRecoveryResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    organization_ref: &'a str,
+    input_set_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnknownResourceMutationResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    organization_ref: &'a str,
+    operation: &'a str,
+    resource_kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_id: Option<&'a str>,
     commitment: &'static str,
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
-
-    use nix::sys::stat::Mode;
-    use nix::unistd::mkfifo;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, mpsc};
 
     use super::*;
-    use crate::api::UnreachableCategory;
+    use crate::api::{
+        HttpTransportPolicy, InputScalarMetadata, NamedInputMetadata, RunCreationAcceptance,
+        RunInputManifest, UnreachableCategory,
+    };
 
     struct ScriptedObservationApi {
         responses: RefCell<VecDeque<Result<Run, RunFailure>>>,
@@ -1382,26 +1370,6 @@ mod tests {
         fn sleep(&self, duration: Duration) {
             self.sleeps.borrow_mut().push(duration);
             self.now.set(self.now.get() + duration);
-        }
-    }
-
-    #[test]
-    fn cloud_file_input_rejects_fifo_without_opening_a_writer() {
-        let temporary = tempfile::tempdir().unwrap();
-        let fifo = temporary.path().join("input.fifo");
-        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let file = [
-            OsString::from("payload"),
-            OsString::from("application/octet-stream"),
-            fifo.clone().into_os_string(),
-        ];
-
-        match prepare_scalar_input(&[], &[], &[], &file) {
-            Err(ScalarInputFailure::NotRegular { kind, path }) => {
-                assert_eq!(kind, NamedScalarInputKind::File);
-                assert_eq!(path, fifo);
-            }
-            _ => panic!("FIFO was not rejected as a nonregular File input"),
         }
     }
 
@@ -1463,6 +1431,218 @@ mod tests {
             "updatedAt": "2026-08-10T12:00:00Z"
         }))
         .expect("run fixture should match the generated model")
+    }
+
+    fn dispatch_test_api<'a>(api_url: &str, client: &'a HttpClient) -> RunApi<'a> {
+        RunApi::new(
+            api_url,
+            "test-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+            client,
+        )
+        .unwrap()
+    }
+
+    fn create_dispatch_test_run(
+        api: &RunApi<'_>,
+        begin_dispatch: impl Fn() -> bool,
+    ) -> Result<RunCreationAcceptance, RunFailure> {
+        api.create(
+            "acme-research",
+            "create-run-key",
+            CreateRunInput {
+                project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                workflow_path: "workflows/build.yaml",
+                source_branch: None,
+                display_name: None,
+                input_set_id: Some("ris_explicit"),
+            },
+            begin_dispatch,
+        )
+    }
+
+    fn assert_interrupted<T>(result: Result<T, RunFailure>) {
+        assert!(matches!(result, Err(RunFailure::Interrupted)));
+    }
+
+    fn assert_no_pending_request(listener: &TcpListener) {
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn create_signal_snapshot_preserves_dispatch_and_input_set_provenance() {
+        let allocated = super::super::OperationControl::new(CreateRecoveryState::new(None));
+        assert!(
+            allocated.begin_dispatch_with_recovery(
+                CreateRecoveryState::input_set_allocation_dispatched()
+            )
+        );
+        assert!(
+            allocated.update_recovery(CreateRecoveryState::allocated_input_set("ris_allocated"))
+        );
+        let snapshot = allocated.claim_signal().unwrap();
+        assert_eq!(
+            create_signal_recovery(snapshot),
+            CreateSignalRecovery::InputSet("ris_allocated".to_owned())
+        );
+        assert!(!allocated.begin_dispatch());
+
+        let explicit =
+            super::super::OperationControl::new(CreateRecoveryState::new(Some("ris_explicit")));
+        assert!(explicit.begin_dispatch_with_recovery(explicit.recovery().run_dispatched()));
+        let snapshot = explicit.claim_signal().unwrap();
+        assert_eq!(
+            snapshot.recovery,
+            CreateRecoveryState::RunDispatched(Some(CreateInputSetOwnership::Explicit(
+                "ris_explicit".to_owned()
+            )))
+        );
+        assert_eq!(
+            create_signal_recovery(snapshot),
+            CreateSignalRecovery::Run(Some("ris_explicit".to_owned()))
+        );
+
+        let inputless = super::super::OperationControl::new(CreateRecoveryState::new(None));
+        assert!(inputless.begin_dispatch_with_recovery(inputless.recovery().run_dispatched()));
+        assert_eq!(
+            create_signal_recovery(inputless.claim_signal().unwrap()),
+            CreateSignalRecovery::Run(None)
+        );
+    }
+
+    fn assert_signal_before_dispatch_sends_no_request<T: Send>(
+        recovery: CreateRecoveryState,
+        dispatch_recovery: CreateRecoveryState,
+        operation: impl FnOnce(&RunApi<'_>, &dyn Fn() -> bool) -> Result<T, RunFailure> + Send,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let control = Arc::new(super::super::OperationControl::new(recovery));
+        let before_claim = Arc::new(Barrier::new(2));
+        let release_claim = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let worker_control = Arc::clone(&control);
+            let worker_before_claim = Arc::clone(&before_claim);
+            let worker_release_claim = Arc::clone(&release_claim);
+            let worker = scope.spawn(move || {
+                let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+                let api = dispatch_test_api(&api_url, &client);
+                let begin_dispatch = || {
+                    worker_before_claim.wait();
+                    worker_release_claim.wait();
+                    worker_control.begin_dispatch_with_recovery(dispatch_recovery.clone())
+                };
+                operation(&api, &begin_dispatch)
+            });
+
+            before_claim.wait();
+            let snapshot = control.claim_signal().unwrap();
+            assert!(!snapshot.dispatched);
+            release_claim.wait();
+            assert_interrupted(worker.join().unwrap());
+        });
+
+        assert_no_pending_request(&listener);
+    }
+
+    #[test]
+    fn cancellation_wins_at_real_run_and_input_set_dispatch_boundaries() {
+        assert_signal_before_dispatch_sends_no_request(
+            CreateRecoveryState::new(Some("ris_explicit")),
+            CreateRecoveryState::new(Some("ris_explicit")).run_dispatched(),
+            |api, begin_dispatch| create_dispatch_test_run(api, begin_dispatch),
+        );
+
+        let manifest = RunInputManifest {
+            inputs: BTreeMap::from([(
+                "request".to_owned(),
+                NamedInputMetadata::Text(InputScalarMetadata {
+                    size_bytes: 0,
+                    sha256: ring::digest::digest(&ring::digest::SHA256, b"")
+                        .as_ref()
+                        .try_into()
+                        .unwrap(),
+                }),
+            )]),
+        };
+        assert_signal_before_dispatch_sends_no_request(
+            CreateRecoveryState::new(None),
+            CreateRecoveryState::input_set_allocation_dispatched(),
+            |api, begin_dispatch| {
+                api.create_input_set(
+                    "acme-research",
+                    "create-input-set-key",
+                    "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    &manifest,
+                    begin_dispatch,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn cancellation_blocks_a_run_create_transport_retry_after_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_listener = listener.try_clone().unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let control = Arc::new(super::super::OperationControl::new(
+            CreateRecoveryState::new(Some("ris_explicit")),
+        ));
+        let (retry_ready, observe_retry) = mpsc::sync_channel(0);
+        let (release_retry, retry_released) = mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let server = scope.spawn(move || {
+                let (mut stream, _) = server_listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST "));
+                while line != "\r\n" {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                }
+                drop(reader);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nIdempotency-Key: create-run-key\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                    )
+                    .unwrap();
+            });
+
+            let worker_control = Arc::clone(&control);
+            let worker = scope.spawn(move || {
+                let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+                let api = dispatch_test_api(&api_url, &client);
+                let dispatches = AtomicUsize::new(0);
+                let dispatch_recovery = worker_control.recovery().run_dispatched();
+                create_dispatch_test_run(&api, || {
+                    if dispatches.fetch_add(1, Ordering::AcqRel) == 1 {
+                        retry_ready.send(()).unwrap();
+                        retry_released.recv().unwrap();
+                    }
+                    worker_control.begin_dispatch_with_recovery(dispatch_recovery.clone())
+                })
+            });
+
+            observe_retry.recv().unwrap();
+            let snapshot = control.claim_signal().unwrap();
+            assert_eq!(
+                create_signal_recovery(snapshot),
+                CreateSignalRecovery::Run(Some("ris_explicit".to_owned()))
+            );
+            release_retry.send(()).unwrap();
+            assert_interrupted(worker.join().unwrap());
+            server.join().unwrap();
+        });
+
+        listener.set_nonblocking(true).unwrap();
+        assert_no_pending_request(&listener);
     }
 
     #[test]

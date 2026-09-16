@@ -4,6 +4,8 @@ use base64::Engine as _;
 use ring::digest::{SHA256, digest};
 
 #[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt as _;
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 const TOKEN: &str = "unique-cloud-run-command-token-sentinel";
@@ -248,7 +250,7 @@ fn scalar_input_set_body(
         "aggregateSizeBytes": bytes.len(),
         "state": state,
         "createdAt": "2026-08-24T01:00:00Z",
-        "openDeadlineAt": "2026-08-25T01:00:00Z",
+        "openDeadlineAt": "2999-08-25T01:00:00Z",
         "members": [{"memberId": "inputs/request", "uploadConfirmed": uploaded}],
         "replayed": replayed
     });
@@ -312,7 +314,7 @@ fn scalar_upload_capability_response(bytes: &[u8], media_type: &str, url: &str) 
         &[("Cache-Control", "private, no-store")],
         &serde_json::to_vec(&serde_json::json!({
             "inputSetId": INPUT_SET_ID,
-            "capabilityExpiresAt": "2026-08-24T01:05:00Z",
+            "capabilityExpiresAt": "2998-08-24T01:05:00Z",
             "members": [{
                 "memberId": "inputs/request",
                 "url": url,
@@ -453,6 +455,51 @@ fn run_create_sends_inputless_request_and_reports_plain_and_json_receipts() {
         assert_eq!(key.len(), 64);
         assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
+}
+
+#[test]
+fn run_create_consumes_an_explicit_sealed_input_set_without_restaging() {
+    let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(true);
+    let insertion = arguments.len() - 1;
+    arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
+
+    let output = run_with_env(&arguments, &environment);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "accepted");
+    assert_eq!(result["inputSetId"], INPUT_SET_ID);
+    let request = server.finish().remove(0);
+    assert!(request.contains("/runs HTTP/1.1"));
+    assert_eq!(request_body(&request)["inputSetId"], INPUT_SET_ID);
+}
+
+#[test]
+fn explicit_input_set_conflicts_with_acquired_inputs_before_cloud_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+        .args([
+            "run",
+            "create",
+            ORGANIZATION,
+            "--project-id",
+            PROJECT_ID,
+            "--workflow-path",
+            WORKFLOW_PATH,
+            "--input-set-id",
+            INPUT_SET_ID,
+            "--input-text",
+            "request",
+            "private argument sentinel",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private argument sentinel"));
 }
 
 #[test]
@@ -733,6 +780,1475 @@ fn run_create_stages_named_file_with_exact_media_type_and_bytes() {
         input_bytes
     );
     assert_eq!(header_value(&upload, "content-type"), media_type);
+}
+
+#[test]
+fn run_create_stages_mixed_values_ordered_attachments_and_present_empty_collections() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.txt");
+    let second_path = directory.path().join("second.bin");
+    fs::write(&first_path, b"first attachment").unwrap();
+    fs::write(&second_path, b"second attachment").unwrap();
+    let json_bytes = b"{\"enabled\":true}";
+    let values: [&[u8]; 4] = [b"", b"first attachment", b"second attachment", json_bytes];
+    let media_types = [
+        "text/plain; charset=utf-8",
+        "text/plain",
+        "application/octet-stream",
+        "application/json",
+    ];
+    let storages = values
+        .iter()
+        .map(|_| OneShotServer::respond("204 No Content", None, b""))
+        .collect::<Vec<_>>();
+    let urls = storages
+        .iter()
+        .enumerate()
+        .map(|(index, storage)| format!("{}/member-{index}?signature=mixed", storage.api_url))
+        .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "inputs": {
+            "emptyText": {
+                "kind": "text",
+                "sizeBytes": 0,
+                "sha256": hex_digest(b"")
+            },
+            "evidence": {
+                "kind": "attachments",
+                "items": [
+                    {
+                        "index": 0,
+                        "displayName": null,
+                        "mediaType": "text/plain",
+                        "sizeBytes": values[1].len(),
+                        "sha256": hex_digest(values[1])
+                    },
+                    {
+                        "index": 1,
+                        "displayName": null,
+                        "mediaType": "application/octet-stream",
+                        "sizeBytes": values[2].len(),
+                        "sha256": hex_digest(values[2])
+                    }
+                ]
+            },
+            "nothing": {"kind": "attachments", "items": []},
+            "settings": {
+                "kind": "json",
+                "sizeBytes": json_bytes.len(),
+                "sha256": hex_digest(json_bytes)
+            }
+        }
+    });
+    let canonical = serde_json::to_vec(&manifest).unwrap();
+    let member_ids = [
+        "inputs/emptyText",
+        "inputs/evidence/000000",
+        "inputs/evidence/000001",
+        "inputs/settings",
+    ];
+    let set_body = |state: &str, uploaded: bool| {
+        let mut body = serde_json::json!({
+            "id": INPUT_SET_ID,
+            "organizationId": ORGANIZATION_ID,
+            "projectId": PROJECT_ID,
+            "boundsProfile": 1,
+            "manifest": manifest.clone(),
+            "manifestDigest": {"algorithm": "sha256", "value": hex_digest(&canonical)},
+            "inputCount": 4,
+            "attachmentCount": 2,
+            "aggregateSizeBytes": values.iter().map(|value| value.len()).sum::<usize>(),
+            "state": state,
+            "createdAt": "2026-08-24T01:00:00Z",
+            "openDeadlineAt": "2999-08-25T01:00:00Z",
+            "members": member_ids.iter().map(|member| serde_json::json!({
+                "memberId": member,
+                "uploadConfirmed": uploaded
+            })).collect::<Vec<_>>(),
+            "replayed": false
+        });
+        if state == "sealed" {
+            body["sealedAt"] = serde_json::json!("2026-08-24T01:02:00Z");
+            body["sealedDeadlineAt"] = serde_json::json!("2026-08-25T01:02:00Z");
+        }
+        body
+    };
+    let create_response = http_response_with_headers(
+        "201 Created",
+        Some("application/json"),
+        &[
+            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+            (
+                "Location",
+                "/v1/organizations/acme-research/run-input-sets/ris_01k0z6r1w8f4jy2m7q9v3x5abc",
+            ),
+        ],
+        &serde_json::to_vec(&set_body("open", false)).unwrap(),
+    );
+    let capability_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "inputSetId": INPUT_SET_ID,
+            "capabilityExpiresAt": "2998-08-24T01:05:00Z",
+            "members": member_ids.iter().enumerate().map(|(index, member)| serde_json::json!({
+                "memberId": member,
+                "url": urls[index],
+                "requiredHeaders": {
+                    "contentLength": values[index].len().to_string(),
+                    "contentType": media_types[index],
+                    "ifNoneMatch": "*",
+                    "xAmzChecksumSha256": base64::engine::general_purpose::STANDARD.encode(sha256(values[index]))
+                }
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    );
+    let sealed_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &serde_json::to_vec(&set_body("sealed", true)).unwrap(),
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        create_response,
+        capability_response,
+        sealed_response,
+        acceptance_response(false),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(true);
+    let insertion = arguments.len() - 1;
+    arguments.splice(
+        insertion..insertion,
+        [
+            "--input-text",
+            "emptyText",
+            "",
+            "--input-json",
+            "settings",
+            std::str::from_utf8(json_bytes).unwrap(),
+            "--input-attachment",
+            "evidence",
+            "text/plain",
+            first_path.to_str().unwrap(),
+            "--input-attachment",
+            "evidence",
+            "application/octet-stream",
+            second_path.to_str().unwrap(),
+            "--input-attachments-empty",
+            "nothing",
+        ],
+    );
+
+    let output = run_with_env(&arguments, &environment);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_secret_output(&output, &[TOKEN, "first attachment", "second attachment"]);
+    let requests = server.finish();
+    assert_eq!(request_body(&requests[0])["inputs"], manifest["inputs"]);
+    assert_eq!(
+        request_body(&requests[1]),
+        serde_json::json!({"members": member_ids})
+    );
+    assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
+    for (storage, expected) in storages.into_iter().zip(values) {
+        assert_eq!(
+            storage
+                .finish()
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .1
+                .as_bytes(),
+            expected
+        );
+    }
+}
+
+fn retained_inputs_response(bytes: &[u8]) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "inputSetId": INPUT_SET_ID,
+            "manifest": {
+                "schemaVersion": 1,
+                "inputs": {
+                    "request": {
+                        "kind": "text",
+                        "sizeBytes": bytes.len(),
+                        "sha256": hex_digest(bytes)
+                    }
+                }
+            },
+            "manifestDigest": {
+                "algorithm": "sha256",
+                "value": scalar_manifest_digest(bytes, "text")
+            },
+            "sealedAt": "2026-08-24T01:02:00Z",
+            "contentExpiresAt": null,
+            "inputCount": 1,
+            "attachmentCount": 0,
+            "aggregateSizeBytes": bytes.len(),
+            "availability": "available"
+        }))
+        .unwrap(),
+    )
+}
+
+fn download_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "inputSetId": INPUT_SET_ID,
+            "capabilityExpiresAt": "2998-08-24T01:05:00Z",
+            "members": [{
+                "memberId": "inputs/request",
+                "attachmentIndex": null,
+                "displayName": null,
+                "mediaType": "text/plain; charset=utf-8",
+                "sizeBytes": bytes.len(),
+                "sha256": hex_digest(bytes),
+                "url": url
+            }]
+        }))
+        .unwrap(),
+    )
+}
+
+fn retained_inputs_response_for_manifest(
+    manifest: &serde_json::Value,
+    input_count: usize,
+    attachment_count: usize,
+    aggregate_size_bytes: usize,
+) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "inputSetId": INPUT_SET_ID,
+            "manifest": manifest,
+            "manifestDigest": {
+                "algorithm": "sha256",
+                "value": hex_digest(&serde_json::to_vec(manifest).unwrap())
+            },
+            "sealedAt": "2026-08-24T01:02:00Z",
+            "contentExpiresAt": null,
+            "inputCount": input_count,
+            "attachmentCount": attachment_count,
+            "aggregateSizeBytes": aggregate_size_bytes,
+            "availability": "available"
+        }))
+        .unwrap(),
+    )
+}
+
+fn download_capability_response_for_members(members: serde_json::Value) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "inputSetId": INPUT_SET_ID,
+            "capabilityExpiresAt": "2998-08-24T01:05:00Z",
+            "members": members
+        }))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn explicit_input_set_flow_creates_open_then_uploads_seals_and_consumes() {
+    let input_bytes = b"explicit single-use input\n";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("request.txt");
+    fs::write(&path, input_bytes).unwrap();
+
+    let (create_server, _credentials, credential_path) =
+        prepared_run(vec![create_input_set_response(input_bytes, false)]);
+    let environment = deployment_environment(&create_server.api_url, &credential_path);
+    let create = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "create",
+            ORGANIZATION,
+            "--project-id",
+            PROJECT_ID,
+            "--input-text-file",
+            "request",
+            path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&create.stdout).unwrap();
+    assert_eq!(result["outcome"], "created");
+    assert_eq!(result["inputSet"]["id"], INPUT_SET_ID);
+    assert_eq!(result["inputSet"]["state"], "open");
+    let requests = create_server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("/run-input-sets HTTP/1.1"));
+    assert!(!requests[0].contains("upload-capabilities"));
+    assert!(!requests[0].contains("/seal"));
+
+    let storage = OneShotServer::respond("204 No Content", None, b"");
+    let signed_url = format!("{}/object?signature=input-set-upload", storage.api_url);
+    let open_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            input_bytes,
+            "text",
+            "open",
+            false,
+            false,
+        ))
+        .unwrap(),
+    );
+    let (upload_server, _credentials, credential_path) = prepared_run(vec![
+        open_response,
+        upload_capability_response(input_bytes, &signed_url),
+    ]);
+    let environment = deployment_environment(&upload_server.api_url, &credential_path);
+    let upload = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "upload",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--member-file",
+            "inputs/request",
+            path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(upload.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&upload.stdout).unwrap()["outcome"],
+        "uploaded"
+    );
+    let requests = upload_server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("/upload-capabilities HTTP/1.1"));
+    storage.finish();
+
+    let uploaded_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            input_bytes,
+            "text",
+            "open",
+            true,
+            false,
+        ))
+        .unwrap(),
+    );
+    let (seal_server, _credentials, credential_path) = prepared_run(vec![
+        uploaded_response,
+        seal_input_set_response(input_bytes, false),
+    ]);
+    let environment = deployment_environment(&seal_server.api_url, &credential_path);
+    let seal = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "seal",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(seal.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&seal.stdout).unwrap()["outcome"],
+        "sealed"
+    );
+    let requests = seal_server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("/seal HTTP/1.1"));
+
+    let (consume_server, _credentials, credential_path) =
+        prepared_run(vec![acceptance_response(false)]);
+    let environment = deployment_environment(&consume_server.api_url, &credential_path);
+    let mut arguments = create_args(true);
+    let insertion = arguments.len() - 1;
+    arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
+    let consume = run_with_env(&arguments, &environment);
+
+    assert!(consume.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&consume.stdout).unwrap();
+    assert_eq!(result["outcome"], "accepted");
+    assert_eq!(result["inputSetId"], INPUT_SET_ID);
+    let requests = consume_server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("/runs HTTP/1.1"));
+    assert_eq!(request_body(&requests[0])["inputSetId"], INPUT_SET_ID);
+}
+
+#[test]
+fn input_set_mutation_commands_upload_seal_and_delete_with_fresh_requests() {
+    let input_bytes = b"selected single-use input\n";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("request.txt");
+    fs::write(&path, input_bytes).unwrap();
+
+    let storage = OneShotServer::respond("204 No Content", None, b"");
+    let signed_url = format!("{}/object?signature=input-set-upload", storage.api_url);
+    let open_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            input_bytes,
+            "text",
+            "open",
+            false,
+            false,
+        ))
+        .unwrap(),
+    );
+    let (upload_server, _credentials, credential_path) = prepared_run(vec![
+        open_response,
+        upload_capability_response(input_bytes, &signed_url),
+    ]);
+    let environment = deployment_environment(&upload_server.api_url, &credential_path);
+    let upload = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "upload",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--member-file",
+            "inputs/request",
+            path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(upload.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&upload.stdout).unwrap()["outcome"],
+        "uploaded"
+    );
+    let requests = upload_server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains(&format!("/run-input-sets/{INPUT_SET_ID} HTTP/1.1")));
+    assert!(requests[1].contains(&format!(
+        "/run-input-sets/{INPUT_SET_ID}/upload-capabilities HTTP/1.1"
+    )));
+    storage.finish();
+    assert_no_secret_output(&upload, &[TOKEN, "input-set-upload"]);
+
+    let uploaded_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            input_bytes,
+            "text",
+            "open",
+            true,
+            false,
+        ))
+        .unwrap(),
+    );
+    let (seal_server, _credentials, credential_path) = prepared_run(vec![
+        uploaded_response,
+        seal_input_set_response(input_bytes, false),
+    ]);
+    let environment = deployment_environment(&seal_server.api_url, &credential_path);
+    let seal = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "seal",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(seal.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&seal.stdout).unwrap()["outcome"],
+        "sealed"
+    );
+    let requests = seal_server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains(&format!("/run-input-sets/{INPUT_SET_ID}/seal HTTP/1.1")));
+    let seal_key = header_value(&requests[1], "idempotency-key");
+    assert_eq!(seal_key.len(), 64);
+
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+        .args(["run", "input-set", "delete", ORGANIZATION, INPUT_SET_ID])
+        .output()
+        .unwrap();
+    assert_eq!(unconfirmed.status.code(), Some(2));
+
+    let response = http_response_with_headers(
+        "204 No Content",
+        None,
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        b"",
+    );
+    let (delete_server, _credentials, credential_path) = prepared_run(vec![response]);
+    let environment = deployment_environment(&delete_server.api_url, &credential_path);
+    let delete = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "delete",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(delete.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&delete.stdout).unwrap()["outcome"],
+        "deleted"
+    );
+    let request = delete_server.finish().remove(0);
+    assert!(request.starts_with(&format!(
+        "DELETE /api/v1/organizations/{ORGANIZATION}/run-input-sets/{INPUT_SET_ID} HTTP/1.1"
+    )));
+    let delete_key = header_value(&request, "idempotency-key");
+    assert_eq!(delete_key.len(), 64);
+    assert_ne!(seal_key, delete_key);
+}
+
+#[test]
+fn sealing_an_already_sealed_input_set_reports_a_lifecycle_conflict() {
+    let input_bytes = b"already sealed";
+    let sealed_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            input_bytes,
+            "text",
+            "sealed",
+            true,
+            false,
+        ))
+        .unwrap(),
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![sealed_response]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "seal",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["outcome"], "conflict");
+    assert_eq!(receipt["inputSetId"], INPUT_SET_ID);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains(&format!("/run-input-sets/{INPUT_SET_ID} HTTP/1.1")));
+    assert!(!requests[0].contains("/seal HTTP/1.1"));
+}
+
+#[test]
+fn input_set_upload_rejects_changed_member_bytes_before_capability_issue() {
+    let expected = b"original immutable member";
+    let changed = b"changed immutable member";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("request.txt");
+    fs::write(&path, changed).unwrap();
+    let open_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            expected, "text", "open", false, false,
+        ))
+        .unwrap(),
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![open_response]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "upload",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--member-file",
+            "inputs/request",
+            path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+        "invalid_input"
+    );
+    assert_eq!(server.finish().len(), 1);
+    assert_no_secret_output(
+        &output,
+        &[
+            TOKEN,
+            std::str::from_utf8(expected).unwrap(),
+            std::str::from_utf8(changed).unwrap(),
+        ],
+    );
+}
+
+#[test]
+fn input_set_upload_resumes_one_exact_attachment_member() {
+    let uploaded_bytes = b"already accepted sibling";
+    let selected_bytes = b"missing second attachment";
+    let directory = tempfile::tempdir().unwrap();
+    let selected_path = directory.path().join("second.bin");
+    fs::write(&selected_path, selected_bytes).unwrap();
+    let manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "inputs": {
+            "evidence": {
+                "kind": "attachments",
+                "items": [
+                    {
+                        "index": 0,
+                        "displayName": "first.txt",
+                        "mediaType": "text/plain",
+                        "sizeBytes": uploaded_bytes.len(),
+                        "sha256": hex_digest(uploaded_bytes)
+                    },
+                    {
+                        "index": 1,
+                        "displayName": "second.bin",
+                        "mediaType": "application/octet-stream",
+                        "sizeBytes": selected_bytes.len(),
+                        "sha256": hex_digest(selected_bytes)
+                    }
+                ]
+            }
+        }
+    });
+    let set = serde_json::json!({
+        "id": INPUT_SET_ID,
+        "organizationId": ORGANIZATION_ID,
+        "projectId": PROJECT_ID,
+        "boundsProfile": 1,
+        "manifest": manifest.clone(),
+        "manifestDigest": {
+            "algorithm": "sha256",
+            "value": hex_digest(&serde_json::to_vec(&manifest).unwrap())
+        },
+        "inputCount": 1,
+        "attachmentCount": 2,
+        "aggregateSizeBytes": uploaded_bytes.len() + selected_bytes.len(),
+        "state": "open",
+        "createdAt": "2026-08-24T01:00:00Z",
+        "openDeadlineAt": "2999-08-25T01:00:00Z",
+        "members": [
+            {"memberId": "inputs/evidence/000000", "uploadConfirmed": true},
+            {"memberId": "inputs/evidence/000001", "uploadConfirmed": false}
+        ],
+        "replayed": false
+    });
+    let storage = OneShotServer::respond("204 No Content", None, b"");
+    let signed_url = format!("{}/second?signature=resume", storage.api_url);
+    let capabilities = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "inputSetId": INPUT_SET_ID,
+            "capabilityExpiresAt": "2998-08-24T01:05:00Z",
+            "members": [{
+                "memberId": "inputs/evidence/000001",
+                "url": signed_url,
+                "requiredHeaders": {
+                    "contentLength": selected_bytes.len().to_string(),
+                    "contentType": "application/octet-stream",
+                    "ifNoneMatch": "*",
+                    "xAmzChecksumSha256": base64::engine::general_purpose::STANDARD.encode(sha256(selected_bytes))
+                }
+            }]
+        }))
+        .unwrap(),
+    );
+    let open_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&set).unwrap(),
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![open_response, capabilities]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "upload",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--member-file",
+            "inputs/evidence/000001",
+            selected_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+        "uploaded"
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_body(&requests[1]),
+        serde_json::json!({"members": ["inputs/evidence/000001"]})
+    );
+    assert_eq!(
+        storage
+            .finish()
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .1
+            .as_bytes(),
+        selected_bytes
+    );
+    assert_no_secret_output(
+        &output,
+        &[
+            TOKEN,
+            "resume",
+            std::str::from_utf8(selected_bytes).unwrap(),
+        ],
+    );
+}
+
+#[test]
+fn input_set_and_retained_input_show_commands_emit_structural_json() {
+    let input_bytes = b"show input";
+    let input_set_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            input_bytes,
+            "text",
+            "open",
+            false,
+            false,
+        ))
+        .unwrap(),
+    );
+    let (input_set_server, _credentials, credential_path) = prepared_run(vec![input_set_response]);
+    let environment = deployment_environment(&input_set_server.api_url, &credential_path);
+    let input_set_output = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "show",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(input_set_output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&input_set_output.stdout).unwrap();
+    assert_eq!(result["outcome"], "found");
+    assert_eq!(
+        result["inputSet"]["manifest"]["inputs"]["request"]["kind"],
+        "text"
+    );
+    input_set_server.finish();
+
+    let (retained_server, _credentials, credential_path) =
+        prepared_run(vec![retained_inputs_response(input_bytes)]);
+    let environment = deployment_environment(&retained_server.api_url, &credential_path);
+    let retained_output = run_with_env(
+        &[
+            "run",
+            "inputs",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(retained_output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&retained_output.stdout).unwrap();
+    assert_eq!(result["outcome"], "found");
+    assert_eq!(result["inventory"]["inputSetId"], INPUT_SET_ID);
+    assert_eq!(
+        result["inventory"]["manifest"]["inputs"]["request"]["kind"],
+        "text"
+    );
+    assert_no_secret_output(&retained_output, &[TOKEN, "show input"]);
+    retained_server.finish();
+}
+
+#[test]
+fn run_input_http_decoders_reject_duplicate_members_before_using_success_responses() {
+    let input_bytes = b"duplicate response member";
+    let response_body = |response: Vec<u8>| {
+        String::from_utf8(response)
+            .unwrap()
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .1
+            .to_owned()
+    };
+    let duplicate = |body: String, original: &str, replacement: &str| {
+        let replaced = body.replacen(original, replacement, 1);
+        assert_ne!(
+            replaced, body,
+            "fixture member should exist exactly as encoded"
+        );
+        replaced
+    };
+
+    let input_set_body = serde_json::to_string(&scalar_input_set_body(
+        input_bytes,
+        "text",
+        "open",
+        false,
+        false,
+    ))
+    .unwrap();
+    let input_set_body = duplicate(
+        input_set_body,
+        r#""state":"open""#,
+        r#""state":"open","state":"sealed""#,
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        input_set_body.as_bytes(),
+    )]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "show",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_invalid_response(&output);
+    assert_eq!(server.finish().len(), 1);
+
+    let retained_body = duplicate(
+        response_body(retained_inputs_response(input_bytes)),
+        r#""kind":"text""#,
+        r#""kind":"text","\u006bind":"text""#,
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        retained_body.as_bytes(),
+    )]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &[
+            "run",
+            "inputs",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_invalid_response(&output);
+    assert_eq!(server.finish().len(), 1);
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("request.txt");
+    fs::write(&source, input_bytes).unwrap();
+    let upload_body = duplicate(
+        response_body(upload_capability_response(
+            input_bytes,
+            "https://storage.invalid/object?signature=duplicate-upload",
+        )),
+        r#""contentType":"text/plain; charset=utf-8""#,
+        r#""contentType":"text/plain; charset=utf-8","content\u0054ype":"text/plain; charset=utf-8""#,
+    );
+    let open_response = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[],
+        &serde_json::to_vec(&scalar_input_set_body(
+            input_bytes,
+            "text",
+            "open",
+            false,
+            false,
+        ))
+        .unwrap(),
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        open_response,
+        http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Cache-Control", "private, no-store")],
+            upload_body.as_bytes(),
+        ),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &[
+            "run",
+            "input-set",
+            "upload",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--member-file",
+            "inputs/request",
+            source.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_invalid_response(&output);
+    assert_eq!(server.finish().len(), 2);
+
+    let download_body = duplicate(
+        response_body(download_capability_response(
+            input_bytes,
+            "https://storage.invalid/object?signature=duplicate-download",
+        )),
+        r#""displayName":null"#,
+        r#""displayName":null,"display\u004eame":null"#,
+    );
+    let destination = directory.path().join("duplicate-download");
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        retained_inputs_response(input_bytes),
+        http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Cache-Control", "private, no-store")],
+            download_body.as_bytes(),
+        ),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &[
+            "run",
+            "inputs",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_invalid_response(&output);
+    assert!(!destination.exists());
+    assert_eq!(server.finish().len(), 2);
+    assert_no_secret_output(&output, &[TOKEN, "duplicate-upload", "duplicate-download"]);
+}
+
+#[test]
+fn retained_inputs_download_uses_inventory_bound_logical_paths() {
+    let input_bytes = b"private retained input bytes\n";
+    let storage = OneShotServer::respond("200 OK", Some("text/plain"), input_bytes);
+    let signed_url = format!("{}/object?signature=retained-input", storage.api_url);
+    let (download_server, _credentials, credential_path) = prepared_run(vec![
+        retained_inputs_response(input_bytes),
+        download_capability_response(input_bytes, &signed_url),
+    ]);
+    let environment = deployment_environment(&download_server.api_url, &credential_path);
+    let destination_parent = tempfile::tempdir().unwrap();
+    let destination = destination_parent.path().join("inputs-download");
+
+    let output = run_with_env(
+        &[
+            "run",
+            "inputs",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(destination.join("inputs/request")).unwrap(),
+        input_bytes
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "downloaded");
+    assert_eq!(result["inputSetId"], INPUT_SET_ID);
+    assert_eq!(result["memberCount"], 1);
+    let requests = download_server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains(&format!("/runs/{RUN_ID}/inputs HTTP/1.1")));
+    assert_eq!(
+        request_body(&requests[1]),
+        serde_json::json!({"members": ["inputs/request"]})
+    );
+    let storage_request = storage.finish();
+    assert!(storage_request.starts_with("GET /api/object?signature="));
+    assert!(!storage_request.contains("authorization:"));
+    assert_no_secret_output(
+        &output,
+        &[
+            TOKEN,
+            "retained-input",
+            std::str::from_utf8(input_bytes).unwrap(),
+        ],
+    );
+}
+
+#[test]
+fn retained_inputs_download_selects_exact_members_only() {
+    let first = b"unselected private bytes";
+    let second = b"selected private bytes";
+    let manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "inputs": {
+            "first": {
+                "kind": "text",
+                "sizeBytes": first.len(),
+                "sha256": hex_digest(first)
+            },
+            "second": {
+                "kind": "text",
+                "sizeBytes": second.len(),
+                "sha256": hex_digest(second)
+            }
+        }
+    });
+    let storage = OneShotServer::respond("200 OK", Some("text/plain"), second);
+    let signed_url = format!(
+        "{}/second?signature=unique-selected-capability-sentinel",
+        storage.api_url
+    );
+    let capabilities = download_capability_response_for_members(serde_json::json!([{
+        "memberId": "inputs/second",
+        "attachmentIndex": null,
+        "displayName": null,
+        "mediaType": "text/plain; charset=utf-8",
+        "sizeBytes": second.len(),
+        "sha256": hex_digest(second),
+        "url": signed_url
+    }]));
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        retained_inputs_response_for_manifest(&manifest, 2, 0, first.len() + second.len()),
+        capabilities,
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let destination_parent = tempfile::tempdir().unwrap();
+    let destination = destination_parent.path().join("selected-inputs");
+
+    let output = run_with_env(
+        &[
+            "run",
+            "inputs",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--member",
+            "inputs/second",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(destination.join("inputs/second")).unwrap(), second);
+    assert!(!destination.join("inputs/first").exists());
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["memberCount"], 1);
+    assert_eq!(receipt["totalSizeBytes"], second.len());
+    let requests = server.finish();
+    assert_eq!(
+        request_body(&requests[1]),
+        serde_json::json!({"members": ["inputs/second"]})
+    );
+    storage.finish();
+    assert_no_secret_output(
+        &output,
+        &[
+            TOKEN,
+            "unique-selected-capability-sentinel",
+            std::str::from_utf8(first).unwrap(),
+            std::str::from_utf8(second).unwrap(),
+        ],
+    );
+}
+
+#[test]
+fn retained_inputs_download_accepts_a_relative_destination() {
+    let input_bytes = b"relative destination bytes";
+    let storage = OneShotServer::respond("200 OK", Some("text/plain"), input_bytes);
+    let signed_url = format!("{}/object?signature=relative", storage.api_url);
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        retained_inputs_response(input_bytes),
+        download_capability_response(input_bytes, &signed_url),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let current_directory = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args([
+            "run",
+            "inputs",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            "retained-inputs",
+            "--json",
+            "--allow-insecure-http",
+        ])
+        .current_dir(current_directory.path())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+
+    let output = command.output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(
+            current_directory
+                .path()
+                .join("retained-inputs/inputs/request")
+        )
+        .unwrap(),
+        input_bytes
+    );
+    server.finish();
+    storage.finish();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_inputs_json_download_rejects_an_unrepresentable_destination_before_transfer() {
+    let (server, _credentials, credential_path) = prepared_run(Vec::new());
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let destination_parent = tempfile::tempdir().unwrap();
+    let destination = destination_parent
+        .path()
+        .join(std::ffi::OsString::from_vec(b"download-\xff".to_vec()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args([
+            "run",
+            "inputs",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+        ])
+        .arg(&destination)
+        .args(["--json", "--allow-insecure-http"])
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!destination.exists());
+    assert!(server.finish().is_empty());
+}
+
+#[test]
+fn retained_input_integrity_failure_leaves_no_destination() {
+    let expected = b"expected retained bytes";
+    let storage = OneShotServer::respond("200 OK", Some("text/plain"), b"different retained bytes");
+    let signed_url = format!("{}/object?signature=integrity-mismatch", storage.api_url);
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        retained_inputs_response(expected),
+        download_capability_response(expected, &signed_url),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let destination_parent = tempfile::tempdir().unwrap();
+    let destination = destination_parent.path().join("must-not-exist");
+
+    let output = run_with_env(
+        &[
+            "run",
+            "inputs",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!destination.exists());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "integrity_mismatch");
+    assert_no_secret_output(&output, &[TOKEN, "integrity-mismatch"]);
+    server.finish();
+    storage.finish();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interrupted_retained_input_download_removes_verified_private_staging() {
+    let first = b"already downloaded private input\n";
+    let second = b"paused private input\n";
+    let manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "inputs": {
+            "first": {
+                "kind": "text",
+                "sizeBytes": first.len(),
+                "sha256": hex_digest(first)
+            },
+            "second": {
+                "kind": "text",
+                "sizeBytes": second.len(),
+                "sha256": hex_digest(second)
+            }
+        }
+    });
+    let first_storage = OneShotServer::respond("200 OK", Some("text/plain"), first);
+    let mut second_storage =
+        ScriptedServer::respond_with_paused_first_response(vec![http_response_with_headers(
+            "200 OK",
+            Some("text/plain"),
+            &[],
+            second,
+        )]);
+    let first_url = format!("{}/first?signature=first-private", first_storage.api_url);
+    let second_url = format!(
+        "{}/second?signature=interrupted-retained-input",
+        second_storage.api_url
+    );
+    let capabilities = download_capability_response_for_members(serde_json::json!([
+        {
+            "memberId": "inputs/first",
+            "attachmentIndex": null,
+            "displayName": null,
+            "mediaType": "text/plain; charset=utf-8",
+            "sizeBytes": first.len(),
+            "sha256": hex_digest(first),
+            "url": first_url
+        },
+        {
+            "memberId": "inputs/second",
+            "attachmentIndex": null,
+            "displayName": null,
+            "mediaType": "text/plain; charset=utf-8",
+            "sizeBytes": second.len(),
+            "sha256": hex_digest(second),
+            "url": second_url
+        }
+    ]));
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        retained_inputs_response_for_manifest(&manifest, 2, 0, first.len() + second.len()),
+        capabilities,
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let destination_parent = tempfile::tempdir().unwrap();
+    let destination = destination_parent.path().join("must-not-be-committed");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args([
+            "run",
+            "inputs",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let child = command.spawn().unwrap();
+    let request = second_storage.next_request();
+    assert!(request.starts_with("GET /api/second?signature="));
+
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    second_storage.release_paused_response();
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stderr.is_empty());
+    assert!(!destination.exists());
+    assert!(
+        fs::read_dir(destination_parent.path())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".scherzo-input-download-"))
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "interrupted");
+    assert_eq!(result["runId"], RUN_ID);
+    assert_no_secret_output(
+        &output,
+        &[
+            TOKEN,
+            "first-private",
+            "interrupted-retained-input",
+            std::str::from_utf8(first).unwrap(),
+            std::str::from_utf8(second).unwrap(),
+        ],
+    );
+    assert_eq!(server.finish().len(), 2);
+    first_storage.finish();
+    second_storage.finish();
+}
+
+#[test]
+fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_request() {
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+        .args(["run", "inputs", "delete", ORGANIZATION, RUN_ID])
+        .output()
+        .unwrap();
+    assert_eq!(unconfirmed.status.code(), Some(2));
+
+    let response = http_response_with_headers(
+        "204 No Content",
+        None,
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        b"",
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![response]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &[
+            "run",
+            "inputs",
+            "delete",
+            ORGANIZATION,
+            RUN_ID,
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+        "deleted"
+    );
+    let request = server.finish().remove(0);
+    assert!(request.starts_with(&format!(
+        "DELETE /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/inputs HTTP/1.1"
+    )));
+    assert_eq!(header_value(&request, "idempotency-key").len(), 64);
 }
 
 #[test]
@@ -1044,7 +2560,7 @@ fn ambiguous_transport_retry_reuses_the_create_key_and_request() {
 }
 
 #[test]
-fn text_input_sequence_refreshes_fresh_authority_and_recovers_ambiguous_mutations() {
+fn text_input_sequence_refreshes_authority_but_does_not_treat_network_failure_as_upload_evidence() {
     let input_bytes = b"Explain why 2 + 3 = 5.\n";
     let input_directory = tempfile::tempdir().unwrap();
     let input_path = input_directory.path().join("request.txt");
@@ -1074,10 +2590,6 @@ fn text_input_sequence_refreshes_fresh_authority_and_recovers_ambiguous_mutation
             }),
         ),
         upload_capability_response(input_bytes, &signed_url),
-        Vec::new(),
-        seal_input_set_response(input_bytes, true),
-        Vec::new(),
-        acceptance_response(true),
     ]);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
@@ -1099,14 +2611,10 @@ fn text_input_sequence_refreshes_fresh_authority_and_recovers_ambiguous_mutation
         &environment,
     );
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(4));
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["outcome"], "accepted");
-    assert_eq!(receipt["replayed"], true);
+    assert_eq!(receipt["outcome"], "unreachable");
+    assert_eq!(receipt["inputSetId"], INPUT_SET_ID);
     assert_no_secret_output(
         &output,
         &[
@@ -1117,7 +2625,7 @@ fn text_input_sequence_refreshes_fresh_authority_and_recovers_ambiguous_mutation
         ],
     );
     let requests = server.finish();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 4);
     assert!(requests[1].contains("/upload-capabilities HTTP/1.1"));
     assert!(requests[2].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
     assert!(requests[3].contains("/upload-capabilities HTTP/1.1"));
@@ -1131,19 +2639,6 @@ fn text_input_sequence_refreshes_fresh_authority_and_recovers_ambiguous_mutation
         header_value(&requests[3], "authorization"),
         format!("Bearer {REFRESHED_TOKEN}")
     );
-    assert_eq!(
-        header_value(&requests[4], "idempotency-key"),
-        header_value(&requests[5], "idempotency-key")
-    );
-    assert_eq!(
-        requests[4].split_once("\r\n\r\n").unwrap().1,
-        requests[5].split_once("\r\n\r\n").unwrap().1
-    );
-    assert_eq!(
-        header_value(&requests[6], "idempotency-key"),
-        header_value(&requests[7], "idempotency-key")
-    );
-    assert_eq!(request_body(&requests[6]), request_body(&requests[7]));
     let upload = storage.finish();
     assert!(upload.starts_with("PUT "));
     assert!(!upload.contains("authorization:"));
@@ -1983,6 +3478,156 @@ fn signalled_create_reports_unknown_commitment_without_exposing_credentials() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn signalled_input_set_create_reports_unknown_without_an_invented_id() {
+    let input_text = "input set interrupted before its identifier is known";
+    let input_bytes = input_text.as_bytes();
+    let input_directory = tempfile::tempdir().unwrap();
+    let input_path = input_directory.path().join("request.txt");
+    fs::write(&input_path, input_bytes).unwrap();
+    let mut server =
+        ScriptedServer::respond_with_paused_first_response(vec![create_input_set_response(
+            input_bytes,
+            false,
+        )]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture(
+        &credential_path,
+        &server.api_url,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args([
+            "run",
+            "input-set",
+            "create",
+            ORGANIZATION,
+            "--project-id",
+            PROJECT_ID,
+            "--input-text-file",
+            "request",
+            input_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let child = command.spawn().unwrap();
+    assert!(server.next_request().contains("/run-input-sets HTTP/1.1"));
+
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.release_paused_response();
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stderr.is_empty());
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["outcome"], "unknown");
+    assert_eq!(receipt["commitment"], "unknown");
+    assert_eq!(receipt["organizationRef"], ORGANIZATION);
+    assert_eq!(receipt["resourceKind"], "input set");
+    assert!(receipt.get("resourceId").is_none());
+    assert_no_secret_output(&output, &[TOKEN, input_text]);
+    assert!(server.finish().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signalled_input_set_seal_reports_one_unknown_receipt() {
+    let input_bytes = b"sealed input";
+    let mut server = ScriptedServer::respond_with_paused_last_response(vec![
+        http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Cache-Control", "private, no-store")],
+            &serde_json::to_vec(&scalar_input_set_body(
+                input_bytes,
+                "text",
+                "open",
+                true,
+                false,
+            ))
+            .unwrap(),
+        ),
+        seal_input_set_response(input_bytes, false),
+    ]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture(
+        &credential_path,
+        &server.api_url,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args([
+            "run",
+            "input-set",
+            "seal",
+            ORGANIZATION,
+            INPUT_SET_ID,
+            "--json",
+            "--allow-insecure-http",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let child = command.spawn().unwrap();
+    assert!(
+        server
+            .next_request()
+            .contains(&format!("/run-input-sets/{INPUT_SET_ID} HTTP/1.1"))
+    );
+    assert!(
+        server
+            .next_request()
+            .contains(&format!("/run-input-sets/{INPUT_SET_ID}/seal HTTP/1.1"))
+    );
+
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.release_paused_response();
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stderr.is_empty());
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["outcome"], "unknown");
+    assert_eq!(receipt["commitment"], "unknown");
+    assert_eq!(receipt["resourceKind"], "input set");
+    assert_eq!(receipt["resourceId"], INPUT_SET_ID);
+    assert!(server.finish().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn interruption_during_text_input_upload_never_claims_run_acceptance() {
     let input_bytes = b"private interrupted named input sentinel\n";
     let input_directory = tempfile::tempdir().unwrap();
@@ -2035,8 +3680,11 @@ fn interruption_during_text_input_upload_never_claims_run_acceptance() {
     storage.release_paused_response();
 
     assert_eq!(output.status.code(), Some(130));
-    assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "input_set_incomplete");
+    assert_eq!(result["inputSetId"], INPUT_SET_ID);
+    assert_eq!(result["organizationRef"], ORGANIZATION);
     assert_no_secret_output(
         &output,
         &[

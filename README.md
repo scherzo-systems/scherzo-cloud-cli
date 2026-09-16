@@ -171,18 +171,19 @@ The current release supports:
   invitation issuance and lifecycle management, the
   current principal's invitation inbox, one-page member-directory reads, actor-bound GitHub App setup,
   installation and repository discovery, complete project and repository configuration,
-  and named-Text-backed or inputless Cloud run creation, terminal waiting, Artifact Set
-  download, and inspection;
+  mixed named-input and inputless Cloud run creation, explicit single-use Run Input Set
+  administration, retained-input inspection/download/deletion, terminal waiting, and
+  Artifact Set download and inspection;
 - runner and runner-pool administration plus prerequisite diagnostics; and
 - enrollment and service operation for an outbound runner that connects only to its
   Cloud-issued endpoint and waits for explicit start authorization.
 
 The Cloud management surface is not complete. The CLI can discover and manage accessible
 organizations, manage invitations and membership, connect GitHub App installations,
-discover authorized repositories, manage projects and runner pools, create named-Text-backed
-or inputless runs for a ready project, wait for terminal status, and download verified
-Artifact Sets. It cannot yet administer general Run Input Sets or guide the rest of Cloud
-onboarding.
+discover authorized repositories, manage projects and runner pools, create mixed-input
+or inputless runs for a ready project, administer Run Input Sets, inspect/download/delete
+retained run inputs, wait for terminal status, and download verified Artifact Sets. It
+does not yet guide the rest of Cloud onboarding.
 
 ## Public API contract
 
@@ -1075,11 +1076,35 @@ scherzo-cloud run create acme-labs \
   --source-branch main \
   --display-name "Release checks"
 
-# Or bind strict JSON to the workflow's named JSON input.
+# Or bind mixed values, including ordered and explicitly empty collections.
 scherzo-cloud run create acme-labs \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --workflow-path workflows/build.yaml \
-  --input-json-file request ./request.json
+  --input-text-file request ./request.txt \
+  --input-json settings '{"mode":"review"}' \
+  --input-attachment evidence text/plain ./notes.txt \
+  --input-attachment evidence application/pdf ./report.pdf \
+  --input-attachments-empty optionalEvidence
+
+# Create an open immutable set, upload its object members, and then seal it.
+scherzo-cloud run input-set create acme-labs \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --input-text-file request ./request.txt \
+  --input-attachment evidence text/plain ./notes.txt \
+  --input-attachment evidence application/pdf ./report.pdf \
+  --json > input-set.json
+input_set_id=$(jq -er '.inputSet.id' input-set.json)
+
+scherzo-cloud run input-set upload acme-labs "$input_set_id" \
+  --member-file inputs/request ./request.txt \
+  --member-file inputs/evidence/000000 ./notes.txt \
+  --member-file inputs/evidence/000001 ./report.pdf
+scherzo-cloud run input-set seal acme-labs "$input_set_id"
+
+scherzo-cloud run create acme-labs \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --workflow-path workflows/build.yaml \
+  --input-set-id "$input_set_id"
 
 # Read the latest public projection.
 scherzo-cloud run show \
@@ -1093,25 +1118,78 @@ scherzo-cloud run wait \
   --timeout 30m
 ```
 
-Without an input flag, `run create` admits an inputless run. Supply one named Text value
-with `--input-text-file NAME PATH`, or one named JSON value with `--input-json NAME JSON`
-or `--input-json-file NAME PATH`. Supply one singular File value with
-`--input-file NAME MEDIA_TYPE PATH`. File-backed sources must be regular files; Text and
-JSON sources are limited to 1 MiB, while a File value may contain up to 64 MiB. File bytes
-and the supplied valid media type are preserved exactly, without inference or
-normalization. A declared File media-type constraint must match exactly. Text must be
-UTF-8; JSON must be strict UTF-8 JSON with duplicate keys and excessive nesting rejected
-before Cloud access. The command stages the exact source
-bytes with their declared kind, seals that Run Input Set, and binds it to the accepted
-run. An empty selected Text file remains a present zero-length Text value. Use the exact
-input name and kind declared by the selected workflow. Storage uploads have a five-minute
-request timeout, separate from the 20-second metadata-request timeout; signed capability
-expiry remains enforced by storage and is not extended by this timeout.
-The receipt reports the accepted
-Run ID and whether the deployment replayed the request. One invocation keeps each
-mutation's idempotency key through an ambiguous transport retry and an access-token
-refresh; keys are not persisted for a later invocation. An interrupt after run dispatch
-reports an unknown acceptance commitment rather than claiming that no run was created.
+Without an input flag, `run create` admits an inputless run. The mixed-input flags may be
+repeated in one invocation: Text uses `--input-text NAME TEXT` or
+`--input-text-file NAME PATH`, JSON uses `--input-json NAME JSON` or
+`--input-json-file NAME PATH`, a singular File uses
+`--input-file NAME MEDIA_TYPE PATH`, and ordered attachment members use repeated
+`--input-attachment NAME MEDIA_TYPE PATH`. `--input-attachments-empty NAME` preserves a
+present collection with no members. A name may be bound once, except that attachment
+members append to one collection in argument order. One Text or JSON file source may use
+`-` to claim standard input; File and attachment paths always name regular files.
+
+Text and JSON values are limited to 1 MiB, each File or attachment member to 64 MiB, all
+values together to 256 MiB, named inputs to 256, and attachment members to 256. Text must
+be UTF-8. JSON must be strict UTF-8 JSON with duplicate keys and excessive nesting
+rejected before Cloud access. Bytes and explicit valid media types are preserved exactly,
+including zero-length values. The CLI computes the canonical manifest digest, allocates
+one input set, requests upload capabilities in batches of at most 100, uploads every
+logical member, seals the set, and only then creates the run. A storage `412 Precondition
+Failed` is treated only as evidence that seal verification is required; connection and
+timeout failures are not treated as upload evidence. Storage uploads have a five-minute
+request timeout, separate from the 20-second metadata-request timeout.
+
+Use `run input-set create` to acquire local sources, compute the immutable manifest, and
+allocate an open set. It returns the set metadata and ID without requesting upload
+capabilities, writing object storage, or sealing. `run input-set show` inspects a set and
+manifest. `run input-set upload` maps each selected logical member ID to a caller-owned
+regular file with repeated `--member-file MEMBER PATH` flags. It rereads the authoritative
+manifest, requires each file's exact size and digest, and reports accepted members
+separately from `412` members that still require authoritative sealing. This permits a
+later invocation to upload all object members or resume only missing members, including
+one member such as `inputs/evidence/000001` from a larger attachment collection. Empty
+attachment collections require no upload. `run input-set seal` completes authoritative
+verification.
+`run input-set delete ... --yes` makes a set logically unavailable and schedules exact-key
+content cleanup. Once a set is sealed, pass
+its exact ID to `run create --input-set-id`; this conflicts with every acquisition flag
+and never restages content.
+
+Create receipts report the accepted Run ID, the consumed input-set ID when present, and
+whether the deployment replayed the request. One invocation keeps each mutation's
+idempotency key through an ambiguous API transport retry and an access-token refresh;
+keys are not persisted for a later invocation. If preparation stops after allocation,
+JSON and human diagnostics retain the input-set ID so an operator can inspect, upload,
+seal, or delete that set explicitly. An interrupt after run dispatch reports an unknown
+acceptance commitment rather than claiming that no run was created.
+
+Retained content is explicit run-scoped administration:
+
+```sh
+scherzo-cloud run inputs show acme-labs "$run_id" --json
+# Omit --member to download every member, or repeat it for an exact subset.
+scherzo-cloud run inputs download acme-labs "$run_id" \
+  --member inputs/request \
+  --output ./retained-inputs --json
+scherzo-cloud run inputs delete acme-labs "$run_id" --yes
+```
+
+A download first validates the retained inventory, requests capabilities in batches of at
+most 100, and verifies every selected size and SHA-256 digest. Omit `--member` to select
+all members, or repeat `--member MEMBER` to select exact logical IDs; selected members
+retain canonical manifest order. Members are written beneath the new destination using
+their deterministic logical IDs, such as `inputs/request` and
+`inputs/evidence/000000`. Private staging is atomically renamed only after all selected
+members verify, and an existing destination is never replaced. Interruption before the
+commit phase or any integrity failure leaves no committed destination; the CLI attempts
+to unlink its private staging, which is filesystem cleanup rather than physical media
+erasure. An interruption racing the atomic commit reports unknown commitment and
+directs the caller to inspect the destination. Capability URLs, input bytes, and bearer
+credentials are never included in command output. Retention expiry is reported as
+`gone`. Successful deletion makes content logically unavailable and schedules exact-key
+cleanup; it does not attest physical erasure. Both deletion commands require literal
+`--yes`, use fresh idempotency keys, and report an unknown commitment if interrupted
+after dispatch.
 
 Add `--json` for schema-version-1 output. A create receipt preserves `replayed` as a
 boolean and identifies the submitted `organizationRef`. Show and terminal wait results

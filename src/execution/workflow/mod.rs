@@ -49,7 +49,6 @@ pub(crate) mod runtime;
 mod schema;
 mod schema_common;
 pub(crate) mod step_runtime;
-mod strict_json;
 mod strict_yaml;
 pub(crate) mod terminal_host;
 #[cfg(test)]
@@ -86,7 +85,6 @@ pub(crate) const fn maximum_retained_bytes_per_stream(step_count: usize) -> u64 
 }
 
 static STRUCTURAL_VALIDATOR: OnceLock<Result<Validator, ()>> = OnceLock::new();
-static MEDIA_TYPE_VALIDATOR: OnceLock<Result<Validator, ()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecodeFailureKind {
@@ -159,31 +157,24 @@ fn structural_validator() -> Option<&'static Validator> {
         .ok()
 }
 
-pub(crate) fn parse_strict_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
-    strict_json::from_slice(bytes)
+pub(crate) fn is_input_name(value: &str) -> bool {
+    crate::workflow_contract::is_identifier(value)
 }
 
-pub(crate) fn is_input_name(value: &str) -> bool {
-    schema_common::is_identifier(value)
+pub(crate) fn is_valid_input_display_name(value: Option<&str>) -> bool {
+    crate::workflow_contract::is_valid_input_display_name(value)
 }
 
 pub(crate) fn is_lowercase_hex(value: &str, length: usize) -> bool {
-    schema_common::is_lowercase_hex(value, length)
+    crate::workflow_contract::is_lowercase_hex(value, length)
 }
 
 pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
-    schema_common::lowercase_hex(bytes)
+    crate::workflow_contract::lowercase_hex(bytes)
 }
 
 pub(crate) fn is_valid_media_type(value: &str) -> bool {
-    MEDIA_TYPE_VALIDATOR
-        .get_or_init(|| {
-            let schema = serde_json::from_str::<Value>(STRUCTURAL_SCHEMA).map_err(|_| ())?;
-            let media_type_schema = schema.pointer("/$defs/MediaType").ok_or(())?;
-            jsonschema::draft202012::new(media_type_schema).map_err(|_| ())
-        })
-        .as_ref()
-        .is_ok_and(|validator| validator.is_valid(&Value::String(value.to_owned())))
+    crate::workflow_contract::is_valid_media_type(value)
 }
 
 #[cfg(test)]

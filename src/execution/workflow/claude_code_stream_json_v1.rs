@@ -14,7 +14,7 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
 };
-use super::strict_json;
+use crate::workflow_contract::strict_json;
 #[cfg(test)]
 const QUALIFICATION_VERSION: &str =
     crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION;

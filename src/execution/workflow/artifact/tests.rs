@@ -8,8 +8,8 @@ use std::sync::{Arc, Barrier};
 use super::*;
 use crate::execution::workflow::canonical_json;
 use crate::execution::workflow::result_validation::RetainedJsonSchema;
-use crate::execution::workflow::strict_json;
 use crate::execution::workflow::value::{CapturedJson, CapturedText, SemanticCarrierError};
+use crate::workflow_contract::strict_json;
 
 struct CaptureFixture {
     _temporary: tempfile::TempDir,

@@ -17,7 +17,7 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation,
 };
-use super::strict_json;
+use crate::workflow_contract::strict_json;
 
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_CORRELATION_BYTES: u64 = 64 * 1024;

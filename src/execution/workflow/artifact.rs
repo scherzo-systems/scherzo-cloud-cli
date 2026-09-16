@@ -28,10 +28,10 @@ use super::private_staging::{
 };
 use super::result_validation::RetainedJsonSchema;
 use super::schema_common::lowercase_hex;
-use super::strict_json;
 #[cfg(test)]
 use super::validated::WorkflowValueType;
 use super::value::{CapturedJson, CapturedText, CapturedValue};
+use crate::workflow_contract::strict_json;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const COPY_BUFFER_BYTES_U64: u64 = 64 * 1024;
