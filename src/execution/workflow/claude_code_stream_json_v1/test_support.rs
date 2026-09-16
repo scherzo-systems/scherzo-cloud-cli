@@ -32,6 +32,7 @@ use crate::execution::workflow::runtime::{ActionId, TransitionSequence};
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAXIMUM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const PLACEHOLDER_API_KEY: &str = "scherzo-loopback-placeholder";
+const CONFORMANCE_SHELL_ENVIRONMENT: &str = "SCHERZO_CLAUDE_CODE_CONFORMANCE_SHELL";
 /// Opaque placeholder for the native `signature_delta` that accompanies a thinking
 /// block. Claude Code forwards this value without interpreting it in one exchange.
 const THINKING_SIGNATURE: &str = "c2NoZXJ6by1sb29wYmFjay10aGlua2luZy1zaWduYXR1cmU=";
@@ -158,12 +159,20 @@ pub(super) fn admitted_adapter(
     )
 }
 
+pub(super) struct NativeResourceFixture {
+    pub(super) hook_observation: PathBuf,
+    pub(super) expected_hook_observation: String,
+    pub(super) mcp_observation: PathBuf,
+    pub(super) marketplace: PathBuf,
+}
+
 pub(super) struct SyntheticClaudeCodeRoot {
     _temporary: tempfile::TempDir,
     project: PathBuf,
     home: PathBuf,
     config: PathBuf,
     private: PathBuf,
+    shell: PathBuf,
     system_prompt: PathBuf,
 }
 
@@ -196,6 +205,13 @@ impl SyntheticClaudeCodeRoot {
             .to_owned();
         let canonical_project = fs::canonicalize(&project).unwrap();
         assert!(!canonical_project.starts_with(repository));
+        let shell = std::env::var_os(CONFORMANCE_SHELL_ENVIRONMENT)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("{CONFORMANCE_SHELL_ENVIRONMENT} must name the controlled conformance shell")
+            });
+        let shell = fs::canonicalize(shell).unwrap();
+        assert!(shell.is_file());
 
         Self {
             _temporary: temporary,
@@ -203,6 +219,7 @@ impl SyntheticClaudeCodeRoot {
             home,
             config,
             private,
+            shell,
             system_prompt,
         }
     }
@@ -217,6 +234,177 @@ impl SyntheticClaudeCodeRoot {
 
     pub(super) fn private(&self) -> &Path {
         &self.private
+    }
+
+    pub(super) fn install_native_resource_fixture(
+        &self,
+        instruction_marker: &str,
+        skill_marker: &str,
+        plugin_marker: &str,
+        mcp_marker: &str,
+    ) -> NativeResourceFixture {
+        fs::write(
+            self.project.join("CLAUDE.md"),
+            format!("# Qualification instructions\n\n{instruction_marker}\n"),
+        )
+        .unwrap();
+        let project_skill = self.project.join(".claude/skills/scherzo-resource");
+        fs::create_dir_all(&project_skill).unwrap();
+        fs::write(
+            project_skill.join("SKILL.md"),
+            format!(
+                "---\nname: scherzo-resource\ndescription: {skill_marker}\n---\n\n# Qualification skill\n"
+            ),
+        )
+        .unwrap();
+
+        let hook_observation = self.private.join("native-hook-observation.txt");
+        let hook_script = self.private.join("native-hook.sh");
+        fs::write(
+            &hook_script,
+            format!(
+                "set -eu\nprintf '%s\\n' \\\n  \"$SCHERZO_USER_SETTING\" \\\n  \"$SCHERZO_PROJECT_SETTING\" \\\n  \"$SCHERZO_LOCAL_SETTING\" \\\n  \"$CLAUDE_CONFIG_DIR\" \\\n  \"$DISABLE_UPDATES\" \\\n  \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\" \\\n  \"$CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL\" \\\n  \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" \\\n  \"$CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS\" \\\n  > '{}'\n",
+                hook_observation.display(),
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            self.config.join("settings.json"),
+            serde_json::to_vec_pretty(&json!({
+                "env": {
+                    "SCHERZO_USER_SETTING": "user"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let project_settings = self.project.join(".claude");
+        fs::create_dir_all(&project_settings).unwrap();
+        fs::write(
+            project_settings.join("settings.json"),
+            serde_json::to_vec_pretty(&json!({
+                "env": {
+                    "SCHERZO_PROJECT_SETTING": "project"
+                },
+                "hooks": {
+                    "UserPromptSubmit": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("{} {}", self.shell.display(), hook_script.display())
+                        }]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            project_settings.join("settings.local.json"),
+            serde_json::to_vec_pretty(&json!({
+                "env": {
+                    "SCHERZO_LOCAL_SETTING": "local"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mcp_observation = self.private.join("native-mcp-observation.txt");
+        let mcp_server = self.private.join("native-mcp-server.sh");
+        fs::write(
+            &mcp_server,
+            format!(
+                r#"set -eu
+printf 'started\n' > '{}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{}'
+  if [[ "$line" =~ \"id\":([0-9]+) ]]; then
+    id="${{BASH_REMATCH[1]}}"
+  else
+    continue
+  fi
+  case "$line" in
+    *initialize*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"scherzo-native-resource","version":"1.0.0"}}}}}}\n' "$id"
+      ;;
+    *tools/list*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"scherzo_native_resource","description":"{}","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}\n' "$id"
+      ;;
+    *ping*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+                mcp_observation.display(),
+                mcp_observation.display(),
+                mcp_marker,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            self.project.join(".mcp.json"),
+            serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    "scherzo-resource": {
+                        "command": self.shell,
+                        "args": [mcp_server]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let marketplace = self.private.join("marketplace");
+        let plugin = marketplace.join("plugins/scherzo-plugin");
+        fs::create_dir_all(marketplace.join(".claude-plugin")).unwrap();
+        fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+        let plugin_skill = plugin.join("skills/plugin-resource");
+        fs::create_dir_all(&plugin_skill).unwrap();
+        fs::write(
+            marketplace.join(".claude-plugin/marketplace.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "scherzo-marketplace",
+                "owner": { "name": "Scherzo" },
+                "plugins": [{
+                    "name": "scherzo-plugin",
+                    "source": "./plugins/scherzo-plugin",
+                    "description": "Scherzo native qualification plugin",
+                    "version": "1.0.0"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "scherzo-plugin",
+                "description": "Scherzo native qualification plugin",
+                "version": "1.0.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            plugin_skill.join("SKILL.md"),
+            format!(
+                "---\nname: plugin-resource\ndescription: {plugin_marker}\n---\n\n# Qualification plugin skill\n"
+            ),
+        )
+        .unwrap();
+
+        NativeResourceFixture {
+            hook_observation,
+            expected_hook_observation: format!(
+                "user\nproject\nlocal\n{}\n1\n1\n1\n1\n1\n",
+                self.config.display()
+            ),
+            mcp_observation,
+            marketplace,
+        }
     }
 
     pub(super) fn retained_transcript(&self) -> PathBuf {
@@ -252,6 +440,7 @@ impl SyntheticClaudeCodeRoot {
                 OsString::from("ambient-project-name"),
             ),
             (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("SHELL"), self.shell.as_os_str().to_owned()),
             (OsString::from("CI"), OsString::from("1")),
             (OsString::from("NO_COLOR"), OsString::from("1")),
             (
@@ -272,6 +461,7 @@ impl SyntheticClaudeCodeRoot {
             .env("HOME", &self.home)
             .env("CLAUDE_CONFIG_DIR", &self.config)
             .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", &self.shell)
             .env("CI", "1")
             .env("NO_COLOR", "1")
             .env("ANTHROPIC_API_KEY", PLACEHOLDER_API_KEY)

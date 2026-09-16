@@ -1,7 +1,7 @@
 use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +37,10 @@ use crate::execution::workflow::process_group::{ProcessGuardRegistry, process_gr
 const MODEL: &str = "scherzo-loopback";
 const EFFORT: &str = "xhigh";
 const RESPONSE: &str = "loopback complete";
+const NATIVE_INSTRUCTION_MARKER: &str = "LIV2293_NATIVE_INSTRUCTION_MARKER";
+const NATIVE_SKILL_MARKER: &str = "LIV2293_NATIVE_SKILL_MARKER";
+const NATIVE_PLUGIN_MARKER: &str = "LIV2293_NATIVE_PLUGIN_MARKER";
+const NATIVE_MCP_MARKER: &str = "LIV2293_NATIVE_MCP_MARKER";
 const DIRECT_SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const WATCHDOG: Duration = Duration::from_secs(20);
 
@@ -203,6 +207,43 @@ async fn assert_user_cancelled(running: RunningStartedClaudeCode) {
     );
 }
 
+async fn install_native_resource_plugin(
+    executable: &Path,
+    root: &SyntheticClaudeCodeRoot,
+    provider: &LoopbackProvider,
+    marketplace: &Path,
+) {
+    let mut add = Command::new(executable);
+    add.args(["plugin", "marketplace", "add"])
+        .arg(marketplace)
+        .args(["--scope", "user"]);
+    root.configure_command(&mut add, provider);
+    let add = add.output().await.unwrap();
+    assert!(
+        add.status.success(),
+        "failed to add native resource marketplace: stdout={} stderr={}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr),
+    );
+
+    let mut install = Command::new(executable);
+    install.args([
+        "plugin",
+        "install",
+        "scherzo-plugin@scherzo-marketplace",
+        "--scope",
+        "user",
+    ]);
+    root.configure_command(&mut install, provider);
+    let install = install.output().await.unwrap();
+    assert!(
+        install.status.success(),
+        "failed to install native resource plugin: stdout={} stderr={}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+}
+
 fn process_id(bytes: &[u8]) -> Pid {
     let raw = std::str::from_utf8(bytes).unwrap().trim().parse().unwrap();
     Pid::from_raw(raw).unwrap()
@@ -276,6 +317,13 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
         // jscpd:ignore-end
+        let resources = root.install_native_resource_fixture(
+            NATIVE_INSTRUCTION_MARKER,
+            NATIVE_SKILL_MARKER,
+            NATIVE_PLUGIN_MARKER,
+            NATIVE_MCP_MARKER,
+        );
+        install_native_resource_plugin(&executable, &root, &provider, &resources.marketplace).await;
         let expected_cwd = fs::canonicalize(root.project()).unwrap();
         let message = "Complete the deterministic synthetic exchange.";
 
@@ -307,6 +355,24 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         assert_eq!(request.body()["model"], MODEL);
         assert_eq!(request.body()["stream"], true);
         assert!(contains_exact_string(request.body(), message));
+        for marker in [
+            NATIVE_INSTRUCTION_MARKER,
+            NATIVE_SKILL_MARKER,
+            NATIVE_PLUGIN_MARKER,
+            NATIVE_MCP_MARKER,
+        ] {
+            assert!(
+                contains_string_fragment(request.body(), marker),
+                "native request omitted resource marker {marker}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&resources.hook_observation).unwrap(),
+            resources.expected_hook_observation,
+        );
+        let mcp_observation = fs::read_to_string(&resources.mcp_observation).unwrap();
+        assert!(mcp_observation.starts_with("started\n"));
+        assert!(mcp_observation.contains("tools/list"));
         request.release_text(RESPONSE);
 
         let output = child.wait_with_output().await.unwrap();
@@ -835,7 +901,7 @@ async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_befor
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.260 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.263 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.
