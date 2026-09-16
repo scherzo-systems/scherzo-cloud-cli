@@ -2912,8 +2912,14 @@ impl AssignmentManager {
                     quiescence,
                     workspace_disposition,
                 } => {
-                    let Some(LocalSlot::Running(running)) = self.slot.take() else {
-                        continue;
+                    let running = match self.slot.take() {
+                        Some(LocalSlot::Running(running)) => running,
+                        slot => {
+                            // A delayed completion must not discard a successor
+                            // in another phase of its lifecycle.
+                            self.slot = slot;
+                            continue;
+                        }
                     };
                     if running.identity.assignment_id != assignment_id {
                         self.slot = Some(LocalSlot::Running(running));
@@ -3037,8 +3043,14 @@ impl AssignmentManager {
                     final_observation_id,
                     continue_reporting,
                 } => {
-                    let Some(LocalSlot::Finishing(finishing)) = self.slot.take() else {
-                        continue;
+                    let finishing = match self.slot.take() {
+                        Some(LocalSlot::Finishing(finishing)) => finishing,
+                        slot => {
+                            // Acknowledgement can release the predecessor before
+                            // its grace timer fires. Preserve any successor slot.
+                            self.slot = slot;
+                            continue;
+                        }
                     };
                     if finishing.identity.assignment_id == assignment_id
                         && finishing.final_observation_id == final_observation_id
@@ -6009,6 +6021,53 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             };
             assert_eq!(request.duration, Duration::from_millis(expected));
             request.release.send(()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_completion_events_preserve_an_accepted_successor() {
+        for grace_elapsed in [true, false] {
+            let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+            let (_temporary, mut manager) = manager_fixture(workflow);
+            let predecessor = offer("bg");
+            offer_then_prepare(&mut manager, &predecessor).await;
+            let accepted = match manager.slot.take().unwrap() {
+                LocalSlot::Accepted(accepted) => accepted,
+                _ => panic!("predecessor must be accepted"),
+            };
+            let identity = accepted.identity;
+            let final_observation_id = enqueue_finished(&manager, &identity);
+            manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
+                identity: identity.clone(),
+                final_observation_id,
+                root: Some(accepted.root),
+                workspace_disposition: WorkspaceDisposition::Remove,
+            })));
+            manager.acknowledge_observation(final_observation_id);
+            settle_cleanup(&mut manager).await;
+            let successor = offer("bh");
+            offer_then_prepare(&mut manager, &successor).await;
+            let event = if grace_elapsed {
+                ManagerEvent::FinalGraceElapsed {
+                    assignment_id: identity.assignment_id,
+                    final_observation_id,
+                    continue_reporting: true,
+                }
+            } else {
+                ManagerEvent::Finished {
+                    assignment_id: identity.assignment_id,
+                    final_observation_id: Some(final_observation_id),
+                    final_delivery_deadline: None,
+                    lease_clock_failed: false,
+                    retained_root: None,
+                    quiescence: ProcessQuiescence::Proven,
+                    workspace_disposition: WorkspaceDisposition::Remove,
+                }
+            };
+            manager.event_sender.send(event).unwrap();
+            manager.pending_observations(&BTreeSet::new(), 100);
+            assert!(matches!(&manager.slot, Some(LocalSlot::Accepted(accepted))
+                if accepted.identity.assignment_id == successor.assignment_id));
         }
     }
 
