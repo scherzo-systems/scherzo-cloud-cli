@@ -700,6 +700,7 @@ pub(crate) fn assignment_offer() -> Message {
                 "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
                 "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "attemptNumber": 1,
                 "executionSpec": {
                     "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
                     "schemaVersion": 1,

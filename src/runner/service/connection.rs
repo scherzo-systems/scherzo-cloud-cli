@@ -2255,6 +2255,7 @@ where
             run_id,
             project_id,
             attempt_id,
+            attempt_number,
             execution_spec,
             ..
         } => {
@@ -2264,6 +2265,7 @@ where
                 run_id: run_id.clone(),
                 project_id,
                 attempt_id,
+                attempt_number,
                 execution_spec: *execution_spec,
             };
             (effect_id, AssignmentManagerEffect::Offer(Box::new(offer)))

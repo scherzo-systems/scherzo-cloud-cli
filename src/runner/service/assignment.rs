@@ -67,6 +67,7 @@ pub(super) struct AssignmentOffer {
     pub(super) run_id: String,
     pub(super) project_id: String,
     pub(super) attempt_id: String,
+    pub(super) attempt_number: u64,
     pub(super) execution_spec: ExecutionSpecV1RunnerProjection,
 }
 
@@ -1074,6 +1075,7 @@ impl AssignmentIdentity {
 
 pub(super) struct AcceptedAssignment {
     identity: AssignmentIdentity,
+    pub(super) attempt_number: u64,
     pub(super) root: AssignmentRoot,
     pub(super) admitted: AdmittedWorkflow,
     pub(super) transition_budget: usize,
@@ -1432,6 +1434,7 @@ impl AdmissionRuntime {
         };
         Ok(AcceptedAssignment {
             identity: AssignmentIdentity::from_offer(offer),
+            attempt_number: offer.attempt_number,
             root,
             admitted,
             transition_budget,
@@ -3910,6 +3913,7 @@ fn same_assignment(left: &AssignmentOffer, right: &AssignmentOffer) -> bool {
     left.assignment_id == right.assignment_id
         && left.run_id == right.run_id
         && left.attempt_id == right.attempt_id
+        && left.attempt_number == right.attempt_number
         && left.execution_spec == right.execution_spec
 }
 
@@ -4391,6 +4395,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             run_id: format!("run_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
             project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             attempt_id: format!("atm_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
+            attempt_number: 1,
             execution_spec: ExecutionSpecV1RunnerProjection {
                 execution_spec_id: format!("xsp_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
                 schema_version: 1,
@@ -5548,6 +5553,136 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
         settle_cleanup(&mut manager).await;
         assert!(manager.slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_result_upload_preserves_the_cloud_attempt_number() {
+        use crate::runner_protocol::{
+            ArtifactResultConfirmationOutcome, ArtifactResultConfirmationResponse,
+            ArtifactUploadCapability,
+        };
+        use base64::Engine as _;
+
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        manager.artifact_delivery =
+            ArtifactDeliveryBroker::new(manager.outbox.clone(), Arc::clone(&manager.sleeper), true);
+        let mut offered = offer("bg");
+        offered.attempt_number = 2;
+        offer_then_prepare(&mut manager, &offered).await;
+        let mut conflicting = offered.clone();
+        conflicting.attempt_number = 1;
+        assert_eq!(
+            manager.handle_offer(conflicting),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+        spawn_execution(&mut manager, &offered);
+        let mut registration = None;
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            registration = manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .into_iter()
+                .find_map(|entry| match entry.observation {
+                    AssignmentObservation::Artifact {
+                        delivery_id,
+                        request:
+                            ArtifactRequest::RegisterResult {
+                                size_bytes, sha256, ..
+                            },
+                    } => Some((delivery_id, size_bytes, sha256)),
+                    _ => None,
+                });
+            registration.is_some()
+        }))
+        .await
+        .unwrap();
+        let (delivery_id, size, sha256) = registration.unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upload = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let body_start = loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            while request.len() - body_start < usize::try_from(size).unwrap() {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let result: Value = serde_json::from_slice(&request[body_start..]).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            result
+        });
+        let checksum = (0..sha256.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&sha256[index..index + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        let artifact_set_id = "ats_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned();
+        manager
+            .artifact_delivery
+            .handle_response(
+                delivery_id,
+                ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
+                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    outcome: ArtifactResultRegistrationOutcome::Succeeded {
+                        artifact_set_id: artifact_set_id.clone(),
+                        finalization_deadline: "2099-01-01T00:00:00Z".to_owned(),
+                        upload_capability: ArtifactUploadCapability {
+                            url: format!("http://{address}/result"),
+                            content_length: size.to_string(),
+                            content_type: "application/json".to_owned(),
+                            if_none_match: "*".to_owned(),
+                            checksum_sha256: base64::engine::general_purpose::STANDARD
+                                .encode(checksum),
+                            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+                        },
+                    },
+                }),
+            )
+            .unwrap();
+        let result = with_watchdog(upload).await.unwrap().unwrap();
+        assert_eq!(result["attemptNumber"], 2);
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .iter()
+                .any(|entry| {
+                    matches!(
+                        &entry.observation,
+                        AssignmentObservation::Artifact {
+                            request: ArtifactRequest::ConfirmResult { .. },
+                            ..
+                        }
+                    )
+                })
+        }))
+        .await
+        .unwrap();
+        manager
+            .artifact_delivery
+            .handle_response(
+                delivery_id,
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+                    outcome: ArtifactResultConfirmationOutcome::Confirmed { artifact_set_id },
+                }),
+            )
+            .unwrap();
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .unwrap();
+        assert_succeeded(&reports);
+        acknowledge_terminal_and_settle(&mut manager).await;
     }
 
     #[tokio::test]

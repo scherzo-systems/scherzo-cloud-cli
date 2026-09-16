@@ -476,6 +476,7 @@ pub(crate) enum CloudFrame {
         run_id: String,
         project_id: String,
         attempt_id: String,
+        attempt_number: u64,
         execution_spec: Box<ExecutionSpecV1RunnerProjection>,
     },
     AssignmentPrepare {
@@ -1210,6 +1211,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 run_id: frame.payload.run_id.to_string(),
                 project_id: frame.payload.project_id.to_string(),
                 attempt_id: frame.payload.attempt_id.to_string(),
+                attempt_number: frame.payload.attempt_number.get(),
                 execution_spec: Box::new(ExecutionSpecV1RunnerProjection {
                     execution_spec_id: execution_spec.execution_spec_id.to_string(),
                     schema_version,
@@ -1633,6 +1635,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "runId",
             "projectId",
             "attemptId",
+            "attemptNumber",
             "executionSpec",
         ],
         "assignment_prepare" => &[
@@ -2145,6 +2148,24 @@ mod tests {
             }
             Ok(_) => panic!("welcome decoded as another frame type"),
         }
+    }
+
+    #[test]
+    fn retry_offer_keeps_its_authoritative_attempt_number() {
+        let mut offer: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer.json"
+        )))
+        .unwrap();
+        offer["payload"]["attemptNumber"] = json!(2);
+        let decoded = decode_cloud_frame(&serde_json::to_vec(&offer).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            CloudFrame::AssignmentOffer {
+                attempt_number: 2,
+                ..
+            }
+        ));
     }
 
     #[test]

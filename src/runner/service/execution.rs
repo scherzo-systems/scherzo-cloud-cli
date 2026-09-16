@@ -1060,7 +1060,7 @@ impl ExecutionJob {
         }
         Some(WorkflowRunResult {
             run_directory: self.accepted.root.private.path().to_owned(),
-            attempt_number: 1,
+            attempt_number: self.accepted.attempt_number,
             workflow_path: execution.provenance.workflow_path,
             source_root: execution.provenance.source_root,
             content_digest: execution.content_digest,

@@ -954,6 +954,10 @@
                 "attemptId": {
                   "$ref": "#/$defs/attemptId"
                 },
+                "attemptNumber": {
+                  "type": "integer",
+                  "minimum": 1
+                },
                 "executionSpec": {
                   "$ref": "#/$defs/ExecutionSpec"
                 }
@@ -964,6 +968,7 @@
                 "runId",
                 "projectId",
                 "attemptId",
+                "attemptNumber",
                 "executionSpec"
               ]
             }
