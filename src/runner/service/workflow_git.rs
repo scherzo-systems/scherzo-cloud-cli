@@ -785,12 +785,16 @@ fn credential_request_matches(origin: &Url, request: &[u8]) -> bool {
         let Some((name, value)) = line.split_once('=') else {
             return false;
         };
+        if name.is_empty() || line.contains('\0') {
+            return false;
+        }
         let target = match name {
             "protocol" => &mut protocol,
             "host" => &mut host,
             "path" => &mut path,
-            "username" | "wwwauth[]" => continue,
-            _ => return false,
+            // Only these origin fields grant authority. Ignore other well-formed
+            // attributes without forwarding them or negotiating capabilities.
+            _ => continue,
         };
         if target.replace(value).is_some() {
             return false;
@@ -1329,6 +1333,67 @@ mod tests {
             expected_tokens
         );
         report
+    }
+
+    #[test]
+    fn extension_attributes_preserve_exact_repository_matching() {
+        let origin = Url::parse("https://github.example/owner/repo.git").unwrap();
+        for attributes in [
+            "",
+            "capability[]=authtype\ncapability[]=state\n",
+            "extension=value=with=equals\nfuture[]=first\nfuture[]=second\nfuture[]=\n",
+        ] {
+            for (repository, matches) in [("owner/repo.git", true), ("owner/other.git", false)] {
+                let request = format!(
+                    "{attributes}protocol=https\nhost=github.example\npath={repository}\n\n"
+                );
+                assert_eq!(
+                    credential_request_matches(&origin, request.as_bytes()),
+                    matches
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extension_attributes_cannot_supply_or_override_repository_authority() {
+        let origin = Url::parse("https://github.example/owner/repo.git").unwrap();
+        let fields = [
+            "protocol=https",
+            "host=github.example",
+            "path=owner/repo.git",
+        ];
+        for (index, mismatch) in ["protocol=http", "host=other.example", "path=other/repo.git"]
+            .into_iter()
+            .enumerate()
+        {
+            for replacement in [
+                String::new(),
+                mismatch.to_owned(),
+                format!("{0}\n{0}", fields[index]),
+            ] {
+                let mut request_fields = fields.map(str::to_owned);
+                request_fields[index] = replacement;
+                let request = format!(
+                    "extension=ignored\n{}\n\n",
+                    request_fields
+                        .into_iter()
+                        .filter(|field| !field.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                assert!(!credential_request_matches(&origin, request.as_bytes()));
+            }
+        }
+        for malformed in [
+            "missing-separator",
+            "=empty-name",
+            "extension=bad\0value",
+            "bad\0key=value",
+        ] {
+            let request = format!("{}\n{malformed}\n\n", fields.join("\n"));
+            assert!(!credential_request_matches(&origin, request.as_bytes()));
+        }
     }
 
     fn request(authority: &WorkflowGitAuthority, repository: &str) -> Option<Vec<u8>> {
