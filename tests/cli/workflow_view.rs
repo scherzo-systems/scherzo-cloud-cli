@@ -31,11 +31,12 @@ use rustix::termios::Termios;
 #[cfg(target_os = "linux")]
 use rustix::termios::Winsize;
 
+#[cfg(target_os = "linux")]
+use super::poll_until;
 use super::workflow_run::isolated_command;
 #[cfg(target_os = "linux")]
 use super::workflow_run::{
-    RunBundle, finalizer_signal_bundle, open_tui_pty, run, signal_bundle, spawn_tui_run,
-    wait_for_process_poll,
+    RunBundle, TuiProcess, finalizer_signal_bundle, open_tui_pty, run, signal_bundle, spawn_tui_run,
 };
 
 pub(super) fn workflow_view_schema() -> jsonschema::Validator {
@@ -939,18 +940,16 @@ fn signal_interrupts_a_blocked_archive_read_without_waiting_for_filesystem_compl
 
     let (master, slave) = open_tui_pty();
     let original_mode = rustix::termios::tcgetattr(&slave).unwrap();
-    let (mut child, master_writer, reader) =
-        spawn_tui_run(&view_args(&run_directory, &[]), master, &slave);
-    let process = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    let mut tui = spawn_tui_run(&view_args(&run_directory, &[]), master, slave);
+    let process = Pid::from_raw(i32::try_from(tui.child_mut().id()).unwrap()).unwrap();
     wait_for_loader_worker(process);
 
     kill_process(process, Signal::INT).unwrap();
-    let status = wait_for_exit(&mut child, "signal during blocked archive read");
+    let status = wait_for_exit(tui.child_mut(), "signal during blocked archive read");
     assert_eq!(status.code(), Some(130));
-    assert_terminal_mode(&slave, &original_mode);
-    drop(slave);
-    drop(master_writer);
-    let transcript = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+    assert_terminal_mode(tui.slave(), &original_mode);
+    let (_, transcript) = tui.wait_and_finish();
+    let transcript = String::from_utf8_lossy(&transcript).into_owned();
     assert!(!transcript.contains("run_directory_invalid"));
 
     fs::remove_file(&run_file).unwrap();
@@ -989,10 +988,7 @@ fn terminal_setup_failure_after_raw_mode_restores_input_and_preserves_the_archiv
 
 #[cfg(target_os = "linux")]
 struct TuiSession {
-    child: std::process::Child,
-    master_writer: fs::File,
-    reader: std::thread::JoinHandle<Vec<u8>>,
-    slave: OwnedFd,
+    process: TuiProcess,
     original_mode: Termios,
 }
 
@@ -1001,48 +997,39 @@ impl TuiSession {
     fn start(args: &[String]) -> Self {
         let (master, slave) = open_tui_pty();
         let original_mode = rustix::termios::tcgetattr(&slave).unwrap();
-        let (mut child, master_writer, reader) = spawn_tui_run(args, master, &slave);
-        let setup_completed = (0..500)
-            .find_map(|_| {
-                let current = rustix::termios::tcgetattr(&slave).unwrap();
-                if current.local_modes != original_mode.local_modes {
-                    Some(true)
-                } else if child.try_wait().unwrap().is_some() {
-                    Some(false)
-                } else {
-                    wait_for_process_poll();
-                    None
-                }
-            })
-            .unwrap_or(false);
+        let mut process = spawn_tui_run(args, master, slave);
+        let setup_completed = poll_until(
+            "workflow view terminal ownership",
+            || {
+                let current = rustix::termios::tcgetattr(process.slave()).unwrap();
+                (
+                    current.local_modes != original_mode.local_modes,
+                    process.child_mut().try_wait().unwrap(),
+                )
+            },
+            |(owned, status)| *owned || status.is_some(),
+        )
+        .0;
         if !setup_completed {
-            let _ = child.kill();
-            let _ = child.wait();
-            drop(slave);
-            drop(master_writer);
-            let transcript = reader.join().unwrap();
+            let (_, transcript) = process.wait_and_finish();
             panic!(
                 "workflow view did not take terminal ownership: {:?}",
                 String::from_utf8_lossy(&transcript)
             );
         }
         Self {
-            child,
-            master_writer,
-            reader,
-            slave,
+            process,
             original_mode,
         }
     }
 
     fn finish(mut self, input: &[u8]) -> (std::process::ExitStatus, String) {
-        self.master_writer.write_all(input).unwrap();
-        self.master_writer.flush().unwrap();
-        let status = wait_for_exit(&mut self.child, "terminal input");
-        assert_terminal_mode(&self.slave, &self.original_mode);
-        drop(self.slave);
-        drop(self.master_writer);
-        let transcript = String::from_utf8_lossy(&self.reader.join().unwrap()).into_owned();
+        self.process.master_writer().write_all(input).unwrap();
+        self.process.master_writer().flush().unwrap();
+        let status = wait_for_exit(self.process.child_mut(), "terminal input");
+        assert_terminal_mode(self.process.slave(), &self.original_mode);
+        let (_, transcript) = self.process.wait_and_finish();
+        let transcript = String::from_utf8_lossy(&transcript).into_owned();
         assert!(transcript.contains("\u{1b}[?1049h"));
         let restored = transcript
             .rfind("\u{1b}[?1049l")
@@ -1058,15 +1045,15 @@ fn wait_for_loader_worker(process: Pid) {
     let tasks = Path::new("/proc")
         .join(process.as_raw_pid().to_string())
         .join("task");
-    let loader_started = (0..500).any(|_| {
-        let started = fs::read_dir(&tasks)
-            .ok()
-            .is_some_and(|threads| threads.count() > 1);
-        if !started {
-            wait_for_process_poll();
-        }
-        started
-    });
+    let loader_started = poll_until(
+        "archive loader filesystem worker",
+        || {
+            fs::read_dir(&tasks)
+                .ok()
+                .is_some_and(|threads| threads.count() > 1)
+        },
+        |started| *started,
+    );
     assert!(
         loader_started,
         "archive loader did not start its filesystem worker"
@@ -1082,20 +1069,31 @@ fn small_output_pipe() -> (fs::File, OwnedFd) {
 }
 
 #[cfg(target_os = "linux")]
+struct ChildCleanup<'a> {
+    child: &'a mut std::process::Child,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ChildCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn wait_for_exit(child: &mut std::process::Child, action: &str) -> std::process::ExitStatus {
-    (0..200)
-        .find_map(|_| {
-            let status = child.try_wait().unwrap();
-            if status.is_none() {
-                wait_for_process_poll();
-            }
-            status
-        })
-        .unwrap_or_else(|| {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("workflow view did not exit after {action}")
-        })
+    let mut cleanup = ChildCleanup { child, armed: true };
+    let status = poll_until(
+        &format!("workflow view exit after {action}"),
+        || cleanup.child.try_wait().unwrap(),
+        Option::is_some,
+    );
+    cleanup.armed = false;
+    status.unwrap()
 }
 
 #[cfg(target_os = "linux")]
@@ -1119,12 +1117,11 @@ fn assert_terminal_mode(slave: &OwnedFd, expected: &Termios) {
 fn run_view_to_early_exit(args: &[String]) -> (std::process::ExitStatus, String) {
     let (master, slave) = open_tui_pty();
     let original_mode = rustix::termios::tcgetattr(&slave).unwrap();
-    let (mut child, master_writer, reader) = spawn_tui_run(args, master, &slave);
-    let status = wait_for_exit(&mut child, "archive load failure");
-    assert_terminal_mode(&slave, &original_mode);
-    drop(slave);
-    drop(master_writer);
-    let transcript = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+    let mut process = spawn_tui_run(args, master, slave);
+    let status = wait_for_exit(process.child_mut(), "archive load failure");
+    assert_terminal_mode(process.slave(), &original_mode);
+    let (_, transcript) = process.wait_and_finish();
+    let transcript = String::from_utf8_lossy(&transcript).into_owned();
     (status, transcript)
 }
 

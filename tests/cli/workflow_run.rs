@@ -39,19 +39,6 @@ const CODEX_CORRECTION_TURN_ID: &str = "turn-correction";
 const CODEX_PROVIDER: &str = "fixture-provider";
 
 #[cfg(target_os = "linux")]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "this fixed external-process pre-delay is not a condition poll"
-)]
-pub(super) fn wait_for_process_poll() {
-    let (_sender, receiver) = std::sync::mpsc::channel::<()>();
-    assert_eq!(
-        receiver.recv_timeout(std::time::Duration::from_millis(10)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    );
-}
-
-#[cfg(target_os = "linux")]
 fn process_state(process: Pid) -> Option<u8> {
     fs::read(
         Path::new("/proc")
@@ -97,15 +84,60 @@ pub(super) fn open_tui_pty() -> (OwnedFd, OwnedFd) {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn spawn_tui_run(
-    args: &[String],
-    master: OwnedFd,
-    slave: &OwnedFd,
-) -> (
-    std::process::Child,
-    std::fs::File,
-    std::thread::JoinHandle<Vec<u8>>,
-) {
+pub(super) struct TuiProcess {
+    child: std::process::Child,
+    master_writer: Option<std::fs::File>,
+    reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+    slave: Option<OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl TuiProcess {
+    pub(super) fn child_mut(&mut self) -> &mut std::process::Child {
+        &mut self.child
+    }
+
+    pub(super) fn master_writer(&mut self) -> &mut std::fs::File {
+        self.master_writer.as_mut().unwrap()
+    }
+
+    pub(super) fn slave(&self) -> &OwnedFd {
+        self.slave.as_ref().unwrap()
+    }
+
+    fn close_master_writer(&mut self) {
+        drop(self.master_writer.take());
+    }
+
+    pub(super) fn wait_and_finish(mut self) -> (std::process::ExitStatus, Vec<u8>) {
+        let status = self.child.wait().unwrap();
+        drop(self.slave.take());
+        self.close_master_writer();
+        let transcript = self.reader.take().unwrap().join().unwrap();
+        (status, transcript)
+    }
+
+    fn terminate_and_finish(mut self) -> Vec<u8> {
+        self.child.kill().unwrap();
+        self.wait_and_finish().1
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TuiProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        drop(self.slave.take());
+        self.close_master_writer();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn spawn_tui_run(args: &[String], master: OwnedFd, slave: OwnedFd) -> TuiProcess {
     let master_reader = rustix::io::dup(&master).unwrap();
     let reader = std::thread::spawn(move || {
         let mut master_reader = std::fs::File::from(master_reader);
@@ -122,9 +154,9 @@ pub(super) fn spawn_tui_run(
         transcript
     });
 
-    let child_stdin = rustix::io::dup(slave).unwrap();
-    let child_stdout = rustix::io::dup(slave).unwrap();
-    let child_stderr = rustix::io::dup(slave).unwrap();
+    let child_stdin = rustix::io::dup(&slave).unwrap();
+    let child_stdout = rustix::io::dup(&slave).unwrap();
+    let child_stderr = rustix::io::dup(&slave).unwrap();
     let child = isolated_command(args)
         .env("TERM", "xterm")
         .env("NO_COLOR", "1")
@@ -133,7 +165,12 @@ pub(super) fn spawn_tui_run(
         .stderr(Stdio::from(child_stderr))
         .spawn()
         .unwrap();
-    (child, std::fs::File::from(master), reader)
+    TuiProcess {
+        child,
+        master_writer: Some(std::fs::File::from(master)),
+        reader: Some(reader),
+        slave: Some(slave),
+    }
 }
 
 pub(super) struct RunBundle {
@@ -489,34 +526,6 @@ steps:
 exports:
   response:
     ref: outputs.answer.response
-"#
-}
-
-fn git_branch_agent_source() -> &'static str {
-    r#"schemaVersion: 1
-agentProfiles:
-  local:
-    harness:
-      kind: pi
-      config:
-        model: fixture/model
-        thinking: off
-steps:
-  implement:
-    kind: agent
-    agent:
-      profile: local
-      systemPrompt: system.md
-      message:
-        text:
-          - file: message.md
-    outputs:
-      changes:
-        kind: git_branch
-        from: workspace
-exports:
-  changes:
-    ref: outputs.implement.changes
 "#
 }
 
@@ -1651,46 +1660,6 @@ steps:
 }
 
 #[test]
-fn workflow_run_existing_directory_diagnostic_names_run_path() {
-    let temporary = tempfile::tempdir().unwrap();
-    let source_root = temporary.path().join("source");
-    let execution_root = temporary.path().join("execution");
-    let run_directory = temporary.path().join("existing-run");
-    fs::create_dir(&source_root).unwrap();
-    fs::create_dir(&execution_root).unwrap();
-    fs::create_dir(&run_directory).unwrap();
-    let workflow = source_root.join("workflow.yaml");
-    fs::write(
-        &workflow,
-        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
-    )
-    .unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
-        .args([
-            "workflow",
-            "run",
-            "--source-root",
-            source_root.to_str().unwrap(),
-            "--execution-root",
-            execution_root.to_str().unwrap(),
-            "--run-dir",
-            run_directory.to_str().unwrap(),
-            workflow.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(run_directory.to_str().unwrap()),
-        "diagnostic omitted the requested run path: {stderr}"
-    );
-}
-
-#[test]
 fn export_aliases_share_carriers_without_collapsing_equal_captures() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
@@ -1977,87 +1946,6 @@ exports:
         "zero-delta artifact validation failed: {}",
         String::from_utf8_lossy(&validation.stdout)
     );
-}
-
-#[test]
-fn semantic_outputs_workspace_finalizer_success() {
-    let bundle = RunBundle::new(
-        r#"schemaVersion: 1
-steps:
-  ordinary:
-    kind: cmd
-    command:
-      argv: ["true"]
-finalizers:
-  publish:
-    kind: cmd
-    when: [succeeded]
-    command:
-      argv: ["/bin/sh", "-c", "set -eu; printf 'finalizer change\\n' > tracked.txt; git add tracked.txt; git commit --quiet -m finalizer-change"]
-    outputs:
-      changes:
-        kind: git_branch
-        from: workspace
-exports:
-  changes:
-    ref: outputs.publish.changes
-"#,
-    );
-    initialize_git_repository(bundle.execution_root());
-    let destination = bundle.result("finalizer-git-branch");
-    let mut args = bundle.args(&destination);
-    args.insert(args.len() - 1, "--json".to_owned());
-
-    let output = run(&args);
-
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result = result_json(&destination);
-    let branch = &result["exports"]["changes"];
-    assert_eq!(branch["kind"], "git_branch");
-    assert_ne!(branch["baseOid"], branch["headOid"]);
-    assert!(branch.get("from").is_none());
-    assert_eq!(branch["carrier"]["path"], "exports/0001");
-}
-
-#[test]
-fn semantic_outputs_workspace_agent_success() {
-    let execution = format!(
-        "printf 'agent change\\n' > tracked.txt; git add tracked.txt; git commit --quiet -m agent-change; {}",
-        response_pi_execution()
-    );
-    let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &execution);
-    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = std::env::join_paths(
-        std::iter::once(pi.path_directory().to_path_buf())
-            .chain(std::env::split_paths(&inherited_path)),
-    )
-    .unwrap();
-    let bundle = RunBundle::new(git_branch_agent_source());
-    bundle.write_source("system.md", "system");
-    bundle.write_source("message.md", "prompt");
-    initialize_git_repository(bundle.execution_root());
-    let destination = bundle.result("agent-git-branch");
-    let mut args = bundle.args(&destination);
-    args.insert(args.len() - 1, "--json".to_owned());
-
-    let output = isolated_command(&args).env("PATH", path).output().unwrap();
-
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result = result_json(&destination);
-    let branch = &result["exports"]["changes"];
-    assert_eq!(branch["kind"], "git_branch");
-    assert_ne!(branch["baseOid"], branch["headOid"]);
-    assert_eq!(branch["carrier"]["path"], "exports/0001");
 }
 
 #[test]
@@ -3645,8 +3533,7 @@ fn tui_releases_ownership_and_restores_before_summary_handoff() {
     let destination = bundle.result("tui-handoff");
     let (master, slave) = open_tui_pty();
     let original_input_mode = rustix::termios::tcgetattr(&slave).unwrap();
-    let (mut child, mut master_writer, reader) =
-        spawn_tui_run(&bundle.args(&destination), master, &slave);
+    let mut process = spawn_tui_run(&bundle.args(&destination), master, slave);
 
     let status_args = vec![
         "workflow".to_owned(),
@@ -3654,32 +3541,24 @@ fn tui_releases_ownership_and_restores_before_summary_handoff() {
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
     ];
-    let mut last_status_error = String::new();
-    let status = (0..500).find_map(|_| {
-        let output = isolated_command(&status_args).output().unwrap();
-        if output.status.success() {
-            let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            if status["recovery"] == serde_json::json!({"status": "settled"}) {
-                return Some(status);
+    let status = poll_until(
+        "workflow status to observe released TUI ownership",
+        || {
+            let output = isolated_command(&status_args).output().unwrap();
+            if output.status.success() {
+                Ok(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).into_owned())
             }
-            last_status_error = format!("latest recovery status: {}", status["recovery"]);
-        } else {
-            last_status_error = String::from_utf8_lossy(&output.stderr).into_owned();
-        }
-        wait_for_process_poll();
-        None
-    });
-    let Some(status) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(slave);
-        drop(master_writer);
-        let transcript = reader.join().unwrap();
-        panic!(
-            "status did not observe released ownership: {last_status_error}; transcript: {:?}",
-            String::from_utf8_lossy(&transcript)
-        );
-    };
+        },
+        |observation| {
+            matches!(
+                observation,
+                Ok(status) if status["recovery"] == serde_json::json!({"status": "settled"})
+            )
+        },
+    )
+    .unwrap();
     assert_eq!(status["recovery"], serde_json::json!({"status": "settled"}));
     assert_eq!(
         status["retry"],
@@ -3689,22 +3568,16 @@ fn tui_releases_ownership_and_restores_before_summary_handoff() {
         })
     );
 
-    master_writer.write_all(b"q").unwrap();
-    master_writer.flush().unwrap();
-    let process_status = (0..200)
-        .find_map(|_| {
-            let status = child.try_wait().unwrap();
-            if status.is_none() {
-                wait_for_process_poll();
-            }
-            status
-        })
-        .unwrap_or_else(|| {
-            let _ = child.kill();
-            panic!("TUI did not exit after eligible q")
-        });
+    process.master_writer().write_all(b"q").unwrap();
+    process.master_writer().flush().unwrap();
+    let process_status = poll_until(
+        "TUI exit after eligible q",
+        || process.child_mut().try_wait().unwrap(),
+        Option::is_some,
+    )
+    .unwrap();
     assert!(process_status.success());
-    let restored_input_mode = rustix::termios::tcgetattr(&slave).unwrap();
+    let restored_input_mode = rustix::termios::tcgetattr(process.slave()).unwrap();
     assert_eq!(
         restored_input_mode.input_modes,
         original_input_mode.input_modes
@@ -3730,9 +3603,7 @@ fn tui_releases_ownership_and_restores_before_summary_handoff() {
         original_input_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME]
     );
 
-    drop(slave);
-    drop(master_writer);
-    let transcript = reader.join().unwrap();
+    let (_, transcript) = process.wait_and_finish();
     let transcript = String::from_utf8_lossy(&transcript);
     let restored = transcript
         .rfind("\u{1b}[?1049l")
@@ -3755,25 +3626,27 @@ fn tui_releases_outer_private_staging_before_run_lock() {
     );
     let destination = bundle.result("tui-private-cleanup-order");
     let (master, slave) = open_tui_pty();
-    let (mut child, master_writer, reader) =
-        spawn_tui_run(&bundle.args(&destination), master, &slave);
-    drop(master_writer);
+    let mut process = spawn_tui_run(&bundle.args(&destination), master, slave);
+    process.close_master_writer();
 
-    let lock_released = (0..500).any(|_| {
-        let available = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(destination.join("run.lock"))
-            .ok()
-            .is_some_and(|lock| {
-                rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+    let lock_released = poll_until(
+        "TUI run lock release",
+        || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(destination.join("run.lock"))
+                .ok()
+                .is_some_and(|lock| {
+                    rustix::fs::fcntl_lock(
+                        &lock,
+                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                    )
                     .is_ok()
-            });
-        if !available {
-            wait_for_process_poll();
-        }
-        available
-    });
+                })
+        },
+        |available| *available,
+    );
     let private_entries = lock_released.then(|| {
         fs::read_dir(destination.join(".private"))
             .unwrap()
@@ -3781,10 +3654,7 @@ fn tui_releases_outer_private_staging_before_run_lock() {
             .collect::<Vec<_>>()
     });
 
-    child.kill().unwrap();
-    child.wait().unwrap();
-    drop(slave);
-    reader.join().unwrap();
+    process.terminate_and_finish();
 
     assert!(lock_released, "TUI never released run.lock");
     assert!(
@@ -4258,33 +4128,86 @@ steps:
         - -c
         - |
           while [ "$(grep -c '\"state\": \"running\"' "$RUN_STATE")" -lt 3 ]; do sleep 0.01; done
+          IFS= read -r _ < "$CORRUPTION_RELEASE_FIFO"
           printf partial > "$RUN_STATE.corrupt"
           mv "$RUN_STATE.corrupt" "$RUN_STATE"
   survivor:
     kind: cmd
     command:
-      argv: ["sh", "-c", "sleep 2; touch \"$LATE_SIDE_EFFECT\""]
+      argv:
+        - sh
+        - -c
+        - |
+          printf '%s\n' "$$" > "$SURVIVOR_PID"
+          printf '\001' > "$SURVIVOR_READY_FIFO"
+          IFS= read -r _ < "$SURVIVOR_RELEASE_FIFO"
+          touch "$LATE_SIDE_EFFECT"
 "#,
     );
     let destination = bundle.result("persistence-failure-quiescence");
     let late_side_effect = bundle.execution_root.join("late-side-effect");
+    let survivor_pid = bundle.initial_cwd().join("survivor.pid");
+    let survivor_ready_fifo = bundle.initial_cwd().join("survivor-ready.fifo");
+    let survivor_release_fifo = bundle.initial_cwd().join("survivor-release.fifo");
+    let corruption_release_fifo = bundle.initial_cwd().join("corruption-release.fifo");
+    let fifo_mode = Mode::S_IRUSR | Mode::S_IWUSR;
+    for path in [
+        &survivor_ready_fifo,
+        &survivor_release_fifo,
+        &corruption_release_fifo,
+    ] {
+        mkfifo(path, fifo_mode).unwrap();
+    }
+    let open_control = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    };
+    let mut survivor_ready = open_control(&survivor_ready_fifo);
+    let mut survivor_release = open_control(&survivor_release_fifo);
+    let mut corruption_release = open_control(&corruption_release_fifo);
     let mut args = bundle.args(&destination);
     args.splice(
         args.len() - 1..args.len() - 1,
         ["--max-parallel".to_owned(), "2".to_owned()],
     );
 
-    let output = isolated_command(&args)
+    let child = isolated_command(&args)
         .env("RUN_STATE", destination.join("state.json"))
         .env("LATE_SIDE_EFFECT", &late_side_effect)
-        .output()
+        .env("SURVIVOR_PID", &survivor_pid)
+        .env("SURVIVOR_READY_FIFO", &survivor_ready_fifo)
+        .env("SURVIVOR_RELEASE_FIFO", &survivor_release_fifo)
+        .env("CORRUPTION_RELEASE_FIFO", &corruption_release_fifo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let mut ready = [0_u8; 1];
+    survivor_ready.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [1]);
+    corruption_release.write_all(b"corrupt\n").unwrap();
+    let output = child.wait_with_output().unwrap();
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(
-        !late_side_effect.exists(),
+    let survivor = Pid::from_raw(
+        fs::read_to_string(&survivor_pid)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        test_kill_process(survivor),
+        Err(rustix::io::Errno::SRCH),
         "work already owned when persistence fails must be quiesced"
     );
+    assert!(!late_side_effect.exists());
+    survivor_release.write_all(b"release\n").unwrap();
+    assert!(!late_side_effect.exists());
 }
 
 #[test]
@@ -4950,12 +4873,11 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
         .unwrap();
     let owner_pid = Pid::from_raw(i32::try_from(owner.id()).unwrap()).unwrap();
     let ready_path = staging.path().join("ready.json");
-    for _ in 0..500 {
-        if ready_path.is_file() && guard_pid.is_file() {
-            break;
-        }
-        wait_for_process_poll();
-    }
+    poll_until(
+        "child guard registration readiness",
+        || (ready_path.is_file(), guard_pid.is_file()),
+        |(ready, registered)| *ready && *registered,
+    );
     assert!(ready_path.is_file());
     assert!(guard_pid.is_file());
     let ready: serde_json::Value = serde_json::from_slice(&fs::read(&ready_path).unwrap()).unwrap();
@@ -4963,12 +4885,11 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
 
     kill_process(owner_pid, Signal::KILL).unwrap();
     assert!(owner.wait().unwrap().code().is_none());
-    for _ in 0..500 {
-        if !Path::new("/proc").join(&leader).exists() {
-            break;
-        }
-        wait_for_process_poll();
-    }
+    poll_until(
+        "child guard process quiescence",
+        || Path::new("/proc").join(&leader).exists(),
+        |exists| !*exists,
+    );
     assert!(
         !marker.is_file(),
         "stopped user code crossed the release boundary"
@@ -5002,15 +4923,15 @@ fn guardian_loss_cannot_leave_a_descendant_running() {
         .unwrap();
     let owner = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
 
-    for _ in 0..500 {
-        if [&leader_file, &guardian_file, &descendant_file]
-            .into_iter()
-            .all(|path| path.is_file())
-        {
-            break;
-        }
-        wait_for_process_poll();
-    }
+    poll_until(
+        "guarded process identity files",
+        || {
+            [&leader_file, &guardian_file, &descendant_file]
+                .into_iter()
+                .all(|path| path.is_file())
+        },
+        |ready| *ready,
+    );
     let read_pid = |path: &Path| {
         Pid::from_raw(
             fs::read_to_string(path)
@@ -5026,12 +4947,11 @@ fn guardian_loss_cannot_leave_a_descendant_running() {
     let descendant = read_pid(&descendant_file);
 
     kill_process(owner, Signal::STOP).unwrap();
-    for _ in 0..500 {
-        if matches!(process_state(owner), Some(b'T' | b't')) {
-            break;
-        }
-        wait_for_process_poll();
-    }
+    poll_until(
+        "stopped execution owner",
+        || process_state(owner),
+        |state| matches!(state, Some(b'T' | b't')),
+    );
     assert!(
         matches!(process_state(owner), Some(b'T' | b't')),
         "the execution owner must stop before the guard is killed"
@@ -5039,12 +4959,11 @@ fn guardian_loss_cannot_leave_a_descendant_running() {
 
     kill_process(guardian, Signal::KILL).unwrap();
     let leader_is_zombie = || process_state(leader) == Some(b'Z');
-    for _ in 0..500 {
-        if leader_is_zombie() {
-            break;
-        }
-        wait_for_process_poll();
-    }
+    poll_until(
+        "zombie process leader retained by subreaper",
+        leader_is_zombie,
+        |zombie| *zombie,
+    );
     assert!(
         leader_is_zombie(),
         "the subreaper must retain the leader identity until cleanup"

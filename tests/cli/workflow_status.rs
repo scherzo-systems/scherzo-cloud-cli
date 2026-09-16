@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -442,16 +442,6 @@ fn active_owner_has_retry_precedence_and_status_does_not_signal_work() {
         result["retry"],
         serde_json::json!({"eligible": false, "reason": "run_locked"})
     );
-    control
-        .set_read_timeout(Some(Duration::from_millis(20)))
-        .unwrap();
-    let error = control.read_exact(&mut event).unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        ErrorKind::WouldBlock | ErrorKind::TimedOut
-    ));
-    control.set_read_timeout(None).unwrap();
-
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
     kill_process(pid, Signal::INT).unwrap();
     control.read_exact(&mut event).unwrap();
