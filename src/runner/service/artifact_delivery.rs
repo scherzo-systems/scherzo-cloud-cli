@@ -260,11 +260,6 @@ impl ArtifactDeliveryBroker {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn allows_insecure_loopback(&self) -> bool {
-        self.allow_insecure_loopback
-    }
-
     pub(super) fn start(
         &self,
         spec: ArtifactDeliverySpec,

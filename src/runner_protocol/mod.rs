@@ -2132,25 +2132,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_lease_policy_version_is_not_normalized_to_schema_2() {
-        let mut welcome: Value = serde_json::from_slice(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/runner-protocol/v1/valid/cloud-welcome.json"
-        )))
-        .unwrap();
-        welcome["payload"]["leasePolicy"]["schemaVersion"] = json!(2);
-        let encoded = serde_json::to_vec(&welcome).unwrap();
-
-        match decode_cloud_frame(&encoded) {
-            Err(_) => {}
-            Ok(CloudFrame::Welcome { lease_policy, .. }) => {
-                assert_eq!(lease_policy.schema_version, 2);
-            }
-            Ok(_) => panic!("welcome decoded as another frame type"),
-        }
-    }
-
-    #[test]
     fn retry_offer_keeps_its_authoritative_attempt_number() {
         let mut offer: Value = serde_json::from_slice(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

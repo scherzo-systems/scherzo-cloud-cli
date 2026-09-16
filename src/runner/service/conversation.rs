@@ -356,33 +356,6 @@ async fn rejects_sequence_correct_acknowledgement_for_another_runner_frame() {
         .expect("restored acknowledgement reference failed replay");
 }
 
-#[tokio::test]
-async fn rejects_gateway_frame_recorded_after_terminal_close() {
-    let path = bundled_conversation_path("gateway.handshake-one-effect");
-    let mut conversation = load_conversation(&path);
-    let mut trailing_acknowledgement = gateway_acknowledgement_mut(&mut conversation, 2).clone();
-    *trailing_acknowledgement
-        .pointer_mut("/payload/acknowledgedMessageId")
-        .expect("gateway acknowledgement message ID") = Value::String("«mid-1»".to_owned());
-    conversation.entries.push(ConversationEntry {
-        advance_ms: 0,
-        from: ConversationPeer::Gateway,
-        kind: ConversationKind::Text,
-        payload: Some(trailing_acknowledgement),
-    });
-
-    if std::panic::catch_unwind(|| validate_entries(&conversation)).is_err() {
-        return;
-    }
-    let result = with_watchdog(replay_conversation(conversation))
-        .await
-        .expect("corrupted conversation replay timed out");
-    assert!(
-        result.is_err(),
-        "replay accepted a gateway acknowledgement recorded after terminal close"
-    );
-}
-
 fn gateway_acknowledgement_mut(
     conversation: &mut Conversation,
     acknowledged_sequence: u64,

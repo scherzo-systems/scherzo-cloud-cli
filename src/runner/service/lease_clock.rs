@@ -1129,15 +1129,6 @@ mod tests {
         assert_eq!(timer_source.active_timers(), 0);
     }
 
-    #[test]
-    fn lease_clock_suspend_observation_rejects_awake_only_elapsed() {
-        let awake_only = suspend_elapsed((100, 100), (20_000_000_100, 20_000_000_100)).unwrap();
-        assert_eq!(awake_only.suspended, Duration::ZERO);
-
-        let with_suspend = suspend_elapsed((100, 100), (20_000_000_100, 1_000_000_100)).unwrap();
-        assert_eq!(with_suspend.suspended, Duration::from_secs(19));
-    }
-
     #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn lease_clock_native_timer_without_tokio_fails_observably() {

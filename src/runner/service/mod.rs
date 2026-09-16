@@ -3130,75 +3130,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_a_normal_gateway_close_once_before_backoff() {
-        let (listener, endpoint) = fixture_listener().await;
-        let server = tokio::spawn(async move {
-            let mut socket = accept_fixture_socket(&listener).await;
-            expect_opening_hello(&mut socket).await;
-            socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: CloseCode::Normal,
-                    reason: "normal fixture close".into(),
-                })))
-                .await
-                .expect("send normal close");
-            while let Some(Ok(_)) = socket.next().await {}
-        });
+    async fn records_retryable_connection_failure_once_with_backoff() {
+        for (error_type, outcome) in [
+            ("gateway_closed_connection", "disconnected"),
+            ("connect_timeout", "timeout"),
+        ] {
+            let (listener, endpoint) = fixture_listener().await;
+            let server = if error_type == "connect_timeout" {
+                tokio::spawn(async move {
+                    let (_stream, _) = listener.accept().await.expect("accept fixture connection");
+                    std::future::pending::<()>().await;
+                })
+            } else {
+                tokio::spawn(async move {
+                    let mut socket = accept_fixture_socket(&listener).await;
+                    expect_opening_hello(&mut socket).await;
+                    socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Normal,
+                            reason: "normal fixture close".into(),
+                        })))
+                        .await
+                        .expect("send normal close");
+                    while let Some(Ok(_)) = socket.next().await {}
+                })
+            };
 
-        let (sleeper, mut sleep_requests) = controlled_sleeper();
-        let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
-        let (_delay, release_backoff) = backoff_request(&mut sleep_requests).await;
+            let (sleeper, mut sleep_requests) = controlled_sleeper();
+            let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
+            if error_type == "connect_timeout" {
+                sleep_request(&mut sleep_requests, Duration::from_secs(10))
+                    .await
+                    .release();
+            }
+            let (_delay, release_backoff) = backoff_request(&mut sleep_requests).await;
 
-        let events = capture.events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["event.name"], "runner.gateway_connection");
-        assert_eq!(events[0]["error.type"], "gateway_closed_connection");
-        assert_eq!(events[0]["scherzo.connection.failure_kind"], "retryable");
-        assert_eq!(events[0]["scherzo.outcome"], "disconnected");
-        assert!(events[0].get("scherzo.connection.backoff_ms").is_some());
-        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
+            let events = capture.events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event.name"], "runner.gateway_connection");
+            assert_eq!(events[0]["error.type"], error_type);
+            assert_eq!(events[0]["scherzo.connection.failure_kind"], "retryable");
+            assert_eq!(events[0]["scherzo.outcome"], outcome);
+            assert!(events[0].get("scherzo.connection.backoff_ms").is_some());
+            assert_eq!(capture.span_count("runner.gateway_connection"), 1);
 
-        abort_service(service).await;
-        drop(release_backoff);
-        with_watchdog(server)
-            .await
-            .expect("fixture server did not close")
-            .expect("fixture server failed");
-    }
-
-    #[tokio::test]
-    async fn records_a_connection_timeout_once_with_backoff() {
-        let (listener, endpoint) = fixture_listener().await;
-        let server = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.expect("accept fixture connection");
-            std::future::pending::<()>().await;
-        });
-        let (sleeper, mut sleep_requests) = controlled_sleeper();
-        let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
-
-        sleep_request(&mut sleep_requests, Duration::from_secs(10))
-            .await
-            .release();
-        let (_delay, release_backoff) = backoff_request(&mut sleep_requests).await;
-
-        let events = capture.events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["event.name"], "runner.gateway_connection");
-        assert_eq!(events[0]["error.type"], "connect_timeout");
-        assert_eq!(events[0]["scherzo.connection.failure_kind"], "retryable");
-        assert_eq!(events[0]["scherzo.outcome"], "timeout");
-        assert!(events[0].get("scherzo.connection.backoff_ms").is_some());
-        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
-
-        abort_service(service).await;
-        drop(release_backoff);
-        server.abort();
-        assert!(
-            server
-                .await
-                .expect_err("fixture server should be aborted")
-                .is_cancelled()
-        );
+            abort_service(service).await;
+            drop(release_backoff);
+            if error_type == "connect_timeout" {
+                server.abort();
+                assert!(
+                    server
+                        .await
+                        .expect_err("fixture server should be aborted")
+                        .is_cancelled()
+                );
+            } else {
+                with_watchdog(server)
+                    .await
+                    .expect("fixture server did not close")
+                    .expect("fixture server failed");
+            }
+        }
     }
 
     #[tokio::test]

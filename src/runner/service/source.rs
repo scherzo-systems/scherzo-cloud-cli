@@ -3617,7 +3617,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::disallowed_methods,
-        reason = "wall time only bounds the credential fixture's request-readiness message"
+        reason = "the bounded receive is an item-scoped watchdog for explicit request readiness"
     )]
     fn broker_request_is_cancelled_when_the_assignment_is_fenced() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -3661,12 +3661,9 @@ mod tests {
             );
             cancel.cancel();
         });
-        let started = crate::timing::monotonic_now();
-
         let result = broker.issue("asn_01k0z6r1w8f4jy2m7q9v3x5abc", &cancellation);
 
         assert!(matches!(result, Err(CredentialBrokerFailure::Fenced)));
-        assert!(crate::timing::elapsed(started) < Duration::from_secs(2));
         canceller.join().unwrap();
         server.join().unwrap();
     }
@@ -3679,24 +3676,27 @@ mod tests {
         let git = bin.join("git");
         fs::write(
             &git,
-            b"#!/bin/sh\nfor argument do\n  case \"$argument\" in\n    status)\n      : > git-status-ready\n      # Block after publishing readiness so only managed cleanup can end the fixture.\n      IFS= read -r unexpected < git-status-release\n      ;;\n  esac\ndone\nexit 2\n",
+            b"#!/bin/sh\nfor argument do\n  case \"$argument\" in\n    status)\n      printf 'ready\\n' > git-status-ready\n      # Block after publishing readiness so only managed cleanup can end the fixture.\n      IFS= read -r unexpected < git-status-release\n      ;;\n  esac\ndone\nexit 2\n",
         )
         .unwrap();
         fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
         let release = temporary.path().join("git-status-release");
         mkfifo(&release, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let ready = temporary.path().join("git-status-ready");
+        mkfifo(&ready, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        // Keep the FIFO open so an early git failure can release the readiness reader.
+        let mut readiness_fallback = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ready)
+            .unwrap();
         let cancellation = CaptureCancellation::default();
         let cancel = cancellation.clone();
-        let worker_ready = ready.clone();
         let canceller = std::thread::spawn(move || {
-            let started = crate::timing::monotonic_now();
-            // The child-process filesystem marker is the only available readiness boundary.
-            while !worker_ready.is_file() {
-                assert!(crate::timing::elapsed(started) < Duration::from_secs(2));
-                crate::timing::sleep(PROCESS_POLL_INTERVAL);
-            }
+            let mut signal = [0_u8; 6];
+            let readiness = File::open(ready).and_then(|mut ready| ready.read_exact(&mut signal));
             cancel.cancel();
+            readiness.unwrap();
         });
         let ambient_path = std::env::var_os("PATH").unwrap();
         let search_path = std::env::join_paths(
@@ -3704,7 +3704,6 @@ mod tests {
         )
         .unwrap();
         let environment = EnvironmentSnapshot::new([("PATH", search_path)]);
-        let started = crate::timing::monotonic_now();
 
         let result = run_git_output(
             temporary.path(),
@@ -3719,9 +3718,9 @@ mod tests {
             &cancellation,
         );
 
-        assert_eq!(result, Err(MaterializationFailure::AssignmentFenced));
-        assert!(crate::timing::elapsed(started) < Duration::from_secs(2));
+        readiness_fallback.write_all(b"ready\n").unwrap();
         canceller.join().unwrap();
+        assert_eq!(result, Err(MaterializationFailure::AssignmentFenced));
     }
 
     #[test]

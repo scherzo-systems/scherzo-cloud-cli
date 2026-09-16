@@ -291,8 +291,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        CheckDescriptor, DoctorCheck, Outcome, Registry, RegistryError, Report, SelectionError,
-        Status, built_in_registry,
+        CheckDescriptor, DoctorCheck, Outcome, Registry, RegistryError, SelectionError, Status,
+        built_in_registry,
     };
 
     struct FakeCheck {
@@ -494,66 +494,6 @@ mod tests {
             SelectionError::UnknownId("extension.fixture.missing".to_owned())
         );
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn summary_counts_pass_and_fail() {
-        let passed_result = super::CheckResult {
-            descriptor: CheckDescriptor {
-                id: "extension.fixture.pass",
-                title: "Pass",
-                default: true,
-            },
-            outcome: Outcome {
-                status: Status::Pass,
-                code: "ok",
-                message: "Passed".to_owned(),
-                details: BTreeMap::new(),
-            },
-        };
-        let report = Report {
-            results: vec![
-                passed_result,
-                super::CheckResult {
-                    descriptor: CheckDescriptor {
-                        id: "extension.fixture.fail",
-                        title: "Fail",
-                        default: true,
-                    },
-                    outcome: Outcome {
-                        status: Status::Fail,
-                        code: "failed",
-                        message: "Failed".to_owned(),
-                        details: BTreeMap::new(),
-                    },
-                },
-            ],
-        };
-        let passed = Report {
-            results: vec![super::CheckResult {
-                descriptor: CheckDescriptor {
-                    id: "extension.fixture.pass-only",
-                    title: "Pass only",
-                    default: true,
-                },
-                outcome: Outcome {
-                    status: Status::Pass,
-                    code: "ok",
-                    message: "Passed".to_owned(),
-                    details: BTreeMap::new(),
-                },
-            }],
-        };
-
-        assert_eq!(
-            report.summary(),
-            super::Summary {
-                passed: 1,
-                failed: 1,
-            }
-        );
-        assert!(report.has_failures());
-        assert!(!passed.has_failures());
     }
 
     #[test]

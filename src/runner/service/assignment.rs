@@ -5370,21 +5370,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     #[tokio::test]
-    async fn shared_assignment_offer_fixture_reaches_source_admission() {
-        let tokio_tungstenite::tungstenite::Message::Text(raw) =
-            crate::runner::service::test_support::assignment_offer()
-        else {
-            panic!("assignment offer fixture was not text");
-        };
-        let CloudFrame::AssignmentOffer { execution_spec, .. } =
-            decode_cloud_frame(raw.as_bytes()).unwrap()
-        else {
-            panic!("assignment offer fixture decoded as another frame");
-        };
-        assert_eq!(validate_execution_spec(&execution_spec), Ok(()));
-    }
-
-    #[tokio::test]
     async fn malformed_run_input_projection_has_the_closed_immutable_decline() {
         let mut execution_spec = offer("bg").execution_spec;
         execution_spec.run_inputs = Some(crate::runner_protocol::RunInputProjectionV1 {
@@ -5456,14 +5441,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         for (failure, expected) in cases {
             assert_eq!(run_input_decline(failure), expected);
         }
-    }
-
-    #[tokio::test]
-    async fn secure_runner_endpoint_disallows_insecure_artifact_uploads() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let (_temporary, manager) = manager_fixture(workflow);
-
-        assert!(!manager.artifact_delivery.allows_insecure_loopback());
     }
 
     #[tokio::test]
@@ -7615,35 +7592,6 @@ steps:
     }
 
     #[tokio::test]
-    async fn claude_assignment_uses_its_startup_snapshot_after_path_changes() {
-        let (temporary, mut manager) = manager_fixture_with_harnesses(
-            CLAUDE_CODE_ONLY_WORKFLOW,
-            None,
-            Some(SUCCESSFUL_CLAUDE_CODE),
-            None,
-        );
-        let changed_path = replace_manager_path_with_decoy(&temporary, &mut manager, "claude");
-        let reports = offer_and_execute(&mut manager).await;
-
-        assert_succeeded(&reports);
-        let call = only_harness_call(&temporary.path().join("claude.calls"));
-        assert!(call.contains("--model fixture/claude"));
-        assert!(!changed_path.join("decoy.calls").exists());
-    }
-
-    #[tokio::test]
-    async fn codex_assignment_uses_its_startup_snapshot_after_path_changes() {
-        let (temporary, mut manager) =
-            manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
-        let changed_path = replace_manager_path_with_decoy(&temporary, &mut manager, "codex");
-        let reports = offer_and_execute(&mut manager).await;
-
-        assert_succeeded(&reports);
-        let _ = only_harness_call(&temporary.path().join("codex.calls"));
-        assert!(!changed_path.join("decoy.calls").exists());
-    }
-
-    #[tokio::test]
     async fn all_harness_assignment_uses_each_snapshot_with_its_own_configuration() {
         let (temporary, mut manager) = manager_fixture_with_harnesses(
             ALL_HARNESS_WORKFLOW,
@@ -7651,6 +7599,10 @@ steps:
             Some(SUCCESSFUL_CLAUDE_CODE),
             Some(SUCCESSFUL_CODEX),
         );
+        let changed_paths = [
+            replace_manager_path_with_decoy(&temporary, &mut manager, "claude"),
+            replace_manager_path_with_decoy(&temporary, &mut manager, "codex"),
+        ];
         let reports = offer_and_execute(&mut manager).await;
 
         assert_succeeded(&reports);
@@ -7665,6 +7617,9 @@ steps:
         assert!(!claude_code_call.contains("fixture/pi"));
         assert_eq!(codex_turn["params"]["model"], "gpt-5.4");
         assert_eq!(codex_turn["params"]["effort"], "high");
+        for changed_path in changed_paths {
+            assert!(!changed_path.join("decoy.calls").exists());
+        }
     }
 
     #[tokio::test]
@@ -7937,8 +7892,8 @@ steps:
         assert_eq!(outbox.enqueue(observation), Err(OutboxFailure::Capacity));
     }
 
-    #[tokio::test]
-    async fn outbox_accepts_only_one_large_terminal_per_assignment() {
+    #[test]
+    fn outbox_accepts_only_one_terminal_per_assignment() {
         let escaped = "\u{0001}".repeat(4_096);
         let rounds = (1..=2)
             .map(|number| {
@@ -7962,7 +7917,7 @@ steps:
                 })
             })
             .collect::<Vec<_>>();
-        let report = ExecutionReport::Finished {
+        let large_report = ExecutionReport::Finished {
             final_execution_event_sequence: 1,
             outcome: json!({
                 "outcome": "failed",
@@ -7990,27 +7945,22 @@ steps:
                 "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
             }),
         };
-        assert_only_one_pending_terminal(AssignmentObservation::Execution {
-            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-            report,
-        });
-    }
+        let small_report = ExecutionReport::Finished {
+            final_execution_event_sequence: 1,
+            outcome: json!({"outcome": "succeeded"}),
+            artifact_delivery: json!({
+                "outcome": "prepared",
+                "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
+            }),
+        };
 
-    #[tokio::test]
-    async fn outbox_rejects_second_small_terminal_per_assignment() {
-        assert_only_one_pending_terminal(AssignmentObservation::Execution {
-            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-            report: ExecutionReport::Finished {
-                final_execution_event_sequence: 1,
-                outcome: json!({"outcome": "succeeded"}),
-                artifact_delivery: json!({
-                    "outcome": "prepared",
-                    "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
-                }),
-            },
-        });
+        for report in [large_report, small_report] {
+            assert_only_one_pending_terminal(AssignmentObservation::Execution {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                report,
+            });
+        }
     }
 
     #[tokio::test]

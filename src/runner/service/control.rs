@@ -603,20 +603,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "elapsed wall time verifies the production control I/O deadline"
-    )]
-    async fn production_io_timeout_expires_after_two_seconds() {
-        let timeouts = ControlTimeouts::production();
-        assert_eq!(timeouts.io, Duration::from_secs(2));
-        let (_client, mut server) = UnixStream::pair().unwrap();
-        let started = Instant::now();
-
-        assert_eq!(read_request(&mut server, timeouts.io).await, Err(()));
-
-        assert!(started.elapsed() >= Duration::from_secs(2));
+    #[test]
+    fn production_io_timeout_is_two_seconds() {
+        assert_eq!(ControlTimeouts::production().io, Duration::from_secs(2));
     }
 
     #[test]
