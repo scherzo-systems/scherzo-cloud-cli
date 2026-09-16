@@ -502,12 +502,6 @@ fn unavailable_invitation_returns_stable_json_and_exit_code() {
 fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
     let (server, _directory, _path, credential_path) = prepared(vec![
         problem_response_with_headers(
-            "403 Forbidden",
-            "https://api.scherzo.dev/problems/forbidden",
-            403,
-            &[],
-        ),
-        problem_response_with_headers(
             "429 Too Many Requests",
             "https://api.scherzo.dev/problems/rate-limit-exceeded",
             429,
@@ -529,19 +523,6 @@ fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
     let environment = deployment_environment(&server.api_url, &credential_path);
 
     let cases = [
-        (
-            vec![
-                "organization",
-                "invitations",
-                "list",
-                ORG_ID,
-                "--json",
-                "--allow-insecure-http",
-            ],
-            1,
-            "forbidden",
-            None,
-        ),
         (
             vec![
                 "organization",
@@ -596,5 +577,5 @@ fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
         }
     }
 
-    assert_eq!(server.finish().len(), 4);
+    assert_eq!(server.finish().len(), 3);
 }

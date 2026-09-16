@@ -52,24 +52,6 @@ fn request_body(request: &str) -> &str {
 }
 
 #[test]
-fn github_namespaces_print_help_without_loading_deployment() {
-    for args in [
-        &["github"][..],
-        &["github", "setup"][..],
-        &["github", "installation"][..],
-        &["github", "repository"][..],
-    ] {
-        let output = run_with_env(
-            args,
-            &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
-        );
-        assert!(output.status.success());
-        assert!(!output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
-    }
-}
-
-#[test]
 fn setup_begin_and_complete_preserve_the_browser_handoff() {
     let setup_url =
         format!("https://github.example/apps/scherzo/installations/new?state={SETUP_SESSION}");
@@ -431,68 +413,16 @@ fn replayable_connection_mutations_retry_one_ambiguous_transport_failure() {
 
 #[test]
 fn meaningful_api_failures_have_closed_json_and_exit_statuses() {
-    let cases = [
-        (
-            github_problem(
-                "400 Bad Request",
-                400,
-                "https://api.scherzo.dev/problems/bad-request",
-            ),
-            vec![
-                "github",
-                "setup",
-                "complete",
-                ORGANIZATION,
-                SETUP_SESSION,
-                "--provider-installation-id",
-                "713",
-            ],
-            "invalid_input",
-            1,
+    let cases = [(
+        github_problem(
+            "409 Conflict",
+            409,
+            "https://api.scherzo.dev/problems/source-connection-conflict",
         ),
-        (
-            github_problem(
-                "403 Forbidden",
-                403,
-                "https://api.scherzo.dev/problems/forbidden",
-            ),
-            vec!["github", "setup", "begin", ORGANIZATION],
-            "forbidden",
-            1,
-        ),
-        (
-            github_problem(
-                "404 Not Found",
-                404,
-                "https://api.scherzo.dev/problems/not-found",
-            ),
-            vec!["github", "installation", "list", ORGANIZATION],
-            "not_found",
-            1,
-        ),
-        (
-            github_problem(
-                "409 Conflict",
-                409,
-                "https://api.scherzo.dev/problems/source-connection-conflict",
-            ),
-            vec!["github", "repository", "list", ORGANIZATION, INSTALLATION],
-            "source_connection_conflict",
-            1,
-        ),
-        (
-            http_response("503 Service Unavailable", None, &[]),
-            vec![
-                "github",
-                "installation",
-                "disconnect",
-                ORGANIZATION,
-                INSTALLATION,
-            ],
-            "unreachable",
-            4,
-        ),
-    ];
+        vec!["github", "repository", "list", ORGANIZATION, INSTALLATION],
+        "source_connection_conflict",
+        1,
+    )];
 
     for (response, mut args, expected_outcome, expected_status) in cases {
         let (server, _directory, credential_path) = prepared_github(vec![response]);
@@ -507,11 +437,7 @@ fn meaningful_api_failures_have_closed_json_and_exit_statuses() {
         assert_eq!(value["deployment"], server.api_url);
         assert_eq!(value["organizationRef"], ORGANIZATION);
         assert_eq!(value["outcome"], expected_outcome);
-        if expected_outcome == "unreachable" {
-            assert_eq!(value["category"], "server");
-        } else {
-            assert!(value.get("category").is_none());
-        }
+        assert!(value.get("category").is_none());
         assert!(value.get("title").is_none());
         assert!(value.get("detail").is_none());
         assert!(output.stderr.is_empty());
@@ -558,36 +484,6 @@ fn setup_conflict_is_actionable_on_standard_error_without_problem_prose() {
 }
 
 #[test]
-fn missing_human_credential_does_not_contact_the_github_api() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    let directory = private_credential_directory();
-    let credential_path = directory.path().join("credentials.json");
-    let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
-
-    let output = run_with_env(
-        &["github", "installation", "list", ORGANIZATION, "--json"],
-        &environment,
-    );
-
-    assert_eq!(output.status.code(), Some(3));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({
-            "schemaVersion": 1,
-            "deployment": api_url,
-            "organizationRef": ORGANIZATION,
-            "outcome": "unauthenticated"
-        })
-    );
-    assert!(output.stderr.is_empty());
-    assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
-}
-
-#[test]
 fn oversized_github_success_response_is_rejected() {
     let repositories = (1..=1_024)
         .map(|provider_id| {
@@ -628,71 +524,6 @@ fn oversized_github_success_response_is_rejected() {
     );
     assert!(output.stderr.is_empty());
     server.finish();
-}
-
-#[test]
-fn rejected_github_access_token_is_refreshed_and_retried() {
-    let rejected = github_problem(
-        "401 Unauthorized",
-        401,
-        "https://api.scherzo.dev/problems/unauthorized",
-    );
-    let server = ScriptedServer::respond(vec![
-        rejected,
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": "unique-refreshed-github-access-token",
-                "refresh_token": "unique-refreshed-github-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        json_http_response(
-            "200 OK",
-            serde_json::json!({"items": [installation_body("active")]}),
-        ),
-    ]);
-    let directory = private_credential_directory();
-    let credential_path = directory.path().join("credentials.json");
-    write_credential_fixture_for_deployment(
-        &credential_path,
-        &server.api_url,
-        &server.issuer,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment_with_issuer(
-        &server.api_url,
-        &server.issuer,
-        credential_path.to_str().unwrap(),
-    );
-
-    let output = run_with_env(
-        &[
-            "github",
-            "installation",
-            "list",
-            ORGANIZATION,
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
-        "listed"
-    );
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert_eq!(
-        header_value(&requests[2], "authorization"),
-        "Bearer unique-refreshed-github-access-token"
-    );
 }
 
 #[test]

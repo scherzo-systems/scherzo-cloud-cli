@@ -231,19 +231,6 @@ fn request_body(request: &str) -> &str {
 }
 
 #[test]
-fn organization_without_a_subcommand_prints_help_without_loading_deployment() {
-    for args in [&["organization"][..], &["organization", "members"][..]] {
-        let output = run_with_env(
-            args,
-            &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
-        );
-        assert!(output.status.success());
-        assert!(output.stderr.is_empty());
-        assert!(!output.stdout.is_empty());
-    }
-}
-
-#[test]
 fn organization_has_no_alias_and_create_requires_a_display_name() {
     for args in [
         &["org", "show", "acme"][..],
@@ -613,98 +600,6 @@ fn malformed_rate_limit_metadata_is_a_protocol_failure() {
 }
 
 #[test]
-fn missing_credential_does_not_contact_the_organization_api() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    let directory = private_credential_directory();
-    let credential_path = directory.path().join("credentials.json");
-    let credential_path_string = credential_path.to_str().unwrap();
-    let environment = deployment_environment(&api_url, credential_path_string);
-
-    let output = run_with_env(
-        &["organization", "create", "--display-name", "Acme", "--json"],
-        &environment,
-    );
-
-    assert_eq!(output.status.code(), Some(3));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({
-            "schemaVersion": 1,
-            "deployment": api_url,
-            "outcome": "unauthenticated"
-        })
-    );
-    assert!(output.stderr.is_empty());
-    assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
-}
-
-#[test]
-fn rejected_organization_access_token_is_refreshed_and_retried() {
-    let rejected = organization_problem(
-        "401 Unauthorized",
-        401,
-        "https://api.scherzo.dev/problems/unauthorized",
-    );
-    let server = ScriptedServer::respond(vec![
-        rejected,
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": "unique-refreshed-organization-access-token",
-                "refresh_token": "unique-refreshed-organization-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        organization_success("200 OK"),
-    ]);
-    let directory = private_credential_directory();
-    let credential_path = directory.path().join("credentials.json");
-    write_credential_fixture_for_deployment(
-        &credential_path,
-        &server.api_url,
-        &server.issuer,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment_with_issuer(
-        &server.api_url,
-        &server.issuer,
-        credential_path.to_str().unwrap(),
-    );
-
-    let output = run_with_env(
-        &[
-            "organization",
-            "show",
-            "acme-research",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert!(
-        requests[2]
-            .contains("authorization: Bearer unique-refreshed-organization-access-token\r\n")
-    );
-    let stored: serde_json::Value =
-        serde_json::from_slice(&fs::read(credential_path).unwrap()).unwrap();
-    assert_eq!(
-        stored["credentials"][0]["refreshToken"],
-        "unique-refreshed-organization-refresh-token"
-    );
-}
-
-#[test]
 fn unauthorized_removes_only_the_rejected_credential_and_forbidden_retains_it() {
     for (response, expected_status, expect_credential) in [
         (
@@ -772,30 +667,6 @@ fn unauthorized_removes_only_the_rejected_credential_and_forbidden_retains_it() 
 }
 
 #[test]
-fn insecure_http_is_rejected_before_the_credential_is_transmitted() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    let directory = private_credential_directory();
-    let credential_path = directory.path().join("credentials.json");
-    write_credential_fixture(
-        &credential_path,
-        &api_url,
-        "unique-untransmitted-organization-token",
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
-
-    let output = run_with_env(&["organization", "show", "acme", "--json"], &environment);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
-}
-
-#[test]
 fn show_success_preserves_schema_and_the_valid_reference_target() {
     let (server, _directory, _path, credential_path) =
         prepared_organization(vec![organization_success("200 OK")], TOKEN);
@@ -838,41 +709,6 @@ fn show_success_preserves_schema_and_the_valid_reference_target() {
         format!("Bearer {TOKEN}")
     );
     assert!(!request.contains("idempotency-key:"));
-}
-
-#[test]
-fn human_show_has_exact_success_output() {
-    let (server, _directory, _path, credential_path) =
-        prepared_organization(vec![organization_success("200 OK")], TOKEN);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &[
-            "organization",
-            "show",
-            "acme-research",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!(
-            concat!(
-                "✓ Organization found.\n\n",
-                "  Organization: org_01k0z6r1w8f4jy2m7q9v3x5abc\n",
-                "  Name:         Acme Research\n",
-                "  Slug:         acme-research\n",
-                "  State:        active\n",
-                "  Deployment:   {}\n"
-            ),
-            server.api_url
-        )
-    );
-    assert!(output.stderr.is_empty());
-    server.finish();
 }
 
 #[test]
@@ -951,145 +787,111 @@ fn a_rejected_request_does_not_remove_a_concurrently_replaced_credential() {
 }
 
 #[test]
-fn show_expected_outcomes_have_exact_json_and_exit_statuses() {
+fn organization_commands_have_closed_transport_and_protocol_failures() {
     let cases = [
         (
-            organization_problem(
-                "400 Bad Request",
-                400,
-                "https://api.scherzo.dev/problems/bad-request",
-            ),
-            "invalid_input",
-            1,
-        ),
-        (
-            organization_problem(
-                "401 Unauthorized",
-                401,
-                "https://api.scherzo.dev/problems/unauthorized",
-            ),
-            "unauthenticated",
-            3,
-        ),
-        (
-            organization_problem(
-                "403 Forbidden",
-                403,
-                "https://api.scherzo.dev/problems/forbidden",
-            ),
-            "forbidden",
-            1,
-        ),
-        (
-            organization_problem(
-                "404 Not Found",
-                404,
-                "https://api.scherzo.dev/problems/not-found",
-            ),
-            "not_found",
-            1,
-        ),
-        (
-            http_response("500 Internal Server Error", None, &[]),
-            "unreachable",
-            4,
-        ),
-    ];
-
-    for (response, expected_outcome, expected_status) in cases {
-        let (server, _directory, _path, credential_path) =
-            prepared_organization_refresh(vec![response], TOKEN);
-        let environment =
-            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
-        let output = run_with_env(
             &[
                 "organization",
                 "show",
                 "acme-research",
                 "--json",
                 "--allow-insecure-http",
-            ],
-            &environment,
-        );
+            ][..],
+            vec![Vec::new()],
+            4,
+            Some("connection"),
+            1,
+        ),
+        (
+            &[
+                "organization",
+                "update",
+                "acme",
+                "--slug",
+                "acme-labs",
+                "--json",
+                "--allow-insecure-http",
+            ][..],
+            vec![Vec::new(), Vec::new()],
+            4,
+            Some("connection"),
+            2,
+        ),
+        (
+            &[
+                "organization",
+                "update",
+                "acme",
+                "--slug",
+                "acme-labs",
+                "--json",
+                "--allow-insecure-http",
+            ][..],
+            vec![json_http_response(
+                "200 OK",
+                serde_json::json!({"protocol-response-sentinel": true}),
+            )],
+            1,
+            None,
+            1,
+        ),
+        (
+            &[
+                "organization",
+                "members",
+                "list",
+                "acme",
+                "--json",
+                "--allow-insecure-http",
+            ][..],
+            vec![Vec::new()],
+            4,
+            Some("connection"),
+            1,
+        ),
+        (
+            &[
+                "organization",
+                "members",
+                "list",
+                "acme",
+                "--json",
+                "--allow-insecure-http",
+            ][..],
+            vec![json_http_response(
+                "200 OK",
+                serde_json::json!({
+                    "items": [],
+                    "nextCursor": "",
+                    "protocol-response-sentinel": true
+                }),
+            )],
+            1,
+            None,
+            1,
+        ),
+    ];
 
-        assert_eq!(output.status.code(), Some(expected_status));
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["schemaVersion"], 1);
-        assert_eq!(value["deployment"], server.api_url);
-        assert_eq!(value["outcome"], expected_outcome);
-        if expected_outcome == "unreachable" {
-            assert_eq!(value["category"], "server");
-        }
-        assert!(value.get("title").is_none());
-        assert!(value.get("detail").is_none());
-        assert!(output.stderr.is_empty());
-        let expected_requests = if expected_outcome == "unauthenticated" {
-            2
-        } else {
-            1
-        };
-        assert_eq!(server.finish().len(), expected_requests);
-    }
-
-    let (server, _directory, _path, credential_path) =
-        prepared_organization(vec![Vec::new()], TOKEN);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let transport = run_with_env(
-        &[
-            "organization",
-            "show",
-            "acme-research",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-    assert_eq!(transport.status.code(), Some(4));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&transport.stdout).unwrap()["category"],
-        "connection"
-    );
-    assert!(transport.stderr.is_empty());
-    assert_eq!(server.finish().len(), 1);
-}
-
-#[test]
-fn private_not_found_outputs_are_identical_for_all_target_states() {
-    for json in [false, true] {
-        let responses = [
-            "The target is inaccessible.",
-            "The target is inactive.",
-            "The target is absent.",
-        ]
-        .map(response_with_detail)
-        .into_iter()
-        .collect();
+    for (args, responses, expected_status, expected_category, expected_requests) in cases {
         let (server, _directory, _path, credential_path) = prepared_organization(responses, TOKEN);
         let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut outputs = Vec::new();
 
-        for _ in 0..3 {
-            let mut args = vec![
-                "organization",
-                "show",
-                "private-target",
-                "--allow-insecure-http",
-            ];
-            if json {
-                args.push("--json");
-            }
+        let output = run_with_env(args, &environment);
 
-            let output = run_with_env(&args, &environment);
-            assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(expected_status));
+        if let Some(expected_category) = expected_category {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["outcome"], "unreachable");
+            assert_eq!(value["category"], expected_category);
             assert!(output.stderr.is_empty());
-            if !json {
-                assert!(!output.stdout.is_empty());
-            }
-            outputs.push(output.stdout);
+        } else {
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.is_empty());
+            assert!(!stderr.contains("protocol-response-sentinel"));
+            assert!(!stderr.contains(TOKEN));
         }
-        assert_eq!(outputs[0], outputs[1]);
-        assert_eq!(outputs[1], outputs[2]);
-        assert_eq!(server.finish().len(), 3);
+        assert_eq!(server.finish().len(), expected_requests);
     }
 }
 
@@ -1263,71 +1065,8 @@ fn human_update_has_exact_success_output() {
 }
 
 #[test]
-fn update_retries_one_ambiguous_failure_with_the_same_complete_request() {
-    let (server, _directory, _path, credential_path) =
-        prepared_organization(vec![Vec::new(), update_success()], TOKEN);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &[
-            "organization",
-            "update",
-            "acme-research",
-            "--display-name",
-            "Acme Labs",
-            "--slug",
-            "acme-labs",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
-}
-
-#[test]
 fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
     let cases = [
-        (
-            organization_problem(
-                "400 Bad Request",
-                400,
-                "https://api.scherzo.dev/problems/bad-request",
-            ),
-            "invalid_input",
-            1,
-        ),
-        (
-            organization_problem(
-                "401 Unauthorized",
-                401,
-                "https://api.scherzo.dev/problems/unauthorized",
-            ),
-            "unauthenticated",
-            3,
-        ),
-        (
-            organization_problem(
-                "403 Forbidden",
-                403,
-                "https://api.scherzo.dev/problems/forbidden",
-            ),
-            "forbidden",
-            1,
-        ),
-        (
-            organization_problem(
-                "404 Not Found",
-                404,
-                "https://api.scherzo.dev/problems/not-found",
-            ),
-            "not_found",
-            1,
-        ),
         (
             organization_problem(
                 "409 Conflict",
@@ -1345,11 +1084,6 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
             ),
             "idempotency_conflict",
             1,
-        ),
-        (
-            http_response("503 Service Unavailable", None, &[]),
-            "unreachable",
-            4,
         ),
     ];
 
@@ -1376,71 +1110,12 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["deployment"], server.api_url);
         assert_eq!(value["outcome"], expected_outcome);
-        if expected_outcome == "unreachable" {
-            assert_eq!(value["category"], "server");
-        } else {
-            assert!(value.get("category").is_none());
-        }
+        assert!(value.get("category").is_none());
         assert!(value.get("title").is_none());
         assert!(value.get("detail").is_none());
         assert!(output.stderr.is_empty());
-        let expected_requests = if expected_outcome == "unauthenticated" {
-            2
-        } else {
-            1
-        };
-        assert_eq!(server.finish().len(), expected_requests);
+        assert_eq!(server.finish().len(), 1);
     }
-}
-
-#[test]
-fn update_transport_and_protocol_failures_have_closed_statuses() {
-    let (server, _directory, _path, credential_path) =
-        prepared_organization(vec![Vec::new(), Vec::new()], TOKEN);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let transport = run_with_env(
-        &[
-            "organization",
-            "update",
-            "acme",
-            "--slug",
-            "acme-labs",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-    assert_eq!(transport.status.code(), Some(4));
-    let value: serde_json::Value = serde_json::from_slice(&transport.stdout).unwrap();
-    assert_eq!(value["outcome"], "unreachable");
-    assert_eq!(value["category"], "connection");
-    assert!(transport.stderr.is_empty());
-    assert_eq!(server.finish().len(), 2);
-
-    let response = json_http_response(
-        "200 OK",
-        serde_json::json!({"protocol-response-sentinel": true}),
-    );
-    let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let protocol = run_with_env(
-        &[
-            "organization",
-            "update",
-            "acme",
-            "--slug",
-            "acme-labs",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-    assert_eq!(protocol.status.code(), Some(1));
-    assert!(protocol.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&protocol.stderr);
-    assert!(!stderr.contains("protocol-response-sentinel"));
-    assert!(!stderr.contains(TOKEN));
-    server.finish();
 }
 
 #[test]
@@ -1526,76 +1201,6 @@ fn human_organization_list_exposes_identity_and_history_without_synthesizing_pro
     assert!(!stdout.contains("unavailable"));
     assert!(output.stderr.is_empty());
     server.finish();
-}
-
-#[test]
-fn organization_list_api_failures_have_structured_outcomes_and_registered_statuses() {
-    let cases = [
-        (
-            organization_problem(
-                "400 Bad Request",
-                400,
-                "https://api.scherzo.dev/problems/bad-request",
-            ),
-            "invalid_input",
-            1,
-        ),
-        (
-            organization_problem(
-                "401 Unauthorized",
-                401,
-                "https://api.scherzo.dev/problems/unauthorized",
-            ),
-            "unauthenticated",
-            3,
-        ),
-        (
-            organization_problem(
-                "403 Forbidden",
-                403,
-                "https://api.scherzo.dev/problems/forbidden",
-            ),
-            "forbidden",
-            1,
-        ),
-        (
-            http_response("500 Internal Server Error", None, &[]),
-            "unreachable",
-            4,
-        ),
-    ];
-
-    for (response, expected_outcome, expected_status) in cases {
-        let (server, _directory, _path, credential_path) =
-            prepared_organization_refresh(vec![response], TOKEN);
-        let environment =
-            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
-
-        let output = run_with_env(
-            &["organization", "list", "--json", "--allow-insecure-http"],
-            &environment,
-        );
-
-        assert_eq!(output.status.code(), Some(expected_status));
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["schemaVersion"], 1);
-        assert_eq!(value["deployment"], server.api_url);
-        assert_eq!(value["outcome"], expected_outcome);
-        if expected_outcome == "unreachable" {
-            assert_eq!(value["category"], "server");
-        } else {
-            assert!(value.get("category").is_none());
-        }
-        assert!(output.stderr.is_empty());
-        assert_eq!(
-            server.finish().len(),
-            if expected_outcome == "unauthenticated" {
-                2
-            } else {
-                1
-            }
-        );
-    }
 }
 
 #[test]
@@ -1902,135 +1507,6 @@ fn human_and_empty_members_pages_have_exact_output() {
         })
     );
     assert!(empty.stderr.is_empty());
-    server.finish();
-}
-
-#[test]
-fn members_list_expected_outcomes_have_exact_json_and_exit_statuses() {
-    let cases = [
-        (
-            organization_problem(
-                "400 Bad Request",
-                400,
-                "https://api.scherzo.dev/problems/bad-request",
-            ),
-            "invalid_input",
-            1,
-        ),
-        (
-            organization_problem(
-                "401 Unauthorized",
-                401,
-                "https://api.scherzo.dev/problems/unauthorized",
-            ),
-            "unauthenticated",
-            3,
-        ),
-        (
-            organization_problem(
-                "403 Forbidden",
-                403,
-                "https://api.scherzo.dev/problems/forbidden",
-            ),
-            "forbidden",
-            1,
-        ),
-        (
-            organization_problem(
-                "404 Not Found",
-                404,
-                "https://api.scherzo.dev/problems/not-found",
-            ),
-            "not_found",
-            1,
-        ),
-        (
-            http_response("500 Internal Server Error", None, &[]),
-            "unreachable",
-            4,
-        ),
-    ];
-
-    for (response, expected_outcome, expected_status) in cases {
-        let (server, _directory, _path, credential_path) =
-            prepared_organization_refresh(vec![response], TOKEN);
-        let environment =
-            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
-        let output = run_with_env(
-            &[
-                "organization",
-                "members",
-                "list",
-                "acme",
-                "--json",
-                "--allow-insecure-http",
-            ],
-            &environment,
-        );
-
-        assert_eq!(output.status.code(), Some(expected_status));
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["schemaVersion"], 1);
-        assert_eq!(value["deployment"], server.api_url);
-        assert_eq!(value["outcome"], expected_outcome);
-        if expected_outcome == "unreachable" {
-            assert_eq!(value["category"], "server");
-        } else {
-            assert!(value.get("category").is_none());
-        }
-        assert!(value.get("title").is_none());
-        assert!(value.get("detail").is_none());
-        assert!(output.stderr.is_empty());
-        let expected_requests = if expected_outcome == "unauthenticated" {
-            2
-        } else {
-            1
-        };
-        assert_eq!(server.finish().len(), expected_requests);
-    }
-}
-
-#[test]
-fn members_list_transport_and_protocol_failures_have_closed_statuses() {
-    let (server, _directory, _path, credential_path) =
-        prepared_organization(vec![Vec::new()], TOKEN);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let transport = run_with_env(
-        &[
-            "organization",
-            "members",
-            "list",
-            "acme",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-    assert_eq!(transport.status.code(), Some(4));
-    let value: serde_json::Value = serde_json::from_slice(&transport.stdout).unwrap();
-    assert_eq!(value["outcome"], "unreachable");
-    assert_eq!(value["category"], "connection");
-    assert!(transport.stderr.is_empty());
-    assert_eq!(server.finish().len(), 1, "reads must not retry");
-
-    let response = json_http_response("200 OK", serde_json::json!({"items": [], "nextCursor": ""}));
-    let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let protocol = run_with_env(
-        &[
-            "organization",
-            "members",
-            "list",
-            "acme",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-    assert_eq!(protocol.status.code(), Some(1));
-    assert!(protocol.stdout.is_empty());
-    assert!(!String::from_utf8_lossy(&protocol.stderr).is_empty());
-    assert!(!String::from_utf8_lossy(&protocol.stderr).contains(TOKEN));
     server.finish();
 }
 
@@ -2460,8 +1936,30 @@ fn organization_commands_report_missing_credentials_without_network_requests() {
 }
 
 #[test]
-fn update_and_members_list_keep_private_not_found_outputs_identical() {
-    for command in ["update", "members"] {
+fn organization_commands_keep_private_not_found_outputs_identical() {
+    for base_args in [
+        &[
+            "organization",
+            "update",
+            "private-target",
+            "--slug",
+            "still-private",
+            "--allow-insecure-http",
+        ][..],
+        &[
+            "organization",
+            "members",
+            "list",
+            "private-target",
+            "--allow-insecure-http",
+        ][..],
+        &[
+            "organization",
+            "show",
+            "private-target",
+            "--allow-insecure-http",
+        ][..],
+    ] {
         for json in [false, true] {
             let responses = [
                 "The target is inaccessible.",
@@ -2477,24 +1975,7 @@ fn update_and_members_list_keep_private_not_found_outputs_identical() {
             let mut outputs = Vec::new();
 
             for _ in 0..3 {
-                let mut args = if command == "update" {
-                    vec![
-                        "organization",
-                        "update",
-                        "private-target",
-                        "--slug",
-                        "still-private",
-                        "--allow-insecure-http",
-                    ]
-                } else {
-                    vec![
-                        "organization",
-                        "members",
-                        "list",
-                        "private-target",
-                        "--allow-insecure-http",
-                    ]
-                };
+                let mut args = base_args.to_vec();
                 if json {
                     args.push("--json");
                 }

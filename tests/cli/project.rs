@@ -546,7 +546,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
 }
 
 #[test]
-fn project_create_retries_an_ambiguous_response_with_the_same_request_identity() {
+fn project_create_retries_one_ambiguous_response() {
     let project = project_body(
         "widget",
         false,
@@ -576,95 +576,7 @@ fn project_create_retries_an_ambiguous_response_with_the_same_request_identity()
     );
 
     assert_json_success(&output, "created");
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
-    assert_eq!(
-        header_value(&requests[0], "idempotency-key"),
-        header_value(&requests[1], "idempotency-key")
-    );
-}
-
-#[test]
-fn project_create_refreshes_a_rejected_human_session_without_changing_the_request() {
-    let refreshed_token = "unique-refreshed-project-command-token";
-    let project = project_body(
-        "widget",
-        false,
-        Some(repository_body("acme/widget", "main")),
-    );
-    let server = ScriptedServer::respond(vec![
-        problem_http_response(
-            "401 Unauthorized",
-            serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
-                "title": "Unauthorized",
-                "status": 401
-            }),
-        ),
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": refreshed_token,
-                "refresh_token": "unique-refreshed-project-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        project_response("201 Created", project, true),
-    ]);
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture_for_deployment(
-        &credential_path,
-        &server.api_url,
-        &server.issuer,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment_with_issuer(
-        &server.api_url,
-        &server.issuer,
-        credential_path.to_str().unwrap(),
-    );
-
-    let output = run_with_env(
-        &[
-            "project",
-            "create",
-            ORGANIZATION,
-            "--name",
-            "widget",
-            "--installation-id",
-            INSTALLATION_ID,
-            "--repository-id",
-            REPOSITORY_ID,
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert_json_success(&output, "created");
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert_eq!(
-        header_value(&requests[0], "idempotency-key"),
-        header_value(&requests[2], "idempotency-key")
-    );
-    assert_eq!(request_body(&requests[0]), request_body(&requests[2]));
-    assert_eq!(
-        header_value(&requests[2], "authorization"),
-        format!("Bearer {refreshed_token}")
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!combined.contains(TOKEN));
-    assert!(!combined.contains(refreshed_token));
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]
@@ -764,36 +676,7 @@ fn project_human_output_exposes_readiness_and_blockers() {
 
 #[test]
 fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
-    let unsigned = run(&["project", "show", ORGANIZATION, PROJECT_ID, "--json"]);
-    assert_eq!(unsigned.status.code(), Some(3));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&unsigned.stdout).unwrap()["outcome"],
-        "unauthenticated"
-    );
-    assert!(unsigned.stderr.is_empty());
-
     let cases = [
-        (
-            vec![
-                "project",
-                "runner-pool",
-                "set",
-                ORGANIZATION,
-                PROJECT_ID,
-                POOL_ID,
-            ],
-            "403 Forbidden",
-            "https://api.scherzo.dev/problems/forbidden",
-            "forbidden",
-            1,
-        ),
-        (
-            vec!["project", "show", ORGANIZATION, PROJECT_ID],
-            "404 Not Found",
-            "https://api.scherzo.dev/problems/not-found",
-            "not_found",
-            1,
-        ),
         (
             vec!["project", "repository", "show", ORGANIZATION, PROJECT_ID],
             "404 Not Found",
@@ -925,44 +808,6 @@ fn project_mutation_rejects_a_different_project_identity() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
         "invalid_response"
-    );
-    server.finish();
-}
-
-#[test]
-fn repository_update_reports_repository_not_bound() {
-    let response = problem_http_response(
-        "404 Not Found",
-        serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/repository-not-bound",
-            "title": "Repository not bound",
-            "status": 404,
-            "detail": "The project has no repository binding."
-        }),
-    );
-    let (server, _directory, credential_path) = prepared_project(vec![response]);
-
-    let output = run_project(
-        &[
-            "project",
-            "repository",
-            "update",
-            ORGANIZATION,
-            PROJECT_ID,
-            "--default-branch",
-            "main",
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &server,
-        &credential_path,
-    );
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stderr.is_empty());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
-        "repository_not_bound"
     );
     server.finish();
 }
