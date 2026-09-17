@@ -30,55 +30,7 @@ const MAXIMUM_TOTAL_CARRIER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_DIAGNOSTICS: usize = 8_192;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-const DIAGNOSTIC_CODES: &[&str] = &[
-    "artifact_directory_invalid",
-    "artifact_directory_unavailable",
-    "artifact_directory_not_directory",
-    "root_entry_limit_exceeded",
-    "root_entry_unexpected",
-    "boundary_name_invalid",
-    "result_missing",
-    "result_symbolic_link",
-    "result_not_regular_file",
-    "result_unavailable",
-    "result_limit_exceeded",
-    "result_encoding_invalid",
-    "result_json_invalid",
-    "result_schema_unsupported",
-    "recovery_schema_unsupported",
-    "result_schema_invalid",
-    "exports_directory_missing",
-    "exports_directory_symbolic_link",
-    "exports_directory_not_directory",
-    "exports_directory_unavailable",
-    "export_limit_exceeded",
-    "export_entry_invalid",
-    "export_media_type_invalid",
-    "export_path_invalid",
-    "export_ordinal_invalid",
-    "alias_metadata_mismatch",
-    "carrier_limit_exceeded",
-    "carrier_missing",
-    "carrier_symbolic_link",
-    "carrier_not_regular_file",
-    "carrier_unavailable",
-    "carrier_size_limit_exceeded",
-    "carrier_total_size_limit_exceeded",
-    "carrier_size_mismatch",
-    "carrier_digest_mismatch",
-    "carrier_unreferenced",
-    "text_encoding_invalid",
-    "json_content_invalid",
-    "json_content_noncanonical",
-    "git_zero_delta_invalid",
-    "git_bundle_header_invalid",
-    "git_bundle_profile_invalid",
-    "git_pack_invalid",
-    "git_pack_checksum_mismatch",
-    "git_content_invalid",
-    "git_structure_limit_exceeded",
-    "diagnostic_limit_exceeded",
-];
+include!("portable_artifact_diagnostics_generated.rs");
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -101,14 +53,14 @@ pub(crate) enum ArtifactDiagnosticLocation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ArtifactDiagnostic {
-    code: &'static str,
+    code: ArtifactDiagnosticCode,
     message: &'static str,
     location: ArtifactDiagnosticLocation,
 }
 
 impl ArtifactDiagnostic {
     pub(crate) fn code(&self) -> &'static str {
-        self.code
+        self.code.as_str()
     }
 
     pub(crate) fn message(&self) -> &'static str {
@@ -117,7 +69,9 @@ impl ArtifactDiagnostic {
 
     pub(crate) fn missing_carrier_path(&self) -> Option<&str> {
         match &self.location {
-            ArtifactDiagnosticLocation::Carrier { path } if self.code == "carrier_missing" => {
+            ArtifactDiagnosticLocation::Carrier { path }
+                if self.code == ArtifactDiagnosticCode::CarrierMissing =>
+            {
                 Some(path)
             }
             _ => None,
@@ -188,7 +142,7 @@ struct DiagnosticOrder {
 #[derive(Default)]
 struct Diagnostics {
     pending: BTreeMap<DiagnosticOrder, ArtifactDiagnostic>,
-    public_orders: BTreeMap<(&'static str, ArtifactDiagnosticLocation), DiagnosticOrder>,
+    public_orders: BTreeMap<(ArtifactDiagnosticCode, ArtifactDiagnosticLocation), DiagnosticOrder>,
     limit_exceeded: bool,
 }
 
@@ -196,7 +150,7 @@ impl Diagnostics {
     fn push(
         &mut self,
         order: DiagnosticOrder,
-        code: &'static str,
+        code: ArtifactDiagnosticCode,
         location: ArtifactDiagnosticLocation,
     ) {
         let public_key = (code, location.clone());
@@ -223,13 +177,13 @@ impl Diagnostics {
         }
     }
 
-    fn root(&mut self, code: &'static str, path: Option<&str>) {
+    fn root(&mut self, code: ArtifactDiagnosticCode, path: Option<&str>) {
         self.push(
             DiagnosticOrder {
                 stage: 0,
                 major: Vec::new(),
-                check: code_rank(code),
-                code: code_rank(code),
+                check: code.rank(),
+                code: code.rank(),
                 minor: path.unwrap_or_default().as_bytes().to_vec(),
             },
             code,
@@ -237,13 +191,13 @@ impl Diagnostics {
         );
     }
 
-    fn result(&mut self, code: &'static str, pointer: Option<&str>) {
+    fn result(&mut self, code: ArtifactDiagnosticCode, pointer: Option<&str>) {
         self.push(
             DiagnosticOrder {
                 stage: 1,
                 major: Vec::new(),
-                check: code_rank(code),
-                code: code_rank(code),
+                check: code.rank(),
+                code: code.rank(),
                 minor: pointer.unwrap_or_default().as_bytes().to_vec(),
             },
             code,
@@ -253,13 +207,13 @@ impl Diagnostics {
         );
     }
 
-    fn export(&mut self, code: &'static str, export: &str, check: usize) {
+    fn export(&mut self, code: ArtifactDiagnosticCode, export: &str, check: usize) {
         self.push(
             DiagnosticOrder {
                 stage: 2,
                 major: export.as_bytes().to_vec(),
                 check,
-                code: code_rank(code),
+                code: code.rank(),
                 minor: Vec::new(),
             },
             code,
@@ -275,10 +229,10 @@ impl Diagnostics {
                 stage: 3,
                 major: path.as_bytes().to_vec(),
                 check: 0,
-                code: code_rank("alias_metadata_mismatch"),
+                code: ArtifactDiagnosticCode::AliasMetadataMismatch.rank(),
                 minor: Vec::new(),
             },
-            "alias_metadata_mismatch",
+            ArtifactDiagnosticCode::AliasMetadataMismatch,
             ArtifactDiagnosticLocation::Carrier {
                 path: path.to_owned(),
             },
@@ -291,23 +245,23 @@ impl Diagnostics {
                 stage: 4,
                 major: Vec::new(),
                 check: 0,
-                code: code_rank("carrier_limit_exceeded"),
+                code: ArtifactDiagnosticCode::CarrierLimitExceeded.rank(),
                 minor: Vec::new(),
             },
-            "carrier_limit_exceeded",
+            ArtifactDiagnosticCode::CarrierLimitExceeded,
             ArtifactDiagnosticLocation::Result {
                 pointer: Some("/exports".to_owned()),
             },
         );
     }
 
-    fn carrier(&mut self, code: &'static str, path: &str, check: usize) {
+    fn carrier(&mut self, code: ArtifactDiagnosticCode, path: &str, check: usize) {
         self.push(
             DiagnosticOrder {
                 stage: 5,
                 major: path.as_bytes().to_vec(),
                 check,
-                code: code_rank(code),
+                code: code.rank(),
                 minor: Vec::new(),
             },
             code,
@@ -323,21 +277,21 @@ impl Diagnostics {
                 stage: 6,
                 major: Vec::new(),
                 check: 0,
-                code: code_rank("carrier_limit_exceeded"),
+                code: ArtifactDiagnosticCode::CarrierLimitExceeded.rank(),
                 minor: Vec::new(),
             },
-            "carrier_limit_exceeded",
+            ArtifactDiagnosticCode::CarrierLimitExceeded,
             ArtifactDiagnosticLocation::ArtifactDirectory,
         );
     }
 
-    fn inventory(&mut self, code: &'static str, path: Option<&str>) {
+    fn inventory(&mut self, code: ArtifactDiagnosticCode, path: Option<&str>) {
         self.push(
             DiagnosticOrder {
                 stage: 6,
                 major: path.unwrap_or_default().as_bytes().to_vec(),
                 check: 1,
-                code: code_rank(code),
+                code: code.rank(),
                 minor: Vec::new(),
             },
             code,
@@ -350,8 +304,8 @@ impl Diagnostics {
         if self.limit_exceeded {
             diagnostics.truncate(MAXIMUM_DIAGNOSTICS - 1);
             diagnostics.push(ArtifactDiagnostic {
-                code: "diagnostic_limit_exceeded",
-                message: diagnostic_message("diagnostic_limit_exceeded"),
+                code: ArtifactDiagnosticCode::DiagnosticLimitExceeded,
+                message: diagnostic_message(ArtifactDiagnosticCode::DiagnosticLimitExceeded),
                 location: ArtifactDiagnosticLocation::ArtifactDirectory,
             });
         }
@@ -367,73 +321,119 @@ fn boundary_location(path: Option<&str>) -> ArtifactDiagnosticLocation {
     })
 }
 
-fn code_rank(code: &str) -> usize {
-    DIAGNOSTIC_CODES
-        .iter()
-        .position(|candidate| *candidate == code)
-        .unwrap_or(DIAGNOSTIC_CODES.len())
-}
-
-fn diagnostic_message(code: &str) -> &'static str {
+fn diagnostic_message(code: ArtifactDiagnosticCode) -> &'static str {
     match code {
-        "artifact_directory_invalid" => "The artifact directory path cannot be represented safely.",
-        "artifact_directory_unavailable" => "The artifact directory is unavailable.",
-        "artifact_directory_not_directory" => "The artifact directory path is not a directory.",
-        "root_entry_limit_exceeded" => "The artifact directory contains too many entries.",
-        "root_entry_unexpected" => "The artifact directory contains an unexpected entry.",
-        "boundary_name_invalid" => "A directory entry name is not valid UTF-8.",
-        "result_missing" => "The artifact set does not contain result.json.",
-        "result_symbolic_link" => "result.json is a symbolic link.",
-        "result_not_regular_file" => "result.json is not a regular file.",
-        "result_unavailable" => "result.json could not be read safely.",
-        "result_limit_exceeded" => "result.json exceeds the artifact set limit.",
-        "result_encoding_invalid" => "result.json does not use the required UTF-8 encoding.",
-        "result_json_invalid" => "result.json is not one complete unique-member JSON value.",
-        "result_schema_unsupported" => "result.json uses an unsupported schema version.",
-        "recovery_schema_unsupported" => {
+        ArtifactDiagnosticCode::ArtifactDirectoryInvalid => {
+            "The artifact directory path cannot be represented safely."
+        }
+        ArtifactDiagnosticCode::ArtifactDirectoryUnavailable => {
+            "The artifact directory is unavailable."
+        }
+        ArtifactDiagnosticCode::ArtifactDirectoryNotDirectory => {
+            "The artifact directory path is not a directory."
+        }
+        ArtifactDiagnosticCode::RootEntryLimitExceeded => {
+            "The artifact directory contains too many entries."
+        }
+        ArtifactDiagnosticCode::RootEntryUnexpected => {
+            "The artifact directory contains an unexpected entry."
+        }
+        ArtifactDiagnosticCode::BoundaryNameInvalid => "A directory entry name is not valid UTF-8.",
+        ArtifactDiagnosticCode::ResultMissing => "The artifact set does not contain result.json.",
+        ArtifactDiagnosticCode::ResultSymbolicLink => "result.json is a symbolic link.",
+        ArtifactDiagnosticCode::ResultNotRegularFile => "result.json is not a regular file.",
+        ArtifactDiagnosticCode::ResultUnavailable => "result.json could not be read safely.",
+        ArtifactDiagnosticCode::ResultLimitExceeded => {
+            "result.json exceeds the artifact set limit."
+        }
+        ArtifactDiagnosticCode::ResultEncodingInvalid => {
+            "result.json does not use the required UTF-8 encoding."
+        }
+        ArtifactDiagnosticCode::ResultJsonInvalid => {
+            "result.json is not one complete unique-member JSON value."
+        }
+        ArtifactDiagnosticCode::ResultSchemaUnsupported => {
+            "result.json uses an unsupported schema version."
+        }
+        ArtifactDiagnosticCode::RecoverySchemaUnsupported => {
             "result.json uses an unsupported recovery summary schema version."
         }
-        "result_schema_invalid" => "result.json violates the portable workflow result contract.",
-        "exports_directory_missing" => "The artifact set does not contain exports.",
-        "exports_directory_symbolic_link" => "exports is a symbolic link.",
-        "exports_directory_not_directory" => "exports is not a directory.",
-        "exports_directory_unavailable" => "The exports directory could not be read safely.",
-        "export_limit_exceeded" => "result.json declares too many exports.",
-        "export_entry_invalid" => "The export entry violates the closed artifact set shape.",
-        "export_media_type_invalid" => "The export media type is invalid for its artifact kind.",
-        "export_path_invalid" => "The export carrier path is not a portable artifact path.",
-        "export_ordinal_invalid" => {
+        ArtifactDiagnosticCode::ResultSchemaInvalid => {
+            "result.json violates the portable workflow result contract."
+        }
+        ArtifactDiagnosticCode::ExportsDirectoryMissing => {
+            "The artifact set does not contain exports."
+        }
+        ArtifactDiagnosticCode::ExportsDirectorySymbolicLink => "exports is a symbolic link.",
+        ArtifactDiagnosticCode::ExportsDirectoryNotDirectory => "exports is not a directory.",
+        ArtifactDiagnosticCode::ExportsDirectoryUnavailable => {
+            "The exports directory could not be read safely."
+        }
+        ArtifactDiagnosticCode::ExportLimitExceeded => "result.json declares too many exports.",
+        ArtifactDiagnosticCode::ExportEntryInvalid => {
+            "The export entry violates the closed artifact set shape."
+        }
+        ArtifactDiagnosticCode::ExportMediaTypeInvalid => {
+            "The export media type is invalid for its artifact kind."
+        }
+        ArtifactDiagnosticCode::ExportPathInvalid => {
+            "The export carrier path is not a portable artifact path."
+        }
+        ArtifactDiagnosticCode::ExportOrdinalInvalid => {
             "The export carrier path does not use its physical owner's ordinal."
         }
-        "alias_metadata_mismatch" => {
+        ArtifactDiagnosticCode::AliasMetadataMismatch => {
             "Exports sharing a carrier path do not repeat identical metadata."
         }
-        "carrier_limit_exceeded" => "The artifact set exceeds the carrier limit.",
-        "carrier_missing" => "A referenced carrier is missing.",
-        "carrier_symbolic_link" => "A referenced carrier is a symbolic link.",
-        "carrier_not_regular_file" => "A referenced carrier is not a regular file.",
-        "carrier_unavailable" => "A referenced carrier could not be read safely.",
-        "carrier_size_limit_exceeded" => "A carrier exceeds the per-carrier byte limit.",
-        "carrier_total_size_limit_exceeded" => {
+        ArtifactDiagnosticCode::CarrierLimitExceeded => {
+            "The artifact set exceeds the carrier limit."
+        }
+        ArtifactDiagnosticCode::CarrierMissing => "A referenced carrier is missing.",
+        ArtifactDiagnosticCode::CarrierSymbolicLink => "A referenced carrier is a symbolic link.",
+        ArtifactDiagnosticCode::CarrierNotRegularFile => {
+            "A referenced carrier is not a regular file."
+        }
+        ArtifactDiagnosticCode::CarrierUnavailable => {
+            "A referenced carrier could not be read safely."
+        }
+        ArtifactDiagnosticCode::CarrierSizeLimitExceeded => {
+            "A carrier exceeds the per-carrier byte limit."
+        }
+        ArtifactDiagnosticCode::CarrierTotalSizeLimitExceeded => {
             "The artifact set exceeds the aggregate carrier byte limit."
         }
-        "carrier_size_mismatch" => "The carrier size does not match result.json.",
-        "carrier_digest_mismatch" => "The carrier digest does not match result.json.",
-        "carrier_unreferenced" => "The exports directory contains an unreferenced entry.",
-        "text_encoding_invalid" => "The text carrier is not valid UTF-8.",
-        "json_content_invalid" => "The JSON carrier is not one valid RFC 8259 JSON value.",
-        "json_content_noncanonical" => "The JSON carrier is not in compact ordered canonical form.",
-        "git_zero_delta_invalid" => "The zero-delta Git artifact is invalid.",
-        "git_bundle_header_invalid" => "The Git bundle header is invalid.",
-        "git_bundle_profile_invalid" => "The Git bundle does not satisfy the Scherzo profile.",
-        "git_pack_invalid" => "The Git pack stream is invalid.",
-        "git_pack_checksum_mismatch" => "The Git pack checksum does not match.",
-        "git_content_invalid" => "The Git bundle content does not match its descriptor.",
-        "git_structure_limit_exceeded" => "The Git artifact exceeds a structural validation limit.",
-        "diagnostic_limit_exceeded" => {
+        ArtifactDiagnosticCode::CarrierSizeMismatch => {
+            "The carrier size does not match result.json."
+        }
+        ArtifactDiagnosticCode::CarrierDigestMismatch => {
+            "The carrier digest does not match result.json."
+        }
+        ArtifactDiagnosticCode::CarrierUnreferenced => {
+            "The exports directory contains an unreferenced entry."
+        }
+        ArtifactDiagnosticCode::TextEncodingInvalid => "The text carrier is not valid UTF-8.",
+        ArtifactDiagnosticCode::JsonContentInvalid => {
+            "The JSON carrier is not one valid RFC 8259 JSON value."
+        }
+        ArtifactDiagnosticCode::JsonContentNoncanonical => {
+            "The JSON carrier is not in compact ordered canonical form."
+        }
+        ArtifactDiagnosticCode::GitZeroDeltaInvalid => "The zero-delta Git artifact is invalid.",
+        ArtifactDiagnosticCode::GitBundleHeaderInvalid => "The Git bundle header is invalid.",
+        ArtifactDiagnosticCode::GitBundleProfileInvalid => {
+            "The Git bundle does not satisfy the Scherzo profile."
+        }
+        ArtifactDiagnosticCode::GitPackInvalid => "The Git pack stream is invalid.",
+        ArtifactDiagnosticCode::GitPackChecksumMismatch => "The Git pack checksum does not match.",
+        ArtifactDiagnosticCode::GitContentInvalid => {
+            "The Git bundle content does not match its descriptor."
+        }
+        ArtifactDiagnosticCode::GitStructureLimitExceeded => {
+            "The Git artifact exceeds a structural validation limit."
+        }
+        ArtifactDiagnosticCode::DiagnosticLimitExceeded => {
             "Additional artifact diagnostics were omitted at the report limit."
         }
-        _ => "The artifact set is invalid.",
     }
 }
 
@@ -452,9 +452,9 @@ pub(crate) fn validate_portable_artifact_set(
         Ok(path) => path,
         Err(_) => {
             if artifact_directory.is_none() {
-                diagnostics.root("artifact_directory_invalid", None);
+                diagnostics.root(ArtifactDiagnosticCode::ArtifactDirectoryInvalid, None);
             }
-            diagnostics.root("artifact_directory_unavailable", None);
+            diagnostics.root(ArtifactDiagnosticCode::ArtifactDirectoryUnavailable, None);
             return Ok(finish_report(
                 artifact_directory,
                 diagnostics,
@@ -470,7 +470,7 @@ pub(crate) fn validate_portable_artifact_set(
     };
     artifact_directory = canonical.to_str().map(str::to_owned);
     if artifact_directory.is_none() {
-        diagnostics.root("artifact_directory_invalid", None);
+        diagnostics.root(ArtifactDiagnosticCode::ArtifactDirectoryInvalid, None);
     }
 
     let root = match open(
@@ -480,7 +480,7 @@ pub(crate) fn validate_portable_artifact_set(
     ) {
         Ok(root) => root,
         Err(Errno::NOTDIR) => {
-            diagnostics.root("artifact_directory_not_directory", None);
+            diagnostics.root(ArtifactDiagnosticCode::ArtifactDirectoryNotDirectory, None);
             return Ok(finish_report(
                 artifact_directory,
                 diagnostics,
@@ -488,7 +488,7 @@ pub(crate) fn validate_portable_artifact_set(
             ));
         }
         Err(_) => {
-            diagnostics.root("artifact_directory_unavailable", None);
+            diagnostics.root(ArtifactDiagnosticCode::ArtifactDirectoryUnavailable, None);
             return Ok(finish_report(
                 artifact_directory,
                 diagnostics,
@@ -541,9 +541,13 @@ pub(crate) fn validate_portable_artifact_set(
                     .collect::<BTreeSet<_>>();
                 for name in names.difference(&expected) {
                     match std::str::from_utf8(name) {
-                        Ok(name) => diagnostics
-                            .inventory("carrier_unreferenced", Some(&format!("exports/{name}"))),
-                        Err(_) => diagnostics.inventory("boundary_name_invalid", None),
+                        Ok(name) => diagnostics.inventory(
+                            ArtifactDiagnosticCode::CarrierUnreferenced,
+                            Some(&format!("exports/{name}")),
+                        ),
+                        Err(_) => {
+                            diagnostics.inventory(ArtifactDiagnosticCode::BoundaryNameInvalid, None)
+                        }
                     }
                 }
             }
@@ -629,15 +633,19 @@ fn inspect_root_boundary(
     diagnostics: &mut Diagnostics,
 ) -> Result<(), PortableArtifactValidationFailure> {
     match enumerate_names(root, ROOT_OVERFLOW_ENTRY, cancelled) {
-        Ok(EntryInventory::Overflow) => diagnostics.root("root_entry_limit_exceeded", None),
+        Ok(EntryInventory::Overflow) => {
+            diagnostics.root(ArtifactDiagnosticCode::RootEntryLimitExceeded, None)
+        }
         Ok(EntryInventory::Complete(names)) => {
             for name in names {
                 if name == RESULT_FILE.as_bytes() || name == EXPORT_DIRECTORY.as_bytes() {
                     continue;
                 }
                 match std::str::from_utf8(&name) {
-                    Ok(name) => diagnostics.root("root_entry_unexpected", Some(name)),
-                    Err(_) => diagnostics.root("boundary_name_invalid", None),
+                    Ok(name) => {
+                        diagnostics.root(ArtifactDiagnosticCode::RootEntryUnexpected, Some(name))
+                    }
+                    Err(_) => diagnostics.root(ArtifactDiagnosticCode::BoundaryNameInvalid, None),
                 }
             }
         }
@@ -645,7 +653,7 @@ fn inspect_root_boundary(
             return Err(PortableArtifactValidationFailure::Interrupted);
         }
         Err(EnumerationFailure::Unavailable) => {
-            diagnostics.root("artifact_directory_unavailable", None);
+            diagnostics.root(ArtifactDiagnosticCode::ArtifactDirectoryUnavailable, None);
         }
     }
     Ok(())
@@ -655,11 +663,11 @@ fn require_regular_result(stat: &Stat, diagnostics: &mut Diagnostics) -> bool {
     match FileType::from_raw_mode(stat.st_mode) {
         FileType::RegularFile => true,
         FileType::Symlink => {
-            diagnostics.result("result_symbolic_link", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultSymbolicLink, None);
             false
         }
         _ => {
-            diagnostics.result("result_not_regular_file", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultNotRegularFile, None);
             false
         }
     }
@@ -673,11 +681,11 @@ fn read_result(
     let named = match statat(root, RESULT_FILE, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(Errno::NOENT | Errno::NOTDIR) => {
-            diagnostics.result("result_missing", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultMissing, None);
             return Ok(None);
         }
         Err(_) => {
-            diagnostics.result("result_unavailable", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
             return Ok(None);
         }
     };
@@ -689,19 +697,19 @@ fn read_result(
         RESULT_FILE,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
     ) else {
-        diagnostics.result("result_unavailable", None);
+        diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
         return Ok(None);
     };
     let before = match fstat(&descriptor) {
         Ok(stat) if require_regular_result(&stat, diagnostics) => stat,
         Ok(_) => return Ok(None),
         Err(_) => {
-            diagnostics.result("result_unavailable", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
             return Ok(None);
         }
     };
     if !same_identity(&named, &before) {
-        diagnostics.result("result_unavailable", None);
+        diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
     }
 
     let mut file = File::from(descriptor);
@@ -712,19 +720,19 @@ fn read_result(
     ) {
         Ok(BoundedRead::Complete(bytes)) => bytes,
         Ok(BoundedRead::LimitExceeded) => {
-            diagnostics.result("result_limit_exceeded", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultLimitExceeded, None);
             return Ok(None);
         }
         Err(ReadFailure::Interrupted) => {
             return Err(PortableArtifactValidationFailure::Interrupted);
         }
         Err(ReadFailure::Unavailable) => {
-            diagnostics.result("result_unavailable", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
             return Ok(None);
         }
     };
     if retained_file_changed(root, RESULT_FILE, &file, &before) {
-        diagnostics.result("result_unavailable", None);
+        diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
     }
     Ok(Some(bytes))
 }
@@ -889,11 +897,11 @@ fn inspect_metadata(bytes: &[u8], diagnostics: &mut Diagnostics) -> MetadataInsp
     let mut document = match result_metadata::decode_document(bytes) {
         Ok(document) => document,
         Err(ResultDocumentError::Encoding) => {
-            diagnostics.result("result_encoding_invalid", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultEncodingInvalid, None);
             return MetadataInspection::default();
         }
         Err(ResultDocumentError::Json) => {
-            diagnostics.result("result_json_invalid", None);
+            diagnostics.result(ArtifactDiagnosticCode::ResultJsonInvalid, None);
             return MetadataInspection::default();
         }
     };
@@ -906,16 +914,25 @@ fn inspect_metadata(bytes: &[u8], diagnostics: &mut Diagnostics) -> MetadataInsp
         Some(Value::Number(version))
             if version.as_i64().is_some() || version.as_u64().is_some() =>
         {
-            diagnostics.result("result_schema_unsupported", Some("/schemaVersion"));
+            diagnostics.result(
+                ArtifactDiagnosticCode::ResultSchemaUnsupported,
+                Some("/schemaVersion"),
+            );
         }
-        _ => diagnostics.result("result_schema_invalid", Some("/schemaVersion")),
+        _ => diagnostics.result(
+            ArtifactDiagnosticCode::ResultSchemaInvalid,
+            Some("/schemaVersion"),
+        ),
     }
     if supported_schema && result_metadata::dispatch_recovery_summary_versions(&document).is_err() {
-        diagnostics.result("recovery_schema_unsupported", Some("/steps"));
+        diagnostics.result(
+            ArtifactDiagnosticCode::RecoverySchemaUnsupported,
+            Some("/steps"),
+        );
         supported_schema = false;
     }
     if supported_schema && result_metadata::validate_document_envelope(&mut document).is_err() {
-        diagnostics.result("result_schema_invalid", None);
+        diagnostics.result(ArtifactDiagnosticCode::ResultSchemaInvalid, None);
     }
 
     let Some(exports) = document.get_mut("exports").and_then(Value::as_object_mut) else {
@@ -933,7 +950,10 @@ fn inspect_exports(
         ..MetadataInspection::default()
     };
     if exports.len() > MAXIMUM_EXPORTS {
-        diagnostics.result("export_limit_exceeded", Some("/exports"));
+        diagnostics.result(
+            ArtifactDiagnosticCode::ExportLimitExceeded,
+            Some("/exports"),
+        );
     }
 
     exports.sort_keys();
@@ -993,10 +1013,10 @@ fn inspect_exports(
             }
         };
         if !shape_valid {
-            diagnostics.export("export_entry_invalid", name, 0);
+            diagnostics.export(ArtifactDiagnosticCode::ExportEntryInvalid, name, 0);
         }
         if invalid_zero_delta {
-            diagnostics.export("git_zero_delta_invalid", name, 4);
+            diagnostics.export(ArtifactDiagnosticCode::GitZeroDeltaInvalid, name, 4);
         }
 
         if let (Some(kind), Some(media_type)) =
@@ -1004,7 +1024,7 @@ fn inspect_exports(
             && kind != CarrierKind::GitBranch
             && !result_metadata::valid_export_kind(kind.as_str(), media_type)
         {
-            diagnostics.export("export_media_type_invalid", name, 1);
+            diagnostics.export(ArtifactDiagnosticCode::ExportMediaTypeInvalid, name, 1);
         }
         if kind == Some(CarrierKind::GitBranch)
             && nested_carrier
@@ -1012,7 +1032,7 @@ fn inspect_exports(
                 .and_then(Value::as_str)
                 .is_some_and(|media_type| media_type != "application/vnd.git.bundle")
         {
-            diagnostics.export("export_media_type_invalid", name, 1);
+            diagnostics.export(ArtifactDiagnosticCode::ExportMediaTypeInvalid, name, 1);
         }
 
         record_carrier_reference(
@@ -1063,7 +1083,7 @@ fn record_carrier_reference(
         return;
     };
     if result_metadata::parse_carrier_ordinal(path).is_none() {
-        diagnostics.export("export_path_invalid", name, 2);
+        diagnostics.export(ArtifactDiagnosticCode::ExportPathInvalid, name, 2);
         return;
     }
 
@@ -1083,7 +1103,7 @@ fn record_carrier_reference(
         }
     };
     if result_metadata::parse_carrier_ordinal(path) != Some(group.owner_ordinal) {
-        diagnostics.export("export_ordinal_invalid", name, 3);
+        diagnostics.export(ArtifactDiagnosticCode::ExportOrdinalInvalid, name, 3);
     }
 }
 
@@ -1222,22 +1242,34 @@ fn open_exports_directory(
     let named = match statat(root, EXPORT_DIRECTORY, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(Errno::NOENT | Errno::NOTDIR) => {
-            diagnostics.root("exports_directory_missing", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryMissing,
+                Some(EXPORT_DIRECTORY),
+            );
             return Ok(None);
         }
         Err(_) => {
-            diagnostics.root("exports_directory_unavailable", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryUnavailable,
+                Some(EXPORT_DIRECTORY),
+            );
             return Ok(None);
         }
     };
     match FileType::from_raw_mode(named.st_mode) {
         FileType::Symlink => {
-            diagnostics.root("exports_directory_symbolic_link", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectorySymbolicLink,
+                Some(EXPORT_DIRECTORY),
+            );
             return Ok(None);
         }
         FileType::Directory => {}
         _ => {
-            diagnostics.root("exports_directory_not_directory", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryNotDirectory,
+                Some(EXPORT_DIRECTORY),
+            );
             return Ok(None);
         }
     }
@@ -1246,7 +1278,10 @@ fn open_exports_directory(
         EXPORT_DIRECTORY,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
     ) else {
-        diagnostics.root("exports_directory_unavailable", Some(EXPORT_DIRECTORY));
+        diagnostics.root(
+            ArtifactDiagnosticCode::ExportsDirectoryUnavailable,
+            Some(EXPORT_DIRECTORY),
+        );
         return Ok(None);
     };
     Ok(match fstat(&directory) {
@@ -1257,11 +1292,17 @@ fn open_exports_directory(
             Some(directory)
         }
         Ok(opened) if FileType::from_raw_mode(opened.st_mode) != FileType::Directory => {
-            diagnostics.root("exports_directory_not_directory", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryNotDirectory,
+                Some(EXPORT_DIRECTORY),
+            );
             None
         }
         Ok(_) | Err(_) => {
-            diagnostics.root("exports_directory_unavailable", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryUnavailable,
+                Some(EXPORT_DIRECTORY),
+            );
             None
         }
     })
@@ -1271,22 +1312,37 @@ fn recheck_exports_directory(root: &OwnedFd, exports: &OwnedFd, diagnostics: &mu
     let opened = fstat(exports);
     match statat(root, EXPORT_DIRECTORY, AtFlags::SYMLINK_NOFOLLOW) {
         Err(Errno::NOENT | Errno::NOTDIR) => {
-            diagnostics.root("exports_directory_missing", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryMissing,
+                Some(EXPORT_DIRECTORY),
+            );
         }
         Ok(named) => match FileType::from_raw_mode(named.st_mode) {
             FileType::Symlink => {
-                diagnostics.root("exports_directory_symbolic_link", Some(EXPORT_DIRECTORY));
+                diagnostics.root(
+                    ArtifactDiagnosticCode::ExportsDirectorySymbolicLink,
+                    Some(EXPORT_DIRECTORY),
+                );
             }
             FileType::Directory
                 if opened
                     .as_ref()
                     .is_ok_and(|opened| same_identity(&named, opened)) => {}
             FileType::Directory => {
-                diagnostics.root("exports_directory_unavailable", Some(EXPORT_DIRECTORY));
+                diagnostics.root(
+                    ArtifactDiagnosticCode::ExportsDirectoryUnavailable,
+                    Some(EXPORT_DIRECTORY),
+                );
             }
-            _ => diagnostics.root("exports_directory_not_directory", Some(EXPORT_DIRECTORY)),
+            _ => diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryNotDirectory,
+                Some(EXPORT_DIRECTORY),
+            ),
         },
-        Err(_) => diagnostics.root("exports_directory_unavailable", Some(EXPORT_DIRECTORY)),
+        Err(_) => diagnostics.root(
+            ArtifactDiagnosticCode::ExportsDirectoryUnavailable,
+            Some(EXPORT_DIRECTORY),
+        ),
     }
 }
 
@@ -1299,7 +1355,10 @@ fn enumerate_exports(
         Ok(inventory) => Ok(inventory),
         Err(EnumerationFailure::Interrupted) => Err(PortableArtifactValidationFailure::Interrupted),
         Err(EnumerationFailure::Unavailable) => {
-            diagnostics.root("exports_directory_unavailable", Some(EXPORT_DIRECTORY));
+            diagnostics.root(
+                ArtifactDiagnosticCode::ExportsDirectoryUnavailable,
+                Some(EXPORT_DIRECTORY),
+            );
             Ok(EntryInventory::Complete(BTreeSet::new()))
         }
     }
@@ -1348,7 +1407,7 @@ fn validate_carrier(
     diagnostics: &mut Diagnostics,
 ) -> Result<(), PortableArtifactValidationFailure> {
     let Some(exports) = exports else {
-        diagnostics.carrier("carrier_missing", path, 0);
+        diagnostics.carrier(ArtifactDiagnosticCode::CarrierMissing, path, 0);
         return Ok(());
     };
     let Some(name) = path.strip_prefix("exports/") else {
@@ -1357,11 +1416,11 @@ fn validate_carrier(
     let named = match statat(exports, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(Errno::NOENT | Errno::NOTDIR) => {
-            diagnostics.carrier("carrier_missing", path, 0);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierMissing, path, 0);
             return Ok(());
         }
         Err(_) => {
-            diagnostics.carrier("carrier_unavailable", path, 0);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0);
             return Ok(());
         }
     };
@@ -1380,12 +1439,12 @@ fn validate_carrier(
         Ok(stat) if require_regular_carrier(&stat, path, diagnostics) => stat,
         Ok(_) => return Ok(()),
         Err(_) => {
-            diagnostics.carrier("carrier_unavailable", path, 0);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0);
             return Ok(());
         }
     };
     if !same_identity(&named, &before) {
-        diagnostics.carrier("carrier_unavailable", path, 0);
+        diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0);
     }
 
     let mut file = File::from(descriptor);
@@ -1402,7 +1461,11 @@ fn validate_carrier(
             .saturating_add(1)
             .min(COPY_BUFFER_BYTES as u64);
         if permitted == 0 {
-            diagnostics.carrier("carrier_total_size_limit_exceeded", path, 1);
+            diagnostics.carrier(
+                ArtifactDiagnosticCode::CarrierTotalSizeLimitExceeded,
+                path,
+                1,
+            );
             complete = false;
             break;
         }
@@ -1411,7 +1474,7 @@ fn validate_carrier(
         {
             Ok(read) => read,
             Err(_) => {
-                diagnostics.carrier("carrier_unavailable", path, 0);
+                diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0);
                 complete = false;
                 break;
             }
@@ -1423,12 +1486,16 @@ fn validate_carrier(
         observed = observed.saturating_add(read_u64);
         *total_bytes = total_bytes.saturating_add(read_u64);
         if observed > MAXIMUM_CARRIER_BYTES {
-            diagnostics.carrier("carrier_size_limit_exceeded", path, 1);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierSizeLimitExceeded, path, 1);
             complete = false;
             break;
         }
         if *total_bytes > MAXIMUM_TOTAL_CARRIER_BYTES {
-            diagnostics.carrier("carrier_total_size_limit_exceeded", path, 1);
+            diagnostics.carrier(
+                ArtifactDiagnosticCode::CarrierTotalSizeLimitExceeded,
+                path,
+                1,
+            );
             complete = false;
             break;
         }
@@ -1441,7 +1508,7 @@ fn validate_carrier(
             .iter()
             .any(|expected| *expected != observed)
         {
-            diagnostics.carrier("carrier_size_mismatch", path, 2);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierSizeMismatch, path, 2);
         }
         let observed_digest = lowercase_hex(digest.finish().as_ref());
         if group
@@ -1449,7 +1516,7 @@ fn validate_carrier(
             .iter()
             .any(|expected| expected != &observed_digest)
         {
-            diagnostics.carrier("carrier_digest_mismatch", path, 3);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierDigestMismatch, path, 3);
         }
 
         for profile in &group.kinds {
@@ -1463,10 +1530,18 @@ fn validate_carrier(
                     match content {
                         Ok(()) => {}
                         Err(TextContentFailure::Invalid) => {
-                            diagnostics.carrier("text_encoding_invalid", path, 5);
+                            diagnostics.carrier(
+                                ArtifactDiagnosticCode::TextEncodingInvalid,
+                                path,
+                                5,
+                            );
                         }
                         Err(TextContentFailure::Unavailable) => {
-                            diagnostics.carrier("carrier_unavailable", path, 0);
+                            diagnostics.carrier(
+                                ArtifactDiagnosticCode::CarrierUnavailable,
+                                path,
+                                0,
+                            );
                         }
                         Err(TextContentFailure::Interrupted) => {
                             return Err(PortableArtifactValidationFailure::Interrupted);
@@ -1476,13 +1551,21 @@ fn validate_carrier(
                 CarrierKind::Json => {
                     let code = match validate_json_content(&mut file, cancelled) {
                         Ok(()) => None,
-                        Err(JsonContentFailure::Invalid) => Some("json_content_invalid"),
-                        Err(JsonContentFailure::Noncanonical) => Some("json_content_noncanonical"),
+                        Err(JsonContentFailure::Invalid) => {
+                            Some(ArtifactDiagnosticCode::JsonContentInvalid)
+                        }
+                        Err(JsonContentFailure::Noncanonical) => {
+                            Some(ArtifactDiagnosticCode::JsonContentNoncanonical)
+                        }
                         Err(JsonContentFailure::Interrupted) => {
                             return Err(PortableArtifactValidationFailure::Interrupted);
                         }
                         Err(JsonContentFailure::Unavailable) => {
-                            diagnostics.carrier("carrier_unavailable", path, 0);
+                            diagnostics.carrier(
+                                ArtifactDiagnosticCode::CarrierUnavailable,
+                                path,
+                                0,
+                            );
                             None
                         }
                     };
@@ -1523,14 +1606,14 @@ fn diagnose_git_artifact_failure(
     diagnostics: &mut Diagnostics,
 ) -> Result<(), PortableArtifactValidationFailure> {
     let code = match failure {
-        GitArtifactFailure::Header => "git_bundle_header_invalid",
-        GitArtifactFailure::Profile => "git_bundle_profile_invalid",
-        GitArtifactFailure::Pack => "git_pack_invalid",
-        GitArtifactFailure::Checksum => "git_pack_checksum_mismatch",
-        GitArtifactFailure::Content => "git_content_invalid",
-        GitArtifactFailure::StructureLimit => "git_structure_limit_exceeded",
+        GitArtifactFailure::Header => ArtifactDiagnosticCode::GitBundleHeaderInvalid,
+        GitArtifactFailure::Profile => ArtifactDiagnosticCode::GitBundleProfileInvalid,
+        GitArtifactFailure::Pack => ArtifactDiagnosticCode::GitPackInvalid,
+        GitArtifactFailure::Checksum => ArtifactDiagnosticCode::GitPackChecksumMismatch,
+        GitArtifactFailure::Content => ArtifactDiagnosticCode::GitContentInvalid,
+        GitArtifactFailure::StructureLimit => ArtifactDiagnosticCode::GitStructureLimitExceeded,
         GitArtifactFailure::Unavailable => {
-            diagnostics.carrier("carrier_unavailable", path, 0);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0);
             return Ok(());
         }
         GitArtifactFailure::Scratch => {
@@ -1548,11 +1631,11 @@ fn require_regular_carrier(stat: &Stat, path: &str, diagnostics: &mut Diagnostic
     match FileType::from_raw_mode(stat.st_mode) {
         FileType::RegularFile => true,
         FileType::Symlink => {
-            diagnostics.carrier("carrier_symbolic_link", path, 0);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierSymbolicLink, path, 0);
             false
         }
         _ => {
-            diagnostics.carrier("carrier_not_regular_file", path, 0);
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierNotRegularFile, path, 0);
             false
         }
     }
@@ -1565,13 +1648,19 @@ fn diagnose_current_carrier(
     diagnostics: &mut Diagnostics,
 ) {
     match statat(exports, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Err(Errno::NOENT | Errno::NOTDIR) => diagnostics.carrier("carrier_missing", path, 0),
+        Err(Errno::NOENT | Errno::NOTDIR) => {
+            diagnostics.carrier(ArtifactDiagnosticCode::CarrierMissing, path, 0)
+        }
         Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Symlink => diagnostics.carrier("carrier_symbolic_link", path, 0),
-            FileType::RegularFile => diagnostics.carrier("carrier_unavailable", path, 0),
-            _ => diagnostics.carrier("carrier_not_regular_file", path, 0),
+            FileType::Symlink => {
+                diagnostics.carrier(ArtifactDiagnosticCode::CarrierSymbolicLink, path, 0)
+            }
+            FileType::RegularFile => {
+                diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0)
+            }
+            _ => diagnostics.carrier(ArtifactDiagnosticCode::CarrierNotRegularFile, path, 0),
         },
-        Err(_) => diagnostics.carrier("carrier_unavailable", path, 0),
+        Err(_) => diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0),
     }
 }
 
