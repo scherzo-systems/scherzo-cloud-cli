@@ -1,0 +1,14 @@
+```console
+$ scherzo-cloud publication --help
+Work with Scherzo Cloud publications
+
+Usage: scherzo-cloud publication [COMMAND]
+
+Commands:
+  create  Create a Scherzo Cloud publication
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

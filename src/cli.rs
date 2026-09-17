@@ -38,6 +38,7 @@ mod invitation;
 mod organization;
 mod principal;
 mod project;
+mod publication;
 mod run;
 mod runner;
 mod version;
@@ -313,6 +314,8 @@ enum Command {
     Organization(organization::Command),
     #[command(about = project::ABOUT)]
     Project(project::Command),
+    #[command(about = publication::ABOUT)]
+    Publication(publication::Command),
     #[command(about = run::ABOUT)]
     Run(run::Command),
     #[command(about = version::ABOUT)]
@@ -342,6 +345,7 @@ impl Cli {
             Some(Command::Invitation(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Project(command)) => command.execute(),
+            Some(Command::Publication(command)) => command.execute(),
             Some(Command::Run(command)) => command.execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
@@ -775,6 +779,13 @@ impl<R> OperationControl<R> {
         true
     }
 
+    fn dispatched(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dispatched
+    }
+
     fn begin_dispatch_with_recovery(&self, recovery: R) -> bool {
         let Some(mut state) = self.lock_owned_state(OperationOwner::Active) else {
             return false;
@@ -909,6 +920,40 @@ struct HumanApiOutcomeAdapters<O, E> {
     unauthenticated: fn() -> O,
     unreachable: fn(crate::api::UnreachableCategory) -> O,
     operation_error: fn(E) -> anyhow::Error,
+}
+
+fn human_session_client(transport_policy: HttpTransportPolicy) -> anyhow::Result<HttpClient> {
+    HttpClient::new(transport_policy)
+        .map_err(|error| anyhow!(error))
+        .context("prepare human session networking")
+}
+
+fn execute_required_api_operation<T, E>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    mut operation: impl FnMut(&str) -> anyhow::Result<Result<T, E>>,
+    credential_rejected: impl Fn(&E) -> bool,
+    unauthenticated: impl Fn() -> E,
+    unreachable: impl Fn(UnreachableCategory) -> E,
+    session_context: &'static str,
+) -> anyhow::Result<Result<T, E>> {
+    match session::execute_required(
+        client,
+        deployment,
+        |access_token| operation(access_token.expose()),
+        |result| {
+            result
+                .as_ref()
+                .is_ok_and(|operation| operation.as_ref().is_err_and(&credential_rejected))
+        },
+    ) {
+        Ok(RequiredOperation::Unauthenticated) => Ok(Err(unauthenticated())),
+        Ok(RequiredOperation::Completed(result)) => result,
+        Err(error) => match error.unreachable_category() {
+            Some(category) => Ok(Err(unreachable(category))),
+            None => Err(anyhow!(error).context(session_context)),
+        },
+    }
 }
 
 fn execute_human_api_operation<O, E>(
@@ -1337,6 +1382,8 @@ mod tests {
             "project runner-pool remove",
             "project runner-pool set",
             "project show",
+            "publication",
+            "publication create",
             "run",
             "run create",
             "run input-set",

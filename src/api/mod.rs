@@ -12,6 +12,7 @@ mod organizations;
 mod problem;
 mod profile;
 mod projects;
+mod publications;
 mod run_inputs;
 mod runners;
 mod runs;
@@ -24,6 +25,24 @@ fn clear_generated_access_token(configuration: &mut generated::apis::configurati
     if let Some(access_token) = &mut configuration.bearer_access_token {
         access_token.zeroize();
     }
+}
+
+fn generated_api_request(
+    configuration: &generated::apis::configuration::Configuration,
+    method: reqwest::Method,
+    endpoint: &str,
+) -> reqwest::blocking::RequestBuilder {
+    let mut request = configuration
+        .client
+        .request(method, endpoint)
+        .header(reqwest::header::ACCEPT, problem::ACCEPTED_MEDIA_TYPES);
+    if let Some(user_agent) = &configuration.user_agent {
+        request = request.header(reqwest::header::USER_AGENT, user_agent);
+    }
+    if let Some(access_token) = &configuration.bearer_access_token {
+        request = request.bearer_auth(access_token);
+    }
+    request
 }
 
 fn bearer_authorization(access_token: &str) -> Result<HeaderValue, InvalidHeaderValue> {
@@ -91,6 +110,7 @@ pub(crate) use projects::{
     GitHubRepositoryList as ProjectGitHubRepositoryList, Project, ProjectApi, ProjectFailure,
     ProjectList, ProjectReadinessBlocker, ProjectRepository,
 };
+pub(crate) use publications::{Publication, PublicationApi, PublicationFailure};
 pub(crate) use run_inputs::{
     InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,
     RetainedRunInputs, RunInputManifest, RunInputObjectMetadata, RunInputSet, RunInputUpload,

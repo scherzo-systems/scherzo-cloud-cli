@@ -12,6 +12,7 @@ Commands:
   invitation    Manage Scherzo Cloud invitations
   organization  Manage Scherzo Cloud organizations
   project       Manage Scherzo Cloud projects
+  publication   Work with Scherzo Cloud publications
   run           Work with Scherzo Cloud runs
   version       Print version information
   runner        Work with the Scherzo Cloud runner

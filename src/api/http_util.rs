@@ -1,7 +1,7 @@
 use std::io;
 
 use reqwest::blocking::Response as BlockingResponse;
-use reqwest::header::{CONTENT_TYPE, HeaderValue, LOCATION};
+use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION, RETRY_AFTER};
 use reqwest::{Response, StatusCode, Url};
 
 pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
@@ -10,6 +10,16 @@ const MAX_RESPONSE_BODY_BYTES_U64: u64 = 1024 * 1024;
 pub(crate) enum BoundedBodyError {
     TooLarge,
     Transport(reqwest::Error),
+}
+
+pub(crate) struct BufferedBlockingResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) content_type: Option<HeaderValue>,
+    pub(crate) idempotency_keys: Vec<HeaderValue>,
+    pub(crate) locations: Vec<HeaderValue>,
+    pub(crate) cache_controls: Vec<HeaderValue>,
+    pub(crate) retry_afters: Vec<HeaderValue>,
+    pub(crate) body: Vec<u8>,
 }
 
 pub(crate) struct BufferedResponse {
@@ -117,6 +127,47 @@ pub(crate) async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>,
     Ok(body)
 }
 
+pub(crate) fn buffer_blocking_response(
+    response: BlockingResponse,
+) -> Result<BufferedBlockingResponse, BoundedBodyError> {
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let idempotency_keys = response
+        .headers()
+        .get_all("Idempotency-Key")
+        .iter()
+        .cloned()
+        .collect();
+    let locations = response
+        .headers()
+        .get_all(LOCATION)
+        .iter()
+        .cloned()
+        .collect();
+    let cache_controls = response
+        .headers()
+        .get_all(CACHE_CONTROL)
+        .iter()
+        .cloned()
+        .collect();
+    let retry_afters = response
+        .headers()
+        .get_all(RETRY_AFTER)
+        .iter()
+        .cloned()
+        .collect();
+    let body = read_bounded_blocking_body(response)?;
+    Ok(BufferedBlockingResponse {
+        status,
+        content_type,
+        idempotency_keys,
+        locations,
+        cache_controls,
+        retry_afters,
+        body,
+    })
+}
+
 pub(crate) fn read_bounded_blocking_body(
     mut response: BlockingResponse,
 ) -> Result<Vec<u8>, BoundedBodyError> {
@@ -187,6 +238,18 @@ pub(crate) fn append_pagination(endpoint: &mut Url, limit: Option<u16>, cursor: 
             query.append_pair("cursor", cursor);
         }
     }
+}
+
+pub(crate) fn can_retry_ambiguous_mutation(
+    attempt: usize,
+    maximum_attempts: usize,
+    category: super::UnreachableCategory,
+) -> bool {
+    attempt + 1 < maximum_attempts
+        && matches!(
+            category,
+            super::UnreachableCategory::Connection | super::UnreachableCategory::Timeout
+        )
 }
 
 pub(crate) fn require_nonempty(value: &str, reason: &'static str) -> Result<(), &'static str> {

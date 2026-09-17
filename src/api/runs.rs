@@ -1,18 +1,16 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::blocking::Response;
-use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION};
+use reqwest::header::HeaderValue;
 use reqwest::{Method, StatusCode, Url};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::generated::{apis, models};
 use super::http_client::{HttpClient, generated_configuration};
-use super::http_util::{self, BoundedBodyError};
+use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
-    PROBLEM_MEDIA_TYPE, UNAUTHORIZED,
+    self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, PROBLEM_MEDIA_TYPE, UNAUTHORIZED,
 };
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
@@ -115,7 +113,13 @@ impl<'a> RunApi<'a> {
                 Err(error) => {
                     let category = classify_reqwest_error(&error);
                     last_transport_failure = category;
-                    if idempotency_key.is_some() && can_retry_transport(attempt, category) {
+                    if idempotency_key.is_some()
+                        && http_util::can_retry_ambiguous_mutation(
+                            attempt,
+                            CREATE_ATTEMPTS,
+                            category,
+                        )
+                    {
                         crate::timing::sleep(crate::timing::short_retry_delay());
                         continue;
                     }
@@ -131,26 +135,26 @@ impl<'a> RunApi<'a> {
                     idempotency_key,
                 )?;
             }
-            match receive_response(response) {
+            match http_util::buffer_blocking_response(response) {
                 Ok(response) => return Ok(response),
-                Err(ReceiveError::TooLarge) => {
+                Err(BoundedBodyError::TooLarge) => {
                     return Err(RunFailure::protocol(status == StatusCode::UNAUTHORIZED));
                 }
-                Err(ReceiveError::Transport(error))
+                Err(BoundedBodyError::Transport(error))
                     if idempotency_key.is_some() && status == success_status =>
                 {
                     let category = classify_reqwest_error(&error);
                     last_transport_failure = category;
-                    if can_retry_transport(attempt, category) {
+                    if http_util::can_retry_ambiguous_mutation(attempt, CREATE_ATTEMPTS, category) {
                         crate::timing::sleep(crate::timing::short_retry_delay());
                         continue;
                     }
                     return Err(RunFailure::Unreachable(category));
                 }
-                Err(ReceiveError::Transport(_)) if status == StatusCode::UNAUTHORIZED => {
+                Err(BoundedBodyError::Transport(_)) if status == StatusCode::UNAUTHORIZED => {
                     return Err(RunFailure::protocol(true));
                 }
-                Err(ReceiveError::Transport(error)) => {
+                Err(BoundedBodyError::Transport(error)) => {
                     return Err(RunFailure::Unreachable(if status.is_server_error() {
                         UnreachableCategory::Server
                     } else {
@@ -173,19 +177,22 @@ impl<'a> RunApi<'a> {
             .send()
             .map_err(|error| RunFailure::Unreachable(classify_reqwest_error(&error)))?;
         let status = response.status();
-        let response = receive_response(response).map_err(|error| match error {
-            ReceiveError::TooLarge => RunFailure::protocol(status == StatusCode::UNAUTHORIZED),
-            ReceiveError::Transport(_) if status == StatusCode::UNAUTHORIZED => {
-                RunFailure::protocol(true)
-            }
-            ReceiveError::Transport(error) => {
-                RunFailure::Unreachable(if status.is_server_error() {
-                    UnreachableCategory::Server
-                } else {
-                    classify_reqwest_error(&error)
-                })
-            }
-        })?;
+        let response =
+            http_util::buffer_blocking_response(response).map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    RunFailure::protocol(status == StatusCode::UNAUTHORIZED)
+                }
+                BoundedBodyError::Transport(_) if status == StatusCode::UNAUTHORIZED => {
+                    RunFailure::protocol(true)
+                }
+                BoundedBodyError::Transport(error) => {
+                    RunFailure::Unreachable(if status.is_server_error() {
+                        UnreachableCategory::Server
+                    } else {
+                        classify_reqwest_error(&error)
+                    })
+                }
+            })?;
         decode_get_response(response, run_id)
     }
 
@@ -202,18 +209,7 @@ impl<'a> RunApi<'a> {
         method: Method,
         endpoint: &str,
     ) -> reqwest::blocking::RequestBuilder {
-        let mut request = self
-            .configuration
-            .client
-            .request(method, endpoint)
-            .header(reqwest::header::ACCEPT, ACCEPTED_MEDIA_TYPES);
-        if let Some(user_agent) = &self.configuration.user_agent {
-            request = request.header(reqwest::header::USER_AGENT, user_agent);
-        }
-        if let Some(access_token) = &self.configuration.bearer_access_token {
-            request = request.bearer_auth(access_token);
-        }
-        request
+        super::generated_api_request(&self.configuration, method, endpoint)
     }
 }
 
@@ -267,62 +263,7 @@ impl RunFailure {
     }
 }
 
-pub(super) struct ReceivedResponse {
-    pub(super) status: StatusCode,
-    pub(super) content_type: Option<HeaderValue>,
-    pub(super) idempotency_keys: Vec<HeaderValue>,
-    pub(super) locations: Vec<HeaderValue>,
-    pub(super) cache_controls: Vec<HeaderValue>,
-    pub(super) body: Vec<u8>,
-}
-
-enum ReceiveError {
-    TooLarge,
-    Transport(reqwest::Error),
-}
-
-fn receive_response(response: Response) -> Result<ReceivedResponse, ReceiveError> {
-    let status = response.status();
-    let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    let idempotency_keys = response
-        .headers()
-        .get_all("Idempotency-Key")
-        .iter()
-        .cloned()
-        .collect();
-    let locations = response
-        .headers()
-        .get_all(LOCATION)
-        .iter()
-        .cloned()
-        .collect();
-    let cache_controls = response
-        .headers()
-        .get_all(CACHE_CONTROL)
-        .iter()
-        .cloned()
-        .collect();
-    let body = http_util::read_bounded_blocking_body(response).map_err(|error| match error {
-        BoundedBodyError::TooLarge => ReceiveError::TooLarge,
-        BoundedBodyError::Transport(error) => ReceiveError::Transport(error),
-    })?;
-    Ok(ReceivedResponse {
-        status,
-        content_type,
-        idempotency_keys,
-        locations,
-        cache_controls,
-        body,
-    })
-}
-
-fn can_retry_transport(attempt: usize, category: UnreachableCategory) -> bool {
-    attempt + 1 < CREATE_ATTEMPTS
-        && matches!(
-            category,
-            UnreachableCategory::Connection | UnreachableCategory::Timeout
-        )
-}
+pub(super) type ReceivedResponse = BufferedBlockingResponse;
 
 fn decode_create_response(
     response: ReceivedResponse,

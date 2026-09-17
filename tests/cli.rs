@@ -61,6 +61,8 @@ mod organization_deletion;
 mod pi_installation;
 #[path = "cli/project.rs"]
 mod project;
+#[path = "cli/publication.rs"]
+mod publication;
 #[path = "cli/recovery.rs"]
 mod recovery;
 #[path = "cli/run.rs"]

@@ -5,13 +5,12 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
-use crate::api::{
-    CreateRunInput, HttpClient, HttpTransportPolicy, Run, RunApi, RunFailure, RunState,
-};
+#[cfg(test)]
+use crate::api::HttpClient;
+use crate::api::{CreateRunInput, HttpTransportPolicy, Run, RunApi, RunFailure, RunState};
 use crate::execution::workflow::presentation::visible_text;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
 
 use super::OrganizationRef;
 
@@ -727,16 +726,14 @@ fn with_api<T>(
     transport_policy: HttpTransportPolicy,
     mut operation: impl FnMut(&RunApi<'_>) -> Result<T, RunFailure>,
 ) -> anyhow::Result<Result<T, RunFailure>> {
-    let client = HttpClient::new(transport_policy)
-        .map_err(|error| anyhow!(error))
-        .context("prepare human session networking")?;
-    match session::execute_required(
+    let client = super::human_session_client(transport_policy)?;
+    super::execute_required_api_operation(
         &client,
         deployment,
         |access_token| {
             let api = RunApi::new(
                 deployment.fingerprint().api_url(),
-                access_token.expose(),
+                access_token,
                 transport_policy,
                 &client,
             )
@@ -744,21 +741,11 @@ fn with_api<T>(
             .context("prepare Cloud run networking")?;
             Ok(operation(&api))
         },
-        |result| {
-            result.as_ref().is_ok_and(|operation| {
-                operation
-                    .as_ref()
-                    .is_err_and(RunFailure::credential_rejected)
-            })
-        },
-    ) {
-        Ok(RequiredOperation::Unauthenticated) => Ok(Err(RunFailure::Unauthenticated)),
-        Ok(RequiredOperation::Completed(result)) => result,
-        Err(error) => match error.unreachable_category() {
-            Some(category) => Ok(Err(RunFailure::Unreachable(category))),
-            None => Err(anyhow!(error).context("acquire human session for Cloud run operation")),
-        },
-    }
+        RunFailure::credential_rejected,
+        || RunFailure::Unauthenticated,
+        RunFailure::Unreachable,
+        "acquire human session for Cloud run operation",
+    )
 }
 
 fn write_input_acquisition_failure(
