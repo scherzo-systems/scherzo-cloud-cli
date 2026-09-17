@@ -20,8 +20,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 use crate::runner::service::artifact_delivery::ArtifactCloudResponse;
 use crate::runner::service::assignment::{
     ArtifactRequestKind, AssignmentManager, AssignmentManagerFailure, AssignmentOffer,
-    AssignmentPrepare, AssignmentRenewal, AssignmentStart, PendingAssignmentObservation,
-    RetainedObservationFrame, WelcomePolicyFailure,
+    AssignmentPrepare, AssignmentRenewal, AssignmentStart, AssignmentStartAuthorization,
+    PendingAssignmentObservation, RetainedObservationFrame, WelcomePolicyFailure,
 };
 use crate::runner::service::config::Config;
 use crate::runner::service::control::LiveStatus;
@@ -423,6 +423,21 @@ impl<'a> ProtocolLog<'a> {
                     run_id,
                     lease.sequence,
                 ),
+            ),
+            CloudFrame::ExecutionStartAuthorized {
+                envelope,
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            } => (
+                envelope,
+                "execution_start_authorized",
+                vec![
+                    KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                    KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                ],
             ),
             CloudFrame::AssignmentLeaseRenewed {
                 envelope,
@@ -1352,6 +1367,12 @@ impl BufferedEffect {
                 run_id,
                 ..
             }
+            | CloudFrame::ExecutionStartAuthorized {
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            }
             | CloudFrame::AssignmentLeaseRenewed {
                 effect_id,
                 assignment_id,
@@ -1446,6 +1467,7 @@ enum AssignmentManagerEffect {
     Offer(Box<AssignmentOffer>),
     Prepare(AssignmentPrepare),
     Start(AssignmentStart),
+    StartAuthorized(AssignmentStartAuthorization),
     Renewal(AssignmentRenewal),
     Release {
         assignment_id: String,
@@ -2123,6 +2145,7 @@ where
             effect @ CloudFrame::AssignmentOffer { .. }
             | effect @ CloudFrame::AssignmentPrepare { .. }
             | effect @ CloudFrame::AssignmentStart { .. }
+            | effect @ CloudFrame::ExecutionStartAuthorized { .. }
             | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
                 if progress.handshake_completed =>
@@ -2308,6 +2331,24 @@ where
             };
             (effect_id, AssignmentManagerEffect::Start(start))
         }
+        CloudFrame::ExecutionStartAuthorized {
+            effect_id,
+            assignment_id,
+            run_id,
+            attempt_id,
+            ..
+        } => {
+            let authorization = AssignmentStartAuthorization {
+                effect_id: effect_id.clone(),
+                assignment_id: assignment_id.clone(),
+                run_id: run_id.clone(),
+                attempt_id,
+            };
+            (
+                effect_id,
+                AssignmentManagerEffect::StartAuthorized(authorization),
+            )
+        }
         CloudFrame::AssignmentLeaseRenewed {
             effect_id,
             assignment_id,
@@ -2394,6 +2435,9 @@ where
                 manager.handle_prepare(prepare).map(|_| None)
             }
             AssignmentManagerEffect::Start(start) => manager.handle_start(start),
+            AssignmentManagerEffect::StartAuthorized(authorization) => manager
+                .handle_start_authorized(authorization)
+                .map(|()| None),
             AssignmentManagerEffect::Renewal(renewal) => {
                 let result = manager.handle_renewal(renewal);
                 event.set(KeyValue::new(

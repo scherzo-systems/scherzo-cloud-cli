@@ -296,6 +296,7 @@ pub(super) struct ExecutionAuthority {
     pub(super) lease_clock: LeaseClock,
     pub(super) causal_lease: CausalLease,
     pub(super) updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+    pub(super) start_authority: tokio::sync::watch::Receiver<bool>,
 }
 
 trait PreservableStaging {
@@ -370,7 +371,7 @@ pub(super) struct ExecutionJob {
     lease_clock: LeaseClock,
     causal_lease: CausalLease,
     pub(super) authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
-    workflow_git_activated: bool,
+    start_authority: tokio::sync::watch::Receiver<bool>,
     workspace_release_reported: AtomicBool,
 }
 
@@ -390,7 +391,7 @@ impl ExecutionJob {
             lease_clock: authority.lease_clock,
             causal_lease: authority.causal_lease,
             authority_updates: authority.updates,
-            workflow_git_activated: false,
+            start_authority: authority.start_authority,
             workspace_release_reported: AtomicBool::new(false),
         }
     }
@@ -441,7 +442,6 @@ impl ExecutionJob {
     }
 
     async fn run(mut self) {
-        self.workflow_git_activated = self.activate_workflow_git().await;
         let assignment_id = self.accepted.assignment_id().to_owned();
         let attempt_id = self.accepted.attempt_id().to_owned();
         let run_id = self.accepted.run_id().to_owned();
@@ -536,7 +536,7 @@ impl ExecutionJob {
     }
 
     async fn run_workflow(
-        &self,
+        &mut self,
         assignment_id: &str,
         attempt_id: &str,
         run_id: &str,
@@ -550,7 +550,25 @@ impl ExecutionJob {
             .cancellation()
             .source()
             .clone();
-        if !self.workflow_git_activated
+        if let Err(completion) = self
+            .ensure_execution_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
+            .await
+        {
+            return completion;
+        }
+        if self
+            .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
+            .is_none()
+        {
+            return self.abort_retained(assignment_id, attempt_id, 0, "runner_internal_failure");
+        }
+        if let Err(completion) = self
+            .wait_for_start_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
+            .await
+        {
+            return completion;
+        }
+        if !self.activate_workflow_git().await
             && cancellation.cancellation_reason() != Some(CancellationReason::RunnerShutdown)
         {
             return self.execution_environment_lost(assignment_id, attempt_id);
@@ -628,13 +646,6 @@ impl ExecutionJob {
         }
 
         let started_at = RunnerExecutionClock.now();
-        if self
-            .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
-            .is_none()
-        {
-            return self.abort_retained(assignment_id, attempt_id, 0, "runner_internal_failure");
-        }
-
         let diagnostics = StepDiagnosticLog::default();
         let accounting = InvocationAccountingLog::default();
         let observer = RunnerExecutionObserver::new(
@@ -1195,6 +1206,72 @@ impl ExecutionJob {
                 }
                 result = wait_for_lease_deadline(&self.lease_clock, authority.renewal_request) => {
                     result?;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_start_authority(
+        &mut self,
+        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        post_stop_fence: &PostStopFence,
+        assignment_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), ExecutionCompletion> {
+        loop {
+            if *self.start_authority.borrow() {
+                return self
+                    .ensure_execution_authority(
+                        cancellation,
+                        post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                    )
+                    .await;
+            }
+            if cancellation.cancellation_reason().is_some() {
+                return Err(ExecutionCompletion::without_report());
+            }
+            self.ensure_execution_authority(
+                cancellation,
+                post_stop_fence,
+                assignment_id,
+                attempt_id,
+            )
+            .await?;
+            let cancellation_start = self.authority_updates.borrow().cancellation_start;
+            tokio::select! {
+                biased;
+                _ = cancellation.wait_for_cancellation() => {
+                    return Err(ExecutionCompletion::without_report());
+                }
+                changed = self.start_authority.changed() => {
+                    if changed.is_err() {
+                        return Err(ExecutionCompletion::without_report());
+                    }
+                }
+                changed = self.authority_updates.changed() => {
+                    if changed.is_err() {
+                        return Err(ExecutionCompletion::without_report());
+                    }
+                }
+                elapsed = wait_for_lease_deadline(&self.lease_clock, cancellation_start) => {
+                    if elapsed.is_err() {
+                        return Err(self
+                            .fail_before_execution(
+                                cancellation,
+                                post_stop_fence,
+                                assignment_id,
+                                attempt_id,
+                            )
+                            .await);
+                    }
+                    begin_forced_containment(
+                        cancellation,
+                        post_stop_fence,
+                        &self.accepted.process_guards,
+                    );
+                    return Err(ExecutionCompletion::fenced(None, None));
                 }
             }
         }

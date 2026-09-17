@@ -244,6 +244,14 @@ pub(super) struct AssignmentRenewal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AssignmentStartAuthorization {
+    pub(super) effect_id: String,
+    pub(super) assignment_id: String,
+    pub(super) run_id: String,
+    pub(super) attempt_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum AssignmentDecision {
     Accepted {
         effect_id: String,
@@ -1028,6 +1036,7 @@ struct RetainedDecision {
     response_observation_id: Option<u64>,
     causal_lease: Option<CausalLease>,
     start: Option<AssignmentStart>,
+    start_authorization: Option<AssignmentStartAuthorization>,
     renewals: BTreeMap<String, AssignmentRenewal>,
     rejected_renewals: BTreeMap<String, AssignmentRenewal>,
 }
@@ -1197,6 +1206,7 @@ struct RunningAssignment {
     current_grant: ExecutionLeaseGrant,
     causal_lease: CausalLease,
     authority_updates: tokio::sync::watch::Sender<LeaseAuthority>,
+    start_authority: tokio::sync::watch::Sender<bool>,
     workflow_git: WorkflowGitAuthority,
     workspace_release: Option<CleanupResult>,
 }
@@ -2107,6 +2117,7 @@ impl AssignmentManager {
             .source()
             .clone();
         let (authority_updates, authority_receiver) = tokio::sync::watch::channel(authority);
+        let (start_authority, start_authority_receiver) = tokio::sync::watch::channel(false);
         let workflow_git = accepted.workflow_git.clone();
         self.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
@@ -2115,6 +2126,7 @@ impl AssignmentManager {
             current_grant: start.lease,
             causal_lease: causal_lease.clone(),
             authority_updates,
+            start_authority,
             workflow_git,
             workspace_release: None,
         })));
@@ -2127,8 +2139,82 @@ impl AssignmentManager {
                 lease_clock: self.lease_clock.clone(),
                 causal_lease,
                 updates: authority_receiver,
+                start_authority: start_authority_receiver,
             },
         )))
+    }
+
+    fn matching_decision_index(
+        &self,
+        assignment_id: &str,
+        run_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<usize>, AssignmentManagerFailure> {
+        let Some(index) = self
+            .decisions
+            .iter()
+            .position(|decision| decision.offer.assignment_id == assignment_id)
+        else {
+            return Ok(None);
+        };
+        let decision = &self.decisions[index];
+        if decision.offer.run_id != run_id || decision.offer.attempt_id != attempt_id {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        Ok(Some(index))
+    }
+
+    pub(super) fn handle_start_authorized(
+        &mut self,
+        authorization: AssignmentStartAuthorization,
+    ) -> Result<(), AssignmentManagerFailure> {
+        self.drain_events();
+        if self.decisions.iter().any(|decision| {
+            decision.offer.effect_id == authorization.effect_id
+                || decision
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.effect_id == authorization.effect_id)
+                || decision.renewals.contains_key(&authorization.effect_id)
+                || decision
+                    .rejected_renewals
+                    .contains_key(&authorization.effect_id)
+        }) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        if let Some(known) = self.decisions.iter().find_map(|decision| {
+            decision
+                .start_authorization
+                .as_ref()
+                .filter(|known| known.effect_id == authorization.effect_id)
+        }) {
+            return if known == &authorization {
+                Ok(())
+            } else {
+                Err(AssignmentManagerFailure::ConflictingOffer)
+            };
+        }
+        let Some(index) = self.matching_decision_index(
+            &authorization.assignment_id,
+            &authorization.run_id,
+            &authorization.attempt_id,
+        )?
+        else {
+            return Ok(());
+        };
+        let decision = &self.decisions[index];
+        if decision.start.is_none() || decision.start_authorization.is_some() {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        self.decisions[index].start_authorization = Some(authorization.clone());
+        if let Some(LocalSlot::Running(running)) = &self.slot
+            && running.identity.assignment_id == authorization.assignment_id
+            && running.identity.run_id == authorization.run_id
+            && running.identity.attempt_id == authorization.attempt_id
+        {
+            running.start_authority.send_replace(true);
+        }
+        Ok(())
     }
 
     pub(super) fn handle_renewal(
@@ -2163,21 +2249,17 @@ impl AssignmentManager {
                 Err(AssignmentManagerFailure::ConflictingOffer)
             };
         }
-        let Some(index) = self
-            .decisions
-            .iter()
-            .position(|decision| decision.offer.assignment_id == renewal.assignment_id)
+        let Some(index) = self.matching_decision_index(
+            &renewal.assignment_id,
+            &renewal.run_id,
+            &renewal.attempt_id,
+        )?
         else {
             return Ok(RenewalDecision::untimed(
                 RenewalDisposition::UnknownAssignment,
             ));
         };
         let decision = &self.decisions[index];
-        if decision.offer.run_id != renewal.run_id
-            || decision.offer.attempt_id != renewal.attempt_id
-        {
-            return Err(AssignmentManagerFailure::ConflictingOffer);
-        }
         if decision
             .renewals
             .values()
@@ -3217,6 +3299,7 @@ impl AssignmentManager {
             response_observation_id: Some(response_observation_id),
             causal_lease,
             start: None,
+            start_authorization: None,
             renewals: BTreeMap::new(),
             rejected_renewals: BTreeMap::new(),
         });
@@ -4966,6 +5049,15 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
+    fn start_authorization_for(offered: &AssignmentOffer) -> AssignmentStartAuthorization {
+        AssignmentStartAuthorization {
+            effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+            assignment_id: offered.assignment_id.clone(),
+            run_id: offered.run_id.clone(),
+            attempt_id: offered.attempt_id.clone(),
+        }
+    }
+
     fn renewal_for(offered: &AssignmentOffer) -> AssignmentRenewal {
         AssignmentRenewal {
             effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abj".to_owned(),
@@ -5019,10 +5111,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     fn execution_job(manager: &mut AssignmentManager, offered: &AssignmentOffer) -> ExecutionJob {
-        manager
+        let job = manager
             .handle_start(start_for(offered))
             .unwrap()
-            .expect("valid start dispatches execution")
+            .expect("valid start dispatches execution");
+        manager
+            .handle_start_authorized(start_authorization_for(offered))
+            .expect("valid start authorization is accepted");
+        job
     }
 
     fn spawn_execution(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
@@ -6552,6 +6648,130 @@ steps:
         let start = start_for(&offered);
         assert!(manager.handle_start(start.clone()).unwrap().is_some());
         assert!(manager.handle_start(start).unwrap().is_none());
+    }
+
+    async fn start_execution_waiting_for_authority(
+        manager: &mut AssignmentManager,
+        offered: &AssignmentOffer,
+    ) -> WorkflowGitAuthority {
+        let job = manager
+            .handle_start(start_for(offered))
+            .unwrap()
+            .expect("valid start dispatches execution");
+        let workflow_git = match &manager.slot {
+            Some(LocalSlot::Running(running)) => running.workflow_git.clone(),
+            _ => panic!("assignment must be waiting to run"),
+        };
+        job.spawn();
+        with_watchdog(wait_for_manager_state(manager, |manager| {
+            manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .iter()
+                .any(|entry| {
+                    matches!(
+                        &entry.observation,
+                        AssignmentObservation::Execution {
+                            report: ExecutionReport::Started,
+                            ..
+                        }
+                    )
+                })
+        }))
+        .await
+        .expect("execution_started was not queued");
+        assert!(!workflow_git.is_active());
+        workflow_git
+    }
+
+    fn assert_no_executed_workflow_reports(manager: &mut AssignmentManager) {
+        assert!(
+            manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .iter()
+                .all(|entry| !matches!(
+                    &entry.observation,
+                    AssignmentObservation::Execution {
+                        report: ExecutionReport::Transition { .. }
+                            | ExecutionReport::Finished { .. },
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_start_authority_gates_first_workflow_git_fetch() {
+        let workflow = "schemaVersion: 1\nsteps:\n  fetch:\n    kind: cmd\n    command:\n      argv: [\"git\", \"fetch\", \"--quiet\", \"origin\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        start_execution_waiting_for_authority(&mut manager, &offered).await;
+        assert_no_executed_workflow_reports(&mut manager);
+        assert!(
+            manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .iter()
+                .all(|entry| !matches!(
+                    &entry.observation,
+                    AssignmentObservation::Execution {
+                        report: ExecutionReport::Interrupted { .. },
+                        ..
+                    }
+                ))
+        );
+
+        let mut wrong = start_authorization_for(&offered);
+        wrong.run_id = "run_01k0z6r1w8f4jy2m7q9v3x5azz".to_owned();
+        assert_eq!(
+            manager.handle_start_authorized(wrong),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+        assert!(matches!(
+            &manager.slot,
+            Some(LocalSlot::Running(running)) if !*running.start_authority.borrow()
+        ));
+
+        let authorization = start_authorization_for(&offered);
+        manager
+            .handle_start_authorized(authorization.clone())
+            .unwrap();
+        manager.finish_transport();
+        manager
+            .handle_start_authorized(authorization.clone())
+            .expect("an exact reconnect redelivery is idempotent");
+        let mut duplicate = authorization;
+        duplicate.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abz".to_owned();
+        assert_eq!(
+            manager.handle_start_authorized(duplicate),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("authorized workflow Git fetch did not finish");
+        assert_succeeded(&reports);
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| matches!(report, ExecutionReport::Started))
+                .count(),
+            1,
+            "delayed authorization launched execution more than once"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_while_waiting_for_start_authority_never_activates_workflow_git() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let workflow_git = start_execution_waiting_for_authority(&mut manager, &offered).await;
+
+        manager.begin_shutdown().unwrap();
+        wait_for_execution_finalization(&mut manager).await;
+        assert!(!workflow_git.is_active());
+        assert_no_executed_workflow_reports(&mut manager);
     }
 
     fn authority_offsets(authority: &LeaseAuthority) -> Vec<Duration> {

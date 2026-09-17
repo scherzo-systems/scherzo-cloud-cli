@@ -497,6 +497,13 @@ pub(crate) enum CloudFrame {
         execution_spec_id: String,
         lease: ExecutionLeaseGrant,
     },
+    ExecutionStartAuthorized {
+        envelope: CloudEnvelope,
+        effect_id: String,
+        assignment_id: String,
+        run_id: String,
+        attempt_id: String,
+    },
     AssignmentLeaseRenewed {
         envelope: CloudEnvelope,
         effect_id: String,
@@ -1254,6 +1261,16 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 },
             }))
         }
+        generated::RunnerProtocolVersion1::CloudExecutionStartAuthorized(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            Ok(cloud(CloudFrame::ExecutionStartAuthorized {
+                envelope,
+                effect_id: frame.payload.effect_id.to_string(),
+                assignment_id: frame.payload.assignment_id.to_string(),
+                run_id: frame.payload.run_id.to_string(),
+                attempt_id: frame.payload.attempt_id.to_string(),
+            }))
+        }
         generated::RunnerProtocolVersion1::CloudAssignmentLeaseRenewed(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
             let lease = frame.payload.lease;
@@ -1654,6 +1671,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "executionSpecId",
             "lease",
         ],
+        "execution_start_authorized" => &["effectId", "assignmentId", "runId", "attemptId"],
         "assignment_lease_renewed" => &["effectId", "assignmentId", "runId", "attemptId", "lease"],
         "assignment_release" => &["effectId", "assignmentId", "runId", "attemptId", "reason"],
         _ => return Err(DecodeError::InvalidFrame("type")),
@@ -1773,6 +1791,10 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-start.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-execution-start-authorized.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

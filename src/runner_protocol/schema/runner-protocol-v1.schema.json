@@ -83,6 +83,9 @@
       "$ref": "#/$defs/CloudAssignmentStart"
     },
     {
+      "$ref": "#/$defs/CloudExecutionStartAuthorized"
+    },
+    {
       "$ref": "#/$defs/CloudAssignmentLeaseRenewed"
     },
     {
@@ -1075,6 +1078,45 @@
                 "attemptId",
                 "executionSpecId",
                 "lease"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudExecutionStartAuthorized": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "execution_start_authorized"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "runId": {
+                  "$ref": "#/$defs/runId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "runId",
+                "attemptId"
               ]
             }
           }
