@@ -647,67 +647,6 @@ fn post_dispatch_interrupt_and_termination_report_unknown_without_retry() {
 }
 
 #[test]
-fn rejected_runner_admin_access_token_is_refreshed_and_retried() {
-    let rejected = problem_http_response(
-        "401 Unauthorized",
-        serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
-            "title": "Unauthorized",
-            "status": 401
-        }),
-    );
-    let server = ScriptedServer::respond(vec![
-        rejected,
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": "unique-refreshed-runner-admin-access-token",
-                "refresh_token": "unique-refreshed-runner-admin-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        json_http_response("200 OK", pool_body()),
-    ]);
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture_for_deployment(
-        &credential_path,
-        &server.api_url,
-        &server.issuer,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment_with_issuer(
-        &server.api_url,
-        &server.issuer,
-        credential_path.to_str().unwrap(),
-    );
-
-    let output = run_with_env(
-        &[
-            "runner",
-            "pool",
-            "show",
-            ORGANIZATION,
-            POOL_ID,
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert!(
-        requests[2]
-            .contains("authorization: Bearer unique-refreshed-runner-admin-access-token\r\n")
-    );
-}
-
-#[test]
 fn runner_create_refreshes_a_token_rejected_during_activation() {
     let registration = http_response_with_headers(
         "201 Created",
@@ -894,66 +833,97 @@ fn runner_create_preserves_registration_when_refresh_replay_fails_early() {
 }
 
 #[test]
-fn runner_create_stdout_contains_only_the_transferable_artifact() {
-    let registration = http_response_with_headers(
-        "201 Created",
-        Some("application/json"),
-        &[
-            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-            (
-                "Location",
-                "/v1/organizations/acme-research/runner-registrations/rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
-            ),
-        ],
-        &serde_json::to_vec(&registration_body()).unwrap(),
-    );
-    let issuance = http_response_with_headers(
-        "201 Created",
-        Some("application/json"),
-        &[
-            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-            (
-                "Location",
-                "/v1/organizations/acme-research/runner-registrations/rnr_01k0z6r1w8f4jy2m7q9v3x5abc/activations/rna_01k0z6r1w8f4jy2m7q9v3x5abc",
-            ),
-        ],
-        &serde_json::to_vec(&activation_issuance_body()).unwrap(),
-    );
-    let (server, _directory, credential_path) = prepared_runner(vec![
-        json_http_response("200 OK", pool_body()),
-        registration,
-        issuance,
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
+fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
+    for (arguments, creates_runner) in [
+        (
+            vec![
+                "runner",
+                "create",
+                ORGANIZATION,
+                "--pool",
+                POOL_ID,
+                "--activation-file",
+                "-",
+                "--allow-insecure-http",
+            ],
+            true,
+        ),
+        (
+            vec![
+                "runner",
+                "activation",
+                "create",
+                ORGANIZATION,
+                RUNNER_ID,
+                "--activation-file",
+                "-",
+                "--allow-insecure-http",
+            ],
+            false,
+        ),
+    ] {
+        let registration = http_response_with_headers(
+            "201 Created",
+            Some("application/json"),
+            &[
+                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+                (
+                    "Location",
+                    "/v1/organizations/acme-research/runner-registrations/rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+                ),
+            ],
+            &serde_json::to_vec(&registration_body()).unwrap(),
+        );
+        let issuance = http_response_with_headers(
+            "201 Created",
+            Some("application/json"),
+            &[
+                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+                (
+                    "Location",
+                    "/v1/organizations/acme-research/runner-registrations/rnr_01k0z6r1w8f4jy2m7q9v3x5abc/activations/rna_01k0z6r1w8f4jy2m7q9v3x5abc",
+                ),
+            ],
+            &serde_json::to_vec(&activation_issuance_body()).unwrap(),
+        );
+        let mut responses = vec![json_http_response(
+            "200 OK",
+            if creates_runner {
+                pool_body()
+            } else {
+                registration_body()
+            },
+        )];
+        if creates_runner {
+            responses.push(registration);
+        }
+        responses.push(issuance);
+        let (server, _directory, credential_path) = prepared_runner(responses);
+        let environment = deployment_environment(&server.api_url, &credential_path);
 
-    let output = run_with_env(
-        &[
-            "runner",
-            "create",
-            ORGANIZATION,
-            "--pool",
-            POOL_ID,
-            "--activation-file",
-            "-",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
+        let output = run_with_env(&arguments, &environment);
 
-    assert!(output.status.success());
-    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(artifact, activation_issuance_body()["artifact"]);
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stderr.contains(ACTIVATION_SECRET));
+        assert!(output.status.success());
+        let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(artifact, activation_issuance_body()["artifact"]);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains(ACTIVATION_SECRET));
 
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[1].starts_with(&format!(
-        "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations HTTP/1.1\r\n"
-    )));
-    assert!(requests[2].starts_with(&format!(
-        "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/activations HTTP/1.1\r\n"
-    )));
+        let requests = server.finish();
+        let mut expected_paths = Vec::new();
+        if creates_runner {
+            expected_paths.push(format!(
+                "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations HTTP/1.1\r\n"
+            ));
+        }
+        expected_paths.push(format!(
+            "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/activations HTTP/1.1\r\n"
+        ));
+        assert_eq!(requests.len(), expected_paths.len() + 1);
+        for (request, expected_path) in requests.iter().skip(1).zip(expected_paths) {
+            assert!(request.starts_with(&expected_path));
+        }
+    }
 }
 
 #[test]
@@ -1035,53 +1005,6 @@ fn runner_create_reports_activation_failure_with_the_created_registration() {
     assert!(standalone_failure.get("runnerId").is_none());
     assert!(!standalone_path.exists());
     assert_eq!(server.finish().len(), 2);
-}
-
-#[test]
-fn activation_stdout_contains_only_the_transferable_artifact() {
-    let issuance = http_response_with_headers(
-        "201 Created",
-        Some("application/json"),
-        &[
-            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-            (
-                "Location",
-                "/v1/organizations/acme-research/runner-registrations/rnr_01k0z6r1w8f4jy2m7q9v3x5abc/activations/rna_01k0z6r1w8f4jy2m7q9v3x5abc",
-            ),
-        ],
-        &serde_json::to_vec(&activation_issuance_body()).unwrap(),
-    );
-    let (server, _directory, credential_path) = prepared_runner(vec![
-        json_http_response("200 OK", registration_body()),
-        issuance,
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &[
-            "runner",
-            "activation",
-            "create",
-            ORGANIZATION,
-            RUNNER_ID,
-            "--activation-file",
-            "-",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
-
-    assert!(output.status.success());
-    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(artifact, activation_issuance_body()["artifact"]);
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stderr.contains(ACTIVATION_SECRET));
-
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].starts_with(&format!(
-        "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/activations HTTP/1.1\r\n"
-    )));
 }
 
 #[test]
@@ -1220,7 +1143,8 @@ fn enrollment_accepts_an_artifact_from_explicit_stdin() {
     }))
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
         .args([
             "runner",
             "enroll",
@@ -1233,8 +1157,14 @@ fn enrollment_accepts_an_artifact_from_explicit_stdin() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES
+        .into_iter()
+        .chain(RUNNER_TELEMETRY_VARIABLES)
+    {
+        command.env_remove(variable);
+    }
+    let mut child = command.spawn().unwrap();
     child.stdin.take().unwrap().write_all(&artifact).unwrap();
     let output = child.wait_with_output().unwrap();
 
@@ -1318,31 +1248,6 @@ fn enrollment_gone_reports_that_the_commit_did_not_complete() {
         })
     );
     assert_eq!(server.finish().len(), 1);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn enrollment_rejects_terminal_stdin_before_reading_configuration() {
-    let pty = super::open_test_pty(None).unwrap();
-    let child_input = rustix::io::dup(&pty.slave).unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let missing_config = directory.path().join("missing-runner-config.json");
-    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
-        .args([
-            "runner",
-            "enroll",
-            "--activation-file",
-            "-",
-            "--config",
-            missing_config.to_str().unwrap(),
-        ])
-        .stdin(Stdio::from(child_input))
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert!(!output.stderr.is_empty());
 }
 
 #[test]

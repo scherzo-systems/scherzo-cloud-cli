@@ -177,6 +177,12 @@ fn conformance_executable() -> Option<PathBuf> {
         .filter(|path| path.to_string_lossy().ends_with("-pi-0.85.1/bin/pi"))
 }
 
+fn require_conformance_executable() -> PathBuf {
+    conformance_executable().unwrap_or_else(|| {
+        panic!("SCHERZO_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.85.1 executable")
+    })
+}
+
 fn report_code(output: &std::process::Output) -> String {
     serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["checks"][0]["code"]
         .as_str()
@@ -507,10 +513,9 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
 }
 
 #[test]
-fn pinned_conformance_validation_ignores_ambient_force_color() {
-    let Some(executable) = conformance_executable() else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+fn pinned_real_pi_validation_ignores_ambient_force_color() {
+    let executable = require_conformance_executable();
 
     let path = controlled_path_for(&executable);
     let baseline = pi_doctor_json(path.path(), &[]);
@@ -525,10 +530,9 @@ fn pinned_conformance_validation_ignores_ambient_force_color() {
 }
 
 #[test]
-fn validation_does_not_read_trust_or_execute_project_extensions() {
-    let Some(executable) = conformance_executable() else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+fn pinned_real_pi_validation_does_not_read_trust_or_execute_project_extensions() {
+    let executable = require_conformance_executable();
     let project_directory = tempfile::tempdir().expect("temporary Pi project directory");
     let extensions_directory = project_directory.path().join(".pi/extensions");
     fs::create_dir_all(&extensions_directory).expect("extensions directory should be created");
@@ -579,10 +583,9 @@ fn validation_does_not_read_trust_or_execute_project_extensions() {
 }
 
 #[test]
-fn pinned_conformance_executable_is_exact_and_independent_of_saved_trust() {
-    let Some(executable) = conformance_executable() else {
-        return;
-    };
+#[ignore = "requires pinned harness"]
+fn pinned_real_pi_conformance_executable_is_exact_and_independent_of_saved_trust() {
+    let executable = require_conformance_executable();
     let first_agent_directory = tempfile::tempdir().expect("first pinned Pi agent directory");
     let second_agent_directory = tempfile::tempdir().expect("second pinned Pi agent directory");
     let first_settings = br#"{"defaultProjectTrust":"ask"}"#;

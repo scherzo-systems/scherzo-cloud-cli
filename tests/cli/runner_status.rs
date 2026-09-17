@@ -1,6 +1,8 @@
 use super::*;
 
+use std::io::{BufRead as _, BufReader};
 use std::os::unix::net::UnixListener;
+use std::sync::{Arc, Condvar, Mutex};
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
@@ -310,39 +312,87 @@ fn terminal_authentication_remains_locally_inspectable() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    let serve_stderr = serve.stderr.take().unwrap();
+    #[derive(Clone, Copy)]
+    enum TerminalObservation {
+        Reported,
+        StderrClosed,
+    }
+    let terminal_observation = Arc::new((Mutex::new(None), Condvar::new()));
+    let reader_observation = Arc::clone(&terminal_observation);
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        for line in BufReader::new(serve_stderr).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            output.push_str(&line);
+            output.push('\n');
+            let is_terminal_authentication = serde_json::from_str::<serde_json::Value>(&line)
+                .is_ok_and(|record| {
+                    record["event.name"].as_str() == Some("runner.gateway_connection")
+                        && record["scherzo.connection.failure_kind"].as_str()
+                            == Some("terminal_authentication")
+                        && record["scherzo.outcome"].as_str() == Some("failure")
+                });
+            if is_terminal_authentication {
+                let (observation, changed) = &*reader_observation;
+                let mut observation = observation.lock().unwrap();
+                if observation.is_none() {
+                    *observation = Some(TerminalObservation::Reported);
+                    changed.notify_one();
+                }
+            }
+        }
+        let (observation, changed) = &*reader_observation;
+        let mut observation = observation.lock().unwrap();
+        if observation.is_none() {
+            *observation = Some(TerminalObservation::StderrClosed);
+            changed.notify_one();
+        }
+        output
+    });
     request_received.recv().unwrap();
     response_release.send(()).unwrap();
     server.join().unwrap();
 
-    let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let (status, _) = poll_until(
-            "runner status reporting terminal authentication",
-            || {
-                let output = run(&["runner", "status", "--config", &fixture.config]);
-                let serve_status = serve.try_wait().unwrap();
-                (output, serve_status)
-            },
-            |(output, serve_status)| {
-                (output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("authentication_failed"))
-                    || serve_status.is_some()
-            },
-        );
-        status
-    }));
+    // The completed gateway event is emitted after LiveStatus enters its terminal
+    // authentication state, so it is an explicit synchronization signal for one query.
+    const TERMINAL_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+    let (observation, changed) = &*terminal_observation;
+    let (observation, _) = changed
+        .wait_timeout_while(
+            observation.lock().unwrap(),
+            TERMINAL_EVENT_TIMEOUT,
+            |observation| observation.is_none(),
+        )
+        .unwrap();
+    let wait_failure = match *observation {
+        Some(TerminalObservation::Reported) => None,
+        Some(TerminalObservation::StderrClosed) => {
+            Some("Runner Serve closed stderr before reporting terminal authentication".to_owned())
+        }
+        None => Some(format!(
+            "Runner Serve did not report terminal authentication within {TERMINAL_EVENT_TIMEOUT:?}"
+        )),
+    };
+    drop(observation);
+    if let Some(wait_failure) = wait_failure {
+        let _ = serve.kill();
+        let serve_status = serve.wait().unwrap();
+        let serve_stderr = stderr_reader.join().unwrap();
+        panic!("{wait_failure}: {serve_status:?}\n{serve_stderr}");
+    }
+    let status = run(&["runner", "status", "--config", &fixture.config]);
     if serve.try_wait().unwrap().is_none() {
         serve.kill().unwrap();
     }
-    let serve_output = serve.wait_with_output().unwrap();
-    let status = match status {
-        Ok(status) => status,
-        Err(payload) => std::panic::resume_unwind(payload),
-    };
+    serve.wait().unwrap();
+    let serve_stderr = stderr_reader.join().unwrap();
 
     assert!(
         status.status.success(),
-        "Runner Serve became unreachable after terminal authentication: {}",
-        String::from_utf8_lossy(&serve_output.stderr)
+        "Runner Serve became unreachable after terminal authentication: {serve_stderr}"
     );
     assert!(
         String::from_utf8_lossy(&status.stdout).contains("authentication_failed"),
