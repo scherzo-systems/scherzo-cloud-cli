@@ -122,7 +122,10 @@ pub(crate) use runners::{
     RunnerCredentialStoredState, RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList,
     RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
-pub(crate) use runs::{CreateRunInput, Run, RunApi, RunCreationAcceptance, RunFailure, RunState};
+pub(crate) use runs::{
+    CreateRunInput, Run, RunApi, RunCreationAcceptance, RunFailure, RunState,
+    valid_integration_context,
+};
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations
@@ -193,6 +196,40 @@ mod tests {
         explicit_null.input_set_id = Some(None);
         let encoded = serde_json::to_value(explicit_null).expect("null input set should encode");
         assert_eq!(encoded["inputSetId"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn generated_create_run_preserves_nullable_integration_context() {
+        let omitted: generated::models::CreateRunRequest = serde_json::from_value(
+            serde_json::json!({"projectId":"prj_fixture","workflowPath":"workflow.yaml"}),
+        )
+        .expect("omitted integration context should decode");
+        let null: generated::models::CreateRunRequest = serde_json::from_value(
+            serde_json::json!({"projectId":"prj_fixture","workflowPath":"workflow.yaml","integrationContext":null}),
+        )
+        .expect("null integration context should decode");
+        let present: generated::models::CreateRunRequest = serde_json::from_value(
+            serde_json::json!({"projectId":"prj_fixture","workflowPath":"workflow.yaml","integrationContext":{"source":"linear"}}),
+        )
+        .expect("present integration context should decode");
+
+        assert_eq!(omitted.integration_context, None);
+        assert_eq!(null.integration_context, None);
+        assert_eq!(
+            present.integration_context,
+            Some(Some(std::collections::HashMap::from([(
+                "source".to_owned(),
+                "linear".to_owned(),
+            )])))
+        );
+
+        let mut explicit_null = generated::models::CreateRunRequest::new(
+            "prj_fixture".to_owned(),
+            "workflow.yaml".to_owned(),
+        );
+        explicit_null.integration_context = Some(None);
+        let encoded = serde_json::to_value(explicit_null).expect("null context should encode");
+        assert_eq!(encoded["integrationContext"], serde_json::Value::Null);
     }
 
     #[test]

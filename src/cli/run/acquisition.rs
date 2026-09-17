@@ -4,11 +4,12 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use serde::de::{self, MapAccess, Visitor};
 use zeroize::Zeroizing;
 
 use crate::api::{
     InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,
-    RunInputManifest, RunInputUpload, digest_bytes,
+    RunInputManifest, RunInputUpload, digest_bytes, valid_integration_context,
 };
 
 const MAXIMUM_INPUTS: usize = 256;
@@ -16,6 +17,9 @@ const MAXIMUM_TEXT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_ATTACHMENTS: usize = 256;
 const MAXIMUM_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+// Allows the maximum compact context to use six-byte Unicode escapes plus
+// bounded formatting whitespace without permitting an unbounded source read.
+const MAXIMUM_INTEGRATION_CONTEXT_SOURCE_BYTES: u64 = 128 * 1024;
 
 pub(super) struct AcquiredInputObject {
     pub(super) member_id: String,
@@ -72,6 +76,21 @@ pub(super) enum InputAcquisitionFailure {
     AggregateTooLarge,
     TooManyInputs,
     TooManyAttachments,
+    IntegrationContextRead {
+        path: Option<PathBuf>,
+        source: io::Error,
+    },
+    IntegrationContextNotRegular {
+        path: PathBuf,
+    },
+    InvalidIntegrationContext {
+        path: Option<PathBuf>,
+        source: serde_json::Error,
+    },
+    IntegrationContextSourceTooLarge {
+        path: Option<PathBuf>,
+    },
+    IntegrationContextLimits,
 }
 
 impl fmt::Display for InputAcquisitionFailure {
@@ -133,6 +152,52 @@ impl fmt::Display for InputAcquisitionFailure {
             }
             Self::TooManyInputs => formatter.write_str("named input count exceeds 256"),
             Self::TooManyAttachments => formatter.write_str("attachment member count exceeds 256"),
+            Self::IntegrationContextRead { path: None, source } => {
+                write!(
+                    formatter,
+                    "read integration context from standard input: {source}"
+                )
+            }
+            Self::IntegrationContextRead {
+                path: Some(path),
+                source,
+            } => write!(
+                formatter,
+                "read integration context file {}: {source}",
+                path.display()
+            ),
+            Self::IntegrationContextNotRegular { path } => write!(
+                formatter,
+                "integration context source is not a regular file: {}",
+                path.display()
+            ),
+            Self::InvalidIntegrationContext { path: None, source } => write!(
+                formatter,
+                "decode integration context from standard input: invalid JSON at line {}, column {}",
+                source.line(),
+                source.column()
+            ),
+            Self::InvalidIntegrationContext {
+                path: Some(path),
+                source,
+            } => write!(
+                formatter,
+                "decode integration context file {}: invalid JSON at line {}, column {}",
+                path.display(),
+                source.line(),
+                source.column()
+            ),
+            Self::IntegrationContextSourceTooLarge { path: None } => formatter.write_str(
+                "integration context from standard input exceeds the 128 KiB source limit",
+            ),
+            Self::IntegrationContextSourceTooLarge { path: Some(path) } => write!(
+                formatter,
+                "integration context file exceeds the 128 KiB source limit: {}",
+                path.display()
+            ),
+            Self::IntegrationContextLimits => formatter.write_str(
+                "integration context exceeds its key, value, entry, or encoded-size limit",
+            ),
         }
     }
 }
@@ -183,6 +248,58 @@ pub(super) fn acquire_member_files(
         return Err(InputAcquisitionFailure::InvalidArguments);
     }
     Ok(selected.into_values().collect())
+}
+
+pub(super) fn validate_standard_input_claims(
+    arguments: &super::super::NamedInputArgs,
+    integration_context_file: Option<&Path>,
+) -> Result<(), InputAcquisitionFailure> {
+    let mut claims = usize::from(integration_context_file == Some(Path::new("-")));
+    for binding in bindings(&arguments.input_text_file, 2)?
+        .into_iter()
+        .chain(bindings(&arguments.input_json_file, 2)?)
+    {
+        if path_argument(binding.get(1))? == Path::new("-") {
+            claims += 1;
+        }
+    }
+    if claims > 1 {
+        Err(InputAcquisitionFailure::InvalidArguments)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn acquire_integration_context(
+    path: Option<&Path>,
+) -> Result<Option<BTreeMap<String, String>>, InputAcquisitionFailure> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let source_path = source_path(path);
+    let context = if path == Path::new("-") {
+        let input = io::stdin();
+        read_integration_context(input.lock(), source_path)?
+    } else {
+        let file =
+            super::super::open_regular_file_nonblocking(path).map_err(|error| match error {
+                super::super::OpenRegularFileError::Open(source)
+                | super::super::OpenRegularFileError::Metadata(source) => {
+                    InputAcquisitionFailure::IntegrationContextRead {
+                        path: source_path.clone(),
+                        source,
+                    }
+                }
+                super::super::OpenRegularFileError::NotRegular => {
+                    InputAcquisitionFailure::IntegrationContextNotRegular {
+                        path: path.to_owned(),
+                    }
+                }
+            })?;
+        read_integration_context(file, source_path)?
+    };
+    validate_integration_context(&context)?;
+    Ok(Some(context))
 }
 
 pub(super) fn acquire(
@@ -515,6 +632,82 @@ fn read_bounded(
     Ok(bytes)
 }
 
+fn read_integration_context(
+    source: impl Read,
+    path: Option<PathBuf>,
+) -> Result<BTreeMap<String, String>, InputAcquisitionFailure> {
+    let mut document = Zeroizing::new(Vec::new());
+    source
+        .take(MAXIMUM_INTEGRATION_CONTEXT_SOURCE_BYTES + 1)
+        .read_to_end(&mut document)
+        .map_err(|source| InputAcquisitionFailure::IntegrationContextRead {
+            path: path.clone(),
+            source,
+        })?;
+    if document.len() as u64 > MAXIMUM_INTEGRATION_CONTEXT_SOURCE_BYTES {
+        return Err(InputAcquisitionFailure::IntegrationContextSourceTooLarge { path });
+    }
+    decode_integration_context(&document, path)
+}
+
+fn decode_integration_context(
+    document: &[u8],
+    path: Option<PathBuf>,
+) -> Result<BTreeMap<String, String>, InputAcquisitionFailure> {
+    let mut decoder = serde_json::Deserializer::from_slice(document);
+    let context = serde::de::Deserializer::deserialize_map(&mut decoder, IntegrationContextVisitor)
+        .map_err(
+            |source| InputAcquisitionFailure::InvalidIntegrationContext {
+                path: path.clone(),
+                source,
+            },
+        )?;
+    decoder
+        .end()
+        .map_err(|source| InputAcquisitionFailure::InvalidIntegrationContext { path, source })?;
+    Ok(context)
+}
+
+struct IntegrationContextVisitor;
+
+impl<'de> Visitor<'de> for IntegrationContextVisitor {
+    type Value = BTreeMap<String, String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a flat JSON object with unique string members")
+    }
+
+    fn visit_map<A>(self, mut members: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut context = BTreeMap::new();
+        while let Some(key) = members.next_key::<String>()? {
+            if context.contains_key(&key) {
+                return Err(de::Error::custom("duplicate integration context member"));
+            }
+            let value = members.next_value::<String>()?;
+            context.insert(key, value);
+        }
+        Ok(context)
+    }
+}
+
+fn validate_integration_context(
+    context: &BTreeMap<String, String>,
+) -> Result<(), InputAcquisitionFailure> {
+    if !valid_integration_context(
+        context.len(),
+        context
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    ) {
+        Err(InputAcquisitionFailure::IntegrationContextLimits)
+    } else {
+        Ok(())
+    }
+}
+
 fn account_bytes(
     total: &mut u64,
     bytes: &[u8],
@@ -555,6 +748,75 @@ fn source_path(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integration_context_enforces_closed_shape_and_exact_limits() {
+        let mut exact_entries = BTreeMap::new();
+        for index in 0..32 {
+            exact_entries.insert(format!("key{index:02}"), String::new());
+        }
+        let mut exact_encoded = BTreeMap::new();
+        for index in 0..15 {
+            exact_encoded.insert(format!("{index:02}"), "v".repeat(1024));
+        }
+        exact_encoded.insert("15".to_owned(), "v".repeat(895));
+        assert_eq!(serde_json::to_vec(&exact_encoded).unwrap().len(), 16 * 1024);
+        let mut escape_sensitive_boundary = exact_encoded.clone();
+        escape_sensitive_boundary
+            .insert("15".to_owned(), format!("<>&\u{2028}{}", "v".repeat(889)));
+        for context in [
+            BTreeMap::new(),
+            BTreeMap::from([("empty".to_owned(), String::new())]),
+            exact_entries,
+            BTreeMap::from([("k".repeat(64), "v".repeat(1024))]),
+            exact_encoded.clone(),
+            escape_sensitive_boundary,
+        ] {
+            validate_integration_context(&context).unwrap();
+        }
+
+        let mut too_many = BTreeMap::new();
+        for index in 0..33 {
+            too_many.insert(format!("key{index:02}"), String::new());
+        }
+        let mut encoded_over = exact_encoded;
+        encoded_over.get_mut("15").unwrap().push('v');
+        for context in [
+            too_many,
+            BTreeMap::from([(String::new(), "value".to_owned())]),
+            BTreeMap::from([("k".repeat(65), "value".to_owned())]),
+            BTreeMap::from([("key".to_owned(), "v".repeat(1025))]),
+            BTreeMap::from([("nul\0key".to_owned(), "value".to_owned())]),
+            BTreeMap::from([("key".to_owned(), "nul\0value".to_owned())]),
+            encoded_over,
+        ] {
+            assert!(matches!(
+                validate_integration_context(&context),
+                Err(InputAcquisitionFailure::IntegrationContextLimits)
+            ));
+        }
+
+        for document in [
+            br#"{"key":"first","key":"second"}"#.as_slice(),
+            br#"{"key":null}"#.as_slice(),
+            br#"{"key":1}"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#"null"#.as_slice(),
+        ] {
+            assert!(matches!(
+                decode_integration_context(document, None),
+                Err(InputAcquisitionFailure::InvalidIntegrationContext { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn integration_context_source_read_is_bounded_without_waiting_for_eof() {
+        assert!(matches!(
+            read_integration_context(io::repeat(b' '), None),
+            Err(InputAcquisitionFailure::IntegrationContextSourceTooLarge { path: None })
+        ));
+    }
 
     #[test]
     fn mixed_input_acquisition_preserves_collection_order_and_empty_values() {

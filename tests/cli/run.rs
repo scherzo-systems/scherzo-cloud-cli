@@ -5,7 +5,6 @@ use ring::digest::{SHA256, digest};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt as _;
-#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 const TOKEN: &str = "unique-cloud-run-command-token-sentinel";
@@ -19,6 +18,34 @@ const EXECUTION_SPEC_ID: &str = "xsp_01k0z6r1w8f4jy2m7q9v3x5abc";
 const REPOSITORY_CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const INPUT_SET_ID: &str = "ris_01k0z6r1w8f4jy2m7q9v3x5abc";
 const WORKFLOW_PATH: &str = "workflows/build.yaml";
+
+fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &[u8]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES
+        .into_iter()
+        .chain(RUNNER_TELEMETRY_VARIABLES)
+    {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    match stdin.write_all(standard_input) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("write CLI standard input: {error}"),
+    }
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
 
 fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
@@ -122,6 +149,10 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
             "attachmentCount": 2,
             "aggregateBytes": 4096,
             "availability": "available"
+        },
+        "integrationContext": {
+            "issueId": "issue-private-context-sentinel",
+            "source": "linear"
         },
         "createdAt": "2026-08-10T12:00:00Z",
         "updatedAt": "2026-08-10T12:05:00Z"
@@ -455,6 +486,226 @@ fn run_create_sends_inputless_request_and_reports_plain_and_json_receipts() {
         assert_eq!(key.len(), 64);
         assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
+}
+
+#[test]
+fn run_create_sends_integration_context_from_regular_file_and_standard_input() {
+    for source in ["file", "stdin"] {
+        let context = br#"{"empty":"","issueId":"abc-123","source":"linear"}"#;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("context.json");
+        fs::write(&path, context).unwrap();
+        let operand = if source == "file" {
+            path.to_str().unwrap()
+        } else {
+            "-"
+        };
+        let (server, _credentials, credential_path) =
+            prepared_run(vec![acceptance_response(false)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut arguments = create_args(true);
+        let insertion = arguments.len() - 1;
+        arguments.splice(
+            insertion..insertion,
+            ["--integration-context-file", operand],
+        );
+
+        let output = if source == "stdin" {
+            run_with_stdin(&arguments, &environment, context)
+        } else {
+            run_with_env(&arguments, &environment)
+        };
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_no_secret_output(&output, &["abc-123"]);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            request_body(&requests[0])["integrationContext"],
+            serde_json::json!({"empty": "", "issueId": "abc-123", "source": "linear"})
+        );
+    }
+}
+
+#[test]
+fn run_create_reads_named_text_and_json_from_standard_input() {
+    for (flag, kind, input_bytes) in [
+        ("--input-text-file", "text", b"stdin text".as_slice()),
+        ("--input-json-file", "json", br#"{"stdin":true}"#.as_slice()),
+    ] {
+        let storage = OneShotServer::respond("204 No Content", None, b"");
+        let signed_url = format!("{}/private/request?signature=stdin", storage.api_url);
+        let (server, _credentials, credential_path) = prepared_run(vec![
+            create_scalar_input_set_response(input_bytes, kind, false),
+            scalar_upload_capability_response(
+                input_bytes,
+                if kind == "text" {
+                    "text/plain; charset=utf-8"
+                } else {
+                    "application/json"
+                },
+                &signed_url,
+            ),
+            seal_scalar_input_set_response(input_bytes, kind, false),
+            acceptance_response(false),
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let arguments = create_args_with_scalar_input(flag, "request", "-", true);
+
+        let output = run_with_stdin(&arguments, &environment, input_bytes);
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.finish().len(), 4);
+        assert_eq!(
+            storage
+                .finish()
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .1
+                .as_bytes(),
+            input_bytes
+        );
+    }
+}
+
+#[test]
+fn competing_standard_input_claims_reject_before_cloud_access() {
+    for input_flag in ["--input-text-file", "--input-json-file"] {
+        let (server, _credentials, credential_path) = prepared_run(Vec::new());
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut arguments = create_args(true);
+        let insertion = arguments.len() - 1;
+        arguments.splice(
+            insertion..insertion,
+            [
+                "--integration-context-file",
+                "-",
+                input_flag,
+                "request",
+                "-",
+            ],
+        );
+
+        let output = run_with_env(&arguments, &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+            "invalid_input"
+        );
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn invalid_integration_context_rejects_before_cloud_access() {
+    let mut too_many = serde_json::Map::new();
+    for index in 0..33 {
+        too_many.insert(
+            format!("key{index:02}"),
+            serde_json::Value::String(String::new()),
+        );
+    }
+    let invalid_documents = [
+        br#"{"duplicate":"first","duplicate":"second"}"#.to_vec(),
+        serde_json::to_vec(&too_many).unwrap(),
+        serde_json::to_vec(&serde_json::json!({"": "value"})).unwrap(),
+        serde_json::to_vec(&serde_json::json!({"key": "v".repeat(1025)})).unwrap(),
+        br#"{"key":"\u0000"}"#.to_vec(),
+    ];
+    for document in invalid_documents {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("context.json");
+        fs::write(&path, document).unwrap();
+        let (server, _credentials, credential_path) = prepared_run(Vec::new());
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut arguments = create_args(true);
+        let insertion = arguments.len() - 1;
+        arguments.splice(
+            insertion..insertion,
+            ["--integration-context-file", path.to_str().unwrap()],
+        );
+
+        let output = run_with_env(&arguments, &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+            "invalid_input"
+        );
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn invalid_integration_context_plain_output_redacts_caller_values() {
+    const PRIVATE_VALUE: &str = "private-parser-value-sentinel";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("context.json");
+    let encoded_object = serde_json::json!({"token": PRIVATE_VALUE}).to_string();
+    fs::write(&path, serde_json::to_vec(&encoded_object).unwrap()).unwrap();
+    let (server, _credentials, credential_path) = prepared_run(Vec::new());
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(false);
+    let insertion = arguments.len() - 1;
+    arguments.splice(
+        insertion..insertion,
+        ["--integration-context-file", path.to_str().unwrap()],
+    );
+
+    let output = run_with_env(&arguments, &environment);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_no_secret_output(&output, &[PRIVATE_VALUE]);
+    assert!(server.finish().is_empty());
+}
+
+#[test]
+fn oversized_integration_context_standard_input_rejects_before_cloud_access() {
+    let (server, _credentials, credential_path) = prepared_run(Vec::new());
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(true);
+    let insertion = arguments.len() - 1;
+    arguments.splice(insertion..insertion, ["--integration-context-file", "-"]);
+    let oversized_source = vec![b' '; 128 * 1024 + 1];
+
+    let output = run_with_stdin(&arguments, &environment, &oversized_source);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+        "invalid_input"
+    );
+    assert!(server.finish().is_empty());
+}
+
+#[test]
+fn unreadable_integration_context_rejects_before_cloud_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let (server, _credentials, credential_path) = prepared_run(Vec::new());
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(true);
+    let insertion = arguments.len() - 1;
+    arguments.splice(
+        insertion..insertion,
+        ["--integration-context-file", missing.to_str().unwrap()],
+    );
+
+    let output = run_with_env(&arguments, &environment);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(server.finish().is_empty());
 }
 
 #[test]
@@ -2540,11 +2791,20 @@ fn interrupted_create_without_an_idempotency_echo_is_invalid_response() {
 
 #[test]
 fn ambiguous_transport_retry_reuses_the_create_key_and_request() {
-    let (server, _directory, credential_path) =
+    let directory = tempfile::tempdir().unwrap();
+    let context_path = directory.path().join("context.json");
+    fs::write(&context_path, br#"{"issueId":"retry-context"}"#).unwrap();
+    let (server, _credential_directory, credential_path) =
         prepared_run(vec![Vec::new(), acceptance_response(true)]);
     let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(true);
+    let insertion = arguments.len() - 1;
+    arguments.splice(
+        insertion..insertion,
+        ["--integration-context-file", context_path.to_str().unwrap()],
+    );
 
-    let output = run_with_env(&create_args(true), &environment);
+    let output = run_with_env(&arguments, &environment);
 
     assert!(output.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -2823,6 +3083,16 @@ fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
             );
         } else {
             let stdout = String::from_utf8(output.stdout).unwrap();
+            let issue_context = stdout
+                .find("issueId: issue-private-context-sentinel")
+                .expect("plain projection should expose the complete integration context");
+            let source_context = stdout
+                .find("source: linear")
+                .expect("plain projection should expose the complete integration context");
+            assert!(
+                issue_context < source_context,
+                "integration context should be sorted"
+            );
             for field in [
                 format!("run: {RUN_ID}"),
                 "state: running".to_owned(),

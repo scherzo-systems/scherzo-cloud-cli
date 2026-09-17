@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ pub(crate) struct CreateRunInput<'a> {
     pub(crate) source_branch: Option<&'a str>,
     pub(crate) display_name: Option<&'a str>,
     pub(crate) input_set_id: Option<&'a str>,
+    pub(crate) integration_context: Option<&'a BTreeMap<String, String>>,
 }
 
 pub(crate) struct RunApi<'a> {
@@ -77,6 +79,14 @@ impl<'a> RunApi<'a> {
         request.source_branch = input.source_branch.map(str::to_owned);
         request.display_name = input.display_name.map(str::to_owned);
         request.input_set_id = input.input_set_id.map(|id| Some(id.to_owned()));
+        request.integration_context = input.integration_context.map(|context| {
+            Some(
+                context
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        });
         let endpoint = self.collection_endpoint(organization);
         let response = self.send_api_request(
             StatusCode::ACCEPTED,
@@ -393,6 +403,12 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
             .is_none_or(|id| crate::public_id::valid_typed_id(id, "ris_"))
         && (0..=256).contains(&inputs.attachment_count)
         && (0..=268_435_456).contains(&inputs.aggregate_bytes)
+        && valid_integration_context(
+            run.integration_context.len(),
+            run.integration_context
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
         && valid_timestamp(&run.created_at)
         && valid_timestamp(&run.updated_at);
     if valid {
@@ -446,6 +462,48 @@ pub(super) fn require_media_type(
     } else {
         Err(RunFailure::protocol(credential_rejected))
     }
+}
+
+pub(crate) fn valid_integration_context<'a>(
+    entry_count: usize,
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    if entry_count > 32 {
+        return false;
+    }
+    let mut encoded_size = 2;
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        if key.is_empty()
+            || key.len() > 64
+            || value.len() > 1024
+            || key.contains('\0')
+            || value.contains('\0')
+        {
+            return false;
+        }
+        encoded_size += usize::from(index > 0)
+            + compact_json_string_size(key)
+            + 1
+            + compact_json_string_size(value);
+        if encoded_size > 16 * 1024 {
+            return false;
+        }
+    }
+    true
+}
+
+// This is the shared API/CLI size contract: compact UTF-8 JSON escapes only
+// syntax and controls, so HTML-sensitive and Unicode separator characters keep
+// their literal UTF-8 size.
+fn compact_json_string_size(value: &str) -> usize {
+    2 + value
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        })
+        .sum::<usize>()
 }
 
 fn valid_bounded_string(value: &str, minimum: usize, maximum: usize) -> bool {

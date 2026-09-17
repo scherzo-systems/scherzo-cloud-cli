@@ -1082,6 +1082,7 @@ scherzo-cloud run create acme-labs \
   --workflow-path workflows/build.yaml \
   --input-text-file request ./request.txt \
   --input-json settings '{"mode":"review"}' \
+  --integration-context-file ./integration-context.json \
   --input-attachment evidence text/plain ./notes.txt \
   --input-attachment evidence application/pdf ./report.pdf \
   --input-attachments-empty optionalEvidence
@@ -1125,8 +1126,20 @@ repeated in one invocation: Text uses `--input-text NAME TEXT` or
 `--input-file NAME MEDIA_TYPE PATH`, and ordered attachment members use repeated
 `--input-attachment NAME MEDIA_TYPE PATH`. `--input-attachments-empty NAME` preserves a
 present collection with no members. A name may be bound once, except that attachment
-members append to one collection in argument order. One Text or JSON file source may use
-`-` to claim standard input; File and attachment paths always name regular files.
+members append to one collection in argument order. `--integration-context-file PATH`
+supplies a private immutable flat JSON object whose keys and values are strings. It is
+returned by run readers but is not a workflow input. Omitting the flag and supplying an
+empty object have the same run semantics. The object allows at most 32 entries, 64 UTF-8
+bytes per nonempty key, 1 KiB per value, and 16 KiB of compact JSON; empty values are
+valid, U+0000 is not, and duplicate members reject locally. The encoded-size limit uses
+compact UTF-8 JSON with the shortest JSON-required escapes, so `<`, `>`, `&`, U+2028, and U+2029
+retain their literal UTF-8 size. The source document, including escapes and formatting,
+is limited to 128 KiB so file and standard-input reads remain bounded.
+
+One Text or JSON file source or the integration-context file may use `-` to claim standard
+input. Exactly one such operand may claim standard input in an invocation; competing claims
+reject before stdin is read or Cloud is contacted. File and attachment paths always name
+regular files.
 
 Text and JSON values are limited to 1 MiB, each File or attachment member to 64 MiB, all
 values together to 256 MiB, named inputs to 256, and attachment members to 256. Text must
@@ -1187,14 +1200,15 @@ erasure. An interruption racing the atomic commit reports unknown commitment and
 directs the caller to inspect the destination. Capability URLs, input bytes, and bearer
 credentials are never included in command output. Retention expiry is reported as
 `gone`. Successful deletion makes content logically unavailable and schedules exact-key
-cleanup; it does not attest physical erasure. Both deletion commands require literal
+cleanup; it does not attest physical erasure and does not remove the run's integration
+context. Both deletion commands require literal
 `--yes`, use fresh idempotency keys, and report an unknown commitment if interrupted
 after dispatch.
 
 Add `--json` for schema-version-1 output. A create receipt preserves `replayed` as a
 boolean and identifies the submitted `organizationRef`. Show and terminal wait results
 contain the complete public Run projection, including the current attempt, pinned
-workflow and workspace source, input summary, and timestamps.
+workflow and workspace source, input summary, integration context, and timestamps.
 
 `run wait` polls through `queued`, `assigning`, `preparing`, `assigned`, and `running`.
 A `succeeded` projection exits zero; `failed`, `cancelled`, `interrupted`, and `rejected`

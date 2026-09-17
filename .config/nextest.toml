@@ -18,3 +18,10 @@ test-group = "external-process"
 filter = "kind(test)"
 test-group = "external-process"
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.timing]
+# Same policy as the default profile, plus a JUnit report under the Cargo target
+# directory so per-test durations can be ranked; used for timing baselines only.
+
+[profile.timing.junit]
+path = "junit.xml"

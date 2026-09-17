@@ -32,6 +32,8 @@ Options:
           Append an immutable member to a named attachment collection
       --input-attachments-empty <NAME>
           Supply a present named attachment collection with no members
+      --integration-context-file <PATH>
+          Read private immutable integration context from a JSON file, or - for standard input
       --json
           Print the run result as JSON
       --allow-insecure-http

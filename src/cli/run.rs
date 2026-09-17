@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
@@ -112,6 +113,13 @@ struct CreateCommand {
 
     #[command(flatten)]
     inputs: super::NamedInputArgs,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read private immutable integration context from a JSON file, or - for standard input"
+    )]
+    integration_context_file: Option<PathBuf>,
 
     #[command(flatten)]
     options: RunOptions,
@@ -353,6 +361,34 @@ impl CreateCommand {
         deployment: &Deployment,
         control: &super::OperationControl<CreateRecoveryState>,
     ) -> super::CommandResult {
+        if let Err(error) = acquisition::validate_standard_input_claims(
+            &self.inputs,
+            self.integration_context_file.as_deref(),
+        ) {
+            return finish_operation(control, || {
+                write_input_acquisition_failure(
+                    deployment.fingerprint().api_url(),
+                    &self.organization,
+                    &error,
+                    self.options.json,
+                )
+            });
+        }
+        let integration_context = match acquisition::acquire_integration_context(
+            self.integration_context_file.as_deref(),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return finish_operation(control, || {
+                    write_input_acquisition_failure(
+                        deployment.fingerprint().api_url(),
+                        &self.organization,
+                        &error,
+                        self.options.json,
+                    )
+                });
+            }
+        };
         let acquired = if self.inputs.is_empty() {
             None
         } else {
@@ -418,6 +454,7 @@ impl CreateCommand {
                     source_branch: self.source_branch.as_deref(),
                     display_name: self.display_name.as_deref(),
                     input_set_id: input_set_id.as_deref(),
+                    integration_context: integration_context.as_ref(),
                 },
                 || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
             )
@@ -767,7 +804,7 @@ fn write_input_acquisition_failure(
     } else {
         writeln!(
             io::stderr().lock(),
-            "error: acquire Cloud run inputs: {}\n\nCorrect the named input sources and limits, then try again.",
+            "error: acquire Cloud run request data: {}\n\nCorrect the named input sources, integration context, and limits, then try again.",
             visible_text(&failure.to_string())
         )?;
     }
@@ -998,6 +1035,16 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
         "  availability: {}",
         enum_text(&run.inputs.availability)?
     )?;
+    writeln!(stdout, "\nintegration context:")?;
+    if run.integration_context.is_empty() {
+        writeln!(stdout, "  none")?;
+    } else {
+        let mut entries = run.integration_context.iter().collect::<Vec<_>>();
+        entries.sort_by(|(first, _), (second, _)| first.as_bytes().cmp(second.as_bytes()));
+        for (key, value) in entries {
+            writeln!(stdout, "  {}: {}", visible_text(key), visible_text(value))?;
+        }
+    }
     writeln!(stdout, "\ncreated: {}", run.created_at)?;
     writeln!(stdout, "updated: {}", run.updated_at)?;
     writeln!(stdout, "deployment: {deployment}")?;
@@ -1414,6 +1461,7 @@ mod tests {
                 "aggregateBytes": 0,
                 "availability": "available"
             },
+            "integrationContext": {},
             "createdAt": "2026-08-10T12:00:00Z",
             "updatedAt": "2026-08-10T12:00:00Z"
         }))
@@ -1443,6 +1491,7 @@ mod tests {
                 source_branch: None,
                 display_name: None,
                 input_set_id: Some("ris_explicit"),
+                integration_context: None,
             },
             begin_dispatch,
         )
