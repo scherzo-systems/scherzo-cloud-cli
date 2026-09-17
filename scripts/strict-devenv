@@ -33,8 +33,11 @@ fi
 
 # The exported source has no parent wrapper. Retain only values required by its
 # test contract and the exact Devenv binary used by nested boundary tests.
+# CARGO_HOME and CARGO_TARGET_DIR let a caller-owned persistent registry and
+# build cache survive the boundary instead of recompiling from cold each run.
 keep_variables=(
   CARGO_BUILD_JOBS
+  CARGO_HOME
   CARGO_TARGET_DIR
   CI
   DEVENV_TUI

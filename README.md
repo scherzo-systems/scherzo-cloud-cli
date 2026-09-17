@@ -1579,10 +1579,10 @@ Run the canonical check from the repository root:
 
 The command uses `scripts/strict-devenv` to remove the caller's environment before
 Devenv constructs the declared test environment. This is the same entrypoint used by CI.
-It preserves `CARGO_BUILD_JOBS`, `CARGO_TARGET_DIR`, and `RUSTC_WRAPPER` so build
-limits, isolated targets, and runner-owned compiler coordination survive the clean
-boundary. Jobs are per Cargo invocation; a compiler wrapper may coordinate separate
-invocations without relying on their `CARGO_HOME`.
+It preserves `CARGO_BUILD_JOBS`, `CARGO_HOME`, `CARGO_TARGET_DIR`, and `RUSTC_WRAPPER`
+so build limits, a caller-owned registry and build cache, and runner-owned compiler
+coordination survive the clean boundary instead of recompiling the dependency graph
+from cold on every run. Jobs are per Cargo invocation.
 The check verifies public-source isolation, formatting, every target and feature on the
 `rust-version` declared in `Cargo.toml`, checked-in Clippy policy, unit and integration
 tests, and a release build.

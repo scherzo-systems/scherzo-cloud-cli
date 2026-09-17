@@ -14,9 +14,10 @@ fail() {
 ambient_directory=$temporary/ambient-bin
 ambient_command=scherzo-cli-ambient-only-command
 cargo_target=$temporary/cargo-target
+cargo_home=$temporary/cargo-home
 marker_value=must-not-cross-clean-boundary
 diagnostic=$temporary/missing-command.err
-mkdir -p -- "$ambient_directory" "$cargo_target"
+mkdir -p -- "$ambient_directory" "$cargo_target" "$cargo_home"
 printf '#!%s\n%s\n' "$BASH" 'exit 0' >"$ambient_directory/$ambient_command"
 chmod +x "$ambient_directory/$ambient_command"
 
@@ -24,6 +25,7 @@ chmod +x "$ambient_directory/$ambient_command"
 # shellcheck disable=SC2016
 if ! PATH="$ambient_directory:$PATH" \
   CARGO_BUILD_JOBS=1 \
+  CARGO_HOME="$cargo_home" \
   CARGO_TARGET_DIR="$cargo_target" \
   RUSTC_WRAPPER="$ambient_directory/$ambient_command" \
   DEVENV_TUI=false \
@@ -35,6 +37,7 @@ if ! PATH="$ambient_directory:$PATH" \
     ambient_command=$3
     diagnostic=$4
     [[ ${CARGO_TARGET_DIR:-} == "$expected_target" ]]
+    [[ ${CARGO_HOME:-} == "$5" ]]
     [[ ${CARGO_BUILD_JOBS:-} == 1 ]]
     [[ ${RUSTC_WRAPPER:-} == "$ambient_directory/$ambient_command" ]]
     [[ ${DEVENV_TUI:-} == false ]]
@@ -46,6 +49,7 @@ if ! PATH="$ambient_directory:$PATH" \
     fi
     [[ $(<"$diagnostic") == *"$ambient_command"* ]]
   ' bash "$cargo_target" "$ambient_directory" "$ambient_command" "$diagnostic" \
+    "$cargo_home" \
   >"$temporary/environment.out" 2>"$temporary/environment.err"; then
   cat "$temporary/environment.out" "$temporary/environment.err" >&2
   fail 'clean environment did not enforce the exported CLI test contract'
