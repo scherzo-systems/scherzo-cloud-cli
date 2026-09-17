@@ -1585,7 +1585,7 @@ coordination survive the clean boundary instead of recompiling the dependency gr
 from cold on every run. Jobs are per Cargo invocation.
 The check verifies public-source isolation, formatting, every target and feature on the
 `rust-version` declared in `Cargo.toml`, checked-in Clippy policy, unit and integration
-tests, and a release build.
+tests, and release-archive packaging of the tested binary.
 
 ## License
 

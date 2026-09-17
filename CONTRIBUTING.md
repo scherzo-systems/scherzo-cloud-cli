@@ -33,18 +33,20 @@ nix shell github:cachix/devenv/2418e1b43797c44de5166176622c8d8fa0149871 \
 The project uses its standalone devenv environment to provide the minimum Rust toolchain
 declared in `Cargo.toml` and the pinned Node 24 line used by the private PiJsonV1
 extension project. `./scripts/check` enters that environment through the clean boundary
-and runs the same formatting, linting, testing, source-boundary, and release build checks
+and runs the same formatting, linting, testing, source-boundary, and release packaging checks
 used by CI. The canonical check performs a
 locked npm install before checking the extension; run
 `./scripts/check-pi-json-v1-extension` for that focused path.
 
 Rust unit and integration tests run through cargo-nextest with the checked-in
 `.config/nextest.toml` policy. Both `./scripts/check` and the production Nix package select the
-locked workspace with all targets and all features; the local suite additionally rebuilds the
-version tests with a fixed development version, while Nix injects the package version and build
-identity into its complete run. The current workspace is binary-only and has no documentation-test
-target; formatting, Clippy, structural checks, and the release build remain explicit parts of the
-broader local suite rather than Nix package checks.
+locked workspace with all targets and all features. Nix injects the package version and build
+identity into its complete run, which is where the injected-version contract is proved; the local
+suite builds once without injection. The current workspace is binary-only and has no
+documentation-test target; formatting, Clippy, and structural checks remain explicit parts of the
+broader local suite rather than Nix package checks. The local suite packages and verifies the
+release archive from the binary its integration tests already built rather than compiling an
+optimized binary; optimized builds are produced only by the Nix package and release builds.
 
 Nextest gives each selected test its own process, preventing a child forked by one test from
 inheriting another test's open descriptors. This isolation does not prevent races among processes

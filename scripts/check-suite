@@ -158,17 +158,20 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
 cargo nextest run --locked --workspace --all-targets --all-features
-SCHERZO_CLOUD_VERSION=0.2.7 \
-  cargo nextest run --locked --workspace --all-targets --all-features resolved_build_version
-cargo build --locked --workspace --all-features --release
 
+# The packaging checks exercise archive layout, embedded authoring assets, and
+# isolated execution, none of which depend on optimization level. Reuse the
+# binary the integration tests just built instead of a second, optimized
+# compilation of the whole crate; the Nix package and release builds compile
+# optimized binaries with the injected version and identity and run this suite
+# against them.
 host_target=$(rustc -vV | awk '$1 == "host:" { print $2 }')
 case $host_target in
   aarch64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu)
     release_dist=$long_tmp_parent/release-dist
     archive=$(
       "$public_root/scripts/package-release-archive" \
-        --binary "$cargo_target_dir/release/scherzo-cloud" \
+        --binary "$cargo_target_dir/debug/scherzo-cloud" \
         --output "$release_dist" \
         --target "$host_target" \
         --version 0.0.0-dev
