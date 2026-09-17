@@ -20,6 +20,7 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
+const DEFAULT_LIST_LIMIT: usize = 50;
 const PRIVATE_CACHE_CONTROL: &str = "private, no-store";
 const GONE: &str = "https://api.scherzo.dev/problems/gone";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
@@ -32,6 +33,7 @@ const INTERNAL_SERVER_ERROR: &str = "https://api.scherzo.dev/problems/internal-s
 const RETRYABLE_CONFLICT: &str = "https://api.scherzo.dev/problems/retryable-conflict";
 
 pub(crate) type Publication = models::Publication;
+pub(crate) type PublicationList = models::PublicationList;
 
 pub(crate) struct PublicationApi {
     configuration: apis::configuration::Configuration,
@@ -131,6 +133,82 @@ impl PublicationApi {
         }
         Err(PublicationFailure::Unreachable(last_transport_failure))
     }
+
+    pub(crate) fn get(
+        &self,
+        organization: &str,
+        run_id: &str,
+        publication_id: &str,
+    ) -> Result<Publication, PublicationFailure> {
+        let endpoint = format!(
+            "{}/{}",
+            self.collection_endpoint(organization, run_id),
+            apis::urlencode(publication_id)
+        );
+        let response = self.read_response(super::generated_api_request(
+            &self.configuration,
+            Method::GET,
+            &endpoint,
+        ))?;
+        decode_get_response(response, run_id, publication_id)
+    }
+
+    pub(crate) fn list(
+        &self,
+        organization: &str,
+        run_id: &str,
+        limit: Option<u16>,
+        cursor: Option<&str>,
+    ) -> Result<PublicationList, PublicationFailure> {
+        let endpoint = self.collection_endpoint(organization, run_id);
+        let mut request = super::generated_api_request(&self.configuration, Method::GET, &endpoint);
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit)]);
+        }
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = self.read_response(request)?;
+        decode_list_response(
+            response,
+            run_id,
+            limit.map_or(DEFAULT_LIST_LIMIT, usize::from),
+        )
+    }
+
+    fn collection_endpoint(&self, organization: &str, run_id: &str) -> String {
+        format!(
+            "{}/v1/organizations/{}/runs/{}/publications",
+            self.configuration.base_path.trim_end_matches('/'),
+            apis::urlencode(organization),
+            apis::urlencode(run_id)
+        )
+    }
+
+    fn read_response(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> Result<BufferedBlockingResponse, PublicationFailure> {
+        let response = request
+            .send()
+            .map_err(|error| PublicationFailure::Unreachable(classify_reqwest_error(&error)))?;
+        let status = response.status();
+        http_util::buffer_blocking_response(response).map_err(|error| match error {
+            BoundedBodyError::TooLarge => {
+                PublicationFailure::protocol(status == StatusCode::UNAUTHORIZED)
+            }
+            BoundedBodyError::Transport(_) if status == StatusCode::UNAUTHORIZED => {
+                PublicationFailure::protocol(true)
+            }
+            BoundedBodyError::Transport(error) => {
+                PublicationFailure::Unreachable(if status.is_server_error() {
+                    UnreachableCategory::Server
+                } else {
+                    classify_reqwest_error(&error)
+                })
+            }
+        })
+    }
 }
 
 impl Drop for PublicationApi {
@@ -219,13 +297,18 @@ fn decode_create_response(
     expected_idempotency_key: &str,
 ) -> Result<Publication, PublicationFailure> {
     if response.status != StatusCode::ACCEPTED {
-        return Err(classify_failure(&response));
+        return Err(classify_failure(&response, Operation::Create));
     }
     require_media_type(&response, JSON_MEDIA_TYPE, false)?;
     require_exact_header(response.idempotency_keys.iter(), expected_idempotency_key)?;
     require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
     let publication = decode_closed_publication(&response.body)?;
-    validate_publication(&publication, requested_run_id, requested_export_name)?;
+    validate_publication(
+        &publication,
+        requested_run_id,
+        Some(requested_export_name),
+        None,
+    )?;
     let expected_location = format!(
         "/v1/organizations/{}/runs/{}/publications/{}",
         apis::urlencode(&publication.organization_id),
@@ -236,7 +319,50 @@ fn decode_create_response(
     Ok(publication)
 }
 
-fn classify_failure(response: &BufferedBlockingResponse) -> PublicationFailure {
+fn decode_get_response(
+    response: BufferedBlockingResponse,
+    requested_run_id: &str,
+    requested_publication_id: &str,
+) -> Result<Publication, PublicationFailure> {
+    if response.status != StatusCode::OK {
+        return Err(classify_failure(&response, Operation::Get));
+    }
+    require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+    require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+    let publication = decode_closed_publication(&response.body)?;
+    validate_publication(
+        &publication,
+        requested_run_id,
+        None,
+        Some(requested_publication_id),
+    )?;
+    Ok(publication)
+}
+
+fn decode_list_response(
+    response: BufferedBlockingResponse,
+    requested_run_id: &str,
+    maximum_items: usize,
+) -> Result<PublicationList, PublicationFailure> {
+    if response.status != StatusCode::OK {
+        return Err(classify_failure(&response, Operation::List));
+    }
+    require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+    require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+    decode_closed_publication_list(&response.body, requested_run_id, maximum_items)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Operation {
+    Create,
+    Get,
+    List,
+}
+
+fn classify_failure(
+    response: &BufferedBlockingResponse,
+    operation: Operation,
+) -> PublicationFailure {
     match response.status {
         StatusCode::BAD_REQUEST => validated_problem_failure(
             response,
@@ -256,7 +382,7 @@ fn classify_failure(response: &BufferedBlockingResponse) -> PublicationFailure {
         StatusCode::NOT_FOUND => {
             validated_problem_failure(response, &[NOT_FOUND], PublicationFailure::NotFound, false)
         }
-        StatusCode::CONFLICT => validated_problem_failure(
+        StatusCode::CONFLICT if operation == Operation::Create => validated_problem_failure(
             response,
             &[
                 IDEMPOTENCY_CONFLICT,
@@ -267,28 +393,32 @@ fn classify_failure(response: &BufferedBlockingResponse) -> PublicationFailure {
             PublicationFailure::Conflict,
             false,
         ),
-        StatusCode::GONE => {
+        StatusCode::GONE if operation == Operation::Create => {
             validated_problem_failure(response, &[GONE], PublicationFailure::Gone, false)
         }
-        StatusCode::PAYLOAD_TOO_LARGE => validated_problem_failure(
-            response,
-            &[REQUEST_BODY_TOO_LARGE],
-            PublicationFailure::InvalidInput,
-            false,
-        ),
-        StatusCode::UNSUPPORTED_MEDIA_TYPE => validated_problem_failure(
-            response,
-            &[UNSUPPORTED_MEDIA_TYPE],
-            PublicationFailure::InvalidInput,
-            false,
-        ),
+        StatusCode::PAYLOAD_TOO_LARGE if operation == Operation::Create => {
+            validated_problem_failure(
+                response,
+                &[REQUEST_BODY_TOO_LARGE],
+                PublicationFailure::InvalidInput,
+                false,
+            )
+        }
+        StatusCode::UNSUPPORTED_MEDIA_TYPE if operation == Operation::Create => {
+            validated_problem_failure(
+                response,
+                &[UNSUPPORTED_MEDIA_TYPE],
+                PublicationFailure::InvalidInput,
+                false,
+            )
+        }
         StatusCode::INTERNAL_SERVER_ERROR => validated_problem_failure(
             response,
             &[INTERNAL_SERVER_ERROR],
             PublicationFailure::Unreachable(UnreachableCategory::Server),
             false,
         ),
-        StatusCode::SERVICE_UNAVAILABLE => {
+        StatusCode::SERVICE_UNAVAILABLE if operation == Operation::Create => {
             let failure = validated_problem_failure(
                 response,
                 &[RETRYABLE_CONFLICT],
@@ -371,6 +501,12 @@ fn require_media_type(
 fn decode_closed_publication(body: &[u8]) -> Result<Publication, PublicationFailure> {
     let value = crate::workflow_contract::strict_json::from_slice(body)
         .map_err(|_| PublicationFailure::protocol(false))?;
+    decode_closed_publication_value(value)
+}
+
+fn decode_closed_publication_value(
+    value: serde_json::Value,
+) -> Result<Publication, PublicationFailure> {
     require_closed_object(
         &value,
         &[
@@ -408,6 +544,63 @@ fn decode_closed_publication(body: &[u8]) -> Result<Publication, PublicationFail
     require_closed_field(&value, "pullRequest", PULL_REQUEST_FIELDS, true)?;
     require_closed_field(&value, "failure", FAILURE_FIELDS, true)?;
     serde_json::from_value(value).map_err(|_| PublicationFailure::protocol(false))
+}
+
+fn decode_closed_publication_list(
+    body: &[u8],
+    requested_run_id: &str,
+    maximum_items: usize,
+) -> Result<PublicationList, PublicationFailure> {
+    let value = crate::workflow_contract::strict_json::from_slice(body)
+        .map_err(|_| PublicationFailure::protocol(false))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| PublicationFailure::protocol(false))?;
+    if !object.contains_key("items")
+        || object
+            .keys()
+            .any(|field| !matches!(field.as_str(), "items" | "nextCursor"))
+    {
+        return Err(PublicationFailure::protocol(false));
+    }
+    let raw_items = object
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| PublicationFailure::protocol(false))?;
+    if raw_items.len() > maximum_items {
+        return Err(PublicationFailure::protocol(false));
+    }
+    let items = raw_items
+        .iter()
+        .cloned()
+        .map(decode_closed_publication_value)
+        .map(|result| {
+            result.and_then(|publication| {
+                validate_publication(&publication, requested_run_id, None, None)?;
+                Ok(publication)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if items.windows(2).any(|pair| {
+        let first_created = timestamp(&pair[0].created_at);
+        let second_created = timestamp(&pair[1].created_at);
+        match (first_created, second_created) {
+            (Ok(first), Ok(second)) => {
+                first > second || (first == second && pair[0].id >= pair[1].id)
+            }
+            _ => true,
+        }
+    }) {
+        return Err(PublicationFailure::protocol(false));
+    }
+    let next_cursor = match object.get("nextCursor") {
+        None => None,
+        Some(serde_json::Value::String(cursor)) if (1..=2048).contains(&cursor.chars().count()) => {
+            Some(cursor.clone())
+        }
+        Some(_) => return Err(PublicationFailure::protocol(false)),
+    };
+    Ok(PublicationList { items, next_cursor })
 }
 
 const ARTIFACT_FIELDS: &[&str] = &[
@@ -463,7 +656,8 @@ fn require_closed_object(
 fn validate_publication(
     publication: &Publication,
     requested_run_id: &str,
-    requested_export_name: &str,
+    requested_export_name: Option<&str>,
+    requested_publication_id: Option<&str>,
 ) -> Result<(), PublicationFailure> {
     use models::publication::{Outcome, State};
 
@@ -488,7 +682,8 @@ fn validate_publication(
         && crate::public_id::valid_typed_id(&publication.actor_principal_id, "prn_")
         && crate::public_id::valid_typed_id(&publication.target.repository_connection_id, "rpc_");
     let snapshot_valid = publication.run_id == requested_run_id
-        && publication.export_name == requested_export_name
+        && requested_publication_id.is_none_or(|expected| publication.id == expected)
+        && requested_export_name.is_none_or(|expected| publication.export_name == expected)
         && crate::workflow_contract::is_identifier(&publication.export_name)
         && publication.version >= 1
         && publication.artifact.artifact_version == 1
@@ -499,7 +694,7 @@ fn validate_publication(
         && valid_repository_full_name(&publication.target.full_name)
         && valid_bounded_string(&publication.target.base_branch, 1, 1024)
         && publication.target.destination_branch
-            == format!("scherzo/{requested_run_id}/{requested_export_name}")
+            == format!("scherzo/{requested_run_id}/{}", publication.export_name)
         && valid_bounded_string(&publication.target.destination_branch, 1, 1024)
         && valid_bounded_string(&publication.pull_request_metadata.title, 1, 256)
         && valid_bounded_string(&publication.pull_request_metadata.body, 1, 65_536)

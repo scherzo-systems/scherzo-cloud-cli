@@ -12,6 +12,7 @@ const PRINCIPAL_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
 const REPOSITORY_CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const EXPORT_NAME: &str = "changes";
 const CALLER_KEY: &str = "caller-publication-key/unchanged";
+const NEXT_CURSOR: &str = "publication-cursor/next+page";
 
 fn prepared_publication(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
@@ -68,6 +69,44 @@ fn publication_body() -> serde_json::Value {
     })
 }
 
+fn publication_history() -> Vec<serde_json::Value> {
+    let queued = publication_body();
+
+    let mut running = publication_body();
+    running["id"] = serde_json::json!("pub_01k0z6r1w8f4jy2m7q9v3x5abd");
+    running["state"] = serde_json::json!("running");
+    running["version"] = serde_json::json!(2);
+    running["createdAt"] = serde_json::json!("2026-09-03T18:01:00Z");
+    running["updatedAt"] = serde_json::json!("2026-09-03T18:01:01Z");
+    running["startedAt"] = serde_json::json!("2026-09-03T18:01:00Z");
+
+    let mut succeeded = publication_body();
+    succeeded["id"] = serde_json::json!("pub_01k0z6r1w8f4jy2m7q9v3x5abe");
+    succeeded["state"] = serde_json::json!("succeeded");
+    succeeded["version"] = serde_json::json!(3);
+    succeeded["outcome"] = serde_json::json!("no_changes");
+    succeeded["createdAt"] = serde_json::json!("2026-09-03T18:02:00Z");
+    succeeded["updatedAt"] = serde_json::json!("2026-09-03T18:02:02Z");
+    succeeded["startedAt"] = serde_json::json!("2026-09-03T18:02:00Z");
+    succeeded["terminalAt"] = serde_json::json!("2026-09-03T18:02:02Z");
+
+    let mut failed = publication_body();
+    failed["id"] = serde_json::json!("pub_01k0z6r1w8f4jy2m7q9v3x5abf");
+    failed["state"] = serde_json::json!("failed");
+    failed["version"] = serde_json::json!(4);
+    failed["failure"] = serde_json::json!({
+        "phase": "branch",
+        "code": "provider_unavailable",
+        "retryable": true
+    });
+    failed["createdAt"] = serde_json::json!("2026-09-03T18:03:00Z");
+    failed["updatedAt"] = serde_json::json!("2026-09-03T18:03:03Z");
+    failed["startedAt"] = serde_json::json!("2026-09-03T18:03:00Z");
+    failed["terminalAt"] = serde_json::json!("2026-09-03T18:03:03Z");
+
+    vec![queued, running, succeeded, failed]
+}
+
 fn accepted_response(body: &serde_json::Value) -> Vec<u8> {
     publication_response(
         "202 Accepted",
@@ -96,6 +135,10 @@ fn publication_response(
     )
 }
 
+fn ok_publication_response(body: &serde_json::Value) -> Vec<u8> {
+    publication_response("200 OK", body, &[("Cache-Control", "private, no-store")])
+}
+
 fn create_args(json: bool, caller_key: bool) -> Vec<&'static str> {
     let mut args = vec![
         "publication",
@@ -107,6 +150,27 @@ fn create_args(json: bool, caller_key: bool) -> Vec<&'static str> {
     ];
     if caller_key {
         args.extend(["--idempotency-key", CALLER_KEY]);
+    }
+    if json {
+        args.push("--json");
+    }
+    args.push("--allow-insecure-http");
+    args
+}
+
+fn show_args(json: bool) -> Vec<&'static str> {
+    let mut args = vec!["publication", "show", ORGANIZATION, RUN_ID, PUBLICATION_ID];
+    if json {
+        args.push("--json");
+    }
+    args.push("--allow-insecure-http");
+    args
+}
+
+fn list_args(json: bool, page: bool) -> Vec<&'static str> {
+    let mut args = vec!["publication", "list", ORGANIZATION, RUN_ID];
+    if page {
+        args.extend(["--limit", "4", "--cursor", NEXT_CURSOR]);
     }
     if json {
         args.push("--json");
@@ -202,6 +266,279 @@ fn publication_create_sends_the_closed_request_and_renders_plain_and_json_receip
         );
         assert!(!request.contains("targetBranch"));
         assert!(!request.contains("pullRequest"));
+    }
+}
+
+#[test]
+fn publication_show_renders_a_stored_failure_as_a_successful_read() {
+    for json in [false, true] {
+        let mut failed = publication_history().remove(3);
+        failed["id"] = serde_json::json!(PUBLICATION_ID);
+        let (server, _directory, credential_path) =
+            prepared_publication(vec![ok_publication_response(&failed)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(&show_args(json), &environment);
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        if json {
+            assert_eq!(
+                assert_one_json_document(&output.stdout),
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "deployment": server.api_url,
+                    "outcome": "found",
+                    "publication": failed
+                })
+            );
+        } else {
+            let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+            for field in [
+                format!("publication: {PUBLICATION_ID}"),
+                "state: failed".to_owned(),
+                "failure: provider_unavailable".to_owned(),
+                "failure phase: branch".to_owned(),
+                "retryable: true".to_owned(),
+            ] {
+                assert!(
+                    stdout.lines().any(|line| line == field),
+                    "missing {field:?}: {stdout}"
+                );
+            }
+        }
+        assert_no_publication_secret(&output, &[TOKEN]);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications/{PUBLICATION_ID} HTTP/1.1\r\n"
+        )));
+        assert_eq!(
+            header_value(&requests[0], "authorization"),
+            format!("Bearer {TOKEN}")
+        );
+    }
+}
+
+#[test]
+fn publication_list_requests_and_renders_exactly_one_bounded_page() {
+    for json in [false, true] {
+        let items = publication_history();
+        let page = serde_json::json!({
+            "items": items,
+            "nextCursor": NEXT_CURSOR
+        });
+        let (server, _directory, credential_path) =
+            prepared_publication(vec![ok_publication_response(&page)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(&list_args(json, true), &environment);
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        if json {
+            assert_eq!(
+                assert_one_json_document(&output.stdout),
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "deployment": server.api_url,
+                    "outcome": "listed",
+                    "items": page["items"],
+                    "nextCursor": NEXT_CURSOR
+                })
+            );
+        } else {
+            let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+            for state in ["queued", "running", "succeeded", "failed"] {
+                assert!(stdout.lines().any(|line| {
+                    line.starts_with("publication: ") && line.ends_with(&format!("state: {state}"))
+                }));
+            }
+            assert!(stdout.lines().any(|line| {
+                line == "  failure: provider_unavailable · phase: branch · retryable: true"
+            }));
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("next cursor: {NEXT_CURSOR}"))
+            );
+        }
+        assert_no_publication_secret(&output, &[TOKEN]);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1, "list must not follow nextCursor");
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications?limit=4&cursor=publication-cursor%2Fnext%2Bpage HTTP/1.1\r\n"
+        )));
+        assert_eq!(
+            header_value(&requests[0], "authorization"),
+            format!("Bearer {TOKEN}")
+        );
+    }
+
+    let final_page = serde_json::json!({"items": []});
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&final_page)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(&list_args(true, false), &environment);
+
+    assert!(output.status.success());
+    let result = assert_one_json_document(&output.stdout);
+    assert_eq!(result["items"], serde_json::json!([]));
+    assert!(result.get("nextCursor").is_none());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications HTTP/1.1\r\n"
+    )));
+}
+
+#[test]
+fn publication_plain_reads_escape_remote_text_and_redact_receipt_url_secrets() {
+    let base_branch = "main\nforged: base branch\u{1b}[2J";
+    let cursor = "next\nforged: cursor\u{1b}[2J";
+    let branch_url = "https://unique-branch-user:unique-branch-password@example.test/branches/changes?branchToken=unique-branch-token#unique-branch-fragment";
+    let pull_request_url = "https://unique-pr-user:unique-pr-password@example.test/pulls/17?signature=unique-pr-signature#unique-pr-fragment";
+    let mut published = publication_body();
+    published["state"] = serde_json::json!("succeeded");
+    published["version"] = serde_json::json!(2);
+    published["target"]["baseBranch"] = serde_json::json!(base_branch);
+    published["branch"] = serde_json::json!({
+        "headOid": published["artifact"]["headOid"].clone(),
+        "disposition": "created",
+        "url": branch_url
+    });
+    published["pullRequest"] = serde_json::json!({
+        "providerId": "987654",
+        "number": 17,
+        "url": pull_request_url,
+        "disposition": "created",
+        "state": "open"
+    });
+    published["outcome"] = serde_json::json!("pull_request_published");
+    published["updatedAt"] = serde_json::json!("2026-09-03T18:00:03Z");
+    published["startedAt"] = serde_json::json!("2026-09-03T18:00:01Z");
+    published["terminalAt"] = serde_json::json!("2026-09-03T18:00:03Z");
+
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&published)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let show = run_with_env(&show_args(false), &environment);
+
+    assert!(show.status.success());
+    assert!(show.stderr.is_empty());
+    let report = String::from_utf8(show.stdout.clone()).unwrap();
+    assert!(report.contains("base branch: main\\nforged: base branch\\u{1b}[2J"));
+    assert!(report.contains("branch url: https://example.test/branches/changes"));
+    assert!(report.contains("pull request url: https://example.test/pulls/17"));
+    assert!(!report.contains('\u{1b}'));
+    assert!(!report.lines().any(|line| line.starts_with("forged:")));
+    assert_no_publication_secret(
+        &show,
+        &[
+            TOKEN,
+            "unique-branch-user",
+            "unique-branch-password",
+            "unique-branch-token",
+            "unique-branch-fragment",
+            "unique-pr-user",
+            "unique-pr-password",
+            "unique-pr-signature",
+            "unique-pr-fragment",
+        ],
+    );
+    assert_eq!(server.finish().len(), 1);
+
+    let page = serde_json::json!({"items": [published], "nextCursor": cursor});
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&page)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let list = run_with_env(&list_args(false, false), &environment);
+
+    assert!(list.status.success());
+    assert!(list.stderr.is_empty());
+    let report = String::from_utf8(list.stdout.clone()).unwrap();
+    assert!(report.contains("next cursor: next\\nforged: cursor\\u{1b}[2J"));
+    assert!(report.contains("  pull request: https://example.test/pulls/17"));
+    assert!(!report.contains('\u{1b}'));
+    assert!(!report.lines().any(|line| line.starts_with("forged:")));
+    assert_no_publication_secret(
+        &list,
+        &[
+            TOKEN,
+            "unique-pr-user",
+            "unique-pr-password",
+            "unique-pr-signature",
+            "unique-pr-fragment",
+        ],
+    );
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn publication_reads_reject_malformed_or_private_response_shapes() {
+    let signed_url = "https://storage.example.test/private?X-Amz-Credential=private-evidence&X-Amz-Signature=unique-signature";
+    let mut show_body = publication_body();
+    show_body["privateEvidence"] = serde_json::json!({
+        "credential": "unique-publication-private-credential",
+        "url": signed_url
+    });
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&show_body)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(&show_args(true), &environment);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let result = assert_one_json_document(&output.stdout);
+    assert_eq!(result["outcome"], "invalid_response");
+    assert!(result.get("publication").is_none());
+    assert_no_publication_secret(
+        &output,
+        &[
+            TOKEN,
+            signed_url,
+            "private-evidence",
+            "unique-signature",
+            "unique-publication-private-credential",
+        ],
+    );
+    server.finish();
+
+    let history = publication_history();
+    let malformed_pages = [
+        serde_json::json!({"publication": history[0]}),
+        serde_json::json!({"items": [history[1], history[0]]}),
+        serde_json::json!({"items": history, "nextCursor": null}),
+    ];
+    for page in malformed_pages {
+        let (server, _directory, credential_path) =
+            prepared_publication(vec![ok_publication_response(&page)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(&list_args(true, false), &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let result = assert_one_json_document(&output.stdout);
+        assert_eq!(result["outcome"], "invalid_response");
+        assert!(result.get("items").is_none());
+        assert_no_publication_secret(&output, &[TOKEN]);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
     }
 }
 

@@ -1384,6 +1384,8 @@ mod tests {
             "project show",
             "publication",
             "publication create",
+            "publication list",
+            "publication show",
             "run",
             "run create",
             "run input-set",

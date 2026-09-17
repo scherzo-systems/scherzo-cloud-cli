@@ -4,7 +4,9 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::api::{HttpTransportPolicy, Publication, PublicationApi, PublicationFailure};
+use crate::api::{
+    HttpTransportPolicy, Publication, PublicationApi, PublicationFailure, PublicationList,
+};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 
@@ -23,15 +25,34 @@ pub(super) struct Command {
 enum PublicationCommand {
     #[command(about = "Create a Scherzo Cloud publication")]
     Create(CreateCommand),
+    #[command(about = "Show a Scherzo Cloud publication")]
+    Show(ShowCommand),
+    #[command(about = "List Scherzo Cloud publications")]
+    List(ListCommand),
 }
 
 #[derive(Debug, Args)]
-struct CreateCommand {
+struct PublicationRunReference {
     #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
     organization: OrganizationRef,
 
     #[arg(value_name = "RUN", value_parser = parse_run_id, help = "Exact Run ID")]
     run_id: String,
+}
+
+#[derive(Debug, Args)]
+struct Options {
+    #[arg(long, help = "Print the publication result as JSON")]
+    json: bool,
+
+    #[command(flatten)]
+    http: super::HttpOptions,
+}
+
+#[derive(Debug, Args)]
+struct CreateCommand {
+    #[command(flatten)]
+    run: PublicationRunReference,
 
     #[arg(
         long,
@@ -49,11 +70,36 @@ struct CreateCommand {
     )]
     idempotency_key: Option<String>,
 
-    #[arg(long, help = "Print the publication result as JSON")]
-    json: bool,
+    #[command(flatten)]
+    options: Options,
+}
+
+#[derive(Debug, Args)]
+struct ShowCommand {
+    #[command(flatten)]
+    run: PublicationRunReference,
+
+    #[arg(
+        value_name = "PUBLICATION",
+        value_parser = parse_publication_id,
+        help = "Exact Publication ID"
+    )]
+    publication_id: String,
 
     #[command(flatten)]
-    http: super::HttpOptions,
+    options: Options,
+}
+
+#[derive(Debug, Args)]
+struct ListCommand {
+    #[command(flatten)]
+    run: PublicationRunReference,
+
+    #[command(flatten)]
+    pagination: super::PaginationArgs,
+
+    #[command(flatten)]
+    options: Options,
 }
 
 impl Command {
@@ -64,6 +110,18 @@ impl Command {
                 Some(command),
                 &[NAME],
                 "configure Scherzo Cloud publication creation",
+                |command, deployment| command.execute(deployment.clone()),
+            ),
+            Some(PublicationCommand::Show(command)) => super::execute_deployment_command(
+                Some(command),
+                &[NAME],
+                "configure Scherzo Cloud publication access",
+                |command, deployment| command.execute(deployment.clone()),
+            ),
+            Some(PublicationCommand::List(command)) => super::execute_deployment_command(
+                Some(command),
+                &[NAME],
+                "configure Scherzo Cloud publication access",
                 |command, deployment| command.execute(deployment.clone()),
             ),
         }
@@ -78,10 +136,10 @@ impl CreateCommand {
                 .context("generate Cloud publication request identity")?,
         };
         let signal_deployment = deployment.fingerprint().api_url().to_owned();
-        let signal_organization = self.organization.clone();
-        let signal_run_id = self.run_id.clone();
+        let signal_organization = self.run.organization.clone();
+        let signal_run_id = self.run.run_id.clone();
         let signal_export = self.export.clone();
-        let signal_json = self.json;
+        let signal_json = self.options.json;
         let operation_key = idempotency_key.clone();
         super::execute_mutation_with_signals(
             "Cloud publication creation",
@@ -110,10 +168,10 @@ impl CreateCommand {
         idempotency_key: &str,
         control: &super::OperationControl<String>,
     ) -> super::CommandResult {
-        let result = with_api(deployment, self.http.transport_policy(), |api| {
+        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
             api.create(
-                &self.organization,
-                &self.run_id,
+                &self.run.organization,
+                &self.run.run_id,
                 &self.export,
                 idempotency_key,
                 || control.begin_dispatch(),
@@ -123,11 +181,11 @@ impl CreateCommand {
             Ok(result) => write_create(
                 &CreateOutputContext {
                     deployment: deployment.fingerprint().api_url(),
-                    organization: &self.organization,
-                    run_id: &self.run_id,
+                    organization: &self.run.organization,
+                    run_id: &self.run.run_id,
                     export_name: &self.export,
                     idempotency_key,
-                    json: self.json,
+                    json: self.options.json,
                     dispatched: control.dispatched(),
                 },
                 result,
@@ -135,15 +193,70 @@ impl CreateCommand {
             .map_err(Into::into),
             Err(_) if control.dispatched() => write_unknown(
                 deployment.fingerprint().api_url(),
-                &self.organization,
-                &self.run_id,
+                &self.run.organization,
+                &self.run.run_id,
                 &self.export,
                 idempotency_key,
-                self.json,
+                self.options.json,
                 ExitCode::GeneralFailure,
             )
             .map_err(Into::into),
             Err(error) => Err(error.into()),
+        })
+    }
+}
+
+impl ShowCommand {
+    fn execute(self, deployment: Deployment) -> super::CommandResult {
+        super::execute_read_only_with_signals("Cloud publication show", move |control| {
+            let result = with_api(&deployment, self.options.http.transport_policy(), |api| {
+                api.get(
+                    &self.run.organization,
+                    &self.run.run_id,
+                    &self.publication_id,
+                )
+            })?;
+            super::complete_read_only_output(control, || {
+                write_show(
+                    &ReadOutputContext {
+                        deployment: deployment.fingerprint().api_url(),
+                        organization: &self.run.organization,
+                        run_id: &self.run.run_id,
+                        publication_id: Some(&self.publication_id),
+                        json: self.options.json,
+                    },
+                    result,
+                )
+                .map_err(Into::into)
+            })
+        })
+    }
+}
+
+impl ListCommand {
+    fn execute(self, deployment: Deployment) -> super::CommandResult {
+        super::execute_read_only_with_signals("Cloud publication list", move |control| {
+            let result = with_api(&deployment, self.options.http.transport_policy(), |api| {
+                api.list(
+                    &self.run.organization,
+                    &self.run.run_id,
+                    self.pagination.limit,
+                    self.pagination.cursor.as_deref(),
+                )
+            })?;
+            super::complete_read_only_output(control, || {
+                write_list(
+                    &ReadOutputContext {
+                        deployment: deployment.fingerprint().api_url(),
+                        organization: &self.run.organization,
+                        run_id: &self.run.run_id,
+                        publication_id: None,
+                        json: self.options.json,
+                    },
+                    result,
+                )
+                .map_err(Into::into)
+            })
         })
     }
 }
@@ -153,6 +266,17 @@ fn parse_run_id(value: &str) -> Result<String, String> {
         Ok(value.to_owned())
     } else {
         Err("must be an exact Run ID (run_ followed by 26 lowercase ULID characters)".to_owned())
+    }
+}
+
+fn parse_publication_id(value: &str) -> Result<String, String> {
+    if crate::public_id::valid_typed_id(value, "pub_") {
+        Ok(value.to_owned())
+    } else {
+        Err(
+            "must be an exact Publication ID (pub_ followed by 26 lowercase ULID characters)"
+                .to_owned(),
+        )
     }
 }
 
@@ -208,6 +332,14 @@ struct CreateOutputContext<'a> {
     dispatched: bool,
 }
 
+struct ReadOutputContext<'a> {
+    deployment: &'a str,
+    organization: &'a str,
+    run_id: &'a str,
+    publication_id: Option<&'a str>,
+    json: bool,
+}
+
 fn write_create(
     context: &CreateOutputContext<'_>,
     result: Result<Publication, PublicationFailure>,
@@ -223,7 +355,15 @@ fn write_create(
                 })
                 .context("write Cloud publication result")?;
             } else {
-                write_publication_human(context.deployment, context.idempotency_key, &publication)?;
+                let mut output = io::stdout().lock();
+                writeln!(output, "✓ Publication accepted.\n")?;
+                write_publication_human(
+                    &mut output,
+                    &publication,
+                    HumanPublicationLayout::Details,
+                )?;
+                writeln!(output, "idempotency key: {}", context.idempotency_key)?;
+                writeln!(output, "deployment: {}", context.deployment)?;
             }
             Ok(ExitCode::Success)
         }
@@ -231,29 +371,169 @@ fn write_create(
     }
 }
 
+fn write_show(
+    context: &ReadOutputContext<'_>,
+    result: Result<Publication, PublicationFailure>,
+) -> anyhow::Result<ExitCode> {
+    match result {
+        Ok(publication) => {
+            if context.json {
+                super::write_pretty_json(&PublicationResult {
+                    schema_version: 1,
+                    deployment: context.deployment,
+                    outcome: "found",
+                    publication: &publication,
+                })
+                .context("write Cloud publication result")?;
+            } else {
+                let mut output = io::stdout().lock();
+                writeln!(output, "✓ Publication found.\n")?;
+                write_publication_human(
+                    &mut output,
+                    &publication,
+                    HumanPublicationLayout::Details,
+                )?;
+                writeln!(output, "deployment: {}", context.deployment)?;
+            }
+            Ok(ExitCode::Success)
+        }
+        Err(failure) => write_read_failure(context, &failure),
+    }
+}
+
+fn write_list(
+    context: &ReadOutputContext<'_>,
+    result: Result<PublicationList, PublicationFailure>,
+) -> anyhow::Result<ExitCode> {
+    match result {
+        Ok(page) => {
+            if context.json {
+                super::write_cloud_list_json(
+                    context.deployment,
+                    &page.items,
+                    page.next_cursor.as_deref(),
+                )
+                .context("write Cloud publication list")?;
+            } else {
+                let mut output = io::stdout().lock();
+                writeln!(output, "✓ Publications listed.\n")?;
+                for publication in &page.items {
+                    write_publication_human(
+                        &mut output,
+                        publication,
+                        HumanPublicationLayout::Summary,
+                    )?;
+                }
+                if !page.items.is_empty() {
+                    writeln!(output)?;
+                }
+                if let Some(cursor) = page.next_cursor {
+                    writeln!(output, "next cursor: {}", cursor.escape_default())?;
+                }
+                writeln!(output, "deployment: {}", context.deployment)?;
+            }
+            Ok(ExitCode::Success)
+        }
+        Err(failure) => write_read_failure(context, &failure),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HumanPublicationLayout {
+    Details,
+    Summary,
+}
+
 fn write_publication_human(
-    deployment: &str,
-    idempotency_key: &str,
+    output: &mut impl Write,
     publication: &Publication,
+    layout: HumanPublicationLayout,
 ) -> anyhow::Result<()> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    writeln!(stdout, "✓ Publication accepted.\n")?;
-    writeln!(stdout, "publication: {}", publication.id)?;
-    writeln!(stdout, "run: {}", publication.run_id)?;
-    writeln!(stdout, "export: {}", publication.export_name)?;
-    writeln!(stdout, "state: {}", enum_text(&publication.state)?)?;
-    writeln!(stdout, "version: {}", publication.version)?;
-    writeln!(stdout, "repository: {}", publication.target.full_name)?;
-    writeln!(stdout, "base branch: {}", publication.target.base_branch)?;
+    let state = enum_text(&publication.state)?;
+    if matches!(layout, HumanPublicationLayout::Summary) {
+        writeln!(
+            output,
+            "publication: {} · export: {} · state: {state}",
+            publication.id, publication.export_name
+        )?;
+        if let Some(outcome) = publication.outcome {
+            writeln!(output, "  outcome: {}", enum_text(&outcome)?)?;
+        }
+        if let Some(failure) = publication.failure.as_deref() {
+            writeln!(
+                output,
+                "  failure: {} · phase: {} · retryable: {}",
+                enum_text(&failure.code)?,
+                enum_text(&failure.phase)?,
+                failure.retryable
+            )?;
+        }
+        if let Some(pull_request) = publication.pull_request.as_deref() {
+            let url = redacted_human_url(&pull_request.url)?;
+            writeln!(output, "  pull request: {}", url.escape_default())?;
+        }
+        return Ok(());
+    }
+
+    writeln!(output, "publication: {}", publication.id)?;
+    writeln!(output, "run: {}", publication.run_id)?;
+    writeln!(output, "export: {}", publication.export_name)?;
+    writeln!(output, "state: {state}")?;
+    writeln!(output, "version: {}", publication.version)?;
+    writeln!(output, "repository: {}", publication.target.full_name)?;
     writeln!(
-        stdout,
+        output,
+        "base branch: {}",
+        publication.target.base_branch.escape_default()
+    )?;
+    writeln!(
+        output,
         "destination branch: {}",
         publication.target.destination_branch
     )?;
-    writeln!(stdout, "idempotency key: {idempotency_key}")?;
-    writeln!(stdout, "deployment: {deployment}")?;
+    if let Some(outcome) = publication.outcome {
+        writeln!(output, "outcome: {}", enum_text(&outcome)?)?;
+    }
+    if let Some(branch) = publication.branch.as_deref() {
+        writeln!(output, "branch: {}", enum_text(&branch.disposition)?)?;
+        let url = redacted_human_url(&branch.url)?;
+        writeln!(output, "branch url: {}", url.escape_default())?;
+    }
+    if let Some(pull_request) = publication.pull_request.as_deref() {
+        writeln!(output, "pull request: {}", pull_request.number)?;
+        writeln!(
+            output,
+            "pull request state: {}",
+            enum_text(&pull_request.state)?
+        )?;
+        let url = redacted_human_url(&pull_request.url)?;
+        writeln!(output, "pull request url: {}", url.escape_default())?;
+    }
+    if let Some(failure) = publication.failure.as_deref() {
+        writeln!(output, "failure: {}", enum_text(&failure.code)?)?;
+        writeln!(output, "failure phase: {}", enum_text(&failure.phase)?)?;
+        writeln!(output, "retryable: {}", failure.retryable)?;
+    }
+    writeln!(output, "created: {}", publication.created_at)?;
+    writeln!(output, "updated: {}", publication.updated_at)?;
+    if let Some(started_at) = publication.started_at.as_deref() {
+        writeln!(output, "started: {started_at}")?;
+    }
+    if let Some(terminal_at) = publication.terminal_at.as_deref() {
+        writeln!(output, "terminal: {terminal_at}")?;
+    }
     Ok(())
+}
+
+fn redacted_human_url(value: &str) -> anyhow::Result<String> {
+    let mut url = url::Url::parse(value).context("parse validated Cloud publication URL")?;
+    url.set_password(None)
+        .map_err(|()| anyhow!("redact Cloud publication URL password"))?;
+    url.set_username("")
+        .map_err(|()| anyhow!("redact Cloud publication URL username"))?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.into())
 }
 
 fn enum_text(value: &impl Serialize) -> anyhow::Result<String> {
@@ -356,6 +636,88 @@ fn write_failure(
     Ok(class.exit_code())
 }
 
+// Read failures intentionally omit creation-only retry coordinates. Keeping this projection
+// separate prevents a show or list error from implying that a mutation may have committed.
+// jscpd:ignore-start
+fn write_read_failure(
+    context: &ReadOutputContext<'_>,
+    failure: &PublicationFailure,
+) -> anyhow::Result<ExitCode> {
+    let (outcome, category, human, class) = match failure {
+        PublicationFailure::Unauthenticated => (
+            "unauthenticated",
+            None,
+            "error: Cloud publication access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login"
+                .to_owned(),
+            OutcomeClass::Unauthenticated,
+        ),
+        PublicationFailure::Forbidden => (
+            "forbidden",
+            None,
+            "error: Cloud publication access is not permitted for this account\n\nAsk an organization owner to check your access."
+                .to_owned(),
+            OutcomeClass::Forbidden,
+        ),
+        PublicationFailure::InvalidInput => (
+            "invalid_input",
+            None,
+            format!(
+                "error: Cloud publication input rejected by {}\n\nCheck the organization, run, publication, limit, and cursor values, then try again.",
+                context.deployment
+            ),
+            OutcomeClass::GeneralFailure,
+        ),
+        PublicationFailure::NotFound => (
+            "not_found",
+            None,
+            "error: Cloud publication history not found or unavailable\n\nCheck the organization, run, and publication identifiers, then try again."
+                .to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        PublicationFailure::Unreachable(category) => (
+            "unreachable",
+            Some(category.as_str()),
+            format!(
+                "error: contact Cloud publication API at {}: {}\n\nTry again after network access is restored.",
+                context.deployment,
+                category.as_str()
+            ),
+            super::unreachable_outcome_class(*category),
+        ),
+        PublicationFailure::Interrupted => (
+            "interrupted",
+            None,
+            "error: Cloud publication read was interrupted\n\nRun the command again.".to_owned(),
+            OutcomeClass::Interrupted,
+        ),
+        PublicationFailure::Conflict
+        | PublicationFailure::Gone
+        | PublicationFailure::Protocol { .. } => (
+            "invalid_response",
+            None,
+            "error: Cloud publication API response does not match the public contract\n\nTry again later."
+                .to_owned(),
+            OutcomeClass::Protocol,
+        ),
+    };
+    if context.json {
+        super::write_pretty_json(&ReadFailureResult {
+            schema_version: 1,
+            deployment: context.deployment,
+            outcome,
+            organization_ref: context.organization,
+            run_id: context.run_id,
+            publication_id: context.publication_id,
+            category,
+        })
+        .context("write Cloud publication failure")?;
+    } else {
+        writeln!(io::stderr().lock(), "{human}")?;
+    }
+    Ok(class.exit_code())
+}
+// jscpd:ignore-end
+
 fn with_recovery_key(human: String, idempotency_key: &str) -> String {
     if let Some((diagnostic, remedy)) = human.split_once("\n\n") {
         format!("{diagnostic}\nidempotency key: {idempotency_key}\n\n{remedy}")
@@ -401,6 +763,29 @@ struct CreateResult<'a> {
     deployment: &'a str,
     idempotency_key: &'a str,
     publication: &'a Publication,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicationResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    publication: &'a Publication,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadFailureResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    organization_ref: &'a str,
+    run_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publication_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<&'a str>,
 }
 
 // Publication failures keep their run/export/key recovery coordinates explicit; sharing the
