@@ -3425,6 +3425,186 @@ pub(super) mod test_support {
         AssignmentManager::new(config, lease_clock, dependencies)
     }
 
+    pub(in crate::runner::service) struct RenewalTimingFixture {
+        clock: LeaseClock,
+        control: super::super::lease_clock::ControlledLeaseClock,
+        waits: tokio::sync::mpsc::UnboundedReceiver<(
+            Duration,
+            super::super::lease_clock::LeaseTimerRelease,
+        )>,
+        authority: tokio::sync::watch::Receiver<LeaseAuthority>,
+        causal_lease: CausalLease,
+        cancellation: CancellationSource,
+        identity: AssignmentIdentity,
+    }
+
+    impl RenewalTimingFixture {
+        pub(in crate::runner::service) async fn start_execution_supervisor(
+            &mut self,
+        ) -> super::super::execution::test_support::LiveLeaseExecution {
+            let execution = super::super::execution::test_support::supervise_assignment_lease(
+                self.clock.clone(),
+                self.authority.clone(),
+                self.causal_lease.clone(),
+                self.cancellation.clone(),
+                self.identity.assignment_id.clone(),
+                self.identity.attempt_id.clone(),
+            );
+            let (renewal_wait, renewal_release) =
+                super::super::test_support::with_watchdog(self.waits.recv())
+                    .await
+                    .expect("initial renewal timer was not armed")
+                    .expect("controlled lease clock closed before initial renewal timer");
+            assert_eq!(renewal_wait, Duration::ZERO);
+            renewal_release.release();
+            let (cancellation_wait, _cancellation_release) =
+                super::super::test_support::with_watchdog(self.waits.recv())
+                    .await
+                    .expect("initial cancellation timer was not armed")
+                    .expect("controlled lease clock closed before initial cancellation timer");
+            assert_eq!(cancellation_wait, Duration::from_secs(1));
+            execution
+        }
+
+        pub(in crate::runner::service) async fn wait_until_execution_observes_renewal(&mut self) {
+            let expected = self
+                .authority
+                .borrow()
+                .renewal_request
+                .checked_duration_since(self.clock.now().expect("read fixture lease clock"))
+                .expect("renewed authority request remains in the future");
+            let (renewal_wait, _renewal_release) =
+                super::super::test_support::with_watchdog(self.waits.recv())
+                    .await
+                    .expect("renewed authority timer was not armed")
+                    .expect("controlled lease clock closed before renewed authority timer");
+            assert_eq!(renewal_wait, expected);
+        }
+
+        pub(in crate::runner::service) fn advance(&self, duration: Duration) {
+            self.control.advance(duration);
+        }
+
+        pub(in crate::runner::service) fn authority_sequence(&self) -> u64 {
+            self.authority.borrow().sequence
+        }
+
+        pub(in crate::runner::service) fn cancellation_headroom(&self) -> Option<Duration> {
+            self.authority
+                .borrow()
+                .cancellation_start
+                .checked_duration_since(self.clock.now().ok()?)
+                .ok()
+        }
+
+        pub(in crate::runner::service) fn cancellation_started(&self) -> bool {
+            self.cancellation.cancellation_reason().is_some()
+        }
+    }
+
+    pub(in crate::runner::service) fn install_running_renewal_fixture(
+        manager: &mut AssignmentManager,
+        offer: AssignmentOffer,
+    ) -> RenewalTimingFixture {
+        let policy = ExecutionLeasePolicy {
+            schema_version: 2,
+            force_stop_and_reap_budget_milliseconds: 5000,
+            terminal_report_delivery_budget_milliseconds: 5000,
+            renewal_delivery_budget_milliseconds: 5000,
+            lease_duration_milliseconds: 320_000,
+            fencing_margin_milliseconds: 11_000,
+        };
+        manager
+            .retain_lease_policy(&policy)
+            .expect("retain fixture lease policy");
+        let (clock, control, waits) = super::super::lease_clock::controlled_lease_clock();
+        manager.lease_clock = clock.clone();
+        let initial_basis = clock.now().expect("read fixture lease clock");
+        let cancellation_grace = Duration::from_secs(1);
+        let initial_authority =
+            LeaseAuthority::derive(1, initial_basis, &policy, cancellation_grace)
+                .expect("derive initial fixture authority");
+        control.advance(
+            initial_authority
+                .renewal_request
+                .checked_duration_since(initial_basis)
+                .expect("measure fixture renewal schedule"),
+        );
+        let renewal_basis = clock.now().expect("read fixture renewal basis");
+        let causal_lease = CausalLease::new(initial_basis);
+        {
+            let mut state = causal_lease.lock();
+            state.bases.insert(2, renewal_basis);
+            state.renewal_requests.insert(2);
+        }
+        let remaining = initial_authority
+            .cancellation_start
+            .checked_duration_since(renewal_basis)
+            .expect("measure fixture cancellation headroom");
+        control.advance(
+            remaining
+                .checked_sub(Duration::from_secs(1))
+                .expect("leave one second of fixture cancellation headroom"),
+        );
+
+        let identity = AssignmentIdentity::from_offer(&offer);
+        let response = AssignmentDecision::Accepted {
+            effect_id: offer.effect_id.clone(),
+            assignment_id: offer.assignment_id.clone(),
+            offered_execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+        };
+        let start = AssignmentStart {
+            effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5aby".to_owned(),
+            assignment_id: offer.assignment_id.clone(),
+            run_id: offer.run_id.clone(),
+            attempt_id: offer.attempt_id.clone(),
+            execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+            lease: ExecutionLeaseGrant { sequence: 1 },
+        };
+        manager.decisions.push_back(RetainedDecision {
+            offer,
+            response,
+            response_observation_id: None,
+            causal_lease: Some(causal_lease.clone()),
+            start: Some(start),
+            start_authorization: None,
+            renewals: BTreeMap::new(),
+            rejected_renewals: BTreeMap::new(),
+        });
+        let cancellation = CancellationSource::new();
+        let (authority_updates, authority) = tokio::sync::watch::channel(initial_authority);
+        let (start_authority, _start_authority) = tokio::sync::watch::channel(true);
+        let broker = manager
+            .source_broker
+            .clone()
+            .expect("fixture assignment source broker");
+        let workflow_git = super::super::workflow_git::test_support::lease_authority_fixture(
+            &identity.assignment_id,
+            broker,
+            Arc::clone(&manager.sleeper),
+        );
+        manager.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
+            identity: identity.clone(),
+            cancellation: cancellation.clone(),
+            cancellation_grace,
+            current_grant: ExecutionLeaseGrant { sequence: 1 },
+            causal_lease: causal_lease.clone(),
+            authority_updates,
+            start_authority,
+            workflow_git,
+            workspace_release: None,
+        })));
+        RenewalTimingFixture {
+            clock,
+            control,
+            waits,
+            authority,
+            causal_lease,
+            cancellation,
+            identity,
+        }
+    }
+
     pub(in crate::runner::service) fn install_root_preparer(
         manager: &mut AssignmentManager,
         root_preparer: Arc<dyn AssignmentRootPreparer>,

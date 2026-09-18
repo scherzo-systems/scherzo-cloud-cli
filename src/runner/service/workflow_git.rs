@@ -272,6 +272,21 @@ struct AuthorityState {
     teardown_report: Option<WorkflowGitTeardownReport>,
 }
 
+impl AuthorityState {
+    fn installed() -> Self {
+        Self {
+            lifecycle: AuthorityLifecycle::Installed,
+            active: None,
+            worker: None,
+            issuances: Vec::new(),
+            current_issuance: None,
+            expired_observations: Vec::new(),
+            socket_identity: None,
+            teardown_report: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthorityLifecycle {
     Installed,
@@ -415,16 +430,7 @@ impl WorkflowGitAuthority {
                 clock,
                 recorder,
                 stop: AtomicBool::new(false),
-                state: Mutex::new(AuthorityState {
-                    lifecycle: AuthorityLifecycle::Installed,
-                    active: None,
-                    worker: None,
-                    issuances: Vec::new(),
-                    current_issuance: None,
-                    expired_observations: Vec::new(),
-                    socket_identity: None,
-                    teardown_report: None,
-                }),
+                state: Mutex::new(AuthorityState::installed()),
                 teardown_changed: Condvar::new(),
             }),
         })
@@ -1128,6 +1134,58 @@ fn record_teardown(
             ),
         ],
     );
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    pub(in crate::runner::service) fn lease_authority_fixture(
+        assignment_id: &str,
+        broker: Arc<dyn SourceCredentialBroker>,
+        clock: Arc<dyn Sleeper>,
+    ) -> WorkflowGitAuthority {
+        let placeholder = PathBuf::from("/nonexistent/scherzo-lease-authority-fixture");
+        WorkflowGitAuthority {
+            inner: Arc::new(WorkflowGitAuthorityInner {
+                assignment_id: Arc::from(assignment_id),
+                origin: Url::parse("https://github.example/scherzo/fixture.git")
+                    .expect("parse fixture workflow Git origin"),
+                origin_text: Arc::from("https://github.example/scherzo/fixture.git"),
+                workspace: placeholder.clone(),
+                environment: EnvironmentSnapshot::new(std::iter::empty::<(
+                    std::ffi::OsString,
+                    std::ffi::OsString,
+                )>()),
+                scoped_helper_key: Arc::from("credential.fixture.helper"),
+                helper_value: Arc::from("fixture"),
+                helper_path: placeholder.clone(),
+                helper_identity: PathIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+                helper_contents: Arc::from([]),
+                socket_path: placeholder.clone(),
+                socket_address: placeholder.clone(),
+                alias_directory: placeholder.clone(),
+                alias_directory_identity: PathIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+                alias_link: placeholder,
+                alias_link_identity: PathIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+                broker,
+                clock,
+                recorder: None,
+                stop: AtomicBool::new(false),
+                state: Mutex::new(AuthorityState::installed()),
+                teardown_changed: Condvar::new(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

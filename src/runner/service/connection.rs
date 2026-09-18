@@ -1335,7 +1335,8 @@ struct PendingObservation {
 }
 
 struct BufferedEffect {
-    frame: Option<CloudFrame>,
+    effect_id: String,
+    manager_effect: Option<AssignmentManagerEffect>,
     event: Event,
 }
 
@@ -1348,43 +1349,148 @@ impl BufferedEffect {
         progress: &mut ConnectionProgress,
         connection_event: &Event,
     ) -> Result<Self, ConnectionError> {
-        let (effect_id, assignment_id, run_id) = match &frame {
+        let (effect_id, assignment_id, run_id, lease_sequence, manager_effect) = match frame {
             CloudFrame::AssignmentOffer {
                 effect_id,
                 assignment_id,
                 run_id,
+                project_id,
+                attempt_id,
+                attempt_number,
+                execution_spec,
                 ..
+            } => {
+                let offer = AssignmentOffer {
+                    effect_id: effect_id.clone(),
+                    assignment_id: assignment_id.clone(),
+                    run_id: run_id.clone(),
+                    project_id,
+                    attempt_id,
+                    attempt_number,
+                    execution_spec: *execution_spec,
+                };
+                (
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    None,
+                    AssignmentManagerEffect::Offer(Box::new(offer)),
+                )
             }
-            | CloudFrame::AssignmentPrepare {
+            CloudFrame::AssignmentPrepare {
                 effect_id,
                 assignment_id,
                 run_id,
+                attempt_id,
+                execution_spec_id,
+                preparation_expires_at,
                 ..
+            } => {
+                let prepare = AssignmentPrepare {
+                    effect_id: effect_id.clone(),
+                    assignment_id: assignment_id.clone(),
+                    run_id: run_id.clone(),
+                    attempt_id,
+                    execution_spec_id,
+                    preparation_expires_at,
+                };
+                (
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    None,
+                    AssignmentManagerEffect::Prepare(prepare),
+                )
             }
-            | CloudFrame::AssignmentStart {
+            CloudFrame::AssignmentStart {
                 effect_id,
                 assignment_id,
                 run_id,
+                attempt_id,
+                execution_spec_id,
+                lease,
                 ..
+            } => {
+                let start = AssignmentStart {
+                    effect_id: effect_id.clone(),
+                    assignment_id: assignment_id.clone(),
+                    run_id: run_id.clone(),
+                    attempt_id,
+                    execution_spec_id,
+                    lease,
+                };
+                (
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    None,
+                    AssignmentManagerEffect::Start(start),
+                )
             }
-            | CloudFrame::ExecutionStartAuthorized {
+            CloudFrame::ExecutionStartAuthorized {
                 effect_id,
                 assignment_id,
                 run_id,
+                attempt_id,
                 ..
+            } => {
+                let authorization = AssignmentStartAuthorization {
+                    effect_id: effect_id.clone(),
+                    assignment_id: assignment_id.clone(),
+                    run_id: run_id.clone(),
+                    attempt_id,
+                };
+                (
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    None,
+                    AssignmentManagerEffect::StartAuthorized(authorization),
+                )
             }
-            | CloudFrame::AssignmentLeaseRenewed {
+            CloudFrame::AssignmentLeaseRenewed {
                 effect_id,
                 assignment_id,
                 run_id,
+                attempt_id,
+                lease,
                 ..
+            } => {
+                let lease_sequence = lease.sequence;
+                let renewal = AssignmentRenewal {
+                    effect_id: effect_id.clone(),
+                    assignment_id: assignment_id.clone(),
+                    run_id: run_id.clone(),
+                    attempt_id,
+                    lease,
+                };
+                (
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    Some(lease_sequence),
+                    AssignmentManagerEffect::Renewal(renewal),
+                )
             }
-            | CloudFrame::AssignmentRelease {
+            CloudFrame::AssignmentRelease {
                 effect_id,
                 assignment_id,
                 run_id,
+                attempt_id,
+                reason,
                 ..
-            } => (effect_id, assignment_id, run_id),
+            } => (
+                effect_id,
+                assignment_id.clone(),
+                run_id.clone(),
+                None,
+                AssignmentManagerEffect::Release {
+                    assignment_id,
+                    run_id,
+                    attempt_id,
+                    reason,
+                },
+            ),
             _ => {
                 return Err(ConnectionError::terminal(
                     *progress,
@@ -1396,8 +1502,8 @@ impl BufferedEffect {
             "runner.effect_acknowledgement",
             [
                 KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
-                KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
-                KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id),
+                KeyValue::new(telemetry::attribute::RUN_ID, run_id),
                 KeyValue::new(
                     telemetry::attribute::RUNNER_ID,
                     config.credential().runner_id().to_owned(),
@@ -1405,10 +1511,10 @@ impl BufferedEffect {
                 KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
             ],
         );
-        if let CloudFrame::AssignmentLeaseRenewed { lease, .. } = &frame {
+        if let Some(lease_sequence) = lease_sequence {
             event.set(KeyValue::new(
                 telemetry::attribute::PROTOCOL_LEASE_SEQUENCE,
-                telemetry::integer(lease.sequence),
+                telemetry::integer(lease_sequence),
             ));
             event.set(KeyValue::new(
                 telemetry::attribute::LEASE_DISPOSITION,
@@ -1424,29 +1530,34 @@ impl BufferedEffect {
         };
         record_progress(connection_event, *progress);
         Ok(Self {
-            frame: Some(frame),
+            effect_id,
+            manager_effect: Some(manager_effect),
             event,
         })
     }
 
-    fn into_parts(
-        mut self,
+    fn apply_renewal(
+        &mut self,
+        assignment_manager: &Mutex<AssignmentManager>,
         progress: ConnectionProgress,
-    ) -> Result<(CloudFrame, Event), ConnectionError> {
-        let event = self.event.clone();
-        let Some(frame) = self.frame.take() else {
-            finish_effect_failure(&event, ConnectionCause::UnexpectedGatewayFrame);
-            return Err(ConnectionError::terminal(
-                progress,
-                ConnectionCause::UnexpectedGatewayFrame,
-            ));
-        };
-        Ok((frame, event))
+    ) -> Result<(), ConnectionError> {
+        if matches!(
+            self.manager_effect.as_ref(),
+            Some(AssignmentManagerEffect::Renewal(_))
+        ) && let Some(renewal) = self.manager_effect.take()
+        {
+            apply_assignment_manager_effect(assignment_manager, renewal, &self.event)
+                .map_err(|failure| manager_failure_error(progress, failure))?;
+        }
+        Ok(())
     }
 
-    fn discard(mut self, cause: ConnectionCause, outcome: Outcome) {
+    fn into_parts(self) -> (String, Option<AssignmentManagerEffect>, Event) {
+        (self.effect_id, self.manager_effect, self.event)
+    }
+
+    fn discard(self, cause: ConnectionCause, outcome: Outcome) {
         finish_effect(&self.event, cause, outcome);
-        self.frame = None;
     }
 }
 
@@ -1475,6 +1586,84 @@ enum AssignmentManagerEffect {
         attempt_id: String,
         reason: String,
     },
+}
+
+fn apply_assignment_manager_effect(
+    assignment_manager: &Mutex<AssignmentManager>,
+    manager_effect: AssignmentManagerEffect,
+    event: &Event,
+) -> Result<(), AssignmentManagerFailure> {
+    let manager_result = {
+        let mut manager = assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match manager_effect {
+            AssignmentManagerEffect::Offer(offer) => manager.handle_offer(*offer).map(|_| None),
+            AssignmentManagerEffect::Prepare(prepare) => {
+                manager.handle_prepare(prepare).map(|_| None)
+            }
+            AssignmentManagerEffect::Start(start) => manager.handle_start(start),
+            AssignmentManagerEffect::StartAuthorized(authorization) => manager
+                .handle_start_authorized(authorization)
+                .map(|()| None),
+            AssignmentManagerEffect::Renewal(renewal) => {
+                let result = manager.handle_renewal(renewal);
+                event.set(KeyValue::new(
+                    telemetry::attribute::LEASE_DECISION_DELAY_MS,
+                    event.elapsed_milliseconds(),
+                ));
+                match result {
+                    Ok(decision) => {
+                        decision.record(event);
+                        Ok(None)
+                    }
+                    Err(failure) => {
+                        event.set(KeyValue::new(
+                            telemetry::attribute::LEASE_DISPOSITION,
+                            "error",
+                        ));
+                        Err(failure)
+                    }
+                }
+            }
+            AssignmentManagerEffect::Release {
+                assignment_id,
+                run_id,
+                attempt_id,
+                reason,
+            } => manager
+                .handle_release(&assignment_id, &run_id, &attempt_id, &reason)
+                .map(|_| None),
+        }
+    };
+    match manager_result {
+        Ok(Some(job)) => {
+            job.spawn();
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(failure) => Err(failure),
+    }
+}
+
+fn manager_failure_error(
+    progress: ConnectionProgress,
+    failure: AssignmentManagerFailure,
+) -> ConnectionError {
+    let (cause, terminal) = match failure {
+        AssignmentManagerFailure::ConflictingOffer => {
+            (ConnectionCause::ConflictingAssignmentOffer, true)
+        }
+        AssignmentManagerFailure::DecisionCapacity => {
+            (ConnectionCause::AssignmentDecisionCapacity, false)
+        }
+        AssignmentManagerFailure::LeaseClock => (ConnectionCause::RunnerLeaseClockFailure, true),
+    };
+    if terminal {
+        ConnectionError::terminal(progress, cause)
+    } else {
+        ConnectionError::retryable(progress, cause)
+    }
 }
 
 pub(super) struct ActiveEffectEvent {
@@ -2150,7 +2339,7 @@ where
             | effect @ CloudFrame::AssignmentRelease { .. }
                 if progress.handshake_completed =>
             {
-                let received = BufferedEffect::received(
+                let mut received = BufferedEffect::received(
                     recorder,
                     config,
                     opening.boot_id,
@@ -2185,6 +2374,10 @@ where
                     ));
                 }
                 active_effect_event.start(received.event.clone());
+                // Renewal authority is a local deadline decision, so it must not wait for an
+                // effect-receipt window slot or an outbound write. Exact redelivery remains
+                // idempotent when the subsequent transport receipt is lost.
+                received.apply_renewal(assignment_manager, progress)?;
                 buffered_effect = Some(received);
             }
             _ => {
@@ -2270,130 +2463,7 @@ where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
     // jscpd:ignore-end
-    let (effect, event) = effect.into_parts(*progress)?;
-    let (effect_id, manager_effect) = match effect {
-        CloudFrame::AssignmentOffer {
-            effect_id,
-            assignment_id,
-            run_id,
-            project_id,
-            attempt_id,
-            attempt_number,
-            execution_spec,
-            ..
-        } => {
-            let offer = AssignmentOffer {
-                effect_id: effect_id.clone(),
-                assignment_id: assignment_id.clone(),
-                run_id: run_id.clone(),
-                project_id,
-                attempt_id,
-                attempt_number,
-                execution_spec: *execution_spec,
-            };
-            (effect_id, AssignmentManagerEffect::Offer(Box::new(offer)))
-        }
-        CloudFrame::AssignmentPrepare {
-            effect_id,
-            assignment_id,
-            run_id,
-            attempt_id,
-            execution_spec_id,
-            preparation_expires_at,
-            ..
-        } => {
-            let prepare = AssignmentPrepare {
-                effect_id: effect_id.clone(),
-                assignment_id: assignment_id.clone(),
-                run_id: run_id.clone(),
-                attempt_id,
-                execution_spec_id,
-                preparation_expires_at,
-            };
-            (effect_id, AssignmentManagerEffect::Prepare(prepare))
-        }
-        CloudFrame::AssignmentStart {
-            effect_id,
-            assignment_id,
-            run_id,
-            attempt_id,
-            execution_spec_id,
-            lease,
-            ..
-        } => {
-            let start = AssignmentStart {
-                effect_id: effect_id.clone(),
-                assignment_id: assignment_id.clone(),
-                run_id: run_id.clone(),
-                attempt_id,
-                execution_spec_id,
-                lease,
-            };
-            (effect_id, AssignmentManagerEffect::Start(start))
-        }
-        CloudFrame::ExecutionStartAuthorized {
-            effect_id,
-            assignment_id,
-            run_id,
-            attempt_id,
-            ..
-        } => {
-            let authorization = AssignmentStartAuthorization {
-                effect_id: effect_id.clone(),
-                assignment_id: assignment_id.clone(),
-                run_id: run_id.clone(),
-                attempt_id,
-            };
-            (
-                effect_id,
-                AssignmentManagerEffect::StartAuthorized(authorization),
-            )
-        }
-        CloudFrame::AssignmentLeaseRenewed {
-            effect_id,
-            assignment_id,
-            run_id,
-            attempt_id,
-            lease,
-            ..
-        } => {
-            let renewal = AssignmentRenewal {
-                effect_id: effect_id.clone(),
-                assignment_id: assignment_id.clone(),
-                run_id: run_id.clone(),
-                attempt_id,
-                lease,
-            };
-            (effect_id, AssignmentManagerEffect::Renewal(renewal))
-        }
-        CloudFrame::AssignmentRelease {
-            effect_id,
-            assignment_id,
-            run_id,
-            attempt_id,
-            reason,
-            ..
-        } => {
-            let release_assignment_id = assignment_id.clone();
-            let release_run_id = run_id.clone();
-            (
-                effect_id,
-                AssignmentManagerEffect::Release {
-                    assignment_id: release_assignment_id,
-                    run_id: release_run_id,
-                    attempt_id,
-                    reason,
-                },
-            )
-        }
-        _ => {
-            finish_effect_failure(&event, ConnectionCause::UnexpectedGatewayFrame);
-            return Err(ConnectionError::terminal(
-                *progress,
-                ConnectionCause::UnexpectedGatewayFrame,
-            ));
-        }
-    };
+    let (effect_id, pending_manager_effect, event) = effect.into_parts();
 
     let emission = next_sequence.lock_emission().await;
     let sequence = next_sequence.peek();
@@ -2425,70 +2495,9 @@ where
     .await?;
     drop(emission);
 
-    let manager_result = {
-        let mut manager = assignment_manager
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match manager_effect {
-            AssignmentManagerEffect::Offer(offer) => manager.handle_offer(*offer).map(|_| None),
-            AssignmentManagerEffect::Prepare(prepare) => {
-                manager.handle_prepare(prepare).map(|_| None)
-            }
-            AssignmentManagerEffect::Start(start) => manager.handle_start(start),
-            AssignmentManagerEffect::StartAuthorized(authorization) => manager
-                .handle_start_authorized(authorization)
-                .map(|()| None),
-            AssignmentManagerEffect::Renewal(renewal) => {
-                let result = manager.handle_renewal(renewal);
-                event.set(KeyValue::new(
-                    telemetry::attribute::LEASE_DECISION_DELAY_MS,
-                    event.elapsed_milliseconds(),
-                ));
-                match result {
-                    Ok(decision) => {
-                        decision.record(&event);
-                        Ok(None)
-                    }
-                    Err(failure) => {
-                        event.set(KeyValue::new(
-                            telemetry::attribute::LEASE_DISPOSITION,
-                            "error",
-                        ));
-                        Err(failure)
-                    }
-                }
-            }
-            AssignmentManagerEffect::Release {
-                assignment_id,
-                run_id,
-                attempt_id,
-                reason,
-            } => manager
-                .handle_release(&assignment_id, &run_id, &attempt_id, &reason)
-                .map(|_| None),
-        }
-    };
-    match manager_result {
-        Ok(Some(job)) => job.spawn(),
-        Ok(None) => {}
-        Err(failure) => {
-            let (cause, terminal) = match failure {
-                AssignmentManagerFailure::ConflictingOffer => {
-                    (ConnectionCause::ConflictingAssignmentOffer, true)
-                }
-                AssignmentManagerFailure::DecisionCapacity => {
-                    (ConnectionCause::AssignmentDecisionCapacity, false)
-                }
-                AssignmentManagerFailure::LeaseClock => {
-                    (ConnectionCause::RunnerLeaseClockFailure, true)
-                }
-            };
-            return Err(if terminal {
-                ConnectionError::terminal(*progress, cause)
-            } else {
-                ConnectionError::retryable(*progress, cause)
-            });
-        }
+    if let Some(manager_effect) = pending_manager_effect {
+        apply_assignment_manager_effect(assignment_manager, manager_effect, &event)
+            .map_err(|failure| manager_failure_error(*progress, failure))?;
     }
     Ok(pending)
 }
@@ -2729,8 +2738,9 @@ mod tests {
     use std::fs::{self, File};
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use base64::Engine as _;
@@ -2762,8 +2772,8 @@ mod tests {
         ArtifactRequestKind, AssignmentManager, AssignmentOffer, AssignmentRootPreparer,
         test_support::{
             artifact_delivery, enqueue_finalization_terminal, enqueue_lease_clock_failure_report,
-            enqueue_transitions, install_root_preparer, manager as manager_fixture,
-            manager_with_dependencies, observation_retained,
+            enqueue_transitions, install_root_preparer, install_running_renewal_fixture,
+            manager as manager_fixture, manager_with_dependencies, observation_retained,
         },
     };
     use crate::runner::service::config::Config;
@@ -2783,8 +2793,8 @@ mod tests {
     use crate::runner::service::{Sequence, Sleeper};
     use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
     use crate::runner_protocol::{
-        AssignmentDecline, ExecutionSpecInvalidReason, RunnerEnvelope, RunnerFrame,
-        RunnerUnableReason,
+        AssignmentDecline, CloudFrame, ExecutionSpecInvalidReason, RunnerEnvelope, RunnerFrame,
+        RunnerUnableReason, decode_cloud_frame,
     };
 
     const BOOT_ID: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
@@ -3097,6 +3107,80 @@ mod tests {
         }
     }
 
+    struct EffectSendGate {
+        blocked: Notify,
+        released: AtomicBool,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    impl EffectSendGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                blocked: Notify::new(),
+                released: AtomicBool::new(false),
+                waker: Mutex::new(None),
+            })
+        }
+
+        async fn wait_until_blocked(&self) {
+            self.blocked.notified().await;
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            if let Some(waker) = self.waker.lock().expect("effect send gate poisoned").take() {
+                waker.wake();
+            }
+        }
+    }
+
+    struct GatedEffectWriter {
+        gate: Arc<EffectSendGate>,
+    }
+
+    impl Sink<Message> for GatedEffectWriter {
+        type Error = WebSocketError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.gate.released.load(Ordering::Acquire) {
+                return Poll::Ready(Ok(()));
+            }
+            *self.gate.waker.lock().expect("effect send gate poisoned") =
+                Some(context.waker().clone());
+            if self.gate.released.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                self.gate.blocked.notify_one();
+                Poll::Pending
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, _message: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        // This gate models ready-state pressure only; keeping its inert flush and close beside
+        // that model is clearer than coupling it to the separate multi-point writer fixture.
+        // jscpd:ignore-start
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        // jscpd:ignore-end
+    }
+
     struct BackpressuredCandidateSocket {
         inbound: Option<Result<Message, WebSocketError>>,
         writer: BackpressuredWriter,
@@ -3297,6 +3381,182 @@ mod tests {
             .expect("window fixture timed out");
         result.expect("window fixture connection failed");
         assert_eq!(next_sequence, 35);
+    }
+
+    fn offered_assignment() -> AssignmentOffer {
+        let Message::Text(raw) = assignment_offer() else {
+            panic!("assignment offer fixture must be text");
+        };
+        let CloudFrame::AssignmentOffer {
+            effect_id,
+            assignment_id,
+            run_id,
+            project_id,
+            attempt_id,
+            attempt_number,
+            execution_spec,
+            ..
+        } = decode_cloud_frame(raw.as_bytes()).expect("decode assignment offer fixture")
+        else {
+            panic!("assignment offer fixture decoded as another frame");
+        };
+        AssignmentOffer {
+            effect_id,
+            assignment_id,
+            run_id,
+            project_id,
+            attempt_id,
+            attempt_number,
+            execution_spec: *execution_spec,
+        }
+    }
+
+    fn renewal_effect_document(offered: &AssignmentOffer) -> String {
+        json!({
+            "protocolVersion": 1,
+            "direction": "cloud_to_runner",
+            "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abz",
+            "sentAt": "2026-07-23T00:04:37Z",
+            "type": "assignment_lease_renewed",
+            "payloadVersion": 1,
+            "payload": {
+                "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abz",
+                "assignmentId": offered.assignment_id,
+                "runId": offered.run_id,
+                "attemptId": offered.attempt_id,
+                "lease": { "leaseSequence": 2 }
+            }
+        })
+        .to_string()
+    }
+
+    fn renewal_effect(offered: &AssignmentOffer) -> CloudFrame {
+        decode_cloud_frame(renewal_effect_document(offered).as_bytes())
+            .expect("decode renewal effect fixture")
+    }
+
+    #[tokio::test]
+    async fn renewal_is_applied_before_a_full_observation_window_drains() {
+        let context = EstablishedTestContext::new();
+        let offered = offered_assignment();
+        let mut timing = install_running_renewal_fixture(
+            &mut context.assignment_manager.lock().unwrap(),
+            offered.clone(),
+        );
+        let execution = timing.start_execution_supervisor().await;
+        enqueue_transitions(&context.assignment_manager.lock().unwrap(), 40);
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            let _window = open_and_fill_observation_window(&inbound, &mut outbound).await;
+            inbound.send(Message::Text(renewal_effect_document(&offered).into()));
+            inbound.send(Message::Ping(b"renewal-received".to_vec().into()));
+            assert!(matches!(
+                with_watchdog(outbound.recv())
+                    .await
+                    .expect("renewal synchronization pong timed out")
+                    .expect("renewal synchronization pong missing"),
+                Message::Pong(payload) if payload.as_ref() == b"renewal-received"
+            ));
+            assert_eq!(timing.authority_sequence(), 2);
+            timing.wait_until_execution_observes_renewal().await;
+            timing.advance(Duration::from_secs(2));
+            assert!(!timing.cancellation_started());
+            assert!(timing.cancellation_headroom() > Some(Duration::from_secs(270)));
+            execution.complete().await;
+            inbound.send(Message::Close(None));
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("full-window renewal fixture timed out");
+        result.expect("full-window renewal connection failed");
+        context
+            .active_effect_event
+            .finish(Outcome::Disconnected, None);
+        let event = context.capture.event("runner.effect_acknowledgement");
+        assert_eq!(event["scherzo.lease.disposition"], "applied");
+        assert_eq!(event["scherzo.lease.request_age_ms"], 29_000);
+        assert_eq!(event["scherzo.lease.cancellation_headroom_ms"], 1_000);
+    }
+
+    #[tokio::test]
+    async fn renewal_is_applied_before_effect_receipt_backpressure() {
+        let context = EstablishedTestContext::new();
+        let offered = offered_assignment();
+        let timing = install_running_renewal_fixture(
+            &mut context.assignment_manager.lock().unwrap(),
+            offered.clone(),
+        );
+        let mut progress = ConnectionProgress::unacknowledged();
+        progress.handshake_completed = true;
+        let mut effect = super::BufferedEffect::received(
+            context.recorder.as_ref(),
+            &context.config,
+            BOOT_ID,
+            renewal_effect(&offered),
+            &mut progress,
+            &context.connection_event,
+        )
+        .expect("receive renewal effect");
+        let effect_event = effect.event.clone();
+        effect
+            .apply_renewal(&context.assignment_manager, progress)
+            .expect("apply received renewal");
+        let gate = EffectSendGate::new();
+        let mut writer = GatedEffectWriter {
+            gate: Arc::clone(&gate),
+        };
+        let sleeper = fixture_sleeper();
+        let sequence = Sequence::new(2);
+        let mut protocol = super::ProtocolLog::new(
+            context.recorder.as_ref(),
+            context.config.credential().runner_id(),
+            BOOT_ID,
+            1,
+        );
+        let send = super::send_effect_receipt(
+            &mut writer,
+            sleeper.as_ref(),
+            Duration::from_secs(10),
+            &context.config,
+            context.frame_source.as_ref(),
+            BOOT_ID,
+            &sequence,
+            &mut protocol,
+            &mut progress,
+            &context.connection_event,
+            &context.assignment_manager,
+            effect,
+        );
+        let observe_delay = async {
+            gate.wait_until_blocked().await;
+            assert_eq!(
+                timing.authority_sequence(),
+                2,
+                "outbound receipt pressure delayed the local renewal decision"
+            );
+            timing.advance(Duration::from_secs(2));
+            assert!(!timing.cancellation_started());
+            assert!(
+                timing.cancellation_headroom() > Some(Duration::from_secs(270)),
+                "renewed authority did not remain positive past the old cancellation boundary"
+            );
+            gate.release();
+        };
+
+        let (pending, ()) = with_watchdog(async { tokio::join!(send, observe_delay) })
+            .await
+            .expect("controlled renewal delivery timed out");
+        let pending = pending.expect("send renewal effect receipt");
+        assert_eq!(pending.kind, PendingObservationKind::EffectReceipt);
+        effect_event.finish(Outcome::Disconnected);
+        let event = context.capture.event("runner.effect_acknowledgement");
+        assert_eq!(event["scherzo.lease.disposition"], "applied");
+        assert_eq!(event["scherzo.lease.request_age_ms"], 29_000);
+        assert_eq!(event["scherzo.lease.cancellation_headroom_ms"], 1_000);
+        assert!(event["scherzo.lease.decision_delay_ms"].as_u64().is_some());
     }
 
     #[tokio::test]

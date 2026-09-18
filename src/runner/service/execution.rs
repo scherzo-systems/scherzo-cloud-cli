@@ -2978,6 +2978,87 @@ impl CoordinatorClock for RunnerExecutionClock {
 }
 
 #[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    pub(in crate::runner::service) struct LiveLeaseExecution {
+        completion: tokio::sync::oneshot::Sender<&'static str>,
+        task: tokio::task::JoinHandle<LeaseExecution<&'static str>>,
+        cancellation: crate::execution::workflow::admission::CancellationSource,
+        fence: PostStopFence,
+        guards: AssignmentProcessGuards,
+    }
+
+    impl LiveLeaseExecution {
+        pub(in crate::runner::service) async fn complete(self) {
+            let Self {
+                completion,
+                task,
+                cancellation,
+                fence,
+                guards,
+            } = self;
+            completion
+                .send("completed-after-renewal")
+                .expect("live lease execution ended before completion");
+            assert!(matches!(
+                crate::runner::service::test_support::with_watchdog(task)
+                    .await
+                    .expect("live lease execution supervision timed out")
+                    .expect("live lease execution supervision task failed"),
+                LeaseExecution::Completed {
+                    output: "completed-after-renewal",
+                    ..
+                }
+            ));
+            assert_eq!(cancellation.cancellation_reason(), None);
+            assert!(!fence.is_fenced());
+            assert!(!guards.forced_containment_started());
+        }
+    }
+
+    pub(in crate::runner::service) fn supervise_assignment_lease(
+        lease_clock: LeaseClock,
+        authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+        causal_lease: CausalLease,
+        cancellation: crate::execution::workflow::admission::CancellationSource,
+        assignment_id: String,
+        attempt_id: String,
+    ) -> LiveLeaseExecution {
+        let observed_cancellation = cancellation.clone();
+        let outbox = ObservationOutbox::new();
+        let fence = PostStopFence::with_workflow_git(None);
+        let observed_fence = fence.clone();
+        let guards = AssignmentProcessGuards::new();
+        let observed_guards = guards.clone();
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_under_lease(
+                async { completed.await.expect("live lease execution completion") },
+                &cancellation,
+                &lease_clock,
+                authority_updates,
+                None,
+                &causal_lease,
+                &outbox,
+                &assignment_id,
+                &attempt_id,
+                &fence,
+                &guards,
+            )
+            .await
+        });
+        LiveLeaseExecution {
+            completion,
+            task,
+            cancellation: observed_cancellation,
+            fence: observed_fence,
+            guards: observed_guards,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     // Runner execution and artifact delivery intentionally own separate broker fixtures;
     // their matching imports keep each test module independently readable.
