@@ -662,6 +662,13 @@ fn monitor_guarded_child(
     inspector: &impl ProcessIdentityInspector,
 ) -> Result<(), ()> {
     loop {
+        #[cfg(target_os = "linux")]
+        if running_as_guard_worker()
+            && reap_exited_adopted_descendants(identity.process_group()).is_err()
+        {
+            cleanup_owned_group(root, identity, leader, inspector)?;
+            return Err(());
+        }
         if let Ok(owner_event) = owner_events.try_recv() {
             cleanup_owned_group(root, identity, leader, inspector)?;
             if owner_event == OwnerEvent::Lost {
@@ -848,10 +855,7 @@ fn cleanup_owned_group(
     reap_owned_process_group(identity.process_group()).map_err(|_| ())?;
     // Only the dedicated one-invocation guard owns every direct child. Unit-test callers share
     // their process with unrelated guarded launches and must not sweep those sibling workers.
-    if matches!(
-        std::env::var(INTERNAL_WORKER_ENVIRONMENT).as_deref(),
-        Ok(GUARD_WORKER)
-    ) {
+    if running_as_guard_worker() {
         terminate_and_reap_adopted_descendants().map_err(|_| ())?;
     }
     write_atomic(&root.join(QUIESCED_FILE), b"quiesced\n")?;
@@ -1008,6 +1012,31 @@ fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
     }
 }
 
+// A nested process group can orphan an exited member to this nearest subreaper while the
+// guarded leader is still waiting for that group to disappear. Reap only those adopted direct
+// children here. The authenticated leader is excluded so its status remains available to the
+// ordinary leader-completion path.
+#[cfg(target_os = "linux")]
+fn reap_exited_adopted_descendants(leader: Pid) -> io::Result<()> {
+    for child in linux_direct_children()? {
+        if child == leader {
+            continue;
+        }
+        match waitpid(Some(child), WaitOptions::NOHANG) {
+            Ok(Some(_)) | Ok(None) | Err(Errno::CHILD) | Err(Errno::INTR) => {}
+            Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
+        }
+    }
+    Ok(())
+}
+
+fn running_as_guard_worker() -> bool {
+    matches!(
+        std::env::var(INTERNAL_WORKER_ENVIRONMENT).as_deref(),
+        Ok(GUARD_WORKER)
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn linux_direct_children() -> io::Result<Vec<Pid>> {
     let mut children = Vec::new();
@@ -1143,6 +1172,20 @@ mod tests {
 
     const STALLED_BOUNDARY_FIXTURE: &str =
         "execution::workflow::child_guard::tests::stalled_ready_boundary_fixture";
+    #[cfg(target_os = "linux")]
+    const NESTED_OWNER_FIXTURE: &str =
+        "execution::workflow::child_guard::tests::nested_process_group_owner_fixture";
+    #[cfg(target_os = "linux")]
+    const NESTED_LEADER_FIXTURE: &str =
+        "execution::workflow::child_guard::tests::nested_process_group_leader_fixture";
+    #[cfg(target_os = "linux")]
+    const NESTED_DESCENDANT_FIXTURE: &str =
+        "execution::workflow::child_guard::tests::nested_stubborn_descendant_fixture";
+    #[cfg(target_os = "linux")]
+    const UNRELATED_SIBLING_FIXTURE: &str =
+        "execution::workflow::child_guard::tests::unrelated_sibling_fixture";
+    #[cfg(target_os = "linux")]
+    const NESTED_FIXTURE_ROOT: &str = "SCHERZO_NESTED_GUARD_FIXTURE_ROOT";
 
     struct UnavailableInspector;
 
@@ -1264,6 +1307,336 @@ mod tests {
             }
         );
         assert_eq!(exit_observations.next(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_fixture_file(path: &Path) {
+        let started = crate::timing::monotonic_now();
+        while !path.is_file() {
+            assert!(crate::timing::elapsed(started) < Duration::from_secs(5));
+            // Files are the synchronization ABI between independently executing test binaries;
+            // there is no in-process notification primitive at this operating-system boundary.
+            crate::timing::sleep(WORKER_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_pid(path: &Path) -> Pid {
+        let raw = fs::read_to_string(path).unwrap().trim().parse().unwrap();
+        Pid::from_raw(raw).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_process_state(process: Pid) -> Option<String> {
+        fs::read_to_string(format!("/proc/{}/stat", process.as_raw_pid()))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.split_ascii_whitespace().next())
+                    .map(str::to_owned)
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_fixture_process_group(process_group: Pid, members: &[Pid]) {
+        for member in members {
+            assert_eq!(rustix::process::getpgid(Some(*member)), Ok(process_group));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "launched as the nested process-group execution owner"]
+    fn nested_process_group_owner_fixture() {
+        let root = PathBuf::from(std::env::var_os(NESTED_FIXTURE_ROOT).unwrap());
+        let executable = std::env::current_exe().unwrap();
+        let mut reports = Vec::new();
+
+        for ordinal in 0..2 {
+            let leader_pid_path = root.join(format!("leader-{ordinal}.pid"));
+            let leader_ready = root.join(format!("leader-{ordinal}.ready"));
+            let leader_interrupted = root.join(format!("leader-{ordinal}.interrupted"));
+            let descendant_pid_path = root.join(format!("descendant-{ordinal}.pid"));
+            let descendant_ready = root.join(format!("descendant-{ordinal}.ready"));
+            let descendant_interrupted = root.join(format!("descendant-{ordinal}.interrupted"));
+            let mut leader = StdCommand::new(&executable)
+                .args([
+                    "--exact",
+                    NESTED_LEADER_FIXTURE,
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("SCHERZO_NESTED_LEADER_PID", &leader_pid_path)
+                .env("SCHERZO_NESTED_LEADER_READY", &leader_ready)
+                .env("SCHERZO_NESTED_LEADER_INTERRUPTED", &leader_interrupted)
+                .env("SCHERZO_NESTED_DESCENDANT_PID", &descendant_pid_path)
+                .env("SCHERZO_NESTED_DESCENDANT_READY", &descendant_ready)
+                .env(
+                    "SCHERZO_NESTED_DESCENDANT_INTERRUPTED",
+                    &descendant_interrupted,
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let leader_pid = Pid::from_raw(i32::try_from(leader.id()).unwrap()).unwrap();
+            wait_for_fixture_file(&leader_ready);
+            wait_for_fixture_file(&descendant_ready);
+            let descendant_pid = fixture_pid(&descendant_pid_path);
+            assert_eq!(fixture_pid(&leader_pid_path), leader_pid);
+            assert_fixture_process_group(leader_pid, &[leader_pid, descendant_pid]);
+            let before_leader_state = fixture_process_state(leader_pid);
+            let before_descendant_state = fixture_process_state(descendant_pid);
+
+            kill_process_group(leader_pid, Signal::INT).unwrap();
+            wait_for_fixture_file(&leader_interrupted);
+            wait_for_fixture_file(&descendant_interrupted);
+            assert_fixture_process_group(leader_pid, &[leader_pid, descendant_pid]);
+
+            kill_process_group(leader_pid, Signal::KILL).unwrap();
+            assert!(!leader.wait().unwrap().success());
+            let started = crate::timing::monotonic_now();
+            while !process_group_is_quiescent(leader_pid) {
+                assert!(crate::timing::elapsed(started) < Duration::from_secs(5));
+                // Process-group disappearance has no event descriptor, so this bounded poll is
+                // the unavoidable kernel-observation boundary for the regression fixture.
+                crate::timing::sleep(WORKER_POLL_INTERVAL);
+            }
+            reports.push(serde_json::json!({
+                "processGroup": leader_pid.as_raw_pid(),
+                "before": [
+                    {
+                        "pid": leader_pid.as_raw_pid(),
+                        "processGroup": leader_pid.as_raw_pid(),
+                        "state": before_leader_state,
+                    },
+                    {
+                        "pid": descendant_pid.as_raw_pid(),
+                        "processGroup": leader_pid.as_raw_pid(),
+                        "state": before_descendant_state,
+                    }
+                ],
+                "after": [
+                    {
+                        "pid": leader_pid.as_raw_pid(),
+                        "processGroup": rustix::process::getpgid(Some(leader_pid))
+                            .ok()
+                            .map(Pid::as_raw_pid),
+                        "state": fixture_process_state(leader_pid),
+                    },
+                    {
+                        "pid": descendant_pid.as_raw_pid(),
+                        "processGroup": rustix::process::getpgid(Some(descendant_pid))
+                            .ok()
+                            .map(Pid::as_raw_pid),
+                        "state": fixture_process_state(descendant_pid),
+                    }
+                ],
+                "groupQuiescent": true,
+            }));
+        }
+
+        fs::write(
+            root.join("report.json"),
+            serde_json::to_vec(&reports).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "launched as the nested process-group leader"]
+    fn nested_process_group_leader_fixture() {
+        let interrupted = std::env::var_os("SCHERZO_NESTED_LEADER_INTERRUPTED").unwrap();
+        crate::execution::workflow::test_support::process_fixture_interrupt_handler(move || {
+            fs::write(interrupted, b"interrupted\n").unwrap();
+        });
+        fs::write(
+            std::env::var_os("SCHERZO_NESTED_LEADER_PID").unwrap(),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let mut descendant = StdCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                NESTED_DESCENDANT_FIXTURE,
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        fs::write(
+            std::env::var_os("SCHERZO_NESTED_LEADER_READY").unwrap(),
+            b"ready\n",
+        )
+        .unwrap();
+        let _ = descendant.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "launched as the nested interrupt-resistant descendant"]
+    fn nested_stubborn_descendant_fixture() {
+        let interrupted =
+            crate::execution::workflow::test_support::process_fixture_interrupt_receiver();
+        fs::write(
+            std::env::var_os("SCHERZO_NESTED_DESCENDANT_PID").unwrap(),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        fs::write(
+            std::env::var_os("SCHERZO_NESTED_DESCENDANT_READY").unwrap(),
+            b"ready\n",
+        )
+        .unwrap();
+        interrupted.recv().unwrap();
+        fs::write(
+            std::env::var_os("SCHERZO_NESTED_DESCENDANT_INTERRUPTED").unwrap(),
+            b"interrupted\n",
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "launched as the unrelated sibling process"]
+    fn unrelated_sibling_fixture() {
+        fs::write(
+            std::env::var_os("SCHERZO_UNRELATED_SIBLING_READY").unwrap(),
+            b"ready\n",
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_groups_settle_twice_beneath_a_surviving_subreaper() {
+        let fixture = tempfile::tempdir().unwrap();
+        let sibling_ready = fixture.path().join("sibling.ready");
+        let mut sibling_command = StdCommand::new(std::env::current_exe().unwrap());
+        sibling_command
+            .args([
+                "--exact",
+                UNRELATED_SIBLING_FIXTURE,
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("SCHERZO_UNRELATED_SIBLING_READY", &sibling_ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut sibling = crate::process::ManagedProcessGroup::spawn(&mut sibling_command).unwrap();
+        wait_for_fixture_file(&sibling_ready);
+        let sibling_pid = Pid::from_raw(i32::try_from(sibling.child_mut().id()).unwrap()).unwrap();
+
+        let arguments = [
+            OsString::from("--exact"),
+            OsString::from(NESTED_OWNER_FIXTURE),
+            OsString::from("--ignored"),
+            OsString::from("--test-threads=1"),
+        ];
+        let environment = [(
+            OsString::from(NESTED_FIXTURE_ROOT),
+            fixture.path().as_os_str().to_owned(),
+        )];
+        let cancellation = ChildGuardCancellation::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut outer = {
+            // Tokio process registration needs an entered runtime, but the blocking launch
+            // handshake remains on this synchronous test thread.
+            let _runtime_context = runtime.enter();
+            StoppedChildGuard::spawn_cancellable(
+                &std::env::current_exe().unwrap(),
+                &arguments,
+                &environment,
+                &cancellation,
+                |_| Ok(()),
+            )
+            .unwrap()
+        };
+        let outer_group = outer.identity().process_group();
+        assert!(nix::sys::prctl::get_child_subreaper().unwrap());
+        let mut standard_output = outer.take_stdout().unwrap();
+        let mut standard_error = outer.take_stderr().unwrap();
+        outer.continue_execution_cancellable(&cancellation).unwrap();
+
+        let (waited, output, errors) = runtime.block_on(async {
+            let output = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                standard_output.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            });
+            let errors = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                standard_error.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            });
+            let waited = tokio::select! {
+                result = outer.wait() => Some(result),
+                () = crate::timing::async_sleep(Duration::from_secs(10)) => None,
+            };
+            if waited.is_none() {
+                let _ = outer.force_stop().await;
+            }
+            (waited, output.await.unwrap(), errors.await.unwrap())
+        });
+        let outer_status = waited
+            .unwrap_or_else(|| {
+                panic!(
+                    "nested owner did not settle; stdout={}; stderr={}",
+                    String::from_utf8_lossy(&output),
+                    String::from_utf8_lossy(&errors)
+                )
+            })
+            .unwrap();
+
+        let sibling_survived = sibling.try_wait().unwrap().is_none();
+        let sibling_group = rustix::process::getpgid(Some(sibling_pid)).ok();
+        sibling.terminate();
+
+        assert!(outer_status.success());
+        assert!(process_group_is_quiescent(outer_group));
+        assert!(sibling_survived);
+        assert_eq!(sibling_group, Some(sibling_pid));
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.path().join("report.json")).unwrap()).unwrap();
+        let executions = report.as_array().unwrap();
+        assert_eq!(executions.len(), 2);
+        for execution in executions {
+            assert_eq!(execution["groupQuiescent"], true);
+            assert_eq!(execution["before"].as_array().unwrap().len(), 2);
+            assert!(
+                execution["before"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|member| {
+                        member["processGroup"] == execution["processGroup"]
+                            && member["state"].as_str().is_some_and(|state| state != "Z")
+                    })
+            );
+            assert!(
+                execution["after"].as_array().unwrap().iter().all(|member| {
+                    member["processGroup"].is_null() && member["state"].is_null()
+                })
+            );
+            assert_ne!(execution["processGroup"], sibling_pid.as_raw_pid());
+        }
+        assert_ne!(executions[0]["processGroup"], executions[1]["processGroup"]);
     }
 
     #[cfg(target_os = "linux")]
