@@ -53,7 +53,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -286,6 +286,17 @@ impl HttpOptions {
 }
 
 #[derive(Debug, Args)]
+struct WaitTimeoutArgs {
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse_wait_timeout,
+        help = "Stop waiting after a positive duration (units: ms, s, m, or h)"
+    )]
+    timeout: Option<Duration>,
+}
+
+#[derive(Debug, Args)]
 struct PaginationArgs {
     #[arg(
         long,
@@ -388,6 +399,22 @@ struct CloudListResult<'a, T> {
     items: &'a [T],
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservationResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    organization_ref: &'a str,
+    run_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publication_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<&'static str>,
 }
 
 impl<'a> ApiFailureResult<'a> {
@@ -583,6 +610,10 @@ const OBSERVATION_ACTIVE: u8 = 0;
 const OBSERVATION_COMPLETING: u8 = 1;
 const OBSERVATION_STOPPED: u8 = 2;
 
+trait ObservationControl {
+    fn is_stopped(&self) -> bool;
+}
+
 struct BlockingObservationControl {
     state: AtomicU8,
 }
@@ -621,6 +652,12 @@ impl BlockingObservationControl {
     }
 }
 
+impl ObservationControl for BlockingObservationControl {
+    fn is_stopped(&self) -> bool {
+        self.is_stopped()
+    }
+}
+
 struct ObservationTimeout {
     duration: Option<Duration>,
 }
@@ -632,6 +669,203 @@ impl ObservationTimeout {
             None => std::future::pending().await,
         }
     }
+}
+
+struct DeferredObservationTimeoutStart {
+    sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl DeferredObservationTimeoutStart {
+    fn start(&self) {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct DeferredObservationTimeout {
+    duration: Option<Duration>,
+    started: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl DeferredObservationTimeout {
+    async fn wait(self) {
+        let Some(duration) = self.duration else {
+            return std::future::pending().await;
+        };
+        if self.started.await.is_err() {
+            return std::future::pending().await;
+        }
+        crate::timing::async_sleep(duration).await;
+    }
+}
+
+const OBSERVATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES: usize = 2;
+
+trait ObservationClock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemObservationClock;
+
+impl ObservationClock for SystemObservationClock {
+    fn now(&self) -> Instant {
+        crate::timing::monotonic_now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        crate::timing::sleep(duration);
+    }
+}
+
+#[cfg(test)]
+mod observation_test_support {
+    use std::cell::{Cell, RefCell};
+    use std::time::{Duration, Instant};
+
+    pub(super) struct ControlledObservationClock {
+        now: Cell<Instant>,
+        sleeps: RefCell<Vec<Duration>>,
+    }
+
+    impl ControlledObservationClock {
+        pub(super) fn new(now: Instant) -> Self {
+            Self {
+                now: Cell::new(now),
+                sleeps: RefCell::new(Vec::new()),
+            }
+        }
+
+        pub(super) fn assert_timeout_schedule(self) {
+            assert_eq!(
+                self.sleeps.into_inner(),
+                vec![
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                    Duration::from_secs(1)
+                ]
+            );
+        }
+
+        pub(super) fn assert_single_poll(self) {
+            assert_eq!(
+                self.sleeps.into_inner(),
+                vec![super::OBSERVATION_POLL_INTERVAL]
+            );
+        }
+
+        pub(super) fn into_sleeps(self) -> Vec<Duration> {
+            self.sleeps.into_inner()
+        }
+    }
+
+    impl super::ObservationClock for ControlledObservationClock {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.borrow_mut().push(duration);
+            self.now.set(self.now.get() + duration);
+        }
+    }
+}
+
+enum TerminalObservation<T, S> {
+    Terminal { resource: Box<T>, state: S },
+    TimedOut,
+    Stopped,
+}
+
+fn wait_for_terminal_observation<T, S, E>(
+    mut observe: impl FnMut() -> Result<T, E>,
+    terminal_state: impl Fn(&T) -> Option<S>,
+    retryable_failure: impl Fn(&E) -> bool,
+    timeout: Option<Duration>,
+    control: &impl ObservationControl,
+    clock: &impl ObservationClock,
+) -> Result<TerminalObservation<T, S>, E> {
+    let started_at = clock.now();
+    let mut consecutive_failures = 0;
+    loop {
+        if control.is_stopped() {
+            return Ok(TerminalObservation::Stopped);
+        }
+        if remaining_observation_wait(timeout, started_at, clock.now()).is_none() {
+            return Ok(TerminalObservation::TimedOut);
+        }
+
+        match observe() {
+            Ok(resource) => {
+                consecutive_failures = 0;
+                if let Some(state) = terminal_state(&resource) {
+                    return Ok(TerminalObservation::Terminal {
+                        resource: Box::new(resource),
+                        state,
+                    });
+                }
+            }
+            Err(failure)
+                if retryable_failure(&failure)
+                    && consecutive_failures + 1 < MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES =>
+            {
+                consecutive_failures += 1;
+            }
+            Err(failure) => return Err(failure),
+        }
+
+        if control.is_stopped() {
+            return Ok(TerminalObservation::Stopped);
+        }
+        let Some(remaining) = remaining_observation_wait(timeout, started_at, clock.now()) else {
+            return Ok(TerminalObservation::TimedOut);
+        };
+        clock.sleep(OBSERVATION_POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn remaining_observation_wait(
+    timeout: Option<Duration>,
+    started_at: Instant,
+    now: Instant,
+) -> Option<Duration> {
+    match timeout {
+        Some(timeout) => timeout
+            .checked_sub(now.saturating_duration_since(started_at))
+            .filter(|remaining| !remaining.is_zero()),
+        None => Some(OBSERVATION_POLL_INTERVAL),
+    }
+}
+
+fn parse_wait_timeout(value: &str) -> Result<Duration, String> {
+    let (quantity, milliseconds) = if let Some(quantity) = value.strip_suffix("ms") {
+        (quantity, 1)
+    } else if let Some(quantity) = value.strip_suffix('s') {
+        (quantity, 1_000)
+    } else if let Some(quantity) = value.strip_suffix('m') {
+        (quantity, 60_000)
+    } else if let Some(quantity) = value.strip_suffix('h') {
+        (quantity, 3_600_000)
+    } else {
+        (value, 1_000)
+    };
+    let quantity = quantity
+        .parse::<u64>()
+        .map_err(|_| "duration must be a positive integer followed by ms, s, m, or h".to_owned())?;
+    let total_milliseconds = quantity
+        .checked_mul(milliseconds)
+        .filter(|duration| *duration > 0)
+        .ok_or_else(|| {
+            "duration must be a positive integer followed by ms, s, m, or h".to_owned()
+        })?;
+    Ok(Duration::from_millis(total_milliseconds))
 }
 
 fn blocking_signal_runtime(context: &str) -> anyhow::Result<tokio::runtime::Runtime> {
@@ -720,6 +954,12 @@ struct OperationControl<R> {
     // transitioning the authoritative state to Signal and never grants dispatch/output authority.
     cooperative_stop: AtomicBool,
     state: Mutex<OperationState<R>>,
+}
+
+impl<R> ObservationControl for OperationControl<R> {
+    fn is_stopped(&self) -> bool {
+        self.is_cancelled()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -892,16 +1132,53 @@ fn execute_mutation_with_signals<R>(
 where
     R: Clone + Send + 'static,
 {
+    execute_mutation_with_signals_and_deferred_timeout(
+        context,
+        recovery,
+        None,
+        move |control, _| operation(control),
+        incomplete_signal,
+        |_| Ok(ExitCode::GeneralFailure),
+    )
+}
+
+fn execute_mutation_with_signals_and_deferred_timeout<R>(
+    context: &'static str,
+    recovery: R,
+    timeout: Option<Duration>,
+    operation: impl FnOnce(&OperationControl<R>, &DeferredObservationTimeoutStart) -> CommandResult
+    + Send
+    + 'static,
+    incomplete_signal: impl FnOnce(ExitCode, SignalSnapshot<R>) -> CommandResult + 'static,
+    timed_out: impl FnOnce(SignalSnapshot<R>) -> CommandResult + 'static,
+) -> CommandResult
+where
+    R: Clone + Send + 'static,
+{
     run_blocking_signal_runtime(context, async move {
         let mut signals = ProcessSignals::install(context)?;
         let control = Arc::new(OperationControl::new(recovery));
-        let mut running = spawn_controlled_blocking(Arc::clone(&control), operation);
+        let (timeout_sender, timeout_started) = tokio::sync::oneshot::channel();
+        let timeout_start = Arc::new(DeferredObservationTimeoutStart {
+            sender: Mutex::new(Some(timeout_sender)),
+        });
+        let operation_timeout_start = Arc::clone(&timeout_start);
+        let mut running = spawn_controlled_blocking(Arc::clone(&control), move |control| {
+            operation(control, &operation_timeout_start)
+        });
         tokio::select! {
             biased;
             signal = signals.recv() => {
                 let stopped = control
                     .claim_signal()
                     .map(|snapshot| incomplete_signal(signal, snapshot));
+                finish_stopped_operation(context, &mut running, stopped).await
+            }
+            () = (DeferredObservationTimeout {
+                duration: timeout,
+                started: timeout_started,
+            }).wait() => {
+                let stopped = control.claim_signal().map(timed_out);
                 finish_stopped_operation(context, &mut running, stopped).await
             }
             result = &mut running => finish_read_only_operation(context, result),

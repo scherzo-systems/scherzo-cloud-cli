@@ -107,6 +107,32 @@ fn publication_history() -> Vec<serde_json::Value> {
     vec![queued, running, succeeded, failed]
 }
 
+fn succeeded_publication(outcome: &str) -> serde_json::Value {
+    let mut publication = publication_body();
+    publication["state"] = serde_json::json!("succeeded");
+    publication["version"] = serde_json::json!(3);
+    publication["outcome"] = serde_json::json!(outcome);
+    publication["updatedAt"] = serde_json::json!("2026-09-03T18:00:02Z");
+    publication["startedAt"] = serde_json::json!("2026-09-03T18:00:01Z");
+    publication["terminalAt"] = serde_json::json!("2026-09-03T18:00:02Z");
+    if outcome != "no_changes" {
+        let merged = outcome == "pull_request_already_merged";
+        publication["branch"] = serde_json::json!({
+            "headOid": publication["artifact"]["headOid"].clone(),
+            "disposition": if merged { "reused" } else { "created" },
+            "url": "https://github.example/scherzo-systems/scherzo-cloud/tree/changes"
+        });
+        publication["pullRequest"] = serde_json::json!({
+            "providerId": "987654",
+            "number": 17,
+            "url": "https://github.example/scherzo-systems/scherzo-cloud/pulls/17",
+            "disposition": if merged { "reused" } else { "created" },
+            "state": if merged { "merged" } else { "open" }
+        });
+    }
+    publication
+}
+
 fn accepted_response(body: &serde_json::Value) -> Vec<u8> {
     publication_response(
         "202 Accepted",
@@ -167,6 +193,28 @@ fn show_args(json: bool) -> Vec<&'static str> {
     args
 }
 
+fn create_wait_args(
+    json: bool,
+    caller_key: bool,
+    timeout: Option<&'static str>,
+) -> Vec<&'static str> {
+    let mut args = create_args(json, caller_key);
+    args.push("--wait");
+    if let Some(timeout) = timeout {
+        args.extend(["--timeout", timeout]);
+    }
+    args
+}
+
+fn show_wait_args(json: bool, timeout: Option<&'static str>) -> Vec<&'static str> {
+    let mut args = show_args(json);
+    args.push("--wait");
+    if let Some(timeout) = timeout {
+        args.extend(["--timeout", timeout]);
+    }
+    args
+}
+
 fn list_args(json: bool, page: bool) -> Vec<&'static str> {
     let mut args = vec!["publication", "list", ORGANIZATION, RUN_ID];
     if page {
@@ -196,6 +244,36 @@ fn assert_no_publication_secret(output: &Output, secrets: &[&str]) {
     let text = String::from_utf8_lossy(&bytes);
     for secret in secrets {
         assert!(!text.contains(secret), "output exposed sentinel {secret:?}");
+    }
+}
+
+#[test]
+fn publication_timeout_requires_wait_on_create_and_show() {
+    for args in [
+        vec![
+            "publication",
+            "create",
+            ORGANIZATION,
+            RUN_ID,
+            "--export",
+            EXPORT_NAME,
+            "--timeout",
+            "1s",
+        ],
+        vec![
+            "publication",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            PUBLICATION_ID,
+            "--timeout",
+            "1s",
+        ],
+    ] {
+        let output = run(&args);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
     }
 }
 
@@ -270,6 +348,77 @@ fn publication_create_sends_the_closed_request_and_renders_plain_and_json_receip
 }
 
 #[test]
+fn publication_create_wait_classifies_every_stored_terminal_outcome() {
+    let mut terminal = [
+        succeeded_publication("no_changes"),
+        succeeded_publication("pull_request_published"),
+        succeeded_publication("pull_request_already_merged"),
+        publication_history().remove(3),
+    ];
+    terminal[3]["id"] = serde_json::json!(PUBLICATION_ID);
+
+    for (publication, expected_outcome, expected_exit) in [
+        (&terminal[0], "succeeded", 0),
+        (&terminal[1], "succeeded", 0),
+        (&terminal[2], "succeeded", 0),
+        (&terminal[3], "failed", 1),
+    ] {
+        let accepted = publication_body();
+        let (server, _directory, credential_path) = prepared_publication(vec![
+            accepted_response(&accepted),
+            ok_publication_response(publication),
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(&create_wait_args(true, true, None), &environment);
+
+        assert_eq!(output.status.code(), Some(expected_exit));
+        assert!(output.stderr.is_empty());
+        let result = assert_one_json_document(&output.stdout);
+        assert_eq!(result["schemaVersion"], 1);
+        assert_eq!(result["deployment"], server.api_url);
+        assert_eq!(result["idempotencyKey"], CALLER_KEY);
+        assert_eq!(result["outcome"], expected_outcome);
+        assert_eq!(result["publication"], *publication);
+        assert_no_publication_secret(&output, &[TOKEN]);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(&format!(
+            "POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications HTTP/1.1\r\n"
+        )));
+        assert!(requests[1].starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications/{PUBLICATION_ID} HTTP/1.1\r\n"
+        )));
+        assert_eq!(header_value(&requests[0], "idempotency-key"), CALLER_KEY);
+    }
+}
+
+#[test]
+fn publication_create_wait_completes_from_a_terminal_acceptance_without_an_item_read() {
+    let terminal = succeeded_publication("pull_request_already_merged");
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![accepted_response(&terminal)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(&create_wait_args(true, true, Some("10s")), &environment);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result = assert_one_json_document(&output.stdout);
+    assert_eq!(result["outcome"], "succeeded");
+    assert_eq!(result["idempotencyKey"], CALLER_KEY);
+    assert_eq!(result["publication"], terminal);
+    assert_no_publication_secret(&output, &[TOKEN]);
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(&format!(
+        "POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications HTTP/1.1\r\n"
+    )));
+}
+
+#[test]
 fn publication_show_renders_a_stored_failure_as_a_successful_read() {
     for json in [false, true] {
         let mut failed = publication_history().remove(3);
@@ -324,6 +473,211 @@ fn publication_show_renders_a_stored_failure_as_a_successful_read() {
             format!("Bearer {TOKEN}")
         );
     }
+}
+
+#[test]
+fn publication_show_wait_reports_every_stored_terminal_outcome_as_a_successful_read() {
+    let mut terminal = [
+        succeeded_publication("no_changes"),
+        succeeded_publication("pull_request_published"),
+        succeeded_publication("pull_request_already_merged"),
+        publication_history().remove(3),
+    ];
+    terminal[3]["id"] = serde_json::json!(PUBLICATION_ID);
+
+    for (publication, expected_outcome) in [
+        (&terminal[0], "succeeded"),
+        (&terminal[1], "succeeded"),
+        (&terminal[2], "succeeded"),
+        (&terminal[3], "failed"),
+    ] {
+        let (server, _directory, credential_path) =
+            prepared_publication(vec![ok_publication_response(publication)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(&show_wait_args(true, None), &environment);
+
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let result = assert_one_json_document(&output.stdout);
+        assert_eq!(result["schemaVersion"], 1);
+        assert_eq!(result["deployment"], server.api_url);
+        assert_eq!(result["outcome"], expected_outcome);
+        assert_eq!(result["publication"], *publication);
+        assert_no_publication_secret(&output, &[TOKEN]);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications/{PUBLICATION_ID} HTTP/1.1\r\n"
+        )));
+        assert_eq!(
+            header_value(&requests[0], "authorization"),
+            format!("Bearer {TOKEN}")
+        );
+    }
+
+    assert_eq!(terminal[0]["outcome"], "no_changes");
+    assert_eq!(terminal[2]["outcome"], "pull_request_already_merged");
+    assert_eq!(terminal[2]["pullRequest"]["disposition"], "reused");
+    assert_eq!(terminal[2]["pullRequest"]["state"], "merged");
+}
+
+#[test]
+fn publication_show_wait_renews_authentication_for_each_observation() {
+    const FIRST_REFRESH_TOKEN: &str = "unique-publication-wait-first-refresh-token";
+    const SECOND_ACCESS_TOKEN: &str = "unique-publication-wait-second-access-token";
+    const SECOND_REFRESH_TOKEN: &str = "unique-publication-wait-second-refresh-token";
+
+    let unauthorized = || {
+        problem_http_response(
+            "401 Unauthorized",
+            serde_json::json!({
+                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401
+            }),
+        )
+    };
+    let refresh = |access_token: &str, refresh_token: &str| {
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        )
+    };
+    let terminal = succeeded_publication("no_changes");
+    let server = ScriptedServer::respond(vec![
+        unauthorized(),
+        refresh(REFRESHED_TOKEN, FIRST_REFRESH_TOKEN),
+        ok_publication_response(&publication_body()),
+        unauthorized(),
+        refresh(SECOND_ACCESS_TOKEN, SECOND_REFRESH_TOKEN),
+        ok_publication_response(&terminal),
+    ]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &credential_path,
+        &server.api_url,
+        &server.issuer,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment_with_issuer(
+        &server.api_url,
+        &server.issuer,
+        credential_path.to_str().unwrap(),
+    );
+
+    let output = run_with_env(&show_wait_args(true, Some("10s")), &environment);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result = assert_one_json_document(&output.stdout);
+    assert_eq!(result["outcome"], "succeeded");
+    assert_eq!(result["publication"], terminal);
+    assert_no_publication_secret(
+        &output,
+        &[
+            TOKEN,
+            "unique-fixture-refresh-token",
+            REFRESHED_TOKEN,
+            FIRST_REFRESH_TOKEN,
+            SECOND_ACCESS_TOKEN,
+            SECOND_REFRESH_TOKEN,
+        ],
+    );
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        header_value(&requests[0], "authorization"),
+        format!("Bearer {TOKEN}")
+    );
+    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
+    assert_eq!(
+        request_form(&requests[1])["refresh_token"],
+        "unique-fixture-refresh-token"
+    );
+    assert_eq!(
+        header_value(&requests[2], "authorization"),
+        format!("Bearer {REFRESHED_TOKEN}")
+    );
+    assert_eq!(
+        header_value(&requests[3], "authorization"),
+        format!("Bearer {REFRESHED_TOKEN}")
+    );
+    assert!(requests[4].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
+    assert_eq!(
+        request_form(&requests[4])["refresh_token"],
+        FIRST_REFRESH_TOKEN
+    );
+    assert_eq!(
+        header_value(&requests[5], "authorization"),
+        format!("Bearer {SECOND_ACCESS_TOKEN}")
+    );
+
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();
+    assert_eq!(
+        stored["credentials"][0]["refreshToken"],
+        SECOND_REFRESH_TOKEN
+    );
+}
+
+#[test]
+fn publication_show_wait_reuses_plain_rendering_for_a_stored_failure() {
+    let mut failed = publication_history().remove(3);
+    failed["id"] = serde_json::json!(PUBLICATION_ID);
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&failed)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(&show_wait_args(false, None), &environment);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    for field in [
+        "✗ Publication failed.".to_owned(),
+        format!("publication: {PUBLICATION_ID}"),
+        "state: failed".to_owned(),
+        "failure: provider_unavailable".to_owned(),
+        "failure phase: branch".to_owned(),
+        "retryable: true".to_owned(),
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == field),
+            "missing {field:?}: {stdout}"
+        );
+    }
+    assert_no_publication_secret(&output, &[TOKEN]);
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn publication_show_wait_rejects_a_malformed_observation_without_partial_output() {
+    let mut malformed = publication_body();
+    malformed["privateProviderResponse"] =
+        serde_json::json!("unique-wait-provider-secret-sentinel");
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&malformed)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(&show_wait_args(true, None), &environment);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let result = assert_one_json_document(&output.stdout);
+    assert_eq!(result["outcome"], "invalid_response");
+    assert!(result.get("publication").is_none());
+    assert_no_publication_secret(&output, &[TOKEN, "unique-wait-provider-secret-sentinel"]);
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]
@@ -854,6 +1208,153 @@ fn post_dispatch_session_protocol_failure_emits_one_recovery_document() {
     assert_eq!(header_value(&requests[0], "idempotency-key"), effective_key);
     assert_eq!(header_value(&requests[1], "idempotency-key"), effective_key);
     assert!(requests[2].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn create_wait_timeout_and_signal_after_acceptance_stop_only_observation() {
+    let cases = [
+        (None, Some(rustix::process::Signal::INT), 130, None),
+        (Some("1s"), None, 1, Some("timed_out")),
+    ];
+
+    for (timeout, signal, expected_exit, expected_outcome) in cases {
+        let accepted = publication_body();
+        let mut server = ScriptedServer::respond_with_paused_last_response(vec![
+            accepted_response(&accepted),
+            ok_publication_response(&accepted),
+        ]);
+        let credential_directory = private_credential_directory();
+        let credential_path = credential_directory.path().join("credentials.json");
+        write_credential_fixture(
+            &credential_path,
+            &server.api_url,
+            TOKEN,
+            "2999-01-01T00:00:00Z",
+        );
+        let environment =
+            deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        command
+            .args(create_wait_args(true, true, timeout))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove(CREDENTIALS_FILE_VARIABLE);
+        for variable in DEPLOYMENT_VARIABLES {
+            command.env_remove(variable);
+        }
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let child = command.spawn().unwrap();
+        let create = server.next_request();
+        assert!(create.starts_with(&format!(
+            "POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications HTTP/1.1\r\n"
+        )));
+        let observation = server.next_request();
+        assert!(observation.starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications/{PUBLICATION_ID} HTTP/1.1\r\n"
+        )));
+        assert!(observation.split_once("\r\n\r\n").unwrap().1.is_empty());
+
+        if let Some(signal) = signal {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+                signal,
+            )
+            .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        server.release_paused_response();
+
+        assert_eq!(output.status.code(), Some(expected_exit));
+        assert!(output.stderr.is_empty());
+        match expected_outcome {
+            Some(expected_outcome) => {
+                let result = assert_one_json_document(&output.stdout);
+                assert_eq!(result["outcome"], expected_outcome);
+                assert_eq!(result["organizationRef"], ORGANIZATION);
+                assert_eq!(result["runId"], RUN_ID);
+                assert_eq!(result["publicationId"], PUBLICATION_ID);
+                assert_eq!(result["idempotencyKey"], CALLER_KEY);
+            }
+            None => assert!(output.stdout.is_empty()),
+        }
+        assert_no_publication_secret(&output, &[TOKEN]);
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn timeout_and_signals_stop_only_local_publication_show_observation() {
+    let cases = [
+        (None, Some(rustix::process::Signal::INT), 130, None),
+        (None, Some(rustix::process::Signal::TERM), 143, None),
+        (Some("1s"), None, 1, Some("timed_out")),
+    ];
+
+    for (timeout, signal, expected_exit, expected_outcome) in cases {
+        let mut server =
+            ScriptedServer::respond_with_paused_first_response(vec![ok_publication_response(
+                &publication_body(),
+            )]);
+        let credential_directory = private_credential_directory();
+        let credential_path = credential_directory.path().join("credentials.json");
+        write_credential_fixture(
+            &credential_path,
+            &server.api_url,
+            TOKEN,
+            "2999-01-01T00:00:00Z",
+        );
+        let environment =
+            deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        command
+            .args(show_wait_args(true, timeout))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove(CREDENTIALS_FILE_VARIABLE);
+        for variable in DEPLOYMENT_VARIABLES {
+            command.env_remove(variable);
+        }
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let child = command.spawn().unwrap();
+        let request = server.next_request();
+        assert!(request.starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications/{PUBLICATION_ID} HTTP/1.1\r\n"
+        )));
+        assert!(request.split_once("\r\n\r\n").unwrap().1.is_empty());
+
+        if let Some(signal) = signal {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+                signal,
+            )
+            .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        server.release_paused_response();
+
+        assert_eq!(output.status.code(), Some(expected_exit));
+        assert!(output.stderr.is_empty());
+        match expected_outcome {
+            Some(expected_outcome) => {
+                let result = assert_one_json_document(&output.stdout);
+                assert_eq!(result["outcome"], expected_outcome);
+                assert_eq!(result["organizationRef"], ORGANIZATION);
+                assert_eq!(result["runId"], RUN_ID);
+                assert_eq!(result["publicationId"], PUBLICATION_ID);
+            }
+            None => assert!(output.stdout.is_empty()),
+        }
+        assert_no_publication_secret(&output, &[TOKEN]);
+        assert!(server.finish().is_empty());
+    }
 }
 
 #[cfg(target_os = "linux")]

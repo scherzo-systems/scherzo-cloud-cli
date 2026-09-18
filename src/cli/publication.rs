@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
@@ -6,6 +7,7 @@ use serde::Serialize;
 
 use crate::api::{
     HttpTransportPolicy, Publication, PublicationApi, PublicationFailure, PublicationList,
+    PublicationState,
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
@@ -50,6 +52,21 @@ struct Options {
 }
 
 #[derive(Debug, Args)]
+struct PublicationWaitArgs {
+    #[arg(long, help = "Wait for a terminal publication")]
+    wait: bool,
+
+    #[arg(
+        long,
+        requires = "wait",
+        value_name = "DURATION",
+        value_parser = super::parse_wait_timeout,
+        help = "Stop waiting after a positive duration (units: ms, s, m, or h)"
+    )]
+    timeout: Option<Duration>,
+}
+
+#[derive(Debug, Args)]
 struct CreateCommand {
     #[command(flatten)]
     run: PublicationRunReference,
@@ -71,11 +88,14 @@ struct CreateCommand {
     idempotency_key: Option<String>,
 
     #[command(flatten)]
+    wait: PublicationWaitArgs,
+
+    #[command(flatten)]
     options: Options,
 }
 
 #[derive(Debug, Args)]
-struct ShowCommand {
+struct PublicationReference {
     #[command(flatten)]
     run: PublicationRunReference,
 
@@ -85,6 +105,15 @@ struct ShowCommand {
         help = "Exact Publication ID"
     )]
     publication_id: String,
+}
+
+#[derive(Debug, Args)]
+struct ShowCommand {
+    #[command(flatten)]
+    publication: PublicationReference,
+
+    #[command(flatten)]
+    wait: PublicationWaitArgs,
 
     #[command(flatten)]
     options: Options,
@@ -128,6 +157,12 @@ impl Command {
     }
 }
 
+#[derive(Clone)]
+struct CreateRecovery {
+    idempotency_key: String,
+    publication_id: Option<String>,
+}
+
 impl CreateCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         let idempotency_key = match self.idempotency_key.clone() {
@@ -135,6 +170,18 @@ impl CreateCommand {
             None => crate::idempotency::generate_idempotency_key()
                 .context("generate Cloud publication request identity")?,
         };
+        if self.wait.wait {
+            self.execute_waiting(deployment, idempotency_key)
+        } else {
+            self.execute_without_wait(deployment, idempotency_key)
+        }
+    }
+
+    fn execute_without_wait(
+        self,
+        deployment: Deployment,
+        idempotency_key: String,
+    ) -> super::CommandResult {
         let signal_deployment = deployment.fingerprint().api_url().to_owned();
         let signal_organization = self.run.organization.clone();
         let signal_run_id = self.run.run_id.clone();
@@ -162,21 +209,91 @@ impl CreateCommand {
         )
     }
 
+    fn execute_waiting(
+        self,
+        deployment: Deployment,
+        idempotency_key: String,
+    ) -> super::CommandResult {
+        let timeout = self.wait.timeout;
+        let signal_deployment = deployment.fingerprint().api_url().to_owned();
+        let signal_organization = self.run.organization.clone();
+        let signal_run_id = self.run.run_id.clone();
+        let signal_export = self.export.clone();
+        let signal_json = self.options.json;
+        let timeout_deployment = signal_deployment.clone();
+        let timeout_organization = signal_organization.clone();
+        let timeout_run_id = signal_run_id.clone();
+        let timeout_json = signal_json;
+        let operation_key = idempotency_key.clone();
+        super::execute_mutation_with_signals_and_deferred_timeout(
+            "Cloud publication creation and observation",
+            CreateRecovery {
+                idempotency_key,
+                publication_id: None,
+            },
+            timeout,
+            move |control, timeout_start| {
+                self.execute_waiting_blocking(&deployment, &operation_key, control, timeout_start)
+            },
+            move |signal, snapshot| {
+                if snapshot.recovery.publication_id.is_some() {
+                    Ok(signal)
+                } else {
+                    super::report_dispatched_signal(signal, snapshot, |recovery| {
+                        write_unknown(
+                            &signal_deployment,
+                            &signal_organization,
+                            &signal_run_id,
+                            &signal_export,
+                            &recovery.idempotency_key,
+                            signal_json,
+                            signal,
+                        )
+                        .map_err(Into::into)
+                    })
+                }
+            },
+            move |snapshot| {
+                let Some(publication_id) = snapshot.recovery.publication_id else {
+                    return Ok(ExitCode::GeneralFailure);
+                };
+                write_wait_timeout(&WaitOutputContext {
+                    deployment: timeout_deployment,
+                    organization: String::from(&*timeout_organization),
+                    run_id: timeout_run_id,
+                    publication_id,
+                    idempotency_key: Some(snapshot.recovery.idempotency_key),
+                    json: timeout_json,
+                })
+                .map_err(Into::into)
+            },
+        )
+    }
+
+    fn submit(
+        &self,
+        deployment: &Deployment,
+        idempotency_key: &str,
+        begin_dispatch: impl Fn() -> bool,
+    ) -> anyhow::Result<Result<Publication, PublicationFailure>> {
+        with_api(deployment, self.options.http.transport_policy(), |api| {
+            api.create(
+                &self.run.organization,
+                &self.run.run_id,
+                &self.export,
+                idempotency_key,
+                &begin_dispatch,
+            )
+        })
+    }
+
     fn execute_blocking(
         self,
         deployment: &Deployment,
         idempotency_key: &str,
         control: &super::OperationControl<String>,
     ) -> super::CommandResult {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.create(
-                &self.run.organization,
-                &self.run.run_id,
-                &self.export,
-                idempotency_key,
-                || control.begin_dispatch(),
-            )
-        });
+        let result = self.submit(deployment, idempotency_key, || control.begin_dispatch());
         super::complete_operation(control, || match result {
             Ok(result) => write_create(
                 &CreateOutputContext {
@@ -204,25 +321,148 @@ impl CreateCommand {
             Err(error) => Err(error.into()),
         })
     }
+
+    fn execute_waiting_blocking(
+        self,
+        deployment: &Deployment,
+        idempotency_key: &str,
+        control: &super::OperationControl<CreateRecovery>,
+        timeout_start: &super::DeferredObservationTimeoutStart,
+    ) -> super::CommandResult {
+        let result = self.submit(deployment, idempotency_key, || control.begin_dispatch());
+        let publication = match result {
+            Ok(Ok(publication)) => publication,
+            Ok(Err(failure)) => {
+                return super::complete_operation(control, || {
+                    write_create(
+                        &CreateOutputContext {
+                            deployment: deployment.fingerprint().api_url(),
+                            organization: &self.run.organization,
+                            run_id: &self.run.run_id,
+                            export_name: &self.export,
+                            idempotency_key,
+                            json: self.options.json,
+                            dispatched: control.dispatched(),
+                        },
+                        Err(failure),
+                    )
+                    .map_err(Into::into)
+                });
+            }
+            Err(_) if control.dispatched() => {
+                return super::complete_operation(control, || {
+                    write_unknown(
+                        deployment.fingerprint().api_url(),
+                        &self.run.organization,
+                        &self.run.run_id,
+                        &self.export,
+                        idempotency_key,
+                        self.options.json,
+                        ExitCode::GeneralFailure,
+                    )
+                    .map_err(Into::into)
+                });
+            }
+            Err(error) => {
+                return super::complete_operation(control, || Err(error.into()));
+            }
+        };
+
+        if !control.update_recovery(CreateRecovery {
+            idempotency_key: idempotency_key.to_owned(),
+            publication_id: Some(publication.id.clone()),
+        }) {
+            return Ok(ExitCode::GeneralFailure);
+        }
+        timeout_start.start();
+
+        let publication_id = publication.id.clone();
+        let result = match terminal_publication_state(&publication) {
+            Some(state) => Ok(WaitObservation::Terminal {
+                resource: Box::new(publication),
+                state,
+            }),
+            None => {
+                let clock = super::SystemObservationClock;
+                let reference = PublicationObservationReference {
+                    organization: &self.run.organization,
+                    run_id: &self.run.run_id,
+                    publication_id: &publication_id,
+                };
+                let transport_policy = self.options.http.transport_policy();
+                wait_for_terminal_publication(
+                    || observe_publication(deployment, transport_policy, reference),
+                    PublicationObservationFailure::retryable,
+                    self.wait.timeout,
+                    control,
+                    &clock,
+                )
+            }
+        };
+        if !control.begin_completion() {
+            return Ok(ExitCode::GeneralFailure);
+        }
+        let read_context = ReadOutputContext {
+            deployment: deployment.fingerprint().api_url(),
+            organization: &self.run.organization,
+            run_id: &self.run.run_id,
+            publication_id: Some(&publication_id),
+            idempotency_key: Some(idempotency_key),
+            json: self.options.json,
+        };
+        write_wait_observation(
+            result,
+            &read_context,
+            &WaitOutputContext {
+                deployment: read_context.deployment.to_owned(),
+                organization: read_context.organization.to_owned(),
+                run_id: read_context.run_id.to_owned(),
+                publication_id: publication_id.clone(),
+                idempotency_key: Some(idempotency_key.to_owned()),
+                json: read_context.json,
+            },
+            TerminalPublicationState::exit_code,
+        )
+    }
 }
 
 impl ShowCommand {
+    fn output_context(&self, deployment: &Deployment) -> WaitOutputContext {
+        WaitOutputContext {
+            deployment: deployment.fingerprint().api_url().to_owned(),
+            organization: String::from(&*self.publication.run.organization),
+            run_id: self.publication.run.run_id.clone(),
+            publication_id: self.publication.publication_id.clone(),
+            idempotency_key: None,
+            json: self.options.json,
+        }
+    }
+
     fn execute(self, deployment: Deployment) -> super::CommandResult {
+        if self.wait.wait {
+            self.execute_waiting(deployment)
+        } else {
+            self.execute_without_wait(deployment)
+        }
+    }
+
+    fn execute_without_wait(self, deployment: Deployment) -> super::CommandResult {
         super::execute_read_only_with_signals("Cloud publication show", move |control| {
             let result = with_api(&deployment, self.options.http.transport_policy(), |api| {
                 api.get(
-                    &self.run.organization,
-                    &self.run.run_id,
-                    &self.publication_id,
+                    &self.publication.run.organization,
+                    &self.publication.run.run_id,
+                    &self.publication.publication_id,
                 )
             })?;
             super::complete_read_only_output(control, || {
                 write_show(
                     &ReadOutputContext {
                         deployment: deployment.fingerprint().api_url(),
-                        organization: &self.run.organization,
-                        run_id: &self.run.run_id,
-                        publication_id: Some(&self.publication_id),
+                        organization: &self.publication.run.organization,
+                        run_id: &self.publication.run.run_id,
+                        publication_id: Some(&self.publication.publication_id),
+                        idempotency_key: None,
                         json: self.options.json,
                     },
                     result,
@@ -230,6 +470,56 @@ impl ShowCommand {
                 .map_err(Into::into)
             })
         })
+    }
+
+    fn execute_waiting(self, deployment: Deployment) -> super::CommandResult {
+        let timeout = self.wait.timeout;
+        let timeout_context = self.output_context(&deployment);
+
+        super::execute_observation_with_signals_and_timeout(
+            "Cloud publication show --wait",
+            timeout,
+            move |control| self.execute_waiting_blocking(&deployment, control),
+            // Run and Publication retain separate typed API/session and timeout renderers; only
+            // their polling state machine is shared.
+            // jscpd:ignore-start
+            move || write_wait_timeout(&timeout_context).map_err(Into::into),
+        )
+    }
+
+    fn execute_waiting_blocking(
+        self,
+        deployment: &Deployment,
+        control: &super::BlockingObservationControl,
+    ) -> super::CommandResult {
+        let clock = super::SystemObservationClock;
+        let reference = PublicationObservationReference {
+            organization: &self.publication.run.organization,
+            run_id: &self.publication.run.run_id,
+            publication_id: &self.publication.publication_id,
+        };
+        let transport_policy = self.options.http.transport_policy();
+        let result = wait_for_terminal_publication(
+            // jscpd:ignore-end
+            || observe_publication(deployment, transport_policy, reference),
+            PublicationObservationFailure::retryable,
+            self.wait.timeout,
+            control,
+            &clock,
+        );
+        if !control.begin_completion() {
+            return Ok(ExitCode::GeneralFailure);
+        }
+        let wait_context = self.output_context(deployment);
+        let read_context = ReadOutputContext {
+            deployment: &wait_context.deployment,
+            organization: &wait_context.organization,
+            run_id: &wait_context.run_id,
+            publication_id: Some(&wait_context.publication_id),
+            idempotency_key: None,
+            json: wait_context.json,
+        };
+        write_wait_observation(result, &read_context, &wait_context, |_| ExitCode::Success)
     }
 }
 
@@ -251,6 +541,7 @@ impl ListCommand {
                         organization: &self.run.organization,
                         run_id: &self.run.run_id,
                         publication_id: None,
+                        idempotency_key: None,
                         json: self.options.json,
                     },
                     result,
@@ -258,6 +549,96 @@ impl ListCommand {
                 .map_err(Into::into)
             })
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalPublicationState {
+    Succeeded,
+    Failed,
+}
+
+impl TerminalPublicationState {
+    const fn outcome(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::Succeeded => "✓ Publication succeeded.",
+            Self::Failed => "✗ Publication failed.",
+        }
+    }
+
+    const fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Succeeded => ExitCode::Success,
+            Self::Failed => ExitCode::GeneralFailure,
+        }
+    }
+}
+
+type WaitObservation = super::TerminalObservation<Publication, TerminalPublicationState>;
+
+#[derive(Clone, Copy)]
+struct PublicationObservationReference<'a> {
+    organization: &'a str,
+    run_id: &'a str,
+    publication_id: &'a str,
+}
+
+enum PublicationObservationFailure {
+    Api(PublicationFailure),
+    Command(anyhow::Error),
+}
+
+impl PublicationObservationFailure {
+    fn retryable(&self) -> bool {
+        matches!(self, Self::Api(failure) if failure.retryable_observation())
+    }
+}
+
+fn observe_publication(
+    deployment: &Deployment,
+    transport_policy: HttpTransportPolicy,
+    reference: PublicationObservationReference<'_>,
+) -> Result<Publication, PublicationObservationFailure> {
+    with_api(deployment, transport_policy, |api| {
+        api.get(
+            reference.organization,
+            reference.run_id,
+            reference.publication_id,
+        )
+    })
+    .map_err(PublicationObservationFailure::Command)?
+    .map_err(PublicationObservationFailure::Api)
+}
+
+fn wait_for_terminal_publication<E>(
+    observe: impl FnMut() -> Result<Publication, E>,
+    retryable_failure: impl Fn(&E) -> bool,
+    timeout: Option<Duration>,
+    control: &impl super::ObservationControl,
+    clock: &impl super::ObservationClock,
+) -> Result<WaitObservation, E> {
+    super::wait_for_terminal_observation(
+        observe,
+        terminal_publication_state,
+        retryable_failure,
+        timeout,
+        control,
+        clock,
+    )
+}
+
+fn terminal_publication_state(publication: &Publication) -> Option<TerminalPublicationState> {
+    match publication.state {
+        PublicationState::Queued | PublicationState::Running => None,
+        PublicationState::Succeeded => Some(TerminalPublicationState::Succeeded),
+        PublicationState::Failed => Some(TerminalPublicationState::Failed),
     }
 }
 
@@ -337,6 +718,16 @@ struct ReadOutputContext<'a> {
     organization: &'a str,
     run_id: &'a str,
     publication_id: Option<&'a str>,
+    idempotency_key: Option<&'a str>,
+    json: bool,
+}
+
+struct WaitOutputContext {
+    deployment: String,
+    organization: String,
+    run_id: String,
+    publication_id: String,
+    idempotency_key: Option<String>,
     json: bool,
 }
 
@@ -376,29 +767,108 @@ fn write_show(
     result: Result<Publication, PublicationFailure>,
 ) -> anyhow::Result<ExitCode> {
     match result {
-        Ok(publication) => {
-            if context.json {
-                super::write_pretty_json(&PublicationResult {
-                    schema_version: 1,
-                    deployment: context.deployment,
-                    outcome: "found",
-                    publication: &publication,
-                })
-                .context("write Cloud publication result")?;
-            } else {
-                let mut output = io::stdout().lock();
-                writeln!(output, "✓ Publication found.\n")?;
-                write_publication_human(
-                    &mut output,
-                    &publication,
-                    HumanPublicationLayout::Details,
-                )?;
-                writeln!(output, "deployment: {}", context.deployment)?;
-            }
-            Ok(ExitCode::Success)
-        }
+        Ok(publication) => write_publication_result(
+            context,
+            &publication,
+            "found",
+            "✓ Publication found.",
+            ExitCode::Success,
+        ),
         Err(failure) => write_read_failure(context, &failure),
     }
+}
+
+fn write_wait_terminal(
+    context: &ReadOutputContext<'_>,
+    publication: &Publication,
+    state: TerminalPublicationState,
+    exit_code: ExitCode,
+) -> anyhow::Result<ExitCode> {
+    write_publication_result(
+        context,
+        publication,
+        state.outcome(),
+        state.heading(),
+        exit_code,
+    )
+}
+
+fn write_wait_observation(
+    result: Result<WaitObservation, PublicationObservationFailure>,
+    read_context: &ReadOutputContext<'_>,
+    wait_context: &WaitOutputContext,
+    terminal_exit: impl Fn(TerminalPublicationState) -> ExitCode,
+) -> super::CommandResult {
+    match result {
+        Ok(WaitObservation::Terminal { resource, state }) => {
+            write_wait_terminal(read_context, &resource, state, terminal_exit(state))
+        }
+        Ok(WaitObservation::TimedOut) => write_wait_timeout(wait_context),
+        Ok(WaitObservation::Stopped) => Ok(ExitCode::GeneralFailure),
+        Err(PublicationObservationFailure::Api(failure)) => {
+            write_read_failure(read_context, &failure)
+        }
+        Err(PublicationObservationFailure::Command(error)) => return Err(error.into()),
+    }
+    .map_err(Into::into)
+}
+
+fn write_publication_result(
+    context: &ReadOutputContext<'_>,
+    publication: &Publication,
+    outcome: &'static str,
+    heading: &str,
+    exit_code: ExitCode,
+) -> anyhow::Result<ExitCode> {
+    if context.json {
+        super::write_pretty_json(&PublicationResult {
+            schema_version: 1,
+            deployment: context.deployment,
+            outcome,
+            idempotency_key: context.idempotency_key,
+            publication,
+        })
+        .context("write Cloud publication result")?;
+    } else {
+        let mut output = io::stdout().lock();
+        writeln!(output, "{heading}\n")?;
+        write_publication_human(&mut output, publication, HumanPublicationLayout::Details)?;
+        if let Some(idempotency_key) = context.idempotency_key {
+            writeln!(output, "idempotency key: {idempotency_key}")?;
+        }
+        writeln!(output, "deployment: {}", context.deployment)?;
+    }
+    Ok(exit_code)
+}
+
+fn write_wait_timeout(context: &WaitOutputContext) -> anyhow::Result<ExitCode> {
+    if context.json {
+        super::write_pretty_json(&super::ObservationResult {
+            schema_version: 1,
+            deployment: &context.deployment,
+            outcome: "timed_out",
+            organization_ref: &context.organization,
+            run_id: &context.run_id,
+            publication_id: Some(&context.publication_id),
+            idempotency_key: context.idempotency_key.as_deref(),
+            category: None,
+        })
+        .context("write Cloud publication timeout")?;
+    } else {
+        writeln!(
+            io::stderr().lock(),
+            "error: Cloud publication observation reached its timeout\n\npublication: {}\nrun: {}\norganization: {}{}\n\nRun the command again with --wait and a longer --timeout, or omit --timeout.",
+            context.publication_id,
+            context.run_id,
+            context.organization,
+            context
+                .idempotency_key
+                .as_ref()
+                .map(|key| format!("\nidempotency key: {key}"))
+                .unwrap_or_default()
+        )?;
+    }
+    Ok(ExitCode::GeneralFailure)
 }
 
 fn write_list(
@@ -700,14 +1170,19 @@ fn write_read_failure(
             OutcomeClass::Protocol,
         ),
     };
+    let human = match context.idempotency_key {
+        Some(idempotency_key) => with_recovery_key(human, idempotency_key),
+        None => human,
+    };
     if context.json {
-        super::write_pretty_json(&ReadFailureResult {
+        super::write_pretty_json(&super::ObservationResult {
             schema_version: 1,
             deployment: context.deployment,
             outcome,
             organization_ref: context.organization,
             run_id: context.run_id,
             publication_id: context.publication_id,
+            idempotency_key: context.idempotency_key,
             category,
         })
         .context("write Cloud publication failure")?;
@@ -771,21 +1246,9 @@ struct PublicationResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
     publication: &'a Publication,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadFailureResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    organization_ref: &'a str,
-    run_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    publication_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    category: Option<&'a str>,
 }
 
 // Publication failures keep their run/export/key recovery coordinates explicit; sharing the
@@ -817,4 +1280,142 @@ struct UnknownResult<'a> {
     export_name: &'a str,
     idempotency_key: &'a str,
     commitment: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use super::super::observation_test_support::ControlledObservationClock as ControlledClock;
+    use super::*;
+
+    struct ScriptedObservationApi {
+        responses: RefCell<VecDeque<Result<Publication, PublicationFailure>>>,
+        requests: RefCell<Vec<(String, String, String)>>,
+    }
+
+    impl ScriptedObservationApi {
+        fn new(
+            responses: impl IntoIterator<Item = Result<Publication, PublicationFailure>>,
+        ) -> Self {
+            Self {
+                responses: RefCell::new(responses.into_iter().collect()),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ScriptedObservationApi {
+        fn get_publication(
+            &self,
+            organization: &str,
+            run_id: &str,
+            publication_id: &str,
+        ) -> Result<Publication, PublicationFailure> {
+            self.requests.borrow_mut().push((
+                organization.to_owned(),
+                run_id.to_owned(),
+                publication_id.to_owned(),
+            ));
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .expect("the polling scenario should provide another response")
+        }
+    }
+
+    fn publication(state: PublicationState) -> Publication {
+        Publication {
+            state,
+            ..Publication::default()
+        }
+    }
+
+    fn observe(
+        api: &ScriptedObservationApi,
+        timeout: Option<Duration>,
+        clock: &ControlledClock,
+    ) -> Result<WaitObservation, PublicationFailure> {
+        let reference = PublicationObservationReference {
+            organization: "acme-research",
+            run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+            publication_id: "pub_01k0z6r1w8f4jy2m7q9v3x5abc",
+        };
+        wait_for_terminal_publication(
+            || {
+                api.get_publication(
+                    reference.organization,
+                    reference.run_id,
+                    reference.publication_id,
+                )
+            },
+            PublicationFailure::retryable_observation,
+            timeout,
+            &super::super::BlockingObservationControl::new(),
+            clock,
+        )
+    }
+
+    #[test]
+    fn wait_polls_queued_and_running_until_each_terminal_state() {
+        for (terminal, expected) in [
+            (
+                PublicationState::Succeeded,
+                TerminalPublicationState::Succeeded,
+            ),
+            (PublicationState::Failed, TerminalPublicationState::Failed),
+        ] {
+            let api = ScriptedObservationApi::new([
+                Ok(publication(PublicationState::Queued)),
+                Ok(publication(PublicationState::Running)),
+                Ok(publication(terminal)),
+            ]);
+            let clock = ControlledClock::new(crate::timing::monotonic_now());
+
+            let result = observe(&api, None, &clock)
+                .expect("the scripted publication should reach terminal state");
+
+            assert!(matches!(
+                result,
+                WaitObservation::Terminal { state, .. } if state == expected
+            ));
+            assert_eq!(
+                clock.into_sleeps(),
+                vec![super::super::OBSERVATION_POLL_INTERVAL; 2]
+            );
+            assert_eq!(api.requests.into_inner().len(), 3);
+        }
+    }
+
+    #[test]
+    fn wait_timeout_uses_the_remaining_duration_without_an_extra_request() {
+        let api = ScriptedObservationApi::new([
+            Ok(publication(PublicationState::Queued)),
+            Ok(publication(PublicationState::Running)),
+            Ok(publication(PublicationState::Running)),
+        ]);
+        let clock = ControlledClock::new(crate::timing::monotonic_now());
+
+        let result = observe(&api, Some(Duration::from_secs(5)), &clock)
+            .expect("timeout should be a local observation result");
+
+        assert!(matches!(result, WaitObservation::TimedOut));
+        clock.assert_timeout_schedule();
+        assert_eq!(api.requests.into_inner().len(), 3);
+    }
+
+    #[test]
+    fn wait_bounds_retryable_observation_failures() {
+        let failure = PublicationFailure::Unreachable(crate::api::UnreachableCategory::Connection);
+        let api = ScriptedObservationApi::new([Err(failure), Err(failure)]);
+        let clock = ControlledClock::new(crate::timing::monotonic_now());
+
+        let result = observe(&api, None, &clock);
+
+        assert_eq!(result.err(), Some(failure));
+        clock.assert_single_poll();
+        assert_eq!(api.requests.into_inner().len(), 2);
+    }
 }

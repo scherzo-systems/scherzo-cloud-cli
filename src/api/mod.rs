@@ -110,7 +110,9 @@ pub(crate) use projects::{
     GitHubRepositoryList as ProjectGitHubRepositoryList, Project, ProjectApi, ProjectFailure,
     ProjectList, ProjectReadinessBlocker, ProjectRepository,
 };
-pub(crate) use publications::{Publication, PublicationApi, PublicationFailure, PublicationList};
+pub(crate) use publications::{
+    Publication, PublicationApi, PublicationFailure, PublicationList, PublicationState,
+};
 pub(crate) use run_inputs::{
     InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,
     RetainedRunInputs, RunInputManifest, RunInputObjectMetadata, RunInputSet, RunInputUpload,

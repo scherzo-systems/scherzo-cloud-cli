@@ -1251,6 +1251,81 @@ The input bytes remain at the caller-selected source path; they do not enter com
 arguments or JSON receipts. `result.json` is inspected only after the complete Artifact
 Set has been downloaded, verified, and committed at the requested destination.
 
+## GitHub artifact publications
+
+Publication commands use the selected human OAuth credential to turn one available
+`git_branch` export from a succeeded Cloud run into a ready-for-review pull request.
+Publication is always explicit: run success and export declaration do not publish
+anything automatically.
+
+The complete Publication command surface is:
+
+```sh
+# Create one attempt for an exact export and retain its identity.
+scherzo-cloud publication create acme-labs "$run_id" \
+  --export changes --json > publication-create.json
+publication_id=$(jq -er '.publication.id' publication-create.json)
+
+# Create another attempt and wait locally for its terminal outcome.
+scherzo-cloud publication create acme-labs "$run_id" \
+  --export changes --wait --timeout 30m
+
+# Read the current attempt, optionally waiting for a terminal snapshot.
+scherzo-cloud publication show \
+  acme-labs "$run_id" "$publication_id" --wait --timeout 30m
+
+# List one oldest-first page of attempts beneath the run.
+scherzo-cloud publication list \
+  acme-labs "$run_id" --limit 50
+```
+
+A complete explicit publication workflow first creates and waits for the run, then
+creates and waits for the selected Publication:
+
+```sh
+set -euo pipefail
+organization=acme-labs
+project=prj_01k0z6r1w8f4jy2m7q9v3x5abc
+
+scherzo-cloud run create "$organization" \
+  --project-id "$project" \
+  --workflow-path workflows/publish.yaml \
+  --json > run-create.json
+run_id=$(jq -er '.runId' run-create.json)
+scherzo-cloud run wait "$organization" "$run_id" \
+  --timeout 30m --json > run-wait.json
+jq -e '.outcome == "succeeded"' run-wait.json >/dev/null
+
+scherzo-cloud publication create "$organization" "$run_id" \
+  --export changes --wait --timeout 30m --json > publication.json
+jq -e '.outcome == "succeeded"' publication.json >/dev/null
+publication_id=$(jq -er '.publication.id' publication.json)
+```
+
+Without `--wait`, `publication create` returns after Cloud accepts the attempt. With
+`--wait`, it polls the accepted Publication and exits zero only for a succeeded outcome.
+The caller may supply an opaque `--idempotency-key`; otherwise the CLI generates one and
+preserves it across the invocation's bounded acceptance retries and terminal output. The
+command never accepts a repository, base, destination branch, pull-request metadata, or
+branch-only mode. Cloud derives those values from the run and either reports
+`no_changes`, creates or exactly reuses an open pull request, reports an exact
+already-merged pull request, or stores a structured failure.
+
+`publication show` is a read: without `--wait`, it emits the current snapshot; with
+`--wait`, it polls until any terminal snapshot. Both forms exit zero when they retrieve a
+stored failed Publication, so automation using `show --wait --json` must inspect
+`outcome`. `publication list` returns only the requested page and preserves `nextCursor`
+in JSON instead of following it automatically. `--timeout` requires `--wait`; omitting it
+waits until terminal state or a process signal. Timeout, SIGINT, and SIGTERM stop only
+local observation: they do not cancel, retry, delete, merge, or otherwise mutate the
+Publication or its provider effects. Waiting JSON output is one complete document for
+terminal, timeout, or fatal read outcomes and is empty when a process signal wins.
+
+Publication consumes the run's existing private Artifact Set and grants no public
+artifact access or download URL. Plain output contains only the public Publication
+projection and credential-free, query-free provider links; it does not stream provider
+logs or expose credentials.
+
 ## Runner doctor
 
 Use `scherzo-cloud runner doctor` to inspect the local prerequisites currently known to

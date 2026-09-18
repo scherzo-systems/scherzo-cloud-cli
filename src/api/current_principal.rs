@@ -55,6 +55,10 @@ impl UnreachableCategory {
             Self::Server => "server",
         }
     }
+
+    pub(crate) const fn retryable_observation(self) -> bool {
+        matches!(self, Self::Connection | Self::Timeout | Self::Server)
+    }
 }
 
 #[derive(Debug)]

@@ -256,14 +256,7 @@ impl RunFailure {
     }
 
     pub(crate) fn retryable_observation(&self) -> bool {
-        matches!(
-            self,
-            Self::Unreachable(
-                UnreachableCategory::Connection
-                    | UnreachableCategory::Timeout
-                    | UnreachableCategory::Server
-            )
-        )
+        matches!(self, Self::Unreachable(category) if category.retryable_observation())
     }
 
     pub(super) fn protocol(credential_rejected: bool) -> Self {

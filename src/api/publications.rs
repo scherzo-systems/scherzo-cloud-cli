@@ -34,6 +34,7 @@ const RETRYABLE_CONFLICT: &str = "https://api.scherzo.dev/problems/retryable-con
 
 pub(crate) type Publication = models::Publication;
 pub(crate) type PublicationList = models::PublicationList;
+pub(crate) type PublicationState = models::publication::State;
 
 pub(crate) struct PublicationApi {
     configuration: apis::configuration::Configuration,
@@ -239,6 +240,10 @@ impl PublicationFailure {
             } => *credential_rejected,
             _ => false,
         }
+    }
+
+    pub(crate) fn retryable_observation(&self) -> bool {
+        matches!(self, Self::Unreachable(category) if category.retryable_observation())
     }
 
     fn protocol(credential_rejected: bool) -> Self {

@@ -10,6 +10,8 @@ Arguments:
   <PUBLICATION>   Exact Publication ID
 
 Options:
+      --wait                 Wait for a terminal publication
+      --timeout <DURATION>   Stop waiting after a positive duration (units: ms, s, m, or h)
       --json                 Print the publication result as JSON
       --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                 Print help

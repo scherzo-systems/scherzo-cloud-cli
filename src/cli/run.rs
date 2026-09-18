@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
@@ -21,8 +21,6 @@ mod inputs;
 
 pub(super) const ABOUT: &str = "Work with Scherzo Cloud runs";
 const NAME: &str = "run";
-const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES: usize = 2;
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -148,13 +146,8 @@ struct WaitCommand {
     #[command(flatten)]
     run: RunReference,
 
-    #[arg(
-        long,
-        value_name = "DURATION",
-        value_parser = parse_wait_timeout,
-        help = "Stop waiting after a positive duration (units: ms, s, m, or h)"
-    )]
-    timeout: Option<Duration>,
+    #[command(flatten)]
+    wait: super::WaitTimeoutArgs,
 
     #[command(flatten)]
     options: RunOptions,
@@ -500,19 +493,16 @@ impl ShowCommand {
 
 impl WaitCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
-        let timeout = self.timeout;
+        let timeout = self.wait.timeout;
         let timeout_deployment = deployment.fingerprint().api_url().to_owned();
         let timeout_organization = self.run.organization.clone();
         let timeout_run_id = self.run.run_id.clone();
         let timeout_json = self.options.json;
-        let operation = move |control: &super::BlockingObservationControl| {
-            self.execute_blocking(&deployment, control)
-        };
 
         super::execute_observation_with_signals_and_timeout(
             "Cloud run wait",
             timeout,
-            operation,
+            move |control| self.execute_blocking(&deployment, control),
             move || {
                 write_wait_timeout(
                     &timeout_deployment,
@@ -530,15 +520,13 @@ impl WaitCommand {
         deployment: &Deployment,
         control: &super::BlockingObservationControl,
     ) -> super::CommandResult {
-        let clock = SystemWaitClock;
-        let started_at = clock.now();
+        let clock = super::SystemObservationClock;
         let result = with_api(deployment, self.options.http.transport_policy(), |api| {
             wait_for_terminal_run(
                 api,
                 &self.run.organization,
                 &self.run.run_id,
-                started_at,
-                self.timeout,
+                self.wait.timeout,
                 control,
                 &clock,
             )
@@ -547,9 +535,9 @@ impl WaitCommand {
             return Ok(ExitCode::GeneralFailure);
         }
         match result {
-            Ok(WaitObservation::Terminal { run, state }) => write_wait_terminal(
+            Ok(WaitObservation::Terminal { resource, state }) => write_wait_terminal(
                 deployment.fingerprint().api_url(),
-                &run,
+                &resource,
                 state,
                 self.options.json,
             ),
@@ -579,23 +567,6 @@ trait RunObservationApi {
 impl<'a> RunObservationApi for RunApi<'a> {
     fn get_run(&self, organization: &str, run_id: &str) -> Result<Run, RunFailure> {
         self.get(organization, run_id)
-    }
-}
-
-trait WaitClock {
-    fn now(&self) -> Instant;
-    fn sleep(&self, duration: Duration);
-}
-
-struct SystemWaitClock;
-
-impl WaitClock for SystemWaitClock {
-    fn now(&self) -> Instant {
-        crate::timing::monotonic_now()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        crate::timing::sleep(duration);
     }
 }
 
@@ -639,73 +610,24 @@ impl TerminalRunState {
     }
 }
 
-enum WaitObservation {
-    Terminal {
-        run: Box<Run>,
-        state: TerminalRunState,
-    },
-    TimedOut,
-    Stopped,
-}
+type WaitObservation = super::TerminalObservation<Run, TerminalRunState>;
 
 fn wait_for_terminal_run(
     api: &impl RunObservationApi,
     organization: &str,
     run_id: &str,
-    started_at: Instant,
     timeout: Option<Duration>,
     control: &super::BlockingObservationControl,
-    clock: &impl WaitClock,
+    clock: &impl super::ObservationClock,
 ) -> Result<WaitObservation, RunFailure> {
-    let mut consecutive_failures = 0;
-    loop {
-        if control.is_stopped() {
-            return Ok(WaitObservation::Stopped);
-        }
-        if remaining_wait(timeout, started_at, clock.now()).is_none() {
-            return Ok(WaitObservation::TimedOut);
-        }
-
-        match api.get_run(organization, run_id) {
-            Ok(run) => {
-                consecutive_failures = 0;
-                if let Some(state) = terminal_run_state(run.state) {
-                    return Ok(WaitObservation::Terminal {
-                        run: Box::new(run),
-                        state,
-                    });
-                }
-            }
-            Err(failure)
-                if failure.retryable_observation()
-                    && consecutive_failures + 1 < MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES =>
-            {
-                consecutive_failures += 1;
-            }
-            Err(failure) => return Err(failure),
-        }
-
-        if control.is_stopped() {
-            return Ok(WaitObservation::Stopped);
-        }
-        let Some(remaining) = remaining_wait(timeout, started_at, clock.now()) else {
-            return Ok(WaitObservation::TimedOut);
-        };
-        clock.sleep(WAIT_POLL_INTERVAL.min(remaining));
-    }
-}
-
-fn remaining_wait(
-    timeout: Option<Duration>,
-    started_at: Instant,
-    now: Instant,
-) -> Option<Duration> {
-    match timeout {
-        Some(timeout) => timeout
-            .checked_sub(now.saturating_duration_since(started_at))
-            .filter(|remaining| !remaining.is_zero()),
-        None => Some(WAIT_POLL_INTERVAL),
-    }
+    super::wait_for_terminal_observation(
+        || api.get_run(organization, run_id),
+        |run| terminal_run_state(run.state),
+        RunFailure::retryable_observation,
+        timeout,
+        control,
+        clock,
+    )
 }
 
 const fn terminal_run_state(state: RunState) -> Option<TerminalRunState> {
@@ -732,30 +654,6 @@ fn parse_input_set_id(value: &str) -> Result<String, String> {
                 .to_owned(),
         )
     }
-}
-
-fn parse_wait_timeout(value: &str) -> Result<Duration, String> {
-    let (quantity, milliseconds) = if let Some(quantity) = value.strip_suffix("ms") {
-        (quantity, 1)
-    } else if let Some(quantity) = value.strip_suffix('s') {
-        (quantity, 1_000)
-    } else if let Some(quantity) = value.strip_suffix('m') {
-        (quantity, 60_000)
-    } else if let Some(quantity) = value.strip_suffix('h') {
-        (quantity, 3_600_000)
-    } else {
-        (value, 1_000)
-    };
-    let quantity = quantity
-        .parse::<u64>()
-        .map_err(|_| "duration must be a positive integer followed by ms, s, m, or h".to_owned())?;
-    let total_milliseconds = quantity
-        .checked_mul(milliseconds)
-        .filter(|duration| *duration > 0)
-        .ok_or_else(|| {
-            "duration must be a positive integer followed by ms, s, m, or h".to_owned()
-        })?;
-    Ok(Duration::from_millis(total_milliseconds))
 }
 
 fn with_api<T>(
@@ -916,12 +814,15 @@ fn write_wait_timeout(
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     if json {
-        write_json(&WaitTimeoutResult {
+        write_json(&super::ObservationResult {
             schema_version: 1,
             deployment,
             outcome: "timed_out",
             organization_ref: organization,
             run_id,
+            publication_id: None,
+            idempotency_key: None,
+            category: None,
         })?;
     } else {
         writeln!(
@@ -1287,16 +1188,6 @@ struct WaitResult<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WaitTimeoutResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    organization_ref: &'a str,
-    run_id: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct FailureResult<'a> {
     schema_version: u8,
     deployment: &'a str,
@@ -1348,13 +1239,14 @@ struct UnknownResourceMutationResult<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, mpsc};
 
+    use super::super::observation_test_support::ControlledObservationClock as ControlledWaitClock;
     use super::*;
     use crate::api::{
         HttpTransportPolicy, InputScalarMetadata, NamedInputMetadata, RunCreationAcceptance,
@@ -1382,31 +1274,6 @@ mod tests {
         }
     }
 
-    struct ControlledWaitClock {
-        now: Cell<Instant>,
-        sleeps: RefCell<Vec<Duration>>,
-    }
-
-    impl ControlledWaitClock {
-        fn new(now: Instant) -> Self {
-            Self {
-                now: Cell::new(now),
-                sleeps: RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl WaitClock for ControlledWaitClock {
-        fn now(&self) -> Instant {
-            self.now.get()
-        }
-
-        fn sleep(&self, duration: Duration) {
-            self.sleeps.borrow_mut().push(duration);
-            self.now.set(self.now.get() + duration);
-        }
-    }
-
     fn observe(
         api: &ScriptedObservationApi,
         timeout: Option<Duration>,
@@ -1416,7 +1283,6 @@ mod tests {
             api,
             "acme-research",
             "run_01k0z6r1w8f4jy2m7q9v3x5abc",
-            clock.now(),
             timeout,
             &super::super::BlockingObservationControl::new(),
             clock,
@@ -1710,8 +1576,8 @@ mod tests {
             let result = observe(&api, None, &clock).expect("the polling scenario should complete");
 
             match result {
-                WaitObservation::Terminal { run, state } => {
-                    assert_eq!(run.state, terminal_state);
+                WaitObservation::Terminal { resource, state } => {
+                    assert_eq!(resource.state, terminal_state);
                     assert_eq!(state, expected);
                 }
                 WaitObservation::TimedOut | WaitObservation::Stopped => {
@@ -1719,8 +1585,8 @@ mod tests {
                 }
             }
             assert_eq!(
-                clock.sleeps.into_inner(),
-                vec![WAIT_POLL_INTERVAL; nonterminal.len()]
+                clock.into_sleeps(),
+                vec![super::super::OBSERVATION_POLL_INTERVAL; nonterminal.len()]
             );
         }
     }
@@ -1744,7 +1610,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(clock.sleeps.into_inner(), vec![WAIT_POLL_INTERVAL]);
+        clock.assert_single_poll();
     }
 
     #[test]
@@ -1761,14 +1627,7 @@ mod tests {
             .expect("timeout is a local wait outcome");
 
         assert!(matches!(result, WaitObservation::TimedOut));
-        assert_eq!(
-            clock.sleeps.into_inner(),
-            vec![
-                Duration::from_secs(2),
-                Duration::from_secs(2),
-                Duration::from_secs(1)
-            ]
-        );
+        clock.assert_timeout_schedule();
         assert!(api.responses.into_inner().is_empty());
     }
 
@@ -1782,16 +1641,28 @@ mod tests {
         let result = observe(&api, None, &clock);
 
         assert_eq!(result.err(), Some(failure));
-        assert_eq!(clock.sleeps.into_inner(), vec![WAIT_POLL_INTERVAL]);
+        clock.assert_single_poll();
     }
 
     #[test]
     fn wait_timeout_parser_accepts_documented_units_and_rejects_zero() {
-        assert_eq!(parse_wait_timeout("250ms"), Ok(Duration::from_millis(250)));
-        assert_eq!(parse_wait_timeout("30"), Ok(Duration::from_secs(30)));
-        assert_eq!(parse_wait_timeout("10m"), Ok(Duration::from_secs(600)));
-        assert_eq!(parse_wait_timeout("2h"), Ok(Duration::from_secs(7_200)));
-        assert!(parse_wait_timeout("0s").is_err());
-        assert!(parse_wait_timeout("1.5s").is_err());
+        assert_eq!(
+            super::super::parse_wait_timeout("250ms"),
+            Ok(Duration::from_millis(250))
+        );
+        assert_eq!(
+            super::super::parse_wait_timeout("30"),
+            Ok(Duration::from_secs(30))
+        );
+        assert_eq!(
+            super::super::parse_wait_timeout("10m"),
+            Ok(Duration::from_secs(600))
+        );
+        assert_eq!(
+            super::super::parse_wait_timeout("2h"),
+            Ok(Duration::from_secs(7_200))
+        );
+        assert!(super::super::parse_wait_timeout("0s").is_err());
+        assert!(super::super::parse_wait_timeout("1.5s").is_err());
     }
 }
