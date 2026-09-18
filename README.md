@@ -1501,11 +1501,11 @@ and does not claim that every admitted release or unexecuted host received exact
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.
 
-The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.154.0`, and
+The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.155.0`, and
 requires the generated App Server schema capability used by CodexAppServerV1. Its
 isolated version and schema probes do not read ambient `CODEX_HOME`, provider
 credentials, or native configuration. The report contains the exact observed version,
-supported range, exact repository qualification version `0.153.4`, closed capabilities,
+supported range, exact repository qualification version `0.154.0`, closed capabilities,
 and canonical executable without starting a thread. At execution, async-delivery
 messages, structured asynchronous questions, form elicitation, and bounded additive
 events remain unattended and cannot settle, approve, assign a project, persist, or
@@ -1574,7 +1574,7 @@ operator-controlled `PATH`. Scherzo installs none of them. Each successful insta
 is validated once and retained as an immutable executable, exact-version, profile, and
 capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.86.0`, Claude Code
 requires `>=2.1.234 <2.2.0`, and Codex requires capability-compatible stable
-`>=0.147.0 <0.154.0` with exact repository qualification anchor `0.153.4`. Admission and invocation never repeat a lookup or probe. A missing
+`>=0.147.0 <0.155.0` with exact repository qualification anchor `0.154.0`. Admission and invocation never repeat a lookup or probe. A missing
 or incompatible installation leaves only that harness unavailable, so Runner Serve
 continues to accept command-only and other available-harness assignments. An assignment
 requiring the unavailable harness is rejected before launch, and selection never falls

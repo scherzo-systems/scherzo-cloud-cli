@@ -1995,7 +1995,7 @@ fn protocol_rejections_identify_distinct_failure_conditions() {
             &mut item_mismatch,
             json!({
                 "id": "request",
-                "method": "item/tool/requestUserInput",
+                "method": "item/commandExecution/requestApproval",
                 "params": {
                     "threadId": "thread-1",
                     "turnId": "turn-1",
@@ -2169,7 +2169,7 @@ fn declined_server_requests_enforce_only_correlation_identity() {
         ),
         (
             "item/permissions/requestApproval",
-            Some("reasoning"),
+            None,
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
@@ -2180,7 +2180,7 @@ fn declined_server_requests_enforce_only_correlation_identity() {
         ),
         (
             "item/tool/requestUserInput",
-            Some("reasoning"),
+            None,
             json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",

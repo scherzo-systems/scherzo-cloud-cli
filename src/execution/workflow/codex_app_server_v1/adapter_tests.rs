@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use rustix::process::Pid;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
@@ -584,11 +585,22 @@ impl ProcessFixture {
         provider_address: std::net::SocketAddr,
         value_mode: AgentValueMode,
     ) -> Self {
-        let fixture = Self::with_version(
+        Self::with_exact_binary_attachments_and_config(provider_address, value_mode, &[], "")
+    }
+
+    fn with_exact_binary_attachments_and_config(
+        provider_address: std::net::SocketAddr,
+        value_mode: AgentValueMode,
+        attachments: &[(&[u8], &str, &str)],
+        additional_config: &str,
+    ) -> Self {
+        let fixture = Self::with_provider_attachments_and_codex_home(
             "exact-binary",
             value_mode,
             1024,
             Some(provider_address),
+            attachments,
+            false,
             CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
         );
         let exact = conformance_executable();
@@ -602,7 +614,8 @@ impl ProcessFixture {
              env_key = \"CODEX_API_KEY\"\n\
              wire_api = \"responses\"\n\
              request_max_retries = 0\n\
-             stream_max_retries = 0\n"
+             stream_max_retries = 0\n\
+             {additional_config}"
         );
         std::fs::write(fixture.codex_home.join("config.toml"), config).unwrap();
         fixture
@@ -613,6 +626,10 @@ impl ProcessFixture {
         value_mode: AgentValueMode,
     ) -> (Self, PathBuf) {
         let fixture = Self::with_exact_binary(provider_address, value_mode);
+        Self::capture_exact_binary_stdin(fixture)
+    }
+
+    fn capture_exact_binary_stdin(fixture: Self) -> (Self, PathBuf) {
         let exact = std::fs::read_link(&fixture.executable).unwrap();
         let stdin_capture = fixture
             .arguments
@@ -1999,7 +2016,26 @@ struct ProviderRequest {
 
 enum LoopbackProviderTurn {
     Completed(String),
-    ShellCommand { call_id: String, command: String },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    NamespacedFunctionCall {
+        call_id: String,
+        namespace: String,
+        name: String,
+        arguments: Value,
+    },
+    ToolSearchCall {
+        call_id: String,
+        arguments: Value,
+    },
+    CustomToolCall {
+        call_id: String,
+        name: String,
+        input: String,
+    },
 }
 
 enum LoopbackProviderResponse {
@@ -2030,11 +2066,31 @@ impl LoopbackResponsesProvider {
     }
 
     async fn start_shell_command_then_response(command: &str, response: &str) -> Self {
+        Self::start_function_call_then_response(
+            "approval-call",
+            "exec_command",
+            json!({
+                "cmd": command,
+                "sandbox_permissions": "require_escalated",
+                "justification": "Confirm that Scherzo declines unattended approval.",
+            }),
+            response,
+        )
+        .await
+    }
+
+    async fn start_function_call_then_response(
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+        response: &str,
+    ) -> Self {
         Self::start_with_response_release(
             LoopbackProviderResponse::Turns(VecDeque::from([
-                LoopbackProviderTurn::ShellCommand {
-                    call_id: "approval-call".to_owned(),
-                    command: command.to_owned(),
+                LoopbackProviderTurn::FunctionCall {
+                    call_id: call_id.to_owned(),
+                    name: name.to_owned(),
+                    arguments,
                 },
                 LoopbackProviderTurn::Completed(response.to_owned()),
             ])),
@@ -2181,16 +2237,43 @@ async fn serve_provider_request(
                     "id": "message-loopback",
                     "content": [{"type": "output_text", "text": response}]
                 }),
-                LoopbackProviderTurn::ShellCommand { call_id, command } => json!({
+                LoopbackProviderTurn::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => json!({
                     "type": "function_call",
                     "call_id": call_id,
-                    "name": "exec_command",
-                    "arguments": serde_json::to_string(&json!({
-                        "cmd": command,
-                        "sandbox_permissions": "require_escalated",
-                        "justification": "Confirm that Scherzo declines unattended approval.",
-                    }))
-                    .unwrap(),
+                    "name": name,
+                    "arguments": serde_json::to_string(&arguments).unwrap(),
+                }),
+                LoopbackProviderTurn::NamespacedFunctionCall {
+                    call_id,
+                    namespace,
+                    name,
+                    arguments,
+                } => json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "namespace": namespace,
+                    "name": name,
+                    "arguments": serde_json::to_string(&arguments).unwrap(),
+                }),
+                LoopbackProviderTurn::ToolSearchCall { call_id, arguments } => json!({
+                    "type": "tool_search_call",
+                    "call_id": call_id,
+                    "execution": "client",
+                    "arguments": arguments,
+                }),
+                LoopbackProviderTurn::CustomToolCall {
+                    call_id,
+                    name,
+                    input,
+                } => json!({
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "input": input,
                 }),
             };
             let events = [
@@ -2639,8 +2722,8 @@ pub(super) mod exact_binary {
                     "type": "workspaceWrite",
                     "writableRoots": [self._fixture.expected_cwd],
                     "networkAccess": true,
-                    "excludeTmpdirEnvVar": false,
-                    "excludeSlashTmp": false,
+                    "excludeTmpdirEnvVar": true,
+                    "excludeSlashTmp": true,
                 })
             } else {
                 json!({"type": "externalSandbox", "networkAccess": "enabled"})
@@ -2728,6 +2811,32 @@ pub(super) mod exact_binary {
             .await
         }
 
+        async fn decline_approval(
+            &mut self,
+            expected_method: &str,
+            thread_id: &str,
+            turn_id: &str,
+        ) -> Value {
+            let approval = self
+                .read_until(|frame| {
+                    (frame.get("id").is_some() && frame.get("method").is_some())
+                        || matches!(frame["method"].as_str(), Some("error" | "turn/completed"))
+                })
+                .await;
+            assert_eq!(
+                approval["method"], expected_method,
+                "pinned Codex did not request expected approval: {approval}"
+            );
+            assert_eq!(approval["params"]["threadId"], thread_id);
+            assert_eq!(approval["params"]["turnId"], turn_id);
+            self.send(json!({
+                "id": approval["id"].clone(),
+                "result": {"decision": "decline"},
+            }))
+            .await;
+            approval
+        }
+
         async fn finish(mut self, provider: LoopbackResponsesProvider) {
             self.input.shutdown().await.unwrap();
             drop(self.input);
@@ -2751,6 +2860,232 @@ pub(super) mod exact_binary {
         assert_eq!(request.path, "/responses");
         release_response.send(()).unwrap();
         run.await.unwrap()
+    }
+
+    fn assert_exact_response(outcome: AgentOutcome, started: bool, context: &str) {
+        assert!(started, "{context}: exact Codex outcome: {outcome:?}");
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("{context}: exact Codex did not complete with a response: {outcome:?}");
+        };
+        assert_eq!(response.as_str(), RESPONSE, "{context}");
+    }
+
+    fn configure_mcp_elicitation_fixture(fixture: &ProcessFixture) -> PathBuf {
+        let root = fixture.codex_home.parent().unwrap();
+        let script = root.join("mcp-elicitation.py");
+        let capture = root.join("mcp-elicitation-response.json");
+        std::fs::write(
+            &script,
+            r#"import json
+import os
+import sys
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "scherzo-fixture", "version": "1"},
+            },
+        })
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {
+                "tools": [{
+                    "name": "confirm_action",
+                    "description": "Exercise unattended MCP elicitation.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }],
+            },
+        })
+    elif method == "tools/call":
+        send({
+            "jsonrpc": "2.0",
+            "id": "fixture-elicitation",
+            "method": "elicitation/create",
+            "params": {
+                "mode": "form",
+                "message": "Confirm the synthetic action.",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"confirmation": {"type": "string"}},
+                    "required": ["confirmation"],
+                },
+            },
+        })
+        response = json.loads(sys.stdin.readline())
+        with open(os.environ["SCHERZO_MCP_CAPTURE"], "w", encoding="utf-8") as output:
+            json.dump(response, output, separators=(",", ":"))
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {
+                "content": [{"type": "text", "text": "elicitation settled"}],
+                "isError": False,
+            },
+        })
+    elif method == "ping":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+"#,
+        )
+        .unwrap();
+        let config_path = fixture.codex_home.join("config.toml");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!(
+            "\n[mcp_servers.fixture]\ncommand = \"python3\"\nargs = [{}]\n\
+             [mcp_servers.fixture.env]\nSCHERZO_MCP_CAPTURE = {}\n",
+            serde_json::to_string(script.to_str().unwrap()).unwrap(),
+            serde_json::to_string(capture.to_str().unwrap()).unwrap(),
+        ));
+        std::fs::write(config_path, config).unwrap();
+        capture
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_ordered_attachment_matrix_reaches_the_provider() {
+        with_watchdog(async {
+            let png = base64::engine::general_purpose::STANDARD
+                .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+                .unwrap();
+            let jpeg = base64::engine::general_purpose::STANDARD
+                .decode("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")
+                .unwrap();
+            let attachments: [(&[u8], &str, &str); 8] = [
+                (b"native text attachment", "text/plain", "caller.txt"),
+                (br#"{"a":1,"z":2}"#, "application/json", "caller.json"),
+                (b"", "text/plain; charset=utf-8", "empty.txt"),
+                (&png, "image/png", "caller.png"),
+                (&jpeg, "image/jpeg", "caller.jpg"),
+                (b"%PDF-1.7\nfixture\n", "application/pdf", "caller.pdf"),
+                (b"invalid \xff text", "text/plain", "invalid.txt"),
+                (
+                    b"general sealed bytes",
+                    "application/octet-stream",
+                    "caller.bin",
+                ),
+            ];
+            let (mut provider, release_response) =
+                LoopbackResponsesProvider::start_blocked(RESPONSE).await;
+            let fixture = ProcessFixture::with_exact_binary_attachments_and_config(
+                provider.address,
+                response_mode(),
+                &attachments,
+                "",
+            );
+            let attachment_paths = fixture
+                .invocation
+                .as_ref()
+                .unwrap()
+                .attachments()
+                .iter()
+                .map(|attachment| attachment.path().to_owned())
+                .collect::<Vec<_>>();
+            let original_bytes = attachment_paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>();
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let request = provider.next_request().await;
+            let user_content = request.body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|item| item["role"] == "user")
+                .and_then(|item| item["content"].as_array())
+                .unwrap();
+            assert_eq!(
+                user_content.len(),
+                13,
+                "native provider input: {}",
+                request.body["input"],
+            );
+            for (index, expected) in [
+                "ordinary user turn",
+                "Scherzo attachment 000000 (text/plain) follows:\nnative text attachment",
+                "Scherzo attachment 000001 (application/json) follows:\n{\"a\":1,\"z\":2}",
+                "Scherzo attachment 000002 (text/plain; charset=utf-8) follows:\n",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(user_content[index]["type"], "input_text");
+                assert_eq!(user_content[index]["text"], expected);
+            }
+            for (open_index, image_index, close_index, attachment_index, media_type) in [
+                (4, 5, 6, 3, "image/png"),
+                (7, 8, 9, 4, "image/jpeg"),
+            ] {
+                assert_eq!(
+                    user_content[open_index],
+                    json!({
+                        "type": "input_text",
+                        "text": format!(
+                            "<image name=[Image #{}] path=\"{}\">",
+                            attachment_index - 2,
+                            attachment_paths[attachment_index].to_str().unwrap(),
+                        ),
+                    })
+                );
+                assert_eq!(user_content[image_index]["type"], "input_image");
+                assert_eq!(
+                    user_content[image_index]["image_url"],
+                    format!(
+                        "data:{media_type};base64,{}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(attachments[attachment_index].0),
+                    )
+                );
+                assert_eq!(
+                    user_content[close_index],
+                    json!({"type": "input_text", "text": "</image>"}),
+                );
+            }
+            for (input_index, attachment_index, media_type) in [
+                (10, 5, "application/pdf"),
+                (11, 6, "text/plain"),
+                (12, 7, "application/octet-stream"),
+            ] {
+                assert_eq!(
+                    user_content[input_index],
+                    json!({
+                        "type": "input_text",
+                        "text": format!(
+                            "Scherzo attachment {attachment_index:06} has media type {media_type} and is available to runner tools at {}.",
+                            attachment_paths[attachment_index].to_str().unwrap(),
+                        ),
+                    })
+                );
+            }
+            assert_eq!(
+                attachment_paths
+                    .iter()
+                    .map(|path| std::fs::read(path).unwrap())
+                    .collect::<Vec<_>>(),
+                original_bytes,
+            );
+
+            release_response.send(()).unwrap();
+            let (_, outcome, started) = run.await.unwrap();
+            assert_exact_response(outcome, started, "native attachment delivery");
+            provider.shutdown().await;
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2806,12 +3141,7 @@ pub(super) mod exact_binary {
             assert!(sqlite_home.join("state_5.sqlite").is_file());
             release_response.send(()).unwrap();
             let (fixture, outcome, started) = run.await.unwrap();
-            assert!(started, "exact Codex outcome: {outcome:?}");
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
-            else {
-                panic!("exact Codex must complete one loopback response: {outcome:?}");
-            };
-            assert_eq!(response.as_str(), RESPONSE);
+            assert_exact_response(outcome, started, "native handshake");
             let requests = captured_requests(&stdin_capture);
             let thread_start = requests
                 .iter()
@@ -2844,6 +3174,187 @@ pub(super) mod exact_binary {
 
     #[tokio::test]
     #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_permission_request_grants_no_authority() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_function_call_then_response(
+                "permission-call",
+                "request_permissions",
+                json!({
+                    "reason": "Exercise unattended permission handling.",
+                    "permissions": {"network": {"enabled": true}},
+                }),
+                RESPONSE,
+            )
+            .await;
+            let fixture = ProcessFixture::with_exact_binary_attachments_and_config(
+                provider.address,
+                response_mode(),
+                &[],
+                "[features]\n\
+                 request_permissions_tool = true\n",
+            );
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let initial = provider.next_request().await;
+            assert!(initial.body["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool["name"] == "request_permissions")
+            }));
+            let after_permission = provider.next_request().await;
+            let output = after_permission.body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "permission-call"
+                })
+                .and_then(|item| item["output"].as_str())
+                .expect("exact Codex permission output");
+            assert_eq!(
+                serde_json::from_str::<Value>(output).unwrap(),
+                json!({
+                    "permissions": {"file_system": null, "network": null},
+                    "scope": "turn",
+                })
+            );
+
+            let (_, outcome, started) = run.await.unwrap();
+            assert_exact_response(outcome, started, "unattended permission denial");
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_user_input_is_answered_without_authority() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_function_call_then_response(
+                "user-input-call",
+                "request_user_input",
+                json!({
+                    "questions": [{
+                        "id": "confirm_path",
+                        "header": "Confirm",
+                        "question": "Proceed with the plan?",
+                        "options": [{
+                            "label": "Yes (Recommended)",
+                            "description": "Continue the current plan.",
+                        }],
+                    }],
+                }),
+                RESPONSE,
+            )
+            .await;
+            let fixture = ProcessFixture::with_exact_binary_attachments_and_config(
+                provider.address,
+                response_mode(),
+                &[],
+                "[features]\n\
+                 default_mode_request_user_input = true\n",
+            );
+            let (fixture, stdin_capture) = ProcessFixture::capture_exact_binary_stdin(fixture);
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let initial = provider.next_request().await;
+            assert!(initial.body["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool["name"] == "request_user_input")
+            }));
+            wait_for_fixture_bytes(&stdin_capture, br#""answers":{}"#).await;
+            let after_user_input = provider.next_request().await;
+            let serialized = serde_json::to_string(&after_user_input.body["input"]).unwrap();
+            assert!(serialized.contains("user-input-call"));
+            assert!(serialized.contains(r#"\"answers\":{}"#));
+            for granted in ["acceptForSession", "networkAccess"] {
+                assert!(!serialized.contains(granted));
+            }
+
+            let (_, outcome, started) = run.await.unwrap();
+            assert_exact_response(outcome, started, "unattended user input");
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_mcp_elicitation_is_declined_without_settlement_authority() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_with_response_release(
+                LoopbackProviderResponse::Turns(VecDeque::from([
+                    LoopbackProviderTurn::ToolSearchCall {
+                        call_id: "tool-search-call".to_owned(),
+                        arguments: json!({"query": "Exercise unattended MCP elicitation"}),
+                    },
+                    LoopbackProviderTurn::NamespacedFunctionCall {
+                        call_id: "mcp-call".to_owned(),
+                        namespace: "mcp__fixture".to_owned(),
+                        name: "confirm_action".to_owned(),
+                        arguments: json!({}),
+                    },
+                    LoopbackProviderTurn::Completed(RESPONSE.to_owned()),
+                ])),
+                None,
+            )
+            .await;
+            let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
+            let elicitation_capture = configure_mcp_elicitation_fixture(&fixture);
+            let observations = fixture.observations.clone();
+            let run = tokio::spawn(run_fixture(fixture));
+
+            let initial = provider.next_request().await;
+            assert!(
+                initial.body["tools"].as_array().is_some_and(|tools| {
+                    tools.iter().any(|tool| tool["type"] == "tool_search")
+                })
+            );
+            let after_search = provider.next_request().await;
+            assert!(
+                after_search.body["input"].as_array().is_some_and(|input| {
+                    input.iter().any(|item| {
+                        item["type"] == "tool_search_output"
+                            && item["call_id"] == "tool-search-call"
+                            && item["tools"].as_array().is_some_and(|tools| {
+                                tools.iter().any(|tool| tool["name"] == "mcp__fixture")
+                            })
+                    })
+                }),
+                "exact Codex tool-search output: {}",
+                after_search.body["input"],
+            );
+            let continuation = provider.next_request().await;
+            assert!(continuation.body["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "mcp-call"
+                })
+            }));
+            let response: Value =
+                serde_json::from_slice(&std::fs::read(elicitation_capture).unwrap()).unwrap();
+            assert_eq!(response["id"], "fixture-elicitation");
+            assert_eq!(response["result"], json!({"action": "decline"}));
+
+            let (_, outcome, started) = run.await.unwrap();
+            assert_exact_response(outcome, started, "unattended MCP elicitation");
+            let observations = observations.snapshot();
+            assert!(
+                observations.iter().any(|observation| matches!(
+                    observation.observation(),
+                    AgentObservation::UnrecognizedHarnessEvent { event }
+                        if event["method"] == "account/rateLimits/updated"
+                            && event["params"]["rateLimits"].get("normalModelSlug").is_some()
+                )),
+                "exact Codex did not surface the additive rate-limit notification: {observations:?}",
+            );
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
     async fn pinned_real_codex_approval_decline_and_error_info_conform() {
         with_watchdog(async {
             let mut provider = LoopbackResponsesProvider::start_shell_command_then_response(
@@ -2864,20 +3375,11 @@ pub(super) mod exact_binary {
                 first_request.body["tools"]
             );
             let approval = codex
-                .read_until(|frame| {
-                    (frame.get("id").is_some() && frame.get("method").is_some())
-                        || matches!(frame["method"].as_str(), Some("error" | "turn/completed"))
-                })
-                .await;
-            assert_eq!(
-                approval["method"], "item/commandExecution/requestApproval",
-                "pinned Codex did not request command approval: {approval}"
-            );
-            assert_eq!(approval["params"]["threadId"], thread_id);
-            assert_eq!(approval["params"]["turnId"], turn_id);
-            let approval_id = approval["id"].clone();
-            codex
-                .send(json!({"id": approval_id, "result": {"decision": "decline"}}))
+                .decline_approval(
+                    "item/commandExecution/requestApproval",
+                    &thread_id,
+                    &turn_id,
+                )
                 .await;
 
             let continuation = provider.next_request().await;
@@ -2892,6 +3394,43 @@ pub(super) mod exact_binary {
                 "pinned Codex approval transcript: method={} decision=decline status={}",
                 approval["method"], terminal["params"]["turn"]["status"]
             );
+            codex.finish(provider).await;
+
+            let patch_name = "../unattended-native-approval.txt";
+            let mut provider = LoopbackResponsesProvider::start_with_response_release(
+                LoopbackProviderResponse::Turns(VecDeque::from([
+                    LoopbackProviderTurn::CustomToolCall {
+                        call_id: "patch-approval-call".to_owned(),
+                        name: "apply_patch".to_owned(),
+                        input: format!(
+                            "*** Begin Patch\n*** Add File: {patch_name}\n+must not be written\n*** End Patch\n"
+                        ),
+                    },
+                    LoopbackProviderTurn::Completed(RESPONSE.to_owned()),
+                ])),
+                None,
+            )
+            .await;
+            let mut codex = DirectCodex::start(provider.address);
+            let expected_patch = codex._fixture.expected_cwd.join(patch_name);
+            let (thread_id, turn_id) = codex.start_turn("on-request").await;
+            let first_request = provider.next_request().await;
+            assert!(first_request.body["tools"].as_array().is_some_and(|tools| {
+                tools.iter().any(|tool| tool["name"] == "apply_patch")
+            }));
+            codex
+                .decline_approval("item/fileChange/requestApproval", &thread_id, &turn_id)
+                .await;
+            let continuation = provider.next_request().await;
+            assert!(continuation.body["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["type"] == "custom_tool_call_output"
+                        && item["call_id"] == "patch-approval-call"
+                })
+            }));
+            let terminal = codex.turn_completed(&thread_id, &turn_id).await;
+            assert_eq!(terminal["params"]["turn"]["status"], "completed");
+            assert!(!expected_patch.exists());
             codex.finish(provider).await;
 
             let (mut provider, release_response) =

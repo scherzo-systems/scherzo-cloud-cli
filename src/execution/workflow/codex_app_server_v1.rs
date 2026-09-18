@@ -899,7 +899,19 @@ impl CodexAppServerV1Parser {
                 let params = required_object(object, "params").ok_or_else(|| {
                     self.failure_for(CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid)
                 })?;
-                self.require_interactive_request(params)?;
+                match method {
+                    "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                        self.require_active_item_request(params)?;
+                    }
+                    "item/permissions/requestApproval" | "item/tool/requestUserInput" => {
+                        self.require_tool_input_request(params)?;
+                    }
+                    _ => {
+                        return Err(self.failure_for(
+                            CodexAppServerV1RejectionReason::ServerRequestEnvelopeInvalid,
+                        ));
+                    }
+                }
                 Some(match method {
                     "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                         json!({"decision": "decline"})
@@ -937,18 +949,39 @@ impl CodexAppServerV1Parser {
         Ok(ParserProgress::default())
     }
 
-    fn require_interactive_request(
+    fn require_active_item_request(
         &self,
         params: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
-        self.require_running_correlation(params)?;
-        let item_id = required_nonempty_string(params, "itemId").ok_or_else(|| {
-            self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
-        })?;
+        let item_id = self.require_bounded_request_item(params)?;
         if !self.active_items.contains_key(&ItemId(Arc::from(item_id))) {
             return Err(self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid));
         }
         Ok(())
+    }
+
+    fn require_tool_input_request(
+        &self,
+        params: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        // Codex emits permission and user-input requests directly from a provider tool call,
+        // before that call has an App Server item lifecycle to validate against. Their fixed
+        // empty responses grant no authority, but the opaque routing identity remains bounded.
+        self.require_bounded_request_item(params).map(|_| ())
+    }
+
+    fn require_bounded_request_item<'params>(
+        &self,
+        params: &'params Map<String, Value>,
+    ) -> Result<&'params str, AgentFailureCause> {
+        self.require_running_correlation(params)?;
+        let item_id = required_nonempty_string(params, "itemId").ok_or_else(|| {
+            self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid)
+        })?;
+        if item_id.len() > MAXIMUM_IDENTITY_BYTES || item_id.chars().any(char::is_control) {
+            return Err(self.failure_for(CodexAppServerV1RejectionReason::ItemCorrelationInvalid));
+        }
+        Ok(item_id)
     }
 
     fn require_mcp_elicitation_correlation(
