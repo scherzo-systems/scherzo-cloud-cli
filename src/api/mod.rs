@@ -2,6 +2,7 @@ mod artifacts;
 #[cfg(test)]
 mod artifacts_tests;
 mod current_principal;
+mod delegations;
 mod github;
 mod http_client;
 pub(crate) mod http_util;
@@ -66,6 +67,12 @@ pub(crate) use artifacts::{ArtifactCapabilities, DownloadedMember};
 pub(crate) use current_principal::{
     AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory,
     classify_reqwest_error, get_current_principal,
+};
+pub(crate) use delegations::{
+    AcceptDelegationOutcome, CommonDelegationFailure, Delegation, DelegationApiError,
+    DelegationPage, DelegationState, DelegationTerminalReason, EndDelegationOutcome,
+    GetDelegationOutcome, ListDelegationsOutcome, ProposeDelegationOutcome, accept_delegation,
+    end_delegation, get_delegation, list_current_principal_delegations, propose_delegation,
 };
 pub(crate) use github::{
     GitHubAccountType, GitHubApi, GitHubFailure, GitHubInstallation, GitHubInstallationState,

@@ -43,6 +43,8 @@ mod auth_login;
 mod claude_code_installation;
 #[path = "cli/codex_installation.rs"]
 mod codex_installation;
+#[path = "cli/delegation.rs"]
+mod delegation;
 #[path = "cli/github.rs"]
 mod github;
 #[path = "cli/identities.rs"]

@@ -32,6 +32,7 @@ mod account;
 mod artifact;
 mod atomic_directory;
 mod auth;
+mod delegation;
 mod deletion;
 mod github;
 mod invitation;
@@ -333,6 +334,22 @@ struct PrincipalAuthenticationArgs {
     resolved_service_api_key: Mutex<Option<Arc<ServiceApiKey>>>,
 }
 
+#[derive(Debug, Args)]
+struct RequiredServiceAuthenticationArgs {
+    #[arg(
+        long,
+        value_name = "PATH|-",
+        help = "Authenticate with a service API key from a private file, or - for standard input"
+    )]
+    service_api_key_file: PathBuf,
+}
+
+impl RequiredServiceAuthenticationArgs {
+    fn api_key(&self) -> anyhow::Result<ServiceApiKey> {
+        read_api_key(&self.service_api_key_file).context("read service API key")
+    }
+}
+
 impl PrincipalAuthenticationArgs {
     const fn kind(&self) -> PrincipalAuthenticationKind {
         if self.service_api_key_file.is_some() {
@@ -401,6 +418,8 @@ enum Command {
     Artifact(artifact::Command),
     #[command(about = auth::ABOUT)]
     Auth(auth::Command),
+    #[command(about = delegation::ABOUT)]
+    Delegation(delegation::Command),
     #[command(about = github::ABOUT)]
     Github(github::Command),
     #[command(about = invitation::ABOUT)]
@@ -438,6 +457,7 @@ impl Cli {
             Some(Command::Account(command)) => command.execute(),
             Some(Command::Artifact(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
+            Some(Command::Delegation(command)) => command.execute(),
             Some(Command::Github(command)) => command.execute(),
             Some(Command::Invitation(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
@@ -1901,6 +1921,12 @@ mod tests {
             "auth login",
             "auth logout",
             "auth status",
+            "delegation",
+            "delegation accept",
+            "delegation end",
+            "delegation list",
+            "delegation propose",
+            "delegation show",
             "github",
             "github installation",
             "github installation disconnect",

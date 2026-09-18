@@ -167,7 +167,7 @@ The current release supports:
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, linked sign-in identity management,
   explicit service API-key authentication, service-principal creation and credential rotation,
-  logout, account signup, display-name management, account and organization deletion
+  human-service delegation management, logout, account signup, display-name management, account and organization deletion
   scheduling, organization discovery, profile management and owner audit history,
   invitation issuance and lifecycle management, the
   current principal's invitation inbox, one-page member-directory reads, actor-bound GitHub App setup,
@@ -257,6 +257,44 @@ Service API keys are also separate from runner credentials. They can authorize r
 administration when the service has the required organization role, but they cannot
 enroll a runner, start `runner serve`, authenticate the runner connection, or replace a
 runner activation or runner credential.
+
+## Delegations
+
+A signed-in human proposes a delegation to one exact active service principal:
+
+```sh
+scherzo-cloud delegation propose prn_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+Proposal is deliberately human-only. Acceptance is deliberately service-only and always
+requires the nominated service's explicit API-key input; the CLI never substitutes a
+stored human session:
+
+```sh
+scherzo-cloud delegation accept dlg_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --service-api-key-file ./build-agent.key
+```
+
+Either exact participant may list, show, or end its relationships. Omit
+`--service-api-key-file` to use the renewable human session, or supply it to act as the
+service. Listing returns one page and exposes an opaque next cursor when another page is
+available:
+
+```sh
+scherzo-cloud delegation list --limit 50
+scherzo-cloud delegation list --cursor <CURSOR> \
+  --service-api-key-file ./build-agent.key
+scherzo-cloud delegation show dlg_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud delegation end dlg_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+```
+
+Ended relationships remain visible in delegation history with their terminal timestamp
+and reason. Accepting or ending an already ended relationship returns the stable
+`delegation_transition_unavailable` outcome; an inaccessible relationship returns
+`not_found` without revealing whether it exists. Delegations do not expire under the
+current public API contract. An expired or revoked actor credential instead returns
+`unauthenticated`. Delegation records attribution only and never lends organization
+membership or any other authority.
 
 ## Public API contract
 

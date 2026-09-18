@@ -1,9 +1,7 @@
-use std::io::{self, Write};
-use std::path::PathBuf;
-
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 use serde::Serialize;
+use std::io::{self, Write};
 
 use crate::api::{
     CreateServicePrincipalOutcome, HttpClient, IssueServiceCredentialOutcome,
@@ -13,9 +11,7 @@ use crate::api::{
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
-use crate::service_auth::{
-    ApiKeyCleanup, ApiKeyDestination, ServiceApiKey, ServiceApiKeyError, read_api_key,
-};
+use crate::service_auth::{ApiKeyCleanup, ApiKeyDestination, ServiceApiKey, ServiceApiKeyError};
 
 use super::write_api_failure as write_failure;
 
@@ -79,28 +75,12 @@ struct CreateCommand {
 }
 
 #[derive(Debug, Args)]
-struct RequiredServiceAuthentication {
-    #[arg(
-        long,
-        value_name = "PATH|-",
-        help = "Authenticate with a service API key from a private file, or - for standard input"
-    )]
-    service_api_key_file: PathBuf,
-}
-
-impl RequiredServiceAuthentication {
-    fn api_key(&self) -> anyhow::Result<ServiceApiKey> {
-        read_api_key(&self.service_api_key_file).context("read service API key")
-    }
-}
-
-#[derive(Debug, Args)]
 struct ListCommand {
     #[command(flatten)]
     pagination: super::PaginationArgs,
 
     #[command(flatten)]
-    authentication: RequiredServiceAuthentication,
+    authentication: super::RequiredServiceAuthenticationArgs,
 
     #[command(flatten)]
     options: ServiceOptions,
@@ -116,7 +96,7 @@ struct IssueCommand {
     api_key_file: String,
 
     #[command(flatten)]
-    authentication: RequiredServiceAuthentication,
+    authentication: super::RequiredServiceAuthenticationArgs,
 
     #[command(flatten)]
     options: ServiceOptions,
@@ -132,7 +112,7 @@ struct RevokeCommand {
     credential_id: String,
 
     #[command(flatten)]
-    authentication: RequiredServiceAuthentication,
+    authentication: super::RequiredServiceAuthenticationArgs,
 
     #[command(flatten)]
     options: ServiceOptions,
