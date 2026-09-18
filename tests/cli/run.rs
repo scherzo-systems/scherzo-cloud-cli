@@ -5,6 +5,7 @@ use ring::digest::{SHA256, digest};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt as _;
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 const TOKEN: &str = "unique-cloud-run-command-token-sentinel";
