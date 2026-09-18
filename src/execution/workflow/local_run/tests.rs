@@ -6,18 +6,20 @@ use std::path::Path;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use serde_json::json;
 use std::time::Duration;
 
 use super::*;
 use crate::execution::workflow::admission::{
-    CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
-    ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedFile, ResolvedInput,
-    ResolvedInputs, ResolvedJsonInput, admit_workflow,
+    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedFile,
+    ResolvedInput, ResolvedInputs, ResolvedJsonInput, admit_workflow,
 };
 use crate::execution::workflow::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
-    ArchivedAttemptOperationalErrorCode, ArchivedAttemptState, ArchivedStepDetail,
-    ArchivedWorkflowOutcome, load_local_archived_attempt, load_local_archived_attempt_observed,
+    ArchivedAttemptOperationalErrorCode, ArchivedAttemptState, ArchivedCancellationReason,
+    ArchivedStepDetail, ArchivedWorkflowOutcome, load_local_archived_attempt,
+    load_local_archived_attempt_observed,
 };
 use crate::execution::workflow::resolution;
 
@@ -1151,6 +1153,140 @@ fn settle_as_cancelled(run: &LocalAttemptOwner) {
         .unwrap();
 }
 
+fn settle_as_force_cancelled_with_finalizer(
+    run: &LocalAttemptOwner,
+    phase: super::super::runtime::RunCancellationPhase,
+) {
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled.clone());
+            attempt.state = AttemptStateV1::Cancelled;
+            attempt.force_abort = Some(super::super::runtime::ForceAbortEvidence {
+                reason: CancellationReason::ForceAbort,
+                phase,
+            });
+            let ordinary_reason = match phase {
+                super::super::runtime::RunCancellationPhase::Ordinary => {
+                    attempt.cancellation = None;
+                    CancellationReason::ForceAbort
+                }
+                super::super::runtime::RunCancellationPhase::Finalization => {
+                    attempt.cancellation = Some(AttemptCancellationV1 {
+                        reason: CancellationReasonV1::UserRequest,
+                        requested_at: settled.clone(),
+                        force_stop_deadline: settled,
+                        workflow_confirmed: true,
+                    });
+                    CancellationReason::UserRequest
+                }
+            };
+            for step in &mut attempt.progress.steps {
+                step.state = AttemptStepStateV1::Cancelled;
+                step.detail = Some(NodeDetail::Cancellation(
+                    super::super::evidence::CancellationDetail::new(ordinary_reason),
+                ));
+            }
+            attempt.finalization = Some(AttemptFinalizationV1::Complete(
+                AttemptFinalizationCompleteV1 {
+                    complete: true,
+                    trigger: FinalizationTriggerV1::Cancelled,
+                    finalizers: vec![DurableFinalizerV1 {
+                        id: "cleanup".to_owned(),
+                        role: AttemptNodeRoleV1::Finalizer,
+                        failure_policy: FailurePolicy::Required,
+                        state: AttemptStepStateV1::Cancelled,
+                        detail: Some(NodeDetail::Cancellation(
+                            super::super::evidence::CancellationDetail::new(
+                                CancellationReason::ForceAbort,
+                            ),
+                        )),
+                    }],
+                    issues: Vec::new(),
+                    cancellation: Some(DurableFinalizationCancellationV1 {
+                        reason: CancellationReasonV1::ForceAbort,
+                        force_stop_deadline: None,
+                    }),
+                    force_abort: true,
+                },
+            ));
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn retained_attempt_rejects_force_evidence_on_success() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: { argv: [\"true\"] }\n",
+    );
+    let run =
+        InitialLocalRun::create(&fixture.run_path("forced-success"), &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+    let state = read_state(run.root_handle()).unwrap();
+    assert!(decode_state(&encode_json(&state).unwrap()).is_ok());
+    let mut fabricated_force = serde_json::to_value(state).unwrap();
+    fabricated_force["attempts"][0]["forceAbort"] =
+        json!({ "reason": "force_abort", "phase": "ordinary" });
+    assert_eq!(
+        decode_state(&json_bytes(fabricated_force)),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+}
+
+#[test]
+fn retained_attempt_rejects_phase_impossible_force_evidence() {
+    let workflow = "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: { argv: [\"true\"] }\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: { argv: [\"true\"] }\n";
+
+    let ordinary_fixture = AdmittedFixture::from_source(workflow);
+    let ordinary_run = InitialLocalRun::create(
+        &ordinary_fixture.run_path("ordinary-force"),
+        &ordinary_fixture.admitted,
+    )
+    .unwrap();
+    settle_as_force_cancelled_with_finalizer(
+        &ordinary_run,
+        super::super::runtime::RunCancellationPhase::Ordinary,
+    );
+    let ordinary_state = read_state(ordinary_run.root_handle()).unwrap();
+    assert!(decode_state(&encode_json(&ordinary_state).unwrap()).is_ok());
+    let mut graceful_finalization = serde_json::to_value(ordinary_state).unwrap();
+    let deadline = graceful_finalization["attempts"][0]["createdAt"].clone();
+    graceful_finalization["attempts"][0]["finalization"]["cancellation"] = json!({
+        "reason": "runner_shutdown",
+        "forceStopDeadline": deadline
+    });
+    assert_eq!(
+        decode_state(&json_bytes(graceful_finalization)),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let finalization_fixture = AdmittedFixture::from_source(workflow);
+    let finalization_run = InitialLocalRun::create(
+        &finalization_fixture.run_path("finalization-force"),
+        &finalization_fixture.admitted,
+    )
+    .unwrap();
+    settle_as_force_cancelled_with_finalizer(
+        &finalization_run,
+        super::super::runtime::RunCancellationPhase::Finalization,
+    );
+    let finalization_state = read_state(finalization_run.root_handle()).unwrap();
+    assert!(decode_state(&encode_json(&finalization_state).unwrap()).is_ok());
+    let mut rewritten_ordinary = serde_json::to_value(finalization_state).unwrap();
+    rewritten_ordinary["attempts"][0]["progress"]["steps"][0]["detail"] =
+        json!({ "code": "force_abort" });
+    assert_eq!(
+        decode_state(&json_bytes(rewritten_ordinary)),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+}
+
 fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) -> PathBuf {
     let durable = read_state(run.root_handle()).unwrap();
     let attempt = durable.attempts.last().unwrap();
@@ -1283,6 +1419,7 @@ fn publish_result_fixture(fixture: &AdmittedFixture, run: &LocalAttemptOwner) ->
             "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": outcome,
+        "forceAbort": attempt.force_abort,
         "steps": steps,
         "exports": {}
     });
@@ -1734,6 +1871,54 @@ fn archived_attempt_loads_cancelled_commands_that_never_started() {
 }
 
 #[test]
+fn archived_attempt_loads_ordinary_force_with_suppressed_finalization() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: { argv: [\"true\"] }\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command: { argv: [\"true\"] }\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: { argv: [\"true\"] }\n",
+    );
+    let run_path = fixture.run_path("archive-ordinary-force");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_force_cancelled_with_finalizer(
+        &run,
+        super::super::runtime::RunCancellationPhase::Ordinary,
+    );
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let mut result = result_value(&result_directory);
+    for step in result["steps"].as_array_mut().unwrap() {
+        step["detail"] = json!({ "code": "force_abort" });
+    }
+    result["finalization"] = json!({
+        "trigger": "cancelled",
+        "finalizers": [{
+            "id": "cleanup",
+            "role": "finalizer",
+            "kind": "cmd",
+            "failurePolicy": "required",
+            "state": "cancelled",
+            "detail": { "code": "force_abort" }
+        }],
+        "issues": [],
+        "cancellation": { "reason": "force_abort" },
+        "forceAbort": true
+    });
+    overwrite_result(&result_directory, result);
+
+    let archived = load_local_archived_attempt(&run_path, None).unwrap();
+
+    assert_eq!(
+        archived.force_abort.map(|force_abort| force_abort.phase),
+        Some(super::super::publication::ForceAbortPhaseV1::Ordinary)
+    );
+    assert_eq!(
+        archived
+            .finalization
+            .as_ref()
+            .and_then(|finalization| finalization.cancellation.as_ref())
+            .map(|cancellation| cancellation.reason),
+        Some(ArchivedCancellationReason::ForceAbort)
+    );
+}
+
+#[test]
 fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
     let maximum_retained_bytes_per_stream = 131_072_u64;
     let mut source = String::from("schemaVersion: 1\nsteps:\n");
@@ -1815,6 +2000,7 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
                 .get()
         },
         "outcome": "succeeded",
+        "forceAbort": null,
         "steps": steps,
         "exports": {}
     });
@@ -1893,6 +2079,7 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
             "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "succeeded",
+        "forceAbort": null,
         "steps": [{
             "id": "produce",
             "role": "step",
@@ -2298,6 +2485,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "failed",
+        "forceAbort": null,
         "primaryIssue": {
             "node": { "id": "first", "role": "step" },
             "state": "failed",

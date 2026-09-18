@@ -979,16 +979,23 @@ where
         let cancellation_source = self.admitted.execution().cancellation().source().clone();
         let mut cancellation = cancellation_source.subscribe_operations();
         let grace = self.admitted.execution().cancellation().grace();
-        let initial_operation = cancellation.next_operation();
-        let (initial_cancellation, initial_cancellation_operation) = match initial_operation {
-            Some(CancellationOperation::Graceful { id, reason }) => (
-                Some(CancellationRequest {
-                    reason,
-                    deadline: self.clock.now() + grace,
-                }),
-                Some(id),
-            ),
-            Some(CancellationOperation::ForceAbort { .. }) | None => (None, None),
+        let initial_cancellation = match cancellation.next_operation() {
+            Some(CancellationOperation::Graceful { id, reason }) => {
+                Some(runtime::InitialCancellation::Graceful {
+                    request: CancellationRequest {
+                        reason,
+                        deadline: self.clock.now() + grace,
+                    },
+                    operation: Some(id),
+                })
+            }
+            Some(CancellationOperation::ForceAbort { id }) => {
+                Some(runtime::InitialCancellation::ForceAbort {
+                    operation: id,
+                    deadline: self.clock.now(),
+                })
+            }
+            None => None,
         };
         let mut ordinal = OccurrenceOrdinal(0)
             .next()
@@ -1002,7 +1009,6 @@ where
             runtime::initialize_with_operation::<Provisional, Cause, Output, Clock::Instant>(
                 &self.admitted,
                 initial_cancellation,
-                initial_cancellation_operation,
             );
         if initialization.state.transition_capacity_exceeded() {
             self.commit_coordination_diagnostic(

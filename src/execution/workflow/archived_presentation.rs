@@ -240,6 +240,14 @@ pub(crate) fn render_plain(
             timestamp(cancellation.force_stop_deadline),
         ));
     }
+    if let Some(force_abort) = attempt.force_abort {
+        rendered.push_str(&format!(
+            "{} {} · phase {}\n",
+            styled("force abort:", STYLE_FAILURE, color),
+            archived_cancellation_reason(force_abort.reason),
+            snake_case_debug(force_abort.phase),
+        ));
+    }
     if let Some(finalization) = &attempt.finalization {
         let cleanup = if finalization.force_abort {
             "incomplete · force abort accepted".to_owned()
@@ -651,7 +659,7 @@ pub(crate) const fn archived_cancellation_reason(
         ArchivedCancellationReason::CallerOutputFailure => "caller_output_failure",
         ArchivedCancellationReason::RunnerShutdown => "runner_shutdown",
         ArchivedCancellationReason::ExecutionLeaseExpired => "execution_lease_expired",
-        ArchivedCancellationReason::FinalizationForceAbort => "finalization_force_abort",
+        ArchivedCancellationReason::ForceAbort => "force_abort",
     }
 }
 
@@ -804,6 +812,7 @@ mod tests {
                 "maximumRetainedBytesPerStream": 4194304
             },
             "outcome": "succeeded",
+            "forceAbort": null,
             "steps": [{
                 "id": "prepare",
                 "role": "step",
@@ -967,6 +976,7 @@ mod tests {
             outcome: ArchivedWorkflowOutcome::Succeeded,
             primary_issue: None,
             cancellation: None,
+            force_abort: None,
             finalization: None,
             steps: vec![ArchivedStep {
                 id: "prepare".to_owned(),

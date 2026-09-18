@@ -715,6 +715,7 @@ mod tests {
                 "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
             },
             "outcome": "succeeded",
+            "forceAbort": null,
             "steps": [{
                 "id": "produce", "role": "step", "kind": "agent",
                 "failurePolicy": "required", "state": "succeeded",

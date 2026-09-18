@@ -853,6 +853,68 @@ async fn execution_start_samples_an_already_admitted_cancellation() {
 }
 
 #[tokio::test]
+async fn execution_start_applies_an_already_admitted_force_abort_before_releasing_actions() {
+    let cancellation = CancellationSource::new();
+    assert!(cancellation.request_force_abort());
+    let fixture = admitted_fixture(cancellation, Duration::from_secs(11));
+    let clock_reads = Arc::new(AtomicUsize::new(0));
+    let (_sender, receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::<String, String, String, _, _, _>::new(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::from_secs(200)),
+            reads: Arc::clone(&clock_reads),
+        },
+        RecordingCommitPort {
+            commits: commit_sender,
+            timeline: Arc::clone(&timeline),
+        },
+        ControlledActionPort {
+            actions: action_sender,
+            timeline: Arc::clone(&timeline),
+        },
+    );
+
+    let observer = async {
+        let commit = commits.recv().await.unwrap();
+        assert_eq!(
+            commit.state.workflow,
+            WorkflowState::Cancelled {
+                reason: CancellationReason::ForceAbort,
+            }
+        );
+        assert_eq!(
+            commit.state.force_abort,
+            Some(crate::execution::workflow::runtime::ForceAbortEvidence {
+                reason: CancellationReason::ForceAbort,
+                phase: crate::execution::workflow::runtime::RunCancellationPhase::Ordinary,
+            })
+        );
+        assert!(commit.actions.iter().all(|requested| {
+            !matches!(
+                requested.kind,
+                CommittedActionKind::StartStep | CommittedActionKind::StartRecoveryHandler
+            )
+        }));
+        let release = actions.recv().await.unwrap();
+        assert!(matches!(release.action.action, Action::FinishRun { .. }));
+        release.resume.send(()).unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), observer);
+    assert_eq!(clock_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(result.unwrap().last_occurrence_ordinal.get(), 1);
+    let timeline = timeline.lock().unwrap();
+    assert_eq!(timeline.len(), 2);
+    assert_eq!(timeline[0], TimelineEntry::Commit(OccurrenceOrdinal(1)));
+    assert!(matches!(timeline[1], TimelineEntry::Action(_)));
+}
+
+#[tokio::test]
 async fn scripted_handlerless_port_retains_provisional_history_before_recheck() {
     const RECOVERY_WORKFLOW: &str = r#"schemaVersion: 1
 steps:

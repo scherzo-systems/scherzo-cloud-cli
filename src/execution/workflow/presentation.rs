@@ -1008,11 +1008,11 @@ where
                     TokenRole::Blocked,
                 )
             }
-            TransitionEvent::ForceAbortAccepted { reason, .. } => self.write_event(
+            TransitionEvent::ForceAbortAccepted { reason, phase, .. } => self.write_event(
                 observed_at.utc,
                 "@workflow",
                 "force abort",
-                cancellation_reason(reason),
+                &format!("{} · {}", cancellation_reason(reason), phase.as_str()),
                 TokenRole::Failure,
             ),
             TransitionEvent::Step {
@@ -1572,6 +1572,16 @@ where
                 self.write_line_bytes(line.as_bytes())?;
             }
             RunOutcome::Succeeded => {}
+        }
+
+        if let Some(force_abort) = run.force_abort {
+            let line = format!(
+                "{} {} · phase {}\n",
+                self.styled_token("force abort:", TokenRole::Failure),
+                self.styled_text(cancellation_reason(force_abort.reason), TextTone::Secondary),
+                self.styled_text(force_abort.phase.as_str(), TextTone::Secondary),
+            );
+            self.write_line_bytes(line.as_bytes())?;
         }
 
         if let Some(finalization) = &run.finalization {

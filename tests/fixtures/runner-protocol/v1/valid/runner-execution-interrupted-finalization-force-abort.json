@@ -1,11 +1,11 @@
 {
   "protocolVersion": 1,
   "direction": "runner_to_cloud",
-  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5ac5",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5ac4",
   "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
   "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
-  "sequence": 12,
-  "sentAt": "2026-07-23T00:00:11Z",
+  "sequence": 11,
+  "sentAt": "2026-07-23T00:00:09Z",
   "type": "execution_interrupted",
   "payloadVersion": 1,
   "payload": {
@@ -15,7 +15,7 @@
     "reason": "graceful_shutdown",
     "terminalOutcome": {
       "outcome": "cancelled",
-      "reason": "execution_lease_expired",
+      "reason": "runner_shutdown",
       "finalization": {
         "trigger": "cancelled",
         "finalizers": [
@@ -23,13 +23,27 @@
             "id": "cleanup",
             "role": "finalizer",
             "failurePolicy": "required",
-            "state": "succeeded"
+            "state": "cancelled",
+            "detail": {
+              "code": "force_abort"
+            }
           }
         ],
         "issues": [],
-        "forceAbort": false
+        "cancellation": {
+          "reason": "runner_shutdown",
+          "forceStopDeadline": "2026-07-23T00:00:15Z"
+        },
+        "forceAbort": true
       },
-      "forceAbort": null
+      "forceAbort": {
+        "reason": "force_abort",
+        "phase": "finalization"
+      }
+    },
+    "artifactDelivery": {
+      "outcome": "prepared",
+      "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc"
     }
   }
 }

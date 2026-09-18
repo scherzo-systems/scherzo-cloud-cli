@@ -130,6 +130,7 @@ fn portable_result_bytes() -> Vec<u8> {
             "maximumRetainedBytesPerStream": 4_194_304
         },
         "outcome": "succeeded",
+        "forceAbort": null,
         "steps": [{
             "id": "produce",
             "role": "step",

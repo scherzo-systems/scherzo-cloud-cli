@@ -265,6 +265,7 @@ impl Fixture {
             },
             outcome: RunOutcome::Succeeded,
             cancellation: None,
+            force_abort: None,
             steps: self
                 .workflow
                 .definition

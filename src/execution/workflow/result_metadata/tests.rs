@@ -40,6 +40,7 @@ fn result_fixture() -> Value {
             "maximumRetainedBytesPerStream": super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM
         },
         "outcome": "succeeded",
+        "forceAbort": null,
         "steps": [{
             "id": "produce",
             "role": "step",
@@ -186,13 +187,106 @@ fn force_abort_after_graceful_cancellation_accepts_authoritative_terminal_reason
         "reason": "runner_shutdown",
         "forceStopDeadline": "2026-08-02T12:01:46Z"
     });
+    result["forceAbort"] = json!({
+        "reason": "force_abort",
+        "phase": "finalization"
+    });
     result["finalization"]["forceAbort"] = json!(true);
     result["finalization"]["finalizers"][0]["state"] = json!("cancelled");
     result["finalization"]["finalizers"][0]["detail"] = json!({
-        "code": "finalization_force_abort"
+        "code": "force_abort"
     });
 
     assert!(decode(&encode(&result)).is_ok());
+}
+
+#[test]
+fn finalization_force_abort_cannot_rewrite_an_ordinary_node() {
+    let mut result = finalized_result_fixture();
+    result["outcome"] = json!("cancelled");
+    result["cancellation"] = json!({
+        "reason": "user_request",
+        "forceStopDeadline": "2026-08-02T12:01:46Z"
+    });
+    result["forceAbort"] = json!({
+        "reason": "force_abort",
+        "phase": "finalization"
+    });
+    result["steps"][0]["state"] = json!("cancelled");
+    result["steps"][0]["detail"] = json!({ "code": "force_abort" });
+    result["finalization"]["trigger"] = json!("cancelled");
+    result["finalization"]["cancellation"] = json!({ "reason": "force_abort" });
+    result["finalization"]["forceAbort"] = json!(true);
+    result["finalization"]["finalizers"][0]["state"] = json!("cancelled");
+    result["finalization"]["finalizers"][0]["detail"] = json!({ "code": "force_abort" });
+
+    assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+
+    result["steps"][0]["detail"] = json!({ "code": "user_request" });
+    assert!(decode(&encode(&result)).is_ok());
+}
+
+#[test]
+fn ordinary_force_abort_requires_force_finalization_cancellation() {
+    let mut result = finalized_result_fixture();
+    result["outcome"] = json!("cancelled");
+    result["forceAbort"] = json!({
+        "reason": "force_abort",
+        "phase": "ordinary"
+    });
+    result["steps"][0]["state"] = json!("cancelled");
+    result["steps"][0]["detail"] = json!({ "code": "force_abort" });
+    result["finalization"]["trigger"] = json!("cancelled");
+    result["finalization"]["cancellation"] = json!({
+        "reason": "runner_shutdown",
+        "forceStopDeadline": "2026-08-02T12:01:46Z"
+    });
+    result["finalization"]["forceAbort"] = json!(true);
+    result["finalization"]["finalizers"][0]["state"] = json!("cancelled");
+    result["finalization"]["finalizers"][0]["detail"] = json!({ "code": "force_abort" });
+
+    assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+
+    result["finalization"]["cancellation"] = json!({ "reason": "force_abort" });
+    assert!(decode(&encode(&result)).is_ok());
+}
+
+#[test]
+fn ordinary_force_abort_accepts_only_trigger_ineligible_finalizers() {
+    let mut result = finalized_result_fixture();
+    result["outcome"] = json!("cancelled");
+    result["forceAbort"] = json!({
+        "reason": "force_abort",
+        "phase": "ordinary"
+    });
+    result["steps"][0]["state"] = json!("cancelled");
+    result["steps"][0]["detail"] = json!({ "code": "force_abort" });
+    result["finalization"]["trigger"] = json!("cancelled");
+    result["finalization"]["cancellation"] = json!({
+        "reason": "force_abort"
+    });
+    result["finalization"]["forceAbort"] = json!(true);
+    result["finalization"]["finalizers"][0]["state"] = json!("not_run");
+    result["finalization"]["finalizers"][0]["detail"] =
+        json!({ "code": "finalizer_trigger_not_selected" });
+    let finalizer = result["finalization"]["finalizers"][0]
+        .as_object_mut()
+        .unwrap();
+    finalizer.remove("startedAt");
+    finalizer.remove("durationMilliseconds");
+
+    assert!(decode(&encode(&result)).is_ok());
+
+    result["finalization"]["finalizers"][0] = json!({
+        "id": "cleanup",
+        "role": "finalizer",
+        "kind": "agent",
+        "failurePolicy": "required",
+        "state": "succeeded",
+        "startedAt": "2026-08-02T12:01:45Z",
+        "durationMilliseconds": 100
+    });
+    assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
 }
 
 #[test]

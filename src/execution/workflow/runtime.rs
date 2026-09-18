@@ -704,6 +704,29 @@ enum OrdinaryOutcome {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunCancellationPhase {
+    Ordinary,
+    Finalization,
+}
+
+impl RunCancellationPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Finalization => "finalization",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ForceAbortEvidence {
+    pub(crate) reason: CancellationReason,
+    pub(crate) phase: RunCancellationPhase,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FinalizationCancellation<Deadline = ()> {
     pub(crate) reason: CancellationReason,
@@ -743,6 +766,7 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     pub(crate) exports: Option<ExportSet<Output>>,
     pub(crate) finalization_summary: Option<FinalizationSummary<Deadline>>,
     finalization: Option<FinalizationRuntime<Deadline>>,
+    pub(crate) force_abort: Option<ForceAbortEvidence>,
     pub(crate) last_cancellation_operation: Option<CancellationOperationId>,
     pub(crate) last_transition_sequence: TransitionSequence,
     transition_capacity_exceeded: bool,
@@ -937,6 +961,7 @@ pub(crate) enum TransitionEvent<Deadline> {
     ForceAbortAccepted {
         sequence: TransitionSequence,
         reason: CancellationReason,
+        phase: RunCancellationPhase,
     },
 }
 
@@ -958,13 +983,29 @@ where
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
-    initialize_with_operation(admitted, initial_cancellation, None)
+    initialize_with_operation(
+        admitted,
+        initial_cancellation.map(|request| InitialCancellation::Graceful {
+            request,
+            operation: None,
+        }),
+    )
+}
+
+pub(super) enum InitialCancellation<Deadline> {
+    Graceful {
+        request: CancellationRequest<Deadline>,
+        operation: Option<CancellationOperationId>,
+    },
+    ForceAbort {
+        operation: CancellationOperationId,
+        deadline: Deadline,
+    },
 }
 
 pub(super) fn initialize_with_operation<Provisional, Cause, Output, Deadline>(
     admitted: &AdmittedWorkflow,
-    initial_cancellation: Option<CancellationRequest<Deadline>>,
-    initial_cancellation_operation: Option<CancellationOperationId>,
+    initial_cancellation: Option<InitialCancellation<Deadline>>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
     Cause: Clone,
@@ -974,14 +1015,12 @@ where
     initialize_definition(ExecutionStart {
         definition: RuntimeDefinition::from_admitted(admitted),
         initial_cancellation,
-        initial_cancellation_operation,
     })
 }
 
 struct ExecutionStart<Deadline> {
     definition: RuntimeDefinition,
-    initial_cancellation: Option<CancellationRequest<Deadline>>,
-    initial_cancellation_operation: Option<CancellationOperationId>,
+    initial_cancellation: Option<InitialCancellation<Deadline>>,
 }
 
 fn initialize_definition<Provisional, Cause, Output, Deadline>(
@@ -1026,6 +1065,7 @@ where
             exports: None,
             finalization_summary: None,
             finalization: None,
+            force_abort: None,
             last_cancellation_operation: None,
             last_transition_sequence: TransitionSequence::default(),
             transition_capacity_exceeded: false,
@@ -1035,11 +1075,17 @@ where
         occurrence_accepted: true,
     };
     if let Some(cancellation) = start.initial_cancellation {
-        apply_cancellation(
-            &mut reduction,
-            cancellation,
-            start.initial_cancellation_operation,
-        );
+        match cancellation {
+            InitialCancellation::Graceful { request, operation } => {
+                apply_cancellation(&mut reduction, request, operation);
+            }
+            InitialCancellation::ForceAbort {
+                operation,
+                deadline,
+            } => {
+                apply_force_abort(&mut reduction, operation, deadline);
+            }
+        }
     }
     stabilize(&mut reduction);
     reduction
@@ -1307,7 +1353,7 @@ where
         }
         #[cfg(test)]
         Occurrence::CancellationRequested { reason, deadline } => {
-            if reason == CancellationReason::FinalizationForceAbort {
+            if reason == CancellationReason::ForceAbort {
                 return false;
             }
             return apply_cancellation(reduction, CancellationRequest { reason, deadline }, None);
@@ -1317,7 +1363,7 @@ where
             reason,
             deadline,
         } => {
-            if reason == CancellationReason::FinalizationForceAbort
+            if reason == CancellationReason::ForceAbort
                 || stale_operation(&reduction.state, operation)
             {
                 return false;
@@ -1344,7 +1390,7 @@ where
                 return false;
             };
             let terminal_reason = if action.is_force_abort() {
-                CancellationReason::FinalizationForceAbort
+                CancellationReason::ForceAbort
             } else {
                 cancelling_reason
             };
@@ -1521,63 +1567,131 @@ where
     Output: Clone,
     Deadline: Clone,
 {
-    let WorkflowState::Finalizing {
-        trigger,
-        gate,
-        primary_issue,
-    } = &reduction.state.workflow
-    else {
-        return false;
-    };
-    if matches!(
-        gate,
-        FinalizationGate::Cancelling {
-            force_abort: true,
-            ..
-        }
-    ) {
+    if reduction.state.force_abort.is_some() {
         return false;
     }
-    let trigger = *trigger;
-    let primary_issue = primary_issue.clone();
-    let (reason, phase_deadline) = match gate {
-        FinalizationGate::Open => (CancellationReason::FinalizationForceAbort, None),
-        FinalizationGate::Cancelling {
-            reason, deadline, ..
-        } => (*reason, deadline.clone()),
+    let phase = match reduction.state.workflow {
+        WorkflowState::Executing { .. } => RunCancellationPhase::Ordinary,
+        WorkflowState::Finalizing { .. } => RunCancellationPhase::Finalization,
+        WorkflowState::Succeeded
+        | WorkflowState::Failed { .. }
+        | WorkflowState::Cancelled { .. } => return false,
     };
+    reduction.state.force_abort = Some(ForceAbortEvidence {
+        reason: CancellationReason::ForceAbort,
+        phase,
+    });
     reduction.state.last_cancellation_operation = Some(operation);
-    reduction.state.workflow = WorkflowState::Finalizing {
-        trigger,
-        gate: FinalizationGate::Cancelling {
-            reason,
-            deadline: phase_deadline,
-            force_abort: true,
-        },
-        primary_issue,
-    };
-    if let Some(finalization) = reduction.state.finalization.as_mut() {
-        finalization.force_abort = true;
-        if finalization.cancellation.is_none() {
-            finalization.cancellation = Some(FinalizationCancellation {
-                reason,
-                deadline: None,
-            });
+
+    match reduction.state.workflow.clone() {
+        WorkflowState::Executing { gate } => {
+            let (reason, prior_issue) = match gate {
+                SchedulingGate::FailureStopped { primary_issue } => {
+                    (CancellationReason::ForceAbort, Some(primary_issue))
+                }
+                SchedulingGate::Cancelling {
+                    reason,
+                    prior_issue,
+                } => (reason, prior_issue),
+                SchedulingGate::Open => (CancellationReason::ForceAbort, None),
+            };
+            reduction.state.workflow = WorkflowState::Executing {
+                gate: SchedulingGate::Cancelling {
+                    reason,
+                    prior_issue,
+                },
+            };
         }
+        WorkflowState::Finalizing {
+            trigger,
+            gate,
+            primary_issue,
+        } => {
+            let (reason, phase_deadline) = match gate {
+                FinalizationGate::Open => (CancellationReason::ForceAbort, None),
+                FinalizationGate::Cancelling {
+                    reason, deadline, ..
+                } => (reason, deadline),
+            };
+            reduction.state.workflow = WorkflowState::Finalizing {
+                trigger,
+                gate: FinalizationGate::Cancelling {
+                    reason,
+                    deadline: phase_deadline,
+                    force_abort: true,
+                },
+                primary_issue,
+            };
+            if let Some(finalization) = reduction.state.finalization.as_mut() {
+                finalization.force_abort = true;
+                if finalization.cancellation.is_none() {
+                    finalization.cancellation = Some(FinalizationCancellation {
+                        reason: CancellationReason::ForceAbort,
+                        deadline: None,
+                    });
+                }
+            }
+        }
+        WorkflowState::Succeeded
+        | WorkflowState::Failed { .. }
+        | WorkflowState::Cancelled { .. } => return false,
     }
+
     let sequence = next_sequence(&mut reduction.state);
-    reduction
-        .events
-        .push(TransitionEvent::ForceAbortAccepted { sequence, reason });
+    reduction.events.push(TransitionEvent::ForceAbortAccepted {
+        sequence,
+        reason: CancellationReason::ForceAbort,
+        phase,
+    });
+    let role = match phase {
+        RunCancellationPhase::Ordinary => WorkflowNodeRole::Step,
+        RunCancellationPhase::Finalization => WorkflowNodeRole::Finalizer,
+    };
     cancel_nodes(
         reduction,
-        WorkflowNodeRole::Finalizer,
-        reason,
+        role,
+        CancellationReason::ForceAbort,
         Some(deadline),
         true,
         Some(operation),
     );
     true
+}
+
+fn cancel_pending_nodes<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    role: WorkflowNodeRole,
+    reason: CancellationReason,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let pending = reduction
+        .state
+        .definition
+        .steps
+        .iter()
+        .filter(|(_, definition)| definition.role == role)
+        .filter(|(id, _)| {
+            reduction
+                .state
+                .steps
+                .get(*id)
+                .is_some_and(|runtime| matches!(runtime.state, StepState::Pending))
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for step in pending {
+        transition_step(
+            reduction,
+            &step,
+            StepState::Cancelled {
+                detail: CancellationDetail::new(reason),
+            },
+            None,
+        );
+    }
 }
 
 fn cancel_nodes<Provisional, Cause, Output, Deadline>(
@@ -2251,9 +2365,24 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
                 enter_finalization_or_finish(reduction);
             }
             WorkflowState::Finalizing { .. } => {
-                propagate_finalizer_dispositions(reduction);
+                let suppress_selected = reduction
+                    .state
+                    .force_abort
+                    .is_some_and(|force_abort| force_abort.phase == RunCancellationPhase::Ordinary);
+                if suppress_selected {
+                    propagate_finalizer_trigger_dispositions(reduction);
+                    cancel_pending_nodes(
+                        reduction,
+                        WorkflowNodeRole::Finalizer,
+                        CancellationReason::ForceAbort,
+                    );
+                } else {
+                    propagate_finalizer_dispositions(reduction);
+                }
                 evaluate_ready_conditions(reduction, WorkflowNodeRole::Finalizer);
-                propagate_finalizer_dispositions(reduction);
+                if !suppress_selected {
+                    propagate_finalizer_dispositions(reduction);
+                }
                 select_ready_nodes(reduction, WorkflowNodeRole::Finalizer);
                 finish_finalization_if_terminal(reduction);
             }
@@ -2744,6 +2873,29 @@ fn propagate_finalizer_dispositions<Provisional, Cause, Output, Deadline>(
     Output: Clone,
     Deadline: Clone,
 {
+    propagate_finalizer_trigger_dispositions(reduction);
+    while let Some((finalizer, detail)) = next_finalizer_condition_block(&reduction.state) {
+        settle_blocked(reduction, finalizer, detail);
+    }
+
+    while let Some((finalizer, references)) = next_input_unavailable(&reduction.state) {
+        let prerequisites = references
+            .into_iter()
+            .filter_map(|reference| Prerequisite::body(reference).ok());
+        let Ok(detail) = BlockedDetail::new(prerequisites) else {
+            continue;
+        };
+        settle_blocked(reduction, finalizer, detail);
+    }
+}
+
+fn propagate_finalizer_trigger_dispositions<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
     let Some(trigger) = reduction
         .state
         .finalization
@@ -2781,20 +2933,6 @@ fn propagate_finalizer_dispositions<Provisional, Cause, Output, Deadline>(
             },
             None,
         );
-    }
-
-    while let Some((finalizer, detail)) = next_finalizer_condition_block(&reduction.state) {
-        settle_blocked(reduction, finalizer, detail);
-    }
-
-    while let Some((finalizer, references)) = next_input_unavailable(&reduction.state) {
-        let prerequisites = references
-            .into_iter()
-            .filter_map(|reference| Prerequisite::body(reference).ok());
-        let Ok(detail) = BlockedDetail::new(prerequisites) else {
-            continue;
-        };
-        settle_blocked(reduction, finalizer, detail);
     }
 }
 
@@ -3074,10 +3212,29 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
         OrdinaryOutcome::Failed { primary_issue, .. } => Some(primary_issue.clone()),
         OrdinaryOutcome::Succeeded | OrdinaryOutcome::Cancelled { .. } => None,
     };
+    let force_abort = reduction
+        .state
+        .force_abort
+        .is_some_and(|force_abort| force_abort.phase == RunCancellationPhase::Ordinary);
+    let (gate, cancellation) = if force_abort {
+        (
+            FinalizationGate::Cancelling {
+                reason: CancellationReason::ForceAbort,
+                deadline: None,
+                force_abort: true,
+            },
+            Some(FinalizationCancellation {
+                reason: CancellationReason::ForceAbort,
+                deadline: None,
+            }),
+        )
+    } else {
+        (FinalizationGate::Open, None)
+    };
     let from = reduction.state.workflow.clone();
     let to = WorkflowState::Finalizing {
         trigger,
-        gate: FinalizationGate::Open,
+        gate,
         primary_issue,
     };
     let sequence = next_sequence(&mut reduction.state);
@@ -3086,8 +3243,8 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
         trigger,
         context,
         ordinary_outcome,
-        cancellation: None,
-        force_abort: false,
+        cancellation,
+        force_abort,
     });
     reduction.events.push(TransitionEvent::Workflow {
         sequence,

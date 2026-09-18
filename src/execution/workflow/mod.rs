@@ -23,6 +23,7 @@ pub(crate) mod evidence;
 pub(crate) mod execution;
 pub(crate) mod execution_root;
 mod finalization_context;
+mod force_abort_evidence;
 mod git_artifact;
 pub(crate) mod git_capture;
 mod identity;

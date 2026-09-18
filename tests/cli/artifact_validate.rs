@@ -66,6 +66,7 @@ impl ArtifactSet {
                 "maximumRetainedBytesPerStream": 4194304
             },
             "outcome": "succeeded",
+            "forceAbort": null,
             "steps": [{
                 "id": "produce",
                 "role": "step",

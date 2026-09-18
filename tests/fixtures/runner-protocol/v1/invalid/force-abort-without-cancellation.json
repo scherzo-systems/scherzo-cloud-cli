@@ -22,12 +22,13 @@
             "role": "finalizer",
             "failurePolicy": "required",
             "state": "cancelled",
-            "reason": "finalization_force_abort"
+            "reason": "force_abort"
           }
         ],
         "issues": [],
         "forceAbort": true
-      }
+      },
+      "forceAbort": null
     }
   }
 }

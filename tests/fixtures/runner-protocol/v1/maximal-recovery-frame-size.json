@@ -3,6 +3,6 @@
   "maximumConditionTransitionFrameBytes": 268435456,
   "maximumTerminalFrameBytes": 536870912,
   "runnerTerminalCapacityBytes": 67108864,
-  "maximalRecoveryFrameBytes": 11464578,
+  "maximalRecoveryFrameBytes": 11464596,
   "maximalSettlingFrameBytes": 1964
 }

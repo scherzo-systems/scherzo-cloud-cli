@@ -382,7 +382,10 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
         })
     );
     let expected_run: serde_json::Value = serde_json::from_slice(&run_before).unwrap();
-    let expected_state: serde_json::Value = serde_json::from_slice(&state_before).unwrap();
+    let mut expected_state: serde_json::Value = serde_json::from_slice(&state_before).unwrap();
+    for attempt in expected_state["attempts"].as_array_mut().unwrap() {
+        attempt["forceAbort"] = serde_json::Value::Null;
+    }
     assert_eq!(result["run"], expected_run);
     assert_eq!(result["state"], expected_state);
     assert!(result.get("private").is_none());

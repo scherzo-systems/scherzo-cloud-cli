@@ -27,7 +27,8 @@
         ],
         "issues": [],
         "forceAbort": false
-      }
+      },
+      "forceAbort": null
     }
   }
 }

@@ -812,6 +812,7 @@ impl ExecutionJob {
         if last_sequence == 0
             || observer.terminal_sequence() != Some(last_sequence)
             || !terminal_result_agrees(observer.terminal_state().as_ref(), &result.outcome)
+            || observer.force_abort() != result.force_abort
             || has_finalizers != result.finalization_summary.is_some()
         {
             return self
@@ -911,6 +912,7 @@ impl ExecutionJob {
                     None,
                     None,
                     finalization,
+                    result.force_abort,
                     recovery_summaries.clone(),
                 ),
                 artifact_delivery,
@@ -922,6 +924,7 @@ impl ExecutionJob {
                     Some(workflow_issue(&primary_issue)),
                     None,
                     finalization,
+                    result.force_abort,
                     recovery_summaries,
                 ),
                 artifact_delivery,
@@ -936,6 +939,7 @@ impl ExecutionJob {
                     None,
                     Some("execution_lease_expired"),
                     finalization,
+                    result.force_abort,
                     None,
                 ),
                 artifact_delivery,
@@ -950,6 +954,7 @@ impl ExecutionJob {
                     None,
                     Some("runner_shutdown"),
                     finalization,
+                    result.force_abort,
                     None,
                 ),
                 artifact_delivery,
@@ -1099,6 +1104,7 @@ impl ExecutionJob {
             },
             outcome: execution.outcome,
             cancellation,
+            force_abort: execution.force_abort,
             steps,
             finalization,
             exports: execution.exports,
@@ -1980,6 +1986,7 @@ struct ObserverState {
     last_sequence: u64,
     terminal_sequence: Option<u64>,
     terminal_state: Option<WorkflowState>,
+    force_abort: Option<crate::execution::workflow::runtime::ForceAbortEvidence>,
     cancellation: Option<(CancellationReason, RunnerExecutionInstant)>,
     step_timings: BTreeMap<String, RunnerStepTiming>,
     active_invocations: BTreeMap<String, RunnerActiveInvocation>,
@@ -2023,6 +2030,7 @@ impl RunnerExecutionObserver {
                 last_sequence: 0,
                 terminal_sequence: None,
                 terminal_state: None,
+                force_abort: None,
                 cancellation: None,
                 step_timings: BTreeMap::new(),
                 active_invocations: BTreeMap::new(),
@@ -2042,6 +2050,10 @@ impl RunnerExecutionObserver {
 
     fn terminal_state(&self) -> Option<WorkflowState> {
         self.lock().terminal_state.clone()
+    }
+
+    fn force_abort(&self) -> Option<crate::execution::workflow::runtime::ForceAbortEvidence> {
+        self.lock().force_abort
     }
 
     fn faulted(&self) -> bool {
@@ -2348,7 +2360,14 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                     return;
                 }
             }
-            let workflow_event = workflow_event(&transition, invocation_evidence.as_ref());
+            if let TransitionEvent::ForceAbortAccepted { reason, phase, .. } = &transition.event {
+                state.force_abort = Some(crate::execution::workflow::runtime::ForceAbortEvidence {
+                    reason: *reason,
+                    phase: *phase,
+                });
+            }
+            let workflow_event =
+                workflow_event(&transition, invocation_evidence.as_ref(), state.force_abort);
             let enqueued = observer.outbox.enqueue(AssignmentObservation::Execution {
                 assignment_id: observer.assignment_id.clone(),
                 attempt_id: observer.attempt_id.clone(),
@@ -2453,9 +2472,13 @@ fn terminal_outcome(
     primary_issue: Option<Value>,
     reason: Option<&str>,
     finalization: Option<Value>,
+    force_abort: Option<crate::execution::workflow::runtime::ForceAbortEvidence>,
     recovery_summaries: Option<Value>,
 ) -> Value {
-    let mut object = serde_json::Map::from_iter([("outcome".to_owned(), json!(outcome))]);
+    let mut object = serde_json::Map::from_iter([
+        ("outcome".to_owned(), json!(outcome)),
+        ("forceAbort".to_owned(), json!(force_abort)),
+    ]);
     if let Some(primary_issue) = primary_issue {
         object.insert("primaryIssue".to_owned(), primary_issue);
     }
@@ -2588,6 +2611,7 @@ fn distributed_invocation_evidence(invocation: &RecoveryInvocationV1) -> Option<
 fn workflow_event(
     transition: &TransitionObservation<RunnerExecutionInstant>,
     invocation_evidence: Option<&RecoveryInvocationV1>,
+    force_abort: Option<crate::execution::workflow::runtime::ForceAbortEvidence>,
 ) -> Value {
     let mut event = match &transition.event {
         TransitionEvent::Step {
@@ -2718,13 +2742,32 @@ fn workflow_event(
             "reason": cancellation_reason(*reason),
             "deadline": format_utc(deadline.utc),
         }),
-        TransitionEvent::ForceAbortAccepted { sequence, reason } => json!({
+        TransitionEvent::ForceAbortAccepted {
+            sequence,
+            reason,
+            phase,
+        } => json!({
             "eventVersion": 1,
             "eventType": "force_abort_accepted",
             "transitionSequence": sequence.get(),
             "reason": cancellation_reason(*reason),
+            "phase": phase.as_str(),
         }),
     };
+    if matches!(
+        &transition.event,
+        TransitionEvent::Workflow { to, .. }
+            if matches!(
+                to.as_ref(),
+                WorkflowState::Succeeded
+                    | WorkflowState::Failed { .. }
+                    | WorkflowState::Cancelled { .. }
+            )
+    ) && let Value::Object(object) = &mut event
+        && let Some(Value::Object(to)) = object.get_mut("to")
+    {
+        to.insert("forceAbort".to_owned(), json!(force_abort));
+    }
     if let Some(invocation_evidence) = invocation_evidence
         && let Value::Object(object) = &mut event
     {
@@ -3626,7 +3669,7 @@ mod tests {
         };
 
         assert_eq!(
-            workflow_event(&transition, None),
+            workflow_event(&transition, None, None),
             json!({
                 "eventVersion": 1,
                 "eventType": "step_state_changed",

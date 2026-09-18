@@ -23,7 +23,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::admission::{
-    AdmittedWorkflow, ResolvedAttachment, ResolvedInput, ResolvedInputs, ResolvedJsonInput,
+    AdmittedWorkflow, CancellationReason, ResolvedAttachment, ResolvedInput, ResolvedInputs,
+    ResolvedJsonInput,
 };
 use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
@@ -35,6 +36,10 @@ use super::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use super::document::FailurePolicy;
 use super::evidence::{NodeDetail, NonExecutionCode};
 use super::execution_root::AdmittedExecutionRoot;
+use super::force_abort_evidence::{
+    FirstForceAbortPhase, finalization_cancellation_matches_force_phase,
+    finalization_node_cancellation_matches, ordinary_node_cancellation_matches,
+};
 use super::invocation_accounting::InvocationAccountingLog;
 use super::private_staging::{
     create_staging_root, directory_entry_names, open_directory_path, remove_staging_root, same_file,
@@ -237,6 +242,8 @@ pub(super) struct LocalAttemptV1 {
     owner: AttemptOwnerV1,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) cancellation: Option<AttemptCancellationV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) force_abort: Option<super::runtime::ForceAbortEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     interruption: Option<AttemptInterruptionV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2220,6 +2227,12 @@ where
     if attempt.progress.steps.len() + finalizers.len() != runtime.steps.len() {
         return Err(LocalRunDirectoryError::StateConflict);
     }
+    if let (Some(retained), Some(observed)) = (attempt.force_abort, runtime.force_abort)
+        && retained != observed
+    {
+        return Err(LocalRunDirectoryError::StateConflict);
+    }
+    attempt.force_abort = runtime.force_abort;
     update_progress_nodes(&mut attempt.progress.steps, &runtime.steps)?;
 
     if let Some(summary) = &runtime.finalization_summary {
@@ -2665,6 +2678,7 @@ fn settle_interrupted_attempt(
     execution_may_have_started: bool,
 ) -> Result<(), LocalRunDirectoryError> {
     let cancellation_requested = attempt.cancellation.is_some()
+        || attempt.force_abort.is_some()
         || attempt
             .finalization
             .as_ref()
@@ -3533,7 +3547,18 @@ fn status_snapshot(
             result: status_result(&attempt.result),
         })
         .collect();
-    let state_value = serde_json::to_value(&state).map_err(|_| ())?;
+    let mut state_value = serde_json::to_value(&state).map_err(|_| ())?;
+    for attempt in state_value
+        .get_mut("attempts")
+        .and_then(Value::as_array_mut)
+        .ok_or(())?
+    {
+        attempt
+            .as_object_mut()
+            .ok_or(())?
+            .entry("forceAbort")
+            .or_insert(Value::Null);
+    }
     Ok(LocalRunStatusSnapshot {
         run_directory,
         run,
@@ -3745,6 +3770,7 @@ fn fresh_attempt(
             execution_host: execution_host()?,
         },
         cancellation: None,
+        force_abort: None,
         interruption: None,
         rejection: None,
         progress: AttemptProgressV1 {
@@ -4437,14 +4463,26 @@ fn validate_attempt(
                 AttemptFinalizationV1::Progress(progress) => progress.cancellation.is_some(),
                 AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
             });
+    let first_force_abort_phase = attempt
+        .force_abort
+        .map(|force_abort| force_abort.phase.into());
     if attempt.cancellation.as_ref().is_some_and(|cancellation| {
-        cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+        cancellation.reason == CancellationReasonV1::ForceAbort
             || !valid_timestamp(&cancellation.requested_at)
             || !valid_timestamp(&cancellation.force_stop_deadline)
+    }) || attempt.force_abort.is_some_and(|force_abort| {
+        force_abort.reason != CancellationReason::ForceAbort
+            || matches!(
+                attempt.state,
+                AttemptStateV1::Created | AttemptStateV1::Rejected | AttemptStateV1::Succeeded
+            )
+            || (force_abort.phase == super::runtime::RunCancellationPhase::Finalization
+                && attempt.finalization.is_none())
     }) || matches!(
         attempt.state,
         AttemptStateV1::Cancelling | AttemptStateV1::Cancelled
     ) && attempt.cancellation.is_none()
+        && attempt.force_abort.is_none()
         && !finalization_cancelled
     {
         return Err(LocalRunDirectoryError::StateInvalid);
@@ -4453,7 +4491,9 @@ fn validate_attempt(
         cancellation.workflow_confirmed != matches!(attempt.state, AttemptStateV1::Cancelled)
     }) || attempt.interruption.as_ref().is_some_and(|interruption| {
         interruption.cancellation_requested
-            != (attempt.cancellation.is_some() || finalization_cancelled)
+            != (attempt.cancellation.is_some()
+                || attempt.force_abort.is_some()
+                || finalization_cancelled)
     }) {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
@@ -4464,12 +4504,27 @@ fn validate_attempt(
     {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
+    let ordinary_cancellation = attempt
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation.reason);
     let mut step_ids = BTreeSet::new();
     for step in &attempt.progress.steps {
         if step.id.is_empty()
             || step.role != AttemptNodeRoleV1::Step
             || !step_ids.insert(step.id.as_str())
             || !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref())
+            || step.detail.as_ref().is_some_and(|detail| {
+                let NodeDetail::Cancellation(detail) = detail else {
+                    return false;
+                };
+                !ordinary_node_cancellation_matches(
+                    cancellation_reason(detail.code),
+                    ordinary_cancellation,
+                    CancellationReasonV1::ForceAbort,
+                    first_force_abort_phase,
+                )
+            })
         {
             return Err(LocalRunDirectoryError::StateInvalid);
         }
@@ -4630,6 +4685,13 @@ fn validate_attempt_finalization<'a>(
     let Some(finalization) = &attempt.finalization else {
         return Ok(());
     };
+    let force_abort = match finalization {
+        AttemptFinalizationV1::Progress(progress) => progress.force_abort,
+        AttemptFinalizationV1::Complete(complete) => complete.force_abort,
+    };
+    if force_abort != attempt.force_abort.is_some() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
     match finalization {
         AttemptFinalizationV1::Progress(progress) => {
             if progress.complete
@@ -4642,6 +4704,11 @@ fn validate_attempt_finalization<'a>(
                             finalizer.role,
                             finalizer.state,
                             finalizer.detail.as_ref(),
+                        )
+                        || !retained_finalization_cancellation_detail_valid(
+                            finalizer.detail.as_ref(),
+                            progress.cancellation.as_ref(),
+                            progress.force_abort,
                         )
                 })
             {
@@ -4656,6 +4723,9 @@ fn validate_attempt_finalization<'a>(
             if !valid_finalization_interruption(
                 progress.cancellation.as_ref(),
                 progress.force_abort,
+                attempt
+                    .force_abort
+                    .map(|force_abort| force_abort.phase.into()),
             ) {
                 return Err(LocalRunDirectoryError::StateInvalid);
             }
@@ -4682,6 +4752,11 @@ fn validate_attempt_finalization<'a>(
                         || finalizer.id.is_empty()
                         || !node_ids.insert(finalizer.id.as_str())
                         || !durable_finalizer_valid(finalizer)
+                        || !retained_finalization_cancellation_detail_valid(
+                            finalizer.detail.as_ref(),
+                            complete.cancellation.as_ref(),
+                            complete.force_abort,
+                        )
                 })
             {
                 return Err(LocalRunDirectoryError::StateInvalid);
@@ -4709,6 +4784,9 @@ fn validate_attempt_finalization<'a>(
             if !valid_finalization_interruption(
                 complete.cancellation.as_ref(),
                 complete.force_abort,
+                attempt
+                    .force_abort
+                    .map(|force_abort| force_abort.phase.into()),
             ) {
                 return Err(LocalRunDirectoryError::StateInvalid);
             }
@@ -4717,23 +4795,47 @@ fn validate_attempt_finalization<'a>(
     Ok(())
 }
 
-fn valid_finalization_interruption(
+fn retained_finalization_cancellation_detail_valid(
+    detail: Option<&NodeDetail>,
     cancellation: Option<&DurableFinalizationCancellationV1>,
     force_abort: bool,
 ) -> bool {
+    let Some(NodeDetail::Cancellation(detail)) = detail else {
+        return true;
+    };
+    finalization_node_cancellation_matches(
+        cancellation_reason(detail.code),
+        cancellation.map(|cancellation| cancellation.reason),
+        CancellationReasonV1::ForceAbort,
+        force_abort,
+    )
+}
+
+fn valid_finalization_interruption(
+    cancellation: Option<&DurableFinalizationCancellationV1>,
+    force_abort: bool,
+    first_force_abort_phase: Option<FirstForceAbortPhase>,
+) -> bool {
+    if !finalization_cancellation_matches_force_phase(
+        cancellation.map(|cancellation| cancellation.reason),
+        CancellationReasonV1::ForceAbort,
+        first_force_abort_phase,
+    ) {
+        return false;
+    }
     match (cancellation, force_abort) {
         (None, false) => true,
         (Some(cancellation), false) => {
-            cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+            cancellation.reason != CancellationReasonV1::ForceAbort
                 && cancellation
                     .force_stop_deadline
                     .as_deref()
                     .is_some_and(valid_timestamp)
         }
         (Some(cancellation), true) => {
-            (cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+            (cancellation.reason == CancellationReasonV1::ForceAbort
                 && cancellation.force_stop_deadline.is_none())
-                || (cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+                || (cancellation.reason != CancellationReasonV1::ForceAbort
                     && cancellation
                         .force_stop_deadline
                         .as_deref()
@@ -4783,13 +4885,10 @@ fn attempt_step_detail_valid(
             Some(NodeDetail::NotRun(detail)),
         ) => detail.code == NonExecutionCode::FinalizerTriggerNotSelected,
         (
-            role,
+            AttemptNodeRoleV1::Step | AttemptNodeRoleV1::Finalizer,
             AttemptStepStateV1::Cancelling | AttemptStepStateV1::Cancelled,
-            Some(NodeDetail::Cancellation(detail)),
-        ) => {
-            detail.code != super::admission::CancellationReason::FinalizationForceAbort
-                || role == AttemptNodeRoleV1::Finalizer
-        }
+            Some(NodeDetail::Cancellation(_)),
+        ) => true,
         _ => false,
     }
 }

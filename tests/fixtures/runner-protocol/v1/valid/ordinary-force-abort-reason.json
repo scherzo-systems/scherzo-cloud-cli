@@ -20,7 +20,7 @@
       "to": {
         "state": "executing",
         "gate": "cancelling",
-        "reason": "finalization_force_abort"
+        "reason": "force_abort"
       }
     }
   }

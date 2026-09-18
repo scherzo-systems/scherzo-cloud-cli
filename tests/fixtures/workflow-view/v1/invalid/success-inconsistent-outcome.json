@@ -15,7 +15,10 @@
     "attemptNumber": 1,
     "workflow": {
       "path": "workflow.yaml",
-      "provenance": { "kind": "local", "sourceRoot": "/tmp/source" },
+      "provenance": {
+        "kind": "local",
+        "sourceRoot": "/tmp/source"
+      },
       "digest": {
         "algorithm": "sha256",
         "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -43,11 +46,26 @@
         "startedAt": "2026-08-17T00:00:00Z",
         "durationMilliseconds": 1000,
         "commandOutput": {
-          "stdout": { "encoding": "base64", "data": "", "retainedBytes": 0, "discardedBytes": 0, "truncated": false, "fullyDrained": true },
-          "stderr": { "encoding": "base64", "data": "", "retainedBytes": 0, "discardedBytes": 0, "truncated": false, "fullyDrained": true }
+          "stdout": {
+            "encoding": "base64",
+            "data": "",
+            "retainedBytes": 0,
+            "discardedBytes": 0,
+            "truncated": false,
+            "fullyDrained": true
+          },
+          "stderr": {
+            "encoding": "base64",
+            "data": "",
+            "retainedBytes": 0,
+            "discardedBytes": 0,
+            "truncated": false,
+            "fullyDrained": true
+          }
         }
       }
     ],
-    "exports": {}
+    "exports": {},
+    "forceAbort": null
   }
 }

@@ -12,6 +12,9 @@
     "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
     "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
     "finalExecutionEventSequence": 0,
-    "outcome": { "outcome": "succeeded" }
+    "outcome": {
+      "outcome": "succeeded",
+      "forceAbort": null
+    }
   }
 }

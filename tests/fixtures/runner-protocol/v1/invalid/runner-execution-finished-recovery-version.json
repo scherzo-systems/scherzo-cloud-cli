@@ -15,7 +15,10 @@
     "outcome": {
       "outcome": "failed",
       "failure": {
-        "node": { "id": "verify", "role": "step" },
+        "node": {
+          "id": "verify",
+          "role": "step"
+        },
         "failure": {
           "phase": "execution",
           "cause": "command_unsuccessful_exit",
@@ -34,14 +37,21 @@
                 "invocationId": 1,
                 "failure": {
                   "phase": "execution",
-                  "cause": { "code": "command_exit", "exitCode": 1 }
+                  "cause": {
+                    "code": "command_exit",
+                    "exitCode": 1
+                  }
                 }
               }
             }
           ],
-          "termination": { "kind": "exhausted", "executionNumber": 2 }
+          "termination": {
+            "kind": "exhausted",
+            "executionNumber": 2
+          }
         }
-      }
+      },
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

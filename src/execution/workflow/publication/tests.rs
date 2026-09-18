@@ -27,7 +27,7 @@ use crate::execution::workflow::pi_json_v1::{
     PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits,
 };
 use crate::execution::workflow::resolution;
-use crate::execution::workflow::runtime::OutputSet;
+use crate::execution::workflow::runtime::{ForceAbortEvidence, OutputSet, RunCancellationPhase};
 use crate::execution::workflow::validated::{WorkflowNode, WorkflowNodeRole};
 
 struct PublicationFixture {
@@ -193,6 +193,7 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
         },
         outcome: RunOutcome::Succeeded,
         cancellation: None,
+        force_abort: None,
         steps: vec![
             succeeded_step("produce", outputs),
             succeeded_step("terminal", BTreeMap::new()),
@@ -416,11 +417,20 @@ fn publishes_each_terminal_outcome_as_the_same_self_contained_v1_value() {
     make_failed(&mut failed);
     let mut cancelled = base.clone();
     make_cancelled(&mut cancelled);
+    let mut forced = cancelled.clone();
+    forced.force_abort = Some(ForceAbortEvidence {
+        reason: CancellationReason::ForceAbort,
+        phase: RunCancellationPhase::Ordinary,
+    });
+    forced.steps[1].state = StepState::Cancelled {
+        detail: CancellationDetail::new(CancellationReason::ForceAbort),
+    };
 
     for (name, run, expected_outcome, expected_status) in [
         ("succeeded", base.clone(), "succeeded", 0_u64),
         ("failed", failed, "failed", 1),
         ("cancelled", cancelled, "cancelled", 130),
+        ("force-aborted", forced, "cancelled", 1),
     ] {
         let destination = fixture.destination(name);
         let normalized_destination = fs::canonicalize(destination.parent().unwrap())

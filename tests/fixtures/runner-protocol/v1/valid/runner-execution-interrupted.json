@@ -15,7 +15,8 @@
     "reason": "graceful_shutdown",
     "terminalOutcome": {
       "outcome": "cancelled",
-      "reason": "runner_shutdown"
+      "reason": "runner_shutdown",
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

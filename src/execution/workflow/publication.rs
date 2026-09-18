@@ -123,6 +123,7 @@ pub(crate) struct WorkflowRunResult {
     pub(crate) timing: WorkflowRunTiming,
     pub(crate) outcome: RunOutcome,
     pub(crate) cancellation: Option<WorkflowRunCancellation>,
+    pub(crate) force_abort: Option<super::runtime::ForceAbortEvidence>,
     pub(crate) steps: Vec<WorkflowRunStep>,
     pub(crate) finalization: Option<WorkflowRunFinalization>,
     pub(crate) exports: ExportSet<CapturedValue>,
@@ -379,6 +380,8 @@ pub(crate) struct WorkflowResultV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) cancellation: Option<CancellationV1>,
+    #[serde(deserialize_with = "deserialize_nullable_option")]
+    pub(crate) force_abort: Option<ForceAbortV1>,
     pub(crate) steps: Vec<WorkflowStepV1>,
     #[serde(
         default,
@@ -482,6 +485,20 @@ pub(crate) struct CancellationV1 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ForceAbortV1 {
+    pub(crate) reason: CancellationReasonV1,
+    pub(crate) phase: ForceAbortPhaseV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ForceAbortPhaseV1 {
+    Ordinary,
+    Finalization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CancellationReasonV1 {
     UserRequest,
@@ -489,7 +506,7 @@ pub(crate) enum CancellationReasonV1 {
     CallerOutputFailure,
     RunnerShutdown,
     ExecutionLeaseExpired,
-    FinalizationForceAbort,
+    ForceAbort,
 }
 
 // The published result's terminal-only enum must remain closed independently of the
@@ -1015,6 +1032,14 @@ pub(crate) struct FailureCauseV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) exit_code: Option<i32>,
+}
+
+fn deserialize_nullable_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -2044,6 +2069,13 @@ fn build_result_with_provenance(
             })
         })
         .transpose()?;
+    let force_abort = run.force_abort.map(|force_abort| ForceAbortV1 {
+        reason: cancellation_reason(force_abort.reason),
+        phase: match force_abort.phase {
+            super::runtime::RunCancellationPhase::Ordinary => ForceAbortPhaseV1::Ordinary,
+            super::runtime::RunCancellationPhase::Finalization => ForceAbortPhaseV1::Finalization,
+        },
+    });
     let steps = run
         .steps
         .iter()
@@ -2080,6 +2112,7 @@ fn build_result_with_provenance(
         outcome,
         primary_issue,
         cancellation,
+        force_abort,
         steps,
         finalization,
         exports,
@@ -2799,7 +2832,7 @@ pub(super) fn cancellation_reason(reason: CancellationReason) -> CancellationRea
         CancellationReason::CallerOutputFailure => CancellationReasonV1::CallerOutputFailure,
         CancellationReason::RunnerShutdown => CancellationReasonV1::RunnerShutdown,
         CancellationReason::ExecutionLeaseExpired => CancellationReasonV1::ExecutionLeaseExpired,
-        CancellationReason::FinalizationForceAbort => CancellationReasonV1::FinalizationForceAbort,
+        CancellationReason::ForceAbort => CancellationReasonV1::ForceAbort,
     }
 }
 
@@ -2819,25 +2852,26 @@ fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailab
 fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
     use crate::exit_code::{ExitCode, OutcomeClass};
 
-    if run
-        .steps
-        .iter()
-        .chain(
-            run.finalization
-                .iter()
-                .flat_map(|finalization| &finalization.finalizers),
-        )
-        .any(|step| {
-            step.command_output.as_ref().is_some_and(|output| {
-                !output.standard_output().fully_drained()
-                    || !output.standard_error().fully_drained()
-            }) || step.invocations.iter().any(|invocation| {
-                invocation
-                    .diagnostics
+    if run.force_abort.is_some()
+        || run
+            .steps
+            .iter()
+            .chain(
+                run.finalization
                     .iter()
-                    .any(|diagnostic| !diagnostic.stream.fully_drained)
+                    .flat_map(|finalization| &finalization.finalizers),
+            )
+            .any(|step| {
+                step.command_output.as_ref().is_some_and(|output| {
+                    !output.standard_output().fully_drained()
+                        || !output.standard_error().fully_drained()
+                }) || step.invocations.iter().any(|invocation| {
+                    invocation
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| !diagnostic.stream.fully_drained)
+                })
             })
-        })
         || run.finalization.as_ref().is_some_and(|finalization| {
             finalization.force_abort
                 || finalization
@@ -2849,7 +2883,7 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
                             CancellationReason::CallerOutputFailure
                                 | CancellationReason::RunnerShutdown
                                 | CancellationReason::ExecutionLeaseExpired
-                                | CancellationReason::FinalizationForceAbort
+                                | CancellationReason::ForceAbort
                         )
                     })
         })
@@ -2871,7 +2905,7 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
                     CancellationReason::CallerOutputFailure
                     | CancellationReason::RunnerShutdown
                     | CancellationReason::ExecutionLeaseExpired
-                    | CancellationReason::FinalizationForceAbort,
+                    | CancellationReason::ForceAbort,
             }
             | RunOutcome::Succeeded
             | RunOutcome::Failed { .. } => ExitCode::GeneralFailure.as_u16(),

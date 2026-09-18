@@ -16,8 +16,14 @@
       "eventVersion": 1,
       "eventType": "workflow_state_changed",
       "transitionSequence": 7,
-      "from": { "state": "executing", "gate": "open" },
-      "to": { "state": "succeeded" }
+      "from": {
+        "state": "executing",
+        "gate": "open"
+      },
+      "to": {
+        "state": "succeeded",
+        "forceAbort": null
+      }
     }
   }
 }

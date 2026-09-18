@@ -15,7 +15,8 @@
     "reason": "graceful_shutdown",
     "terminalOutcome": {
       "outcome": "cancelled",
-      "reason": "execution_lease_expired"
+      "reason": "execution_lease_expired",
+      "forceAbort": null
     }
   }
 }

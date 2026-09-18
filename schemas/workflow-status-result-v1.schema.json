@@ -1081,7 +1081,7 @@
             "caller_output_failure",
             "runner_shutdown",
             "execution_lease_expired",
-            "finalization_force_abort"
+            "force_abort"
           ]
         },
         "forceStopDeadline": {
@@ -1718,6 +1718,7 @@
         "executionRoot",
         "createdAt",
         "owner",
+        "forceAbort",
         "progress",
         "processGuards",
         "result"
@@ -1769,6 +1770,16 @@
         },
         "cancellation": {
           "$ref": "#/$defs/Cancellation"
+        },
+        "forceAbort": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/ForceAbortEvidence"
+            }
+          ]
         },
         "interruption": {
           "$ref": "#/$defs/Interruption"
@@ -2889,7 +2900,7 @@
         "caller_output_failure",
         "runner_shutdown",
         "execution_lease_expired",
-        "finalization_force_abort"
+        "force_abort"
       ]
     },
     "RuntimeCancellationDetail": {
@@ -3017,6 +3028,25 @@
       "required": [
         "code",
         "evaluatedPredicates"
+      ]
+    },
+    "ForceAbortEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "const": "force_abort"
+        },
+        "phase": {
+          "enum": [
+            "ordinary",
+            "finalization"
+          ]
+        }
+      },
+      "required": [
+        "reason",
+        "phase"
       ]
     }
   }

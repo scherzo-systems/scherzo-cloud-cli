@@ -14,12 +14,16 @@ use super::evidence::{
     CancellationDetail, FailureDetail, NodeDetail, NonExecutionCode, PrimaryIssueDetail,
     PrimaryIssueState,
 };
+use super::force_abort_evidence::{
+    finalization_cancellation_matches_force_phase, finalization_node_cancellation_matches,
+    ordinary_node_cancellation_matches,
+};
 use super::publication::{
     CancellationReasonV1, DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1,
-    FinalizationTriggerV1, RecoveryHandlerFailureCodeV1, RecoveryHandlerOutcomeV1,
-    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryTerminationV1, RunResultInvariant,
-    WorkflowNodeRoleV1, WorkflowOutcomeV1, WorkflowProvenanceV1, WorkflowResultV1,
-    WorkflowStepStateV1, WorkflowStepV1,
+    FinalizationTriggerV1, ForceAbortPhaseV1, RecoveryHandlerFailureCodeV1,
+    RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
+    RecoveryTerminationV1, RunResultInvariant, WorkflowNodeRoleV1, WorkflowOutcomeV1,
+    WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_identifier, is_lowercase_hex,
@@ -214,16 +218,17 @@ pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), R
             &mut ids,
         )
         .map_err(|_| RunResultInvariant::FinalizationMetadata)?;
-        validate_finalization(finalization)
+        validate_finalization(finalization, result.force_abort)
             .map_err(|_| RunResultInvariant::FinalizationMetadata)?;
     }
+    validate_force_abort(result).map_err(|_| RunResultInvariant::OutcomeMetadata)?;
     validate_outcome(result).map_err(|_| RunResultInvariant::OutcomeMetadata)?;
     validate_exports(&result.exports).map_err(|_| RunResultInvariant::ExportMetadata)
 }
 
 fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
     if let Some(cancellation) = &result.cancellation
-        && (cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+        && (cancellation.reason == CancellationReasonV1::ForceAbort
             || parse_canonical_utc_timestamp(&cancellation.force_stop_deadline).is_none())
     {
         return Err(ResultMetadataError);
@@ -237,7 +242,11 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
         .is_some_and(|primary| primary_role(primary) == WorkflowNodeRoleV1::Step)
     {
         FinalizationTriggerV1::Failed
-    } else if result.cancellation.is_some() {
+    } else if result.cancellation.is_some()
+        || result
+            .force_abort
+            .is_some_and(|force_abort| force_abort.phase == ForceAbortPhaseV1::Ordinary)
+    {
         FinalizationTriggerV1::Cancelled
     } else {
         FinalizationTriggerV1::Succeeded
@@ -251,7 +260,10 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
             .as_ref()
             .is_some_and(|primary| primary_role(primary) == WorkflowNodeRoleV1::Step),
         FinalizationTriggerV1::Cancelled => {
-            result.cancellation.is_some()
+            (result.cancellation.is_some()
+                || result
+                    .force_abort
+                    .is_some_and(|force_abort| force_abort.phase == ForceAbortPhaseV1::Ordinary))
                 && result.steps.iter().all(|step| {
                     step_succeeds_workflow(step) || step.state == WorkflowStepStateV1::Cancelled
                 })
@@ -331,6 +343,46 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
         })
         .then_some(())
         .ok_or(ResultMetadataError)
+}
+
+fn validate_force_abort(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
+    let force_abort = result.force_abort;
+    if force_abort.is_some_and(|force_abort| {
+        force_abort.reason != CancellationReasonV1::ForceAbort
+            || (force_abort.phase == ForceAbortPhaseV1::Finalization
+                && result.finalization.is_none())
+    }) || result
+        .finalization
+        .as_ref()
+        .is_some_and(|finalization| finalization.force_abort != force_abort.is_some())
+    {
+        return Err(ResultMetadataError);
+    }
+
+    let ordinary_cancellation = result
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation_detail(cancellation.reason).code);
+    let first_force_abort_phase = force_abort.map(|force_abort| force_abort.phase.into());
+    if result
+        .steps
+        .iter()
+        .filter(|step| step.state == WorkflowStepStateV1::Cancelled)
+        .any(|step| {
+            let Some(NodeDetail::Cancellation(detail)) = step.detail.as_ref() else {
+                return true;
+            };
+            !ordinary_node_cancellation_matches(
+                detail.code,
+                ordinary_cancellation,
+                super::admission::CancellationReason::ForceAbort,
+                first_force_abort_phase,
+            )
+        })
+    {
+        return Err(ResultMetadataError);
+    }
+    Ok(())
 }
 
 fn primary_role(primary: &super::evidence::PrimaryIssue) -> WorkflowNodeRoleV1 {
@@ -425,6 +477,7 @@ fn valid_condition_capacity(capacity: &super::publication::CloudExecutionCapacit
 
 fn validate_finalization(
     finalization: &super::publication::FinalizationV1,
+    execution_force_abort: Option<super::publication::ForceAbortV1>,
 ) -> Result<(), ResultMetadataError> {
     let expected_issues = finalization
         .finalizers
@@ -451,19 +504,31 @@ fn validate_finalization(
         return Err(ResultMetadataError);
     }
 
+    let first_force_abort_phase = execution_force_abort.map(|force_abort| force_abort.phase.into());
+    if !finalization_cancellation_matches_force_phase(
+        finalization
+            .cancellation
+            .as_ref()
+            .map(|cancellation| cancellation.reason),
+        CancellationReasonV1::ForceAbort,
+        first_force_abort_phase,
+    ) {
+        return Err(ResultMetadataError);
+    }
+
     match (&finalization.cancellation, finalization.force_abort) {
         (None, false) => {}
         (Some(cancellation), false)
-            if cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+            if cancellation.reason != CancellationReasonV1::ForceAbort
                 && cancellation
                     .force_stop_deadline
                     .as_deref()
                     .and_then(parse_canonical_utc_timestamp)
                     .is_some() => {}
         (Some(cancellation), true)
-            if (cancellation.reason == CancellationReasonV1::FinalizationForceAbort
+            if (cancellation.reason == CancellationReasonV1::ForceAbort
                 && cancellation.force_stop_deadline.is_none())
-                || (cancellation.reason != CancellationReasonV1::FinalizationForceAbort
+                || (cancellation.reason != CancellationReasonV1::ForceAbort
                     && cancellation
                         .force_stop_deadline
                         .as_deref()
@@ -480,16 +545,34 @@ fn validate_finalization(
     let cancellation_dispositions_valid = match &finalization.cancellation {
         None => cancelled_finalizers.is_empty(),
         Some(cancellation) => {
-            let expected = NodeDetail::Cancellation(cancellation_detail(cancellation.reason));
-            let force_abort = NodeDetail::Cancellation(cancellation_detail(
-                CancellationReasonV1::FinalizationForceAbort,
-            ));
-            !cancelled_finalizers.is_empty()
-                && cancelled_finalizers.iter().all(|finalizer| {
-                    finalizer.detail.as_ref() == Some(&expected)
-                        || (finalization.force_abort
-                            && finalizer.detail.as_ref() == Some(&force_abort))
-                })
+            let only_trigger_ineligible = cancelled_finalizers.is_empty()
+                && cancellation.reason == CancellationReasonV1::ForceAbort
+                && execution_force_abort
+                    == Some(super::publication::ForceAbortV1 {
+                        reason: CancellationReasonV1::ForceAbort,
+                        phase: ForceAbortPhaseV1::Ordinary,
+                    })
+                && finalization.finalizers.iter().all(|finalizer| {
+                    matches!(
+                        finalizer.detail.as_ref(),
+                        Some(NodeDetail::NotRun(detail))
+                            if detail.code == NonExecutionCode::FinalizerTriggerNotSelected
+                    )
+                });
+            only_trigger_ineligible
+                || !cancelled_finalizers.is_empty()
+                    && cancelled_finalizers.iter().all(|finalizer| {
+                        let Some(NodeDetail::Cancellation(detail)) = finalizer.detail.as_ref()
+                        else {
+                            return false;
+                        };
+                        finalization_node_cancellation_matches(
+                            detail.code,
+                            Some(cancellation_detail(cancellation.reason).code),
+                            super::admission::CancellationReason::ForceAbort,
+                            finalization.force_abort,
+                        )
+                    })
         }
     };
     cancellation_dispositions_valid
@@ -505,7 +588,7 @@ fn cancellation_detail(reason: CancellationReasonV1) -> CancellationDetail {
         CancellationReasonV1::CallerOutputFailure => Canonical::CallerOutputFailure,
         CancellationReasonV1::RunnerShutdown => Canonical::RunnerShutdown,
         CancellationReasonV1::ExecutionLeaseExpired => Canonical::ExecutionLeaseExpired,
-        CancellationReasonV1::FinalizationForceAbort => Canonical::FinalizationForceAbort,
+        CancellationReasonV1::ForceAbort => Canonical::ForceAbort,
     })
 }
 
@@ -543,10 +626,11 @@ fn validate_steps(
                 WorkflowStepStateV1::NotRun,
                 Some(NodeDetail::NotRun(detail)),
             ) => detail.code == NonExecutionCode::FinalizerTriggerNotSelected,
-            (role, WorkflowStepStateV1::Cancelled, Some(NodeDetail::Cancellation(detail))) => {
-                detail.code != super::admission::CancellationReason::FinalizationForceAbort
-                    || role == WorkflowNodeRoleV1::Finalizer
-            }
+            (
+                WorkflowNodeRoleV1::Step | WorkflowNodeRoleV1::Finalizer,
+                WorkflowStepStateV1::Cancelled,
+                Some(NodeDetail::Cancellation(_)),
+            ) => true,
             _ => false,
         };
         let timing_present = step.started_at.is_some();

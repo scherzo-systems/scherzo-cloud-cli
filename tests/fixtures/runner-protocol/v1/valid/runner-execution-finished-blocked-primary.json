@@ -15,16 +15,26 @@
     "outcome": {
       "outcome": "failed",
       "primaryIssue": {
-        "node": { "id": "deploy", "role": "step" },
+        "node": {
+          "id": "deploy",
+          "role": "step"
+        },
         "state": "blocked",
         "detail": {
           "code": "prerequisites_unsatisfied",
           "prerequisites": [
-            { "kind": "control", "node": "verify" },
-            { "kind": "body", "ref": "outputs.build.bundle" }
+            {
+              "kind": "control",
+              "node": "verify"
+            },
+            {
+              "kind": "body",
+              "ref": "outputs.build.bundle"
+            }
           ]
         }
-      }
+      },
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

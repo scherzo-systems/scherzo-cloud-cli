@@ -35,7 +35,8 @@
           "forceStopDeadline": "2026-07-23T00:00:15Z"
         },
         "forceAbort": false
-      }
+      },
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

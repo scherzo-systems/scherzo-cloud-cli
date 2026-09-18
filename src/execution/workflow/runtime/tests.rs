@@ -105,7 +105,6 @@ fn initialize_test(definition: RuntimeDefinition) -> TestReduction {
     initialize_definition(ExecutionStart {
         definition,
         initial_cancellation: None,
-        initial_cancellation_operation: None,
     })
 }
 
@@ -771,8 +770,10 @@ fn initial_cancellation_finishes_without_authorizing_a_start() {
             ],
             1,
         ),
-        initial_cancellation: Some(cancellation(reason, 5_000)),
-        initial_cancellation_operation: None,
+        initial_cancellation: Some(InitialCancellation::Graceful {
+            request: cancellation(reason, 5_000),
+            operation: None,
+        }),
     });
     let cancelling = cancelling_workflow(reason, None);
 
@@ -2721,8 +2722,10 @@ fn trace_cancelled_trigger_and_successful_release() {
     let initialized =
         initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
             definition,
-            initial_cancellation: Some(cancellation(CancellationReason::UserRequest, 10)),
-            initial_cancellation_operation: None,
+            initial_cancellation: Some(InitialCancellation::Graceful {
+                request: cancellation(CancellationReason::UserRequest, 10),
+                operation: None,
+            }),
         });
     let start = initialized
         .actions
@@ -2744,6 +2747,190 @@ fn trace_cancelled_trigger_and_successful_release() {
         StepState::Cancelled { .. }
     ));
     assert!(matches!(start.action, Action::StartStep { .. }));
+}
+
+#[test]
+fn trace_force_abort_during_ordinary_execution_contains_work_and_suppresses_finalizers() {
+    let definition = finalizer_definition(
+        &[
+            ("aWork", FailurePolicy::Required, &[], &[], &["artifact"]),
+            ("zLater", FailurePolicy::Required, &[], &[], &[]),
+        ],
+        &[
+            (
+                "release",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Cancelled],
+                &[("artifact", "outputs.aWork.artifact")],
+                &[],
+            ),
+            (
+                "successOnly",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[],
+                &[],
+            ),
+        ],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "aWork".into(),
+            action: action_id(1),
+        },
+    );
+
+    let forced = reduce_and_advance(
+        &mut state,
+        Occurrence::ForceAbortRequested {
+            operation: CancellationOperationId::fixture(1),
+            deadline: deadline(30),
+        },
+    );
+    assert!(matches!(
+        forced.events.first(),
+        Some(TransitionEvent::ForceAbortAccepted {
+            phase: RunCancellationPhase::Ordinary,
+            reason: CancellationReason::ForceAbort,
+            ..
+        })
+    ));
+    assert_eq!(
+        state.force_abort,
+        Some(ForceAbortEvidence {
+            reason: CancellationReason::ForceAbort,
+            phase: RunCancellationPhase::Ordinary,
+        })
+    );
+    assert!(matches!(
+        state.steps["aWork"].state,
+        StepState::Cancelling { .. }
+    ));
+    assert_eq!(
+        state.steps["zLater"].state,
+        StepState::Cancelled {
+            detail: CancellationDetail::new(CancellationReason::ForceAbort),
+        }
+    );
+    let force_action = forced
+        .actions
+        .iter()
+        .find(|requested| matches!(&requested.action, Action::ForceAbortStep { step, .. } if step == "aWork"))
+        .unwrap()
+        .id;
+
+    let terminal = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "aWork".into(),
+            action: force_action,
+        },
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Cancelled {
+            reason: CancellationReason::ForceAbort,
+        }
+    );
+    assert_eq!(
+        state.steps["release"].state,
+        StepState::Cancelled {
+            detail: CancellationDetail::new(CancellationReason::ForceAbort),
+        }
+    );
+    assert_eq!(
+        state.steps["successOnly"].state,
+        not_run_state(
+            WorkflowNodeRole::Finalizer,
+            NonExecutionCode::FinalizerTriggerNotSelected,
+        )
+    );
+    let summary = state.finalization_summary.as_ref().unwrap();
+    assert!(summary.force_abort);
+    assert_eq!(
+        summary.cancellation,
+        Some(FinalizationCancellation {
+            reason: CancellationReason::ForceAbort,
+            deadline: None,
+        })
+    );
+    assert!(terminal.actions.iter().all(|requested| !matches!(
+        requested.action,
+        Action::StartStep { .. } | Action::StartRecoveryHandler { .. }
+    )));
+
+    let replay = reduce::<String, String, String, TestDeadline>(
+        &state,
+        Occurrence::ForceAbortRequested {
+            operation: CancellationOperationId::fixture(2),
+            deadline: deadline(31),
+        },
+    );
+    assert_noop(&state, &replay);
+}
+
+#[test]
+fn ordinary_force_escalation_preserves_an_earlier_graceful_reason() {
+    let definition = definition(&[("work", &[], &[])], &[], 1);
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
+            reason: CancellationReason::UserRequest,
+            deadline: deadline(20),
+        },
+    );
+    let forced = reduce_and_advance(
+        &mut state,
+        Occurrence::ForceAbortRequested {
+            operation: CancellationOperationId::fixture(2),
+            deadline: deadline(21),
+        },
+    );
+    let force_action = forced.actions[0].id;
+    assert!(matches!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Cancelling {
+                reason: CancellationReason::UserRequest,
+                ..
+            }
+        }
+    ));
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "work".into(),
+            action: force_action,
+        },
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Cancelled {
+            reason: CancellationReason::UserRequest,
+        }
+    );
+    assert_eq!(
+        state.steps["work"].state,
+        StepState::Cancelled {
+            detail: CancellationDetail::new(CancellationReason::ForceAbort),
+        }
+    );
+    assert_eq!(
+        state.force_abort.unwrap().phase,
+        RunCancellationPhase::Ordinary
+    );
 }
 
 #[test]
@@ -2813,6 +3000,21 @@ fn trace_force_abort_waits_for_owned_work_to_quiesce_and_repeated_force_abort_is
         StepState::Cancelled { .. }
     ));
     assert!(matches!(state.workflow, WorkflowState::Finalizing { .. }));
+    assert_eq!(
+        state.force_abort,
+        Some(ForceAbortEvidence {
+            reason: CancellationReason::ForceAbort,
+            phase: RunCancellationPhase::Finalization,
+        })
+    );
+    assert!(matches!(
+        aborted.events.first(),
+        Some(TransitionEvent::ForceAbortAccepted {
+            phase: RunCancellationPhase::Finalization,
+            reason: CancellationReason::ForceAbort,
+            ..
+        })
+    ));
     let replay = reduce::<String, String, String, TestDeadline>(
         &state,
         Occurrence::ForceAbortRequested {
@@ -2832,7 +3034,7 @@ fn trace_force_abort_waits_for_owned_work_to_quiesce_and_repeated_force_abort_is
     assert_eq!(
         state.workflow,
         WorkflowState::Cancelled {
-            reason: CancellationReason::FinalizationForceAbort
+            reason: CancellationReason::ForceAbort
         }
     );
     assert!(matches!(
@@ -2992,8 +3194,10 @@ fn trace_fresh_finalization_cancellation_does_not_replay_ordinary_cancellation()
     let initialized =
         initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
             definition,
-            initial_cancellation: Some(cancellation(CancellationReason::UserRequest, 10)),
-            initial_cancellation_operation: None,
+            initial_cancellation: Some(InitialCancellation::Graceful {
+                request: cancellation(CancellationReason::UserRequest, 10),
+                operation: None,
+            }),
         });
     let mut state = initialized.state;
     let release = initialized.actions[0].id;
@@ -3061,8 +3265,10 @@ fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_output
     let initialized =
         initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
             definition,
-            initial_cancellation: Some(cancellation(CancellationReason::UserRequest, 10)),
-            initial_cancellation_operation: Some(CancellationOperationId::fixture(1)),
+            initial_cancellation: Some(InitialCancellation::Graceful {
+                request: cancellation(CancellationReason::UserRequest, 10),
+                operation: Some(CancellationOperationId::fixture(1)),
+            }),
         });
     let state = initialized.state;
 
@@ -3352,7 +3558,7 @@ fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
     assert_eq!(
         state.steps["release"].state,
         StepState::Cancelled {
-            detail: CancellationDetail::new(CancellationReason::FinalizationForceAbort),
+            detail: CancellationDetail::new(CancellationReason::ForceAbort),
         }
     );
 }

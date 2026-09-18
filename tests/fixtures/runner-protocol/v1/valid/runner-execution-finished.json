@@ -13,7 +13,8 @@
     "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
     "finalExecutionEventSequence": 1,
     "outcome": {
-      "outcome": "succeeded"
+      "outcome": "succeeded",
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

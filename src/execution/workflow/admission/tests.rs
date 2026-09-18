@@ -293,13 +293,28 @@ fn cancellation_source_rearms_graceful_cancellation_and_authorizes_one_force_abo
     );
     assert_eq!(operations.next_operation(), None);
 
+    let ordinary_force = CancellationSource::new();
+    let mut ordinary_operations = ordinary_force.subscribe_operations();
+    assert!(ordinary_force.request_force_abort());
+    assert_eq!(
+        ordinary_operations.next_operation(),
+        Some(CancellationOperation::ForceAbort {
+            id: CancellationOperationId::fixture(1),
+        })
+    );
+    assert!(ordinary_force.begin_finalization_arm());
+    assert!(!ordinary_force.request_force_abort());
+    assert!(ordinary_force.complete_finalization_arm());
+    assert!(!ordinary_force.request_force_abort());
+    assert_eq!(ordinary_operations.next_operation(), None);
+
     let direct_force = CancellationSource::new();
     assert!(direct_force.begin_finalization_arm());
     assert!(direct_force.complete_finalization_arm());
     assert!(direct_force.request_force_abort());
     assert_eq!(
         direct_force.cancellation_reason(),
-        Some(CancellationReason::FinalizationForceAbort)
+        Some(CancellationReason::ForceAbort)
     );
 
     let aborted = CancellationSource::new();

@@ -45,7 +45,8 @@
           }
         ],
         "forceAbort": false
-      }
+      },
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

@@ -51,7 +51,8 @@
           "code": "command_exit",
           "exitCode": 1
         }
-      }
+      },
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

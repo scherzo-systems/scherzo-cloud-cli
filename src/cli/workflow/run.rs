@@ -1251,14 +1251,18 @@ pub(super) fn start_signal_observation(
             let Some(reason) = reason else {
                 return;
             };
-            if cancellation.request_cancellation(reason) {
-                continue;
-            }
-            if cancellation.request_force_abort() {
+            if handle_observed_signal(&cancellation, reason) {
                 return;
             }
         }
     }))
+}
+
+fn handle_observed_signal(cancellation: &CancellationSource, reason: CancellationReason) -> bool {
+    if cancellation.request_cancellation(reason) {
+        return false;
+    }
+    cancellation.finalization_cancellation_requested() && cancellation.request_force_abort()
 }
 
 #[cfg(test)]
@@ -1874,6 +1878,7 @@ fn build_run_result(
         timing: run_timing,
         outcome: execution.outcome,
         cancellation,
+        force_abort: execution.force_abort,
         steps,
         finalization,
         exports: execution.exports,
@@ -2452,6 +2457,33 @@ mod tests {
                 standard_input_reserved: false,
             }
         );
+    }
+
+    #[test]
+    fn repeated_signals_only_force_abort_a_cancelling_finalization() {
+        let ordinary = CancellationSource::new();
+        assert!(!handle_observed_signal(
+            &ordinary,
+            CancellationReason::UserRequest
+        ));
+        assert!(!handle_observed_signal(
+            &ordinary,
+            CancellationReason::TerminationRequest
+        ));
+        assert!(ordinary.request_force_abort());
+
+        let finalization = CancellationSource::new();
+        assert!(finalization.fixture_begin_finalization_arm());
+        assert!(finalization.fixture_complete_finalization_arm());
+        assert!(!handle_observed_signal(
+            &finalization,
+            CancellationReason::UserRequest
+        ));
+        assert!(handle_observed_signal(
+            &finalization,
+            CancellationReason::TerminationRequest
+        ));
+        assert!(!finalization.request_force_abort());
     }
 
     #[tokio::test]

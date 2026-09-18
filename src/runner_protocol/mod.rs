@@ -2287,6 +2287,7 @@ mod tests {
             final_execution_event_sequence: i64::MAX as u64,
             outcome: json!({
                 "outcome": "failed",
+                "forceAbort": null,
                 "primaryIssue": {
                     "node": { "id": "step23", "role": "step" },
                     "state": "failed",

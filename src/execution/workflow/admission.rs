@@ -62,7 +62,7 @@ pub(crate) enum CancellationReason {
     CallerOutputFailure,
     RunnerShutdown,
     ExecutionLeaseExpired,
-    FinalizationForceAbort,
+    ForceAbort,
 }
 
 impl CancellationReason {
@@ -73,7 +73,7 @@ impl CancellationReason {
             Self::CallerOutputFailure => "caller_output_failure",
             Self::RunnerShutdown => "runner_shutdown",
             Self::ExecutionLeaseExpired => "execution_lease_expired",
-            Self::FinalizationForceAbort => "finalization_force_abort",
+            Self::ForceAbort => "force_abort",
         }
     }
 }
@@ -110,7 +110,7 @@ struct CancellationOperationState {
     finalization_arming: bool,
     finalization_armed: bool,
     pending_finalization_reason: Option<CancellationReason>,
-    pending_finalization_force_abort: bool,
+    pending_force_abort: bool,
     phase_reason: Option<CancellationReason>,
     force_abort_requested: bool,
 }
@@ -123,7 +123,7 @@ impl Default for CancellationOperationState {
             finalization_arming: false,
             finalization_armed: false,
             pending_finalization_reason: None,
-            pending_finalization_force_abort: false,
+            pending_force_abort: false,
             phase_reason: None,
             force_abort_requested: false,
         }
@@ -165,15 +165,13 @@ impl CancellationSource {
     }
 
     pub(crate) fn request_cancellation(&self, reason: CancellationReason) -> bool {
-        if reason == CancellationReason::FinalizationForceAbort {
+        if reason == CancellationReason::ForceAbort {
             return false;
         }
         let version = {
             let mut state = lock_cancellation_operations(&self.operations);
             if state.finalization_arming {
-                if state.pending_finalization_reason.is_some()
-                    || state.pending_finalization_force_abort
-                {
+                if state.pending_finalization_reason.is_some() || state.pending_force_abort {
                     return false;
                 }
                 state.pending_finalization_reason = Some(reason);
@@ -202,15 +200,13 @@ impl CancellationSource {
         let admission = {
             let mut state = lock_cancellation_operations(&self.operations);
             if state.finalization_arming {
-                if state.pending_finalization_reason.is_none()
-                    || state.pending_finalization_force_abort
-                {
+                if state.force_abort_requested || state.pending_force_abort {
                     return false;
                 }
-                state.pending_finalization_force_abort = true;
+                state.pending_force_abort = true;
                 None
             } else {
-                if !state.finalization_armed || state.force_abort_requested {
+                if state.force_abort_requested {
                     return false;
                 }
                 let id = CancellationOperationId(state.next_id);
@@ -218,7 +214,7 @@ impl CancellationSource {
                 state.force_abort_requested = true;
                 let closed_open_gate = state.phase_reason.is_none();
                 if closed_open_gate {
-                    state.phase_reason = Some(CancellationReason::FinalizationForceAbort);
+                    state.phase_reason = Some(CancellationReason::ForceAbort);
                 }
                 state
                     .operations
@@ -232,7 +228,7 @@ impl CancellationSource {
         if let Some((version, closed_open_gate)) = admission {
             if closed_open_gate {
                 self.reason
-                    .send_replace(Some(CancellationReason::FinalizationForceAbort));
+                    .send_replace(Some(CancellationReason::ForceAbort));
             }
             self.operation_version.send_replace(version);
         }
@@ -241,6 +237,12 @@ impl CancellationSource {
 
     pub(crate) fn cancellation_reason(&self) -> Option<CancellationReason> {
         *self.reason.borrow()
+    }
+
+    pub(crate) fn finalization_cancellation_requested(&self) -> bool {
+        let state = lock_cancellation_operations(&self.operations);
+        state.finalization_armed && state.phase_reason.is_some()
+            || state.finalization_arming && state.pending_finalization_reason.is_some()
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -298,7 +300,6 @@ impl CancellationSource {
             state.finalization_arming = false;
             state.finalization_armed = true;
             state.phase_reason = None;
-            state.force_abort_requested = false;
             let previous_operations = state.operations.len();
             let reason = state.pending_finalization_reason.take();
             if let Some(reason) = reason {
@@ -309,13 +310,13 @@ impl CancellationSource {
                     .operations
                     .push(CancellationOperation::Graceful { id, reason });
             }
-            if state.pending_finalization_force_abort {
-                state.pending_finalization_force_abort = false;
+            if state.pending_force_abort && !state.force_abort_requested {
+                state.pending_force_abort = false;
                 let id = CancellationOperationId(state.next_id);
                 state.next_id = state.next_id.saturating_add(1);
                 state.force_abort_requested = true;
                 if state.phase_reason.is_none() {
-                    state.phase_reason = Some(CancellationReason::FinalizationForceAbort);
+                    state.phase_reason = Some(CancellationReason::ForceAbort);
                 }
                 state
                     .operations
@@ -344,7 +345,7 @@ impl CancellationSource {
         }
         state.finalization_arming = false;
         state.pending_finalization_reason = None;
-        state.pending_finalization_force_abort = false;
+        state.pending_force_abort = false;
         true
     }
 }

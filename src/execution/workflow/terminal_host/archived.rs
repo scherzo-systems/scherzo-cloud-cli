@@ -667,6 +667,21 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
             tone: Tone::Blocked,
         });
     }
+    if let Some(force_abort) = attempt.force_abort {
+        let phase = match force_abort.phase {
+            crate::execution::workflow::publication::ForceAbortPhaseV1::Ordinary => "ordinary",
+            crate::execution::workflow::publication::ForceAbortPhaseV1::Finalization => {
+                "finalization"
+            }
+        };
+        lines.push(ArchivedSummaryLine {
+            text: format!(
+                "force abort {} · phase {phase}",
+                archived_cancellation_reason(force_abort.reason),
+            ),
+            tone: Tone::Failure,
+        });
+    }
     if let Some(finalization) = &attempt.finalization {
         let trigger = match finalization.trigger {
             crate::execution::workflow::publication::FinalizationTriggerV1::Succeeded => {
@@ -1939,6 +1954,7 @@ mod tests {
                 failure.clone(),
             )),
             cancellation: None,
+            force_abort: None,
             finalization: None,
             steps: vec![
                 ArchivedStep {

@@ -4345,6 +4345,7 @@ fn workflow_header_status(snapshot: &WorkflowRunViewSnapshot) -> (&'static str, 
             }),
             WorkflowRunCleanupState::NotStarted | WorkflowRunCleanupState::Cleaning,
         ) => ("cleaning", Tone::Active),
+        _ if snapshot.force_abort.is_some() => ("force aborted", Tone::Failure),
         _ => (
             workflow_status(&snapshot.workflow),
             workflow_tone(&snapshot.workflow),
@@ -7331,6 +7332,7 @@ finalizers:
             },
             outcome,
             cancellation: cancellation_fact,
+            force_abort: None,
             steps: vec![WorkflowRunStep {
                 id: "complete".to_owned(),
                 role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
@@ -7769,6 +7771,7 @@ finalizers:
             steps: vec![step],
             finalization_start: None,
             cancellation: None,
+            force_abort: None,
             finalization: None,
             authoritative_result: false,
             quiescent: false,

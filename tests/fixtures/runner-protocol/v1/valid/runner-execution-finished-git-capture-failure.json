@@ -25,7 +25,8 @@
           "code": "git_workspace_dirty",
           "output": "changes"
         }
-      }
+      },
+      "forceAbort": null
     },
     "artifactDelivery": {
       "outcome": "prepared",

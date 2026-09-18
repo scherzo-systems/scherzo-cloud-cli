@@ -58,7 +58,8 @@
         "result": {
           "status": "not_published",
           "reason": "interrupted"
-        }
+        },
+        "forceAbort": null
       }
     ],
     "diagnostics": []

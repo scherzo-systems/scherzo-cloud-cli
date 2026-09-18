@@ -19,6 +19,10 @@ use super::evidence::{
     FailureDetail, NodeDetail, NonExecutionCode, Prerequisite, PrimaryIssue, PrimaryIssueDetail,
     PrimaryIssueState,
 };
+use super::force_abort_evidence::{
+    finalization_cancellation_matches_force_phase, finalization_node_cancellation_matches,
+    ordinary_node_cancellation_matches,
+};
 use super::local_run::{
     AttemptFinalizationV1, AttemptNodeRoleV1, AttemptResultV1, AttemptStateV1, AttemptStepStateV1,
     AttemptTriggerV1, LocalAttemptV1, LocalStatusError, LocalStatusErrorCode, RetainedReadBudget,
@@ -28,8 +32,8 @@ use super::local_run::{
 use super::presentation_feed::WorkflowPresentationDefinition;
 use super::publication::{
     CancellationReasonV1, CommandOutputV1, DiagnosticStreamV1, ExportUnavailableReasonV1, ExportV1,
-    FinalizationTriggerV1, WorkflowNodeRoleV1, WorkflowOutcomeV1, WorkflowProvenanceV1,
-    WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    FinalizationTriggerV1, ForceAbortPhaseV1, WorkflowNodeRoleV1, WorkflowOutcomeV1,
+    WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::resolution::WorkflowContentDigest;
 use super::result_metadata;
@@ -124,7 +128,7 @@ pub(crate) enum ArchivedCancellationReason {
     CallerOutputFailure,
     RunnerShutdown,
     ExecutionLeaseExpired,
-    FinalizationForceAbort,
+    ForceAbort,
 }
 
 pub(crate) type ArchivedFailure = FailureDetail;
@@ -135,6 +139,12 @@ pub(crate) struct ArchivedCancellation {
     pub(crate) reason: ArchivedCancellationReason,
     pub(crate) requested_at: OffsetDateTime,
     pub(crate) force_stop_deadline: OffsetDateTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArchivedForceAbort {
+    pub(crate) reason: ArchivedCancellationReason,
+    pub(crate) phase: ForceAbortPhaseV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,6 +243,7 @@ pub(crate) struct LocalArchivedAttempt {
     pub(crate) outcome: ArchivedWorkflowOutcome,
     pub(crate) primary_issue: Option<ArchivedPrimaryIssue>,
     pub(crate) cancellation: Option<ArchivedCancellation>,
+    pub(crate) force_abort: Option<ArchivedForceAbort>,
     pub(crate) finalization: Option<ArchivedFinalization>,
     pub(crate) steps: Vec<ArchivedStep>,
 }
@@ -419,6 +430,7 @@ fn load_local_archived_attempt_with(
         outcome: validated.outcome,
         primary_issue: validated.primary_issue,
         cancellation: validated.cancellation,
+        force_abort: validated.force_abort,
         finalization: validated.finalization,
         steps: validated.steps,
     };
@@ -602,6 +614,7 @@ struct ProjectedResult {
     outcome: ArchivedWorkflowOutcome,
     primary_issue: Option<ArchivedPrimaryIssue>,
     cancellation: Option<ArchivedCancellation>,
+    force_abort: Option<ArchivedForceAbort>,
     finalization: Option<ArchivedFinalization>,
     steps: Vec<ArchivedStep>,
 }
@@ -687,23 +700,39 @@ fn validate_and_project_result(
     steps.extend(finalizers);
     let primary_issue = project_primary_issue(result, &steps)?;
     let cancellation = project_cancellation(attempt, result)?;
-    if steps.iter().any(|step| {
+    let force_abort = project_force_abort(attempt, result)?;
+    let first_force_abort_phase = force_abort.map(|force_abort| force_abort.phase.into());
+    if finalization.as_ref().is_some_and(|summary| {
+        !finalization_cancellation_matches_force_phase(
+            summary
+                .cancellation
+                .as_ref()
+                .map(|cancellation| cancellation.reason),
+            ArchivedCancellationReason::ForceAbort,
+            first_force_abort_phase,
+        )
+    }) || steps.iter().any(|step| {
         let ArchivedStepDetail::Evidence(NodeDetail::Cancellation(detail)) = &step.detail else {
             return false;
         };
         let actual = archived_cancellation_reason(detail.code);
         match step.role {
-            WorkflowNodeRole::Step => {
-                cancellation.as_ref().map(|value| value.reason) != Some(actual)
-            }
+            WorkflowNodeRole::Step => !ordinary_node_cancellation_matches(
+                actual,
+                cancellation.as_ref().map(|value| value.reason),
+                ArchivedCancellationReason::ForceAbort,
+                first_force_abort_phase,
+            ),
             WorkflowNodeRole::Finalizer => {
                 let Some(finalization) = finalization.as_ref() else {
                     return true;
                 };
-                let summary_reason = finalization.cancellation.as_ref().map(|value| value.reason);
-                summary_reason != Some(actual)
-                    && !(finalization.force_abort
-                        && actual == ArchivedCancellationReason::FinalizationForceAbort)
+                !finalization_node_cancellation_matches(
+                    actual,
+                    finalization.cancellation.as_ref().map(|value| value.reason),
+                    ArchivedCancellationReason::ForceAbort,
+                    finalization.force_abort,
+                )
             }
         }
     }) {
@@ -717,6 +746,7 @@ fn validate_and_project_result(
         outcome,
         primary_issue,
         cancellation,
+        force_abort,
         finalization,
         steps,
     })
@@ -1413,6 +1443,39 @@ fn validate_failure_binding(detail: &FailureDetail, definition: &ValidatedStep) 
     Ok(())
 }
 
+fn project_force_abort(
+    attempt: &LocalAttemptV1,
+    result: &WorkflowResultV1,
+) -> Result<Option<ArchivedForceAbort>, ()> {
+    if result.force_abort.is_some() != attempt.force_abort.is_some() {
+        return Err(());
+    }
+    let Some(wire) = result.force_abort else {
+        return Ok(None);
+    };
+    let durable = attempt.force_abort.ok_or(())?;
+    let phase_matches = matches!(
+        (durable.phase, wire.phase),
+        (
+            super::runtime::RunCancellationPhase::Ordinary,
+            ForceAbortPhaseV1::Ordinary
+        ) | (
+            super::runtime::RunCancellationPhase::Finalization,
+            ForceAbortPhaseV1::Finalization
+        )
+    );
+    if durable.reason != super::admission::CancellationReason::ForceAbort
+        || wire.reason != CancellationReasonV1::ForceAbort
+        || !phase_matches
+    {
+        return Err(());
+    }
+    Ok(Some(ArchivedForceAbort {
+        reason: ArchivedCancellationReason::ForceAbort,
+        phase: wire.phase,
+    }))
+}
+
 fn project_cancellation(
     attempt: &LocalAttemptV1,
     result: &WorkflowResultV1,
@@ -1459,9 +1522,7 @@ fn archived_cancellation_reason(
         super::admission::CancellationReason::ExecutionLeaseExpired => {
             ArchivedCancellationReason::ExecutionLeaseExpired
         }
-        super::admission::CancellationReason::FinalizationForceAbort => {
-            ArchivedCancellationReason::FinalizationForceAbort
-        }
+        super::admission::CancellationReason::ForceAbort => ArchivedCancellationReason::ForceAbort,
     }
 }
 
@@ -1478,9 +1539,7 @@ fn cancellation_reason(reason: CancellationReasonV1) -> Result<ArchivedCancellat
         CancellationReasonV1::ExecutionLeaseExpired => {
             Ok(ArchivedCancellationReason::ExecutionLeaseExpired)
         }
-        CancellationReasonV1::FinalizationForceAbort => {
-            Ok(ArchivedCancellationReason::FinalizationForceAbort)
-        }
+        CancellationReasonV1::ForceAbort => Ok(ArchivedCancellationReason::ForceAbort),
     }
 }
 

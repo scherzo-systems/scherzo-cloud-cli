@@ -4765,7 +4765,7 @@ fn second_interrupt_during_finalization_forces_abort_after_graceful_cancellation
     assert_eq!(finalization["forceAbort"], true);
     assert_eq!(
         finalization["finalizers"][0]["detail"]["code"],
-        "finalization_force_abort"
+        "force_abort"
     );
 }
 

@@ -548,9 +548,15 @@ fn normalize_transition<Deadline: DisplayDeadline>(
             reason,
             deadline: deadline.deadline_utc(),
         },
-        TransitionEvent::ForceAbortAccepted { sequence, reason } => {
-            TransitionEvent::ForceAbortAccepted { sequence, reason }
-        }
+        TransitionEvent::ForceAbortAccepted {
+            sequence,
+            reason,
+            phase,
+        } => TransitionEvent::ForceAbortAccepted {
+            sequence,
+            reason,
+            phase,
+        },
     };
     PresentationTransition {
         event,

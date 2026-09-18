@@ -425,7 +425,8 @@ finalizers:
         TransitionObservation::<OffsetDateTime> {
             event: TransitionEvent::ForceAbortAccepted {
                 sequence: TransitionSequence::default(),
-                reason: CancellationReason::UserRequest,
+                reason: CancellationReason::ForceAbort,
+                phase: crate::execution::workflow::runtime::RunCancellationPhase::Finalization,
             },
             step: None,
         },
@@ -830,6 +831,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
         },
         outcome: RunOutcome::Succeeded,
         cancellation: None,
+        force_abort: None,
         steps: vec![
             super::super::publication::WorkflowRunStep {
                 id: "prepare".to_owned(),

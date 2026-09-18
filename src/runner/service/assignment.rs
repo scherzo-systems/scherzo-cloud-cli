@@ -3502,6 +3502,7 @@ pub(super) mod test_support {
                     final_execution_event_sequence: 1,
                     outcome: serde_json::json!({
                         "outcome": "succeeded",
+                        "forceAbort": null,
                         "finalization": {
                             "trigger": "succeeded",
                             "finalizers": [{
@@ -5076,7 +5077,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 attempt_id: identity.attempt_id.clone(),
                 report: ExecutionReport::Finished {
                     final_execution_event_sequence: 1,
-                    outcome: json!({ "outcome": "succeeded" }),
+                    outcome: json!({ "outcome": "succeeded", "forceAbort": null }),
                     artifact_delivery: json!({
                         "outcome": "prepared",
                         "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -5428,7 +5429,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             matches!(
                 reports.last(),
                 Some(ExecutionReport::Finished { outcome, .. })
-                    if outcome == &json!({ "outcome": "succeeded" })
+                    if outcome == &json!({ "outcome": "succeeded", "forceAbort": null })
             ),
             "unexpected reports: {reports:#?}"
         );
@@ -6322,7 +6323,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             AssignmentObservation::Execution {
                 report: ExecutionReport::Finished { outcome, .. },
                 ..
-            } if outcome == &json!({ "outcome": "succeeded" })
+            } if outcome == &json!({ "outcome": "succeeded", "forceAbort": null })
         )));
         assert!(pending.iter().any(|entry| matches!(
             &entry.observation,
@@ -8141,6 +8142,7 @@ steps:
             final_execution_event_sequence: 1,
             outcome: json!({
                 "outcome": "failed",
+                "forceAbort": null,
                 "primaryIssue": {
                     "node": { "id": "verify", "role": "step" },
                     "state": "failed",
@@ -8167,7 +8169,7 @@ steps:
         };
         let small_report = ExecutionReport::Finished {
             final_execution_event_sequence: 1,
-            outcome: json!({"outcome": "succeeded"}),
+            outcome: json!({"outcome": "succeeded", "forceAbort": null}),
             artifact_delivery: json!({
                 "outcome": "prepared",
                 "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",

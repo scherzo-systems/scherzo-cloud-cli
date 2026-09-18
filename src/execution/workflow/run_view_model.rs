@@ -189,6 +189,7 @@ pub(crate) struct WorkflowRunViewSnapshot {
     pub(crate) steps: Vec<WorkflowRunStepView>,
     pub(crate) finalization_start: Option<usize>,
     pub(crate) cancellation: Option<WorkflowRunCancellationView>,
+    pub(crate) force_abort: Option<super::runtime::ForceAbortEvidence>,
     pub(crate) finalization: Option<WorkflowRunFinalization>,
     pub(crate) authoritative_result: bool,
     pub(crate) quiescent: bool,
@@ -286,6 +287,7 @@ where
                     gate: SchedulingGate::Open,
                 },
                 cancellation: None,
+                force_abort: None,
                 finalization: None,
                 authoritative_result: false,
                 terminal_timing: None,
@@ -354,6 +356,7 @@ where
             steps,
             finalization_start: state.finalization_start,
             cancellation: state.cancellation.clone(),
+            force_abort: state.force_abort,
             finalization: state.finalization.clone(),
             authoritative_result: state.authoritative_result,
             quiescent: state.quiescent,
@@ -386,6 +389,7 @@ where
                         reason: cancellation.reason,
                         force_stop_deadline: cancellation.force_stop_deadline,
                     });
+            state.force_abort = run.force_abort;
             for (view, terminal) in state.steps.iter_mut().zip(run_nodes(run)) {
                 view.reconcile(terminal);
             }
@@ -512,6 +516,7 @@ struct WorkflowRunViewState {
     finalization_start: Option<usize>,
     workflow: WorkflowState<OffsetDateTime>,
     cancellation: Option<WorkflowRunCancellationView>,
+    force_abort: Option<super::runtime::ForceAbortEvidence>,
     finalization: Option<WorkflowRunFinalization>,
     authoritative_result: bool,
     terminal_timing: Option<WorkflowRunTiming>,
@@ -619,28 +624,60 @@ impl WorkflowRunViewState {
                     primary_issue: primary_issue.clone(),
                 };
             }
-            TransitionEvent::ForceAbortAccepted { reason, .. } => {
-                let WorkflowState::Finalizing {
-                    trigger,
-                    gate,
-                    primary_issue,
-                } = &self.workflow
-                else {
-                    return;
-                };
-                let deadline = match gate {
-                    super::runtime::FinalizationGate::Open => None,
-                    super::runtime::FinalizationGate::Cancelling { deadline, .. } => *deadline,
-                };
-                self.workflow = WorkflowState::Finalizing {
-                    trigger: *trigger,
-                    gate: super::runtime::FinalizationGate::Cancelling {
-                        reason,
-                        deadline,
-                        force_abort: true,
-                    },
-                    primary_issue: primary_issue.clone(),
-                };
+            TransitionEvent::ForceAbortAccepted { reason, phase, .. } => {
+                self.force_abort = Some(super::runtime::ForceAbortEvidence { reason, phase });
+                match (&self.workflow, phase) {
+                    (
+                        WorkflowState::Executing { gate },
+                        super::runtime::RunCancellationPhase::Ordinary,
+                    ) => {
+                        let (effective_reason, prior_issue) = match gate {
+                            SchedulingGate::Open => (reason, None),
+                            SchedulingGate::FailureStopped { primary_issue } => {
+                                (reason, Some(primary_issue.clone()))
+                            }
+                            SchedulingGate::Cancelling {
+                                reason,
+                                prior_issue,
+                            } => (*reason, prior_issue.clone()),
+                        };
+                        self.workflow = WorkflowState::Executing {
+                            gate: SchedulingGate::Cancelling {
+                                reason: effective_reason,
+                                prior_issue,
+                            },
+                        };
+                    }
+                    (
+                        WorkflowState::Finalizing {
+                            trigger,
+                            gate,
+                            primary_issue,
+                        },
+                        super::runtime::RunCancellationPhase::Finalization,
+                    ) => {
+                        let deadline = match gate {
+                            super::runtime::FinalizationGate::Open => None,
+                            super::runtime::FinalizationGate::Cancelling { deadline, .. } => {
+                                *deadline
+                            }
+                        };
+                        let effective_reason = match gate {
+                            super::runtime::FinalizationGate::Open => reason,
+                            super::runtime::FinalizationGate::Cancelling { reason, .. } => *reason,
+                        };
+                        self.workflow = WorkflowState::Finalizing {
+                            trigger: *trigger,
+                            gate: super::runtime::FinalizationGate::Cancelling {
+                                reason: effective_reason,
+                                deadline,
+                                force_abort: true,
+                            },
+                            primary_issue: primary_issue.clone(),
+                        };
+                    }
+                    _ => {}
+                }
             }
         }
     }

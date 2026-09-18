@@ -28,6 +28,7 @@ pub(crate) struct WorkflowExecutionResult<Deadline = ()> {
     pub(crate) recoveries:
         BTreeMap<String, Option<super::runtime::StepRecoveryState<StepFailureCause>>>,
     pub(crate) finalization_summary: Option<super::runtime::FinalizationSummary<Deadline>>,
+    pub(crate) force_abort: Option<super::runtime::ForceAbortEvidence>,
     pub(crate) exports: ExportSet<CapturedValue>,
     pub(crate) provenance: WorkflowSourceProvenance,
     pub(crate) content_digest: WorkflowContentDigest,
@@ -246,6 +247,7 @@ where
         .map(|(step, runtime)| ((step.clone(), runtime.state), (step, runtime.recovery)))
         .unzip();
     let finalization_summary = coordinated.state.finalization_summary;
+    let force_abort = coordinated.state.force_abort;
     let exports = coordinated
         .state
         .exports
@@ -255,6 +257,7 @@ where
         steps,
         recoveries,
         finalization_summary,
+        force_abort,
         exports,
         provenance,
         content_digest,

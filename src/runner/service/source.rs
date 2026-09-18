@@ -2784,6 +2784,7 @@ mod tests {
                 },
                 outcome: RunOutcome::Succeeded,
                 cancellation: None,
+                force_abort: None,
                 steps: vec![WorkflowRunStep {
                     id: "capture".to_owned(),
                     role: WorkflowNodeRole::Step,
