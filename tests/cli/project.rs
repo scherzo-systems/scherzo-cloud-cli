@@ -1,6 +1,8 @@
 use super::*;
 
 const TOKEN: &str = "unique-project-command-token-sentinel";
+const SERVICE_API_KEY: &str =
+    "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const ORGANIZATION: &str = "acme-research";
 const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
 const MEMBERSHIP_ID: &str = "mem_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -100,6 +102,86 @@ fn assert_json_success(output: &Output, outcome: &str) -> serde_json::Value {
     assert_eq!(value["schemaVersion"], 1);
     assert_eq!(value["outcome"], outcome);
     value
+}
+
+#[test]
+fn project_list_uses_only_the_explicit_service_api_key() {
+    let directory = private_credential_directory();
+    let service_key_path = directory.path().join("service.key");
+    fs::write(&service_key_path, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::set_permissions(&service_key_path, Permissions::from_mode(0o600)).unwrap();
+    let service_key_path = service_key_path.to_str().unwrap();
+
+    let server = ScriptedServer::respond(vec![json_http_response(
+        "200 OK",
+        serde_json::json!({"items": []}),
+    )]);
+    let missing_human_store = directory.path().join("missing-human.json");
+    let environment =
+        deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+    let output = run_with_env(
+        &[
+            "project",
+            "list",
+            ORGANIZATION,
+            "--service-api-key-file",
+            service_key_path,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_json_success(&output, "listed");
+    assert!(!missing_human_store.exists());
+    let request = server.finish().pop().unwrap();
+    assert_eq!(
+        header_value(&request, "authorization"),
+        format!("Bearer {SERVICE_API_KEY}")
+    );
+
+    let server = ScriptedServer::respond(vec![problem_http_response(
+        "401 Unauthorized",
+        serde_json::json!({
+            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "title": "Unauthorized",
+            "status": 401
+        }),
+    )]);
+    let invalid_human_store = directory.path().join("invalid-human.json");
+    fs::write(&invalid_human_store, b"human-store-must-not-be-read\n").unwrap();
+    fs::set_permissions(&invalid_human_store, Permissions::from_mode(0o600)).unwrap();
+    let before = fs::read(&invalid_human_store).unwrap();
+    let environment =
+        deployment_environment(&server.api_url, invalid_human_store.to_str().unwrap());
+    let output = run_with_env(
+        &[
+            "project",
+            "list",
+            ORGANIZATION,
+            "--service-api-key-file",
+            service_key_path,
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "error: service API key rejected\n\n",
+            "Use a different active service API key.\n"
+        )
+    );
+    assert_eq!(fs::read(&invalid_human_store).unwrap(), before);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(SERVICE_API_KEY));
+    let request = server.finish().pop().unwrap();
+    assert_eq!(
+        header_value(&request, "authorization"),
+        format!("Bearer {SERVICE_API_KEY}")
+    );
 }
 
 #[test]

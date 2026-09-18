@@ -567,7 +567,7 @@ fn membership_termination_rejects_malformed_no_content_successes() {
                 idempotency_key: idempotency_key.map(HeaderValue::from_static),
                 location: None,
                 retry_after: None,
-                body: body.to_vec(),
+                body: body.to_vec().into(),
             };
 
             let error = decode_membership_termination_response(operation, response, KEY)

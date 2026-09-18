@@ -16,6 +16,7 @@ use super::CapabilityError;
 pub(super) fn write_issue(
     deployment: &str,
     outcome: &IssueInvitationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -23,7 +24,9 @@ pub(super) fn write_issue(
             write_invitation_result(deployment, "issued", invitation, json)?;
             Ok(ExitCode::Success)
         }
-        IssueInvitationOutcome::Common(failure) => write_common(deployment, failure, json),
+        IssueInvitationOutcome::Common(failure) => {
+            write_common(deployment, failure, authentication, json)
+        }
         IssueInvitationOutcome::NotFound => write_failure(
             deployment,
             "not_found",
@@ -69,6 +72,7 @@ pub(super) fn write_issue(
 pub(super) fn write_organization_list(
     deployment: &str,
     outcome: &ListOrganizationInvitationsOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -85,7 +89,7 @@ pub(super) fn write_organization_list(
             Ok(ExitCode::Success)
         }
         ListOrganizationInvitationsOutcome::Common(failure) => {
-            write_common(deployment, failure, json)
+            write_common(deployment, failure, authentication, json)
         }
         ListOrganizationInvitationsOutcome::NotFound => write_failure(
             deployment,
@@ -102,6 +106,7 @@ pub(super) fn write_organization_list(
 pub(super) fn write_inbox(
     deployment: &str,
     outcome: &ListInvitationInboxOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -113,13 +118,16 @@ pub(super) fn write_inbox(
             }
             Ok(ExitCode::Success)
         }
-        ListInvitationInboxOutcome::Common(failure) => write_common(deployment, failure, json),
+        ListInvitationInboxOutcome::Common(failure) => {
+            write_common(deployment, failure, authentication, json)
+        }
     }
 }
 
 pub(super) fn write_preview(
     deployment: &str,
     outcome: &PreviewInvitationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -149,7 +157,9 @@ pub(super) fn write_preview(
             }
             Ok(ExitCode::Success)
         }
-        PreviewInvitationOutcome::Common(failure) => write_common(deployment, failure, json),
+        PreviewInvitationOutcome::Common(failure) => {
+            write_common(deployment, failure, authentication, json)
+        }
         PreviewInvitationOutcome::Unavailable => write_unavailable(deployment, json),
     }
 }
@@ -157,6 +167,7 @@ pub(super) fn write_preview(
 pub(super) fn write_accept(
     deployment: &str,
     outcome: &AcceptInvitationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -174,7 +185,9 @@ pub(super) fn write_accept(
             }
             Ok(ExitCode::Success)
         }
-        AcceptInvitationOutcome::Common(failure) => write_common(deployment, failure, json),
+        AcceptInvitationOutcome::Common(failure) => {
+            write_common(deployment, failure, authentication, json)
+        }
         AcceptInvitationOutcome::Unavailable => write_unavailable(deployment, json),
         AcceptInvitationOutcome::MembershipLimitReached => write_failure(
             deployment,
@@ -202,6 +215,7 @@ pub(super) fn write_termination(
     invitation_id: &str,
     outcome: &InvitationTerminationOutcome,
     action: TerminationAction<'_>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -232,7 +246,9 @@ pub(super) fn write_termination(
             }
             Ok(ExitCode::Success)
         }
-        InvitationTerminationOutcome::Common(failure) => write_common(deployment, failure, json),
+        InvitationTerminationOutcome::Common(failure) => {
+            write_common(deployment, failure, authentication, json)
+        }
         InvitationTerminationOutcome::NotFound => write_failure(
             deployment,
             "not_found",
@@ -272,13 +288,18 @@ pub(super) fn write_capability_error(
 fn write_common(
     deployment: &str,
     failure: &CommonOrganizationFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, message, class) = match failure {
         CommonOrganizationFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: invitation management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            authentication
+                .rejected_error(
+                    "error: invitation management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         CommonOrganizationFailure::Forbidden => (

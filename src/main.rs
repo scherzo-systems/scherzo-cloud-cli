@@ -20,6 +20,7 @@ mod process;
 mod public_id;
 mod runner;
 mod runner_protocol;
+mod service_auth;
 #[cfg(test)]
 mod test_support;
 mod timing;

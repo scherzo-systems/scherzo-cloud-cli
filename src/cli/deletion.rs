@@ -22,7 +22,7 @@ use crate::human_auth::session::{
 
 const ACCOUNT_ABOUT: &str = "Manage your account deletion schedule";
 const ORGANIZATION_ABOUT: &str = "Manage an organization deletion schedule";
-const ACCOUNT_REQUEST_AFTER_HELP: &str = "Account access:\n  A confirmed request removes this deployment's local human credential.\n  Cancellation requires a fresh browser proof from the same linked identity before the deadline.";
+const ACCOUNT_REQUEST_AFTER_HELP: &str = "Behavior:\n  A human request schedules deletion and removes this deployment's local credential.\n  A service request authenticated with --service-api-key-file deletes the service immediately.\n  Human cancellation requires a fresh browser proof from the same linked identity before the deadline.";
 const ORGANIZATION_REQUEST_AFTER_HELP: &str = "Authorization:\n  Only a current active human owner can request organization deletion.\n\nAccount access:\n  A confirmed organization request leaves the local human credential unchanged.";
 const ACCOUNT_CANCEL_AFTER_HELP: &str = "Proof:\n  This command starts a fresh browser sign-in for the same linked identity.\n  The proof is sent only as the cancellation bearer and is not stored as a local session.";
 const ORGANIZATION_CANCEL_AFTER_HELP: &str = "Authorization:\n  Cancellation requires a current active human owner using the same linked identity that requested deletion.\n\nProof:\n  This command starts a fresh browser sign-in. The proof is not stored as a local session.";
@@ -64,6 +64,9 @@ enum OrganizationDeletionCommand {
 #[derive(Debug, Args)]
 struct AccountRequestCommand {
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     request: RequestOptions,
 }
 
@@ -97,7 +100,7 @@ struct RequestOptions {
         long,
         required = true,
         action = clap::ArgAction::SetTrue,
-        help = "Confirm the 30-day deletion schedule"
+        help = "Confirm the deletion action described below"
     )]
     yes: bool,
 
@@ -165,9 +168,10 @@ impl AccountRequestCommand {
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare account deletion networking")?;
-        let (outcome, binding) = request_deletion_with_session(
+        let (outcome, binding) = request_deletion_with_credential(
             &client,
             deployment,
+            &self.authentication,
             format!(
                 "request account deletion through {}",
                 deployment.fingerprint().api_url()
@@ -208,6 +212,7 @@ impl AccountRequestCommand {
             deployment.fingerprint().api_url(),
             &outcome,
             credential,
+            self.authentication.kind(),
             self.request.json,
         )?;
         if let Some(error) = cleanup_error {
@@ -231,9 +236,10 @@ impl OrganizationRequestCommand {
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare organization deletion networking")?;
-        let (outcome, _binding) = request_deletion_with_session(
+        let (outcome, _binding) = request_deletion_with_credential(
             &client,
             deployment,
+            &super::PrincipalAuthenticationArgs::default(),
             format!(
                 "request organization deletion through {}",
                 deployment.fingerprint().api_url()
@@ -254,6 +260,7 @@ impl OrganizationRequestCommand {
             &outcome,
             matches!(outcome, RequestDeletionOutcome::Scheduled(_))
                 .then_some(LocalCredentialDisposition::Unchanged),
+            super::PrincipalAuthenticationKind::HumanSession,
             self.request.json,
         )
     }
@@ -281,9 +288,10 @@ impl CancellationOptions {
     }
 }
 
-fn request_deletion_with_session(
+fn request_deletion_with_credential(
     client: &HttpClient,
     deployment: &Deployment,
+    authentication: &super::PrincipalAuthenticationArgs,
     api_context: String,
     mut operation: impl FnMut(
         &HttpClient,
@@ -291,6 +299,16 @@ fn request_deletion_with_session(
         &str,
     ) -> Result<RequestDeletionOutcome, LifecycleApiError>,
 ) -> anyhow::Result<(RequestDeletionOutcome, Option<SessionBinding>)> {
+    if let Some(api_key) = authentication.service_api_key()? {
+        return normalize_deletion_result(operation(
+            client,
+            deployment.fingerprint().api_url(),
+            api_key.expose(),
+        ))
+        .map(|outcome| (outcome, None))
+        .context(api_context);
+    }
+
     match session::execute_required_with_binding(
         client,
         deployment,
@@ -303,19 +321,11 @@ fn request_deletion_with_session(
         },
         lifecycle_credential_rejected,
     ) {
-        Ok(RequiredOperationWithBinding::Completed { result, binding }) => result
-            .or_else(|error| {
-                if error.invalid_response() {
-                    Ok(RequestDeletionOutcome::Common(
-                        CommonLifecycleFailure::InvalidResponse,
-                    ))
-                } else {
-                    Err(error)
-                }
-            })
-            .map(|outcome| (outcome, Some(binding)))
-            .map_err(|error| anyhow!(error))
-            .context(api_context),
+        Ok(RequiredOperationWithBinding::Completed { result, binding }) => {
+            normalize_deletion_result(result)
+                .map(|outcome| (outcome, Some(binding)))
+                .context(api_context)
+        }
         Ok(RequiredOperationWithBinding::Unauthenticated) => Ok((
             RequestDeletionOutcome::Common(CommonLifecycleFailure::Unauthenticated),
             None,
@@ -328,6 +338,22 @@ fn request_deletion_with_session(
             None => Err(anyhow!(error).context("acquire human session")),
         },
     }
+}
+
+fn normalize_deletion_result(
+    result: Result<RequestDeletionOutcome, LifecycleApiError>,
+) -> anyhow::Result<RequestDeletionOutcome> {
+    result
+        .or_else(|error| {
+            if error.invalid_response() {
+                Ok(RequestDeletionOutcome::Common(
+                    CommonLifecycleFailure::InvalidResponse,
+                ))
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| anyhow!(error))
 }
 
 fn lifecycle_credential_rejected(
@@ -601,6 +627,7 @@ fn write_request_outcome(
     deployment: &str,
     outcome: &RequestDeletionOutcome,
     credential: Option<LocalCredentialDisposition>,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -620,12 +647,32 @@ fn write_request_outcome(
             }
             Ok(ExitCode::Success)
         }
+        RequestDeletionOutcome::Deleted => {
+            if json {
+                write_json(&DeletionResult {
+                    schema_version: 1,
+                    deployment,
+                    outcome: "deleted",
+                    organization_ref: None,
+                    schedule: None,
+                    category: None,
+                    local_credential: None,
+                })?;
+            } else {
+                writeln!(
+                    io::stdout().lock(),
+                    "✓ Service principal deleted.\n\ndeployment: {deployment}"
+                )?;
+            }
+            Ok(ExitCode::Success)
+        }
         RequestDeletionOutcome::Common(common) => {
             let failure = common_lifecycle_failure(
                 target,
                 deployment,
                 common,
                 FailureOperation::Request,
+                authentication,
             );
             write_request_failure(target, deployment, failure, json)
         }
@@ -876,6 +923,7 @@ impl<'a> CancellationOutput<'a> {
                     deployment,
                     common,
                     FailureOperation::Cancellation,
+                    super::PrincipalAuthenticationKind::HumanSession,
                 );
                 (
                     failure.outcome,
@@ -1000,8 +1048,18 @@ fn common_lifecycle_failure(
     deployment: &str,
     common: &CommonLifecycleFailure,
     operation: FailureOperation,
+    authentication: super::PrincipalAuthenticationKind,
 ) -> FailurePresentation {
     match common {
+        CommonLifecycleFailure::Unauthenticated
+            if authentication == super::PrincipalAuthenticationKind::ServiceApiKey =>
+        {
+            FailurePresentation::new(
+                "unauthenticated",
+                authentication.rejected_error("").to_owned(),
+                OutcomeClass::Unauthenticated,
+            )
+        }
         CommonLifecycleFailure::Unauthenticated => match operation {
             FailureOperation::Request => unauthenticated_failure(
                 target,

@@ -9,10 +9,11 @@ Arguments:
   <RUN>           Exact Run ID
 
 Options:
-      --output <DIRECTORY>   New destination directory for logical input member paths
-      --member <MEMBER>      Download one exact logical member (repeat to select more)
-      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
-      --json                 Write one JSON result to standard output
-  -h, --help                 Print help
+      --output <DIRECTORY>             New destination directory for logical input member paths
+      --member <MEMBER>                Download one exact logical member (repeat to select more)
+      --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
+      --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
+      --json                           Write one JSON result to standard output
+  -h, --help                           Print help
 
 ```

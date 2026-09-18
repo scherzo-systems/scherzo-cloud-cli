@@ -253,8 +253,10 @@ pub(super) fn acquire_member_files(
 pub(super) fn validate_standard_input_claims(
     arguments: &super::super::NamedInputArgs,
     integration_context_file: Option<&Path>,
+    service_api_key_from_stdin: bool,
 ) -> Result<(), InputAcquisitionFailure> {
-    let mut claims = usize::from(integration_context_file == Some(Path::new("-")));
+    let mut claims = usize::from(integration_context_file == Some(Path::new("-")))
+        + usize::from(service_api_key_from_stdin);
     for binding in bindings(&arguments.input_text_file, 2)?
         .into_iter()
         .chain(bindings(&arguments.input_json_file, 2)?)

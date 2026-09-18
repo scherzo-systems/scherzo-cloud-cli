@@ -404,7 +404,11 @@ impl LoginOutput {
                 status: StatusResult::from_status(status),
             })
         } else {
-            write_human_status(status).context("write sign-in status")
+            write_human_status(
+                status,
+                super::super::PrincipalAuthenticationKind::HumanSession,
+            )
+            .context("write sign-in status")
         }
     }
 

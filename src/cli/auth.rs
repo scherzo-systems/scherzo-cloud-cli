@@ -3,12 +3,31 @@ mod login;
 mod logout;
 mod status;
 
+use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
+use crate::api::HttpClient;
 use crate::human_auth::deployment::Deployment;
 
 pub(super) const ABOUT: &str = "Manage your Scherzo Cloud sign-in";
 const NAME: &str = "auth";
+
+#[derive(Debug, Args)]
+struct PrincipalNetworkOptions {
+    #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
+    http: super::HttpOptions,
+}
+
+impl PrincipalNetworkOptions {
+    fn client(&self) -> anyhow::Result<HttpClient> {
+        HttpClient::new(self.http.transport_policy())
+            .map_err(|error| anyhow!(error))
+            .context("prepare identity networking")
+    }
+}
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

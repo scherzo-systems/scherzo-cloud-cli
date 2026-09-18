@@ -22,19 +22,9 @@ pub(super) fn from_api(principal: models::Principal) -> Result<HumanPrincipal, &
     if principal.r#type != models::principal::Type::PrincipalTypeHuman {
         return Err("the principal type is not human");
     }
-    if principal.id.is_empty() {
-        return Err("the principal id is empty");
-    }
-    if principal
-        .display_name
-        .as_ref()
-        .is_some_and(String::is_empty)
-    {
-        return Err("the principal display name is empty");
-    }
-
+    let profile = super::principal_profile::from_api(principal)?;
     Ok(HumanPrincipal {
-        id: principal.id,
-        display_name: principal.display_name,
+        id: profile.id,
+        display_name: profile.display_name,
     })
 }

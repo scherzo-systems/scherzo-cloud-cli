@@ -19,34 +19,6 @@ const REPOSITORY_CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const INPUT_SET_ID: &str = "ris_01k0z6r1w8f4jy2m7q9v3x5abc";
 const WORKFLOW_PATH: &str = "workflows/build.yaml";
 
-fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &[u8]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
-    command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove(CREDENTIALS_FILE_VARIABLE);
-    for variable in DEPLOYMENT_VARIABLES
-        .into_iter()
-        .chain(RUNNER_TELEMETRY_VARIABLES)
-    {
-        command.env_remove(variable);
-    }
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    let mut child = command.spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    match stdin.write_all(standard_input) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-        Err(error) => panic!("write CLI standard input: {error}"),
-    }
-    drop(stdin);
-    child.wait_with_output().unwrap()
-}
-
 fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
     let credential_directory = private_credential_directory();

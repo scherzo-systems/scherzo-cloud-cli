@@ -52,6 +52,7 @@ impl super::RemoteArtifactOperation for Operation {
             &output.run.organization,
             &output.run.run_id,
             output.result,
+            output.authentication,
             self.json,
         )
     }
@@ -62,6 +63,7 @@ fn write_list_result(
     organization: &str,
     run_id: &str,
     result: Result<ArtifactInventoryPage, ArtifactApiError>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -73,7 +75,14 @@ fn write_list_result(
             }
             Ok(ExitCode::Success)
         }
-        Err(error) => write_failure(deployment, organization, run_id, &error, json),
+        Err(error) => write_failure(
+            deployment,
+            organization,
+            run_id,
+            &error,
+            authentication,
+            json,
+        ),
     }
 }
 
@@ -145,6 +154,7 @@ fn write_failure(
     organization: &str,
     run_id: &str,
     error: &ArtifactApiError,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, class) = match error {
@@ -181,7 +191,10 @@ fn write_failure(
         ArtifactApiError::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: Artifact Set access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login"
+            authentication
+                .rejected_error(
+                    "error: Artifact Set access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
         ),

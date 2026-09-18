@@ -43,8 +43,8 @@ impl Command {
                     idempotency_key,
                 )
             },
-            |deployment, outcome, json| {
-                output::write_leave(deployment, &organization_ref, outcome, json)
+            |deployment, outcome, authentication, json| {
+                output::write_leave(deployment, &organization_ref, outcome, authentication, json)
             },
         )
     }

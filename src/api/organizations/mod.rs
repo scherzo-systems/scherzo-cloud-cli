@@ -361,28 +361,61 @@ pub(crate) fn create_organization(
     display_name: &str,
     slug: Option<&str>,
 ) -> Result<CreateOrganizationOutcome, OrganizationError> {
-    create_organization_with_timeout(
+    create_organization_request(
         client,
         api_url,
         access_token,
         idempotency_key,
-        display_name,
-        slug,
+        CreateOrganizationInput {
+            display_name,
+            slug,
+            delegator_principal_id: None,
+        },
         REQUEST_TIMEOUT,
     )
 }
 
-fn create_organization_with_timeout(
+pub(crate) fn create_organization_with_delegator(
     client: &HttpClient,
     api_url: &str,
     access_token: &str,
     idempotency_key: &str,
     display_name: &str,
     slug: Option<&str>,
+    delegator_principal_id: Option<&str>,
+) -> Result<CreateOrganizationOutcome, OrganizationError> {
+    create_organization_request(
+        client,
+        api_url,
+        access_token,
+        idempotency_key,
+        CreateOrganizationInput {
+            display_name,
+            slug,
+            delegator_principal_id,
+        },
+        REQUEST_TIMEOUT,
+    )
+}
+
+struct CreateOrganizationInput<'a> {
+    display_name: &'a str,
+    slug: Option<&'a str>,
+    delegator_principal_id: Option<&'a str>,
+}
+
+fn create_organization_request(
+    client: &HttpClient,
+    api_url: &str,
+    access_token: &str,
+    idempotency_key: &str,
+    input: CreateOrganizationInput<'_>,
     timeout: Duration,
 ) -> Result<CreateOrganizationOutcome, OrganizationError> {
-    let mut request = generated_models::CreateOrganizationRequest::new(display_name.to_owned());
-    request.slug = slug.map(str::to_owned);
+    let mut request =
+        generated_models::CreateOrganizationRequest::new(input.display_name.to_owned());
+    request.slug = input.slug.map(str::to_owned);
+    request.delegator_principal_id = input.delegator_principal_id.map(str::to_owned);
     let body = serialize_request(Operation::Create, &request)?;
     let spec = request_spec(
         client,

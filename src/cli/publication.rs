@@ -42,14 +42,21 @@ struct PublicationRunReference {
     run_id: String,
 }
 
+// Publication and run options intentionally remain distinct so each command keeps its
+// domain-specific JSON help instead of exposing another command's terminology.
+// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct Options {
     #[arg(long, help = "Print the publication result as JSON")]
     json: bool,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     http: super::HttpOptions,
 }
+// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct PublicationWaitArgs {
@@ -276,15 +283,20 @@ impl CreateCommand {
         idempotency_key: &str,
         begin_dispatch: impl Fn() -> bool,
     ) -> anyhow::Result<Result<Publication, PublicationFailure>> {
-        with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.create(
-                &self.run.organization,
-                &self.run.run_id,
-                &self.export,
-                idempotency_key,
-                &begin_dispatch,
-            )
-        })
+        with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.create(
+                    &self.run.organization,
+                    &self.run.run_id,
+                    &self.export,
+                    idempotency_key,
+                    &begin_dispatch,
+                )
+            },
+        )
     }
 
     fn execute_blocking(
@@ -302,6 +314,7 @@ impl CreateCommand {
                     run_id: &self.run.run_id,
                     export_name: &self.export,
                     idempotency_key,
+                    authentication: self.options.authentication.kind(),
                     json: self.options.json,
                     dispatched: control.dispatched(),
                 },
@@ -341,6 +354,7 @@ impl CreateCommand {
                             run_id: &self.run.run_id,
                             export_name: &self.export,
                             idempotency_key,
+                            authentication: self.options.authentication.kind(),
                             json: self.options.json,
                             dispatched: control.dispatched(),
                         },
@@ -391,7 +405,14 @@ impl CreateCommand {
                 };
                 let transport_policy = self.options.http.transport_policy();
                 wait_for_terminal_publication(
-                    || observe_publication(deployment, transport_policy, reference),
+                    || {
+                        observe_publication(
+                            deployment,
+                            transport_policy,
+                            &self.options.authentication,
+                            reference,
+                        )
+                    },
                     PublicationObservationFailure::retryable,
                     self.wait.timeout,
                     control,
@@ -408,6 +429,7 @@ impl CreateCommand {
             run_id: &self.run.run_id,
             publication_id: Some(&publication_id),
             idempotency_key: Some(idempotency_key),
+            authentication: self.options.authentication.kind(),
             json: self.options.json,
         };
         write_wait_observation(
@@ -448,13 +470,18 @@ impl ShowCommand {
 
     fn execute_without_wait(self, deployment: Deployment) -> super::CommandResult {
         super::execute_read_only_with_signals("Cloud publication show", move |control| {
-            let result = with_api(&deployment, self.options.http.transport_policy(), |api| {
-                api.get(
-                    &self.publication.run.organization,
-                    &self.publication.run.run_id,
-                    &self.publication.publication_id,
-                )
-            })?;
+            let result = with_api(
+                &deployment,
+                self.options.http.transport_policy(),
+                &self.options.authentication,
+                |api| {
+                    api.get(
+                        &self.publication.run.organization,
+                        &self.publication.run.run_id,
+                        &self.publication.publication_id,
+                    )
+                },
+            )?;
             super::complete_read_only_output(control, || {
                 write_show(
                     &ReadOutputContext {
@@ -463,6 +490,7 @@ impl ShowCommand {
                         run_id: &self.publication.run.run_id,
                         publication_id: Some(&self.publication.publication_id),
                         idempotency_key: None,
+                        authentication: self.options.authentication.kind(),
                         json: self.options.json,
                     },
                     result,
@@ -501,7 +529,14 @@ impl ShowCommand {
         let transport_policy = self.options.http.transport_policy();
         let result = wait_for_terminal_publication(
             // jscpd:ignore-end
-            || observe_publication(deployment, transport_policy, reference),
+            || {
+                observe_publication(
+                    deployment,
+                    transport_policy,
+                    &self.options.authentication,
+                    reference,
+                )
+            },
             PublicationObservationFailure::retryable,
             self.wait.timeout,
             control,
@@ -517,6 +552,7 @@ impl ShowCommand {
             run_id: &wait_context.run_id,
             publication_id: Some(&wait_context.publication_id),
             idempotency_key: None,
+            authentication: self.options.authentication.kind(),
             json: wait_context.json,
         };
         write_wait_observation(result, &read_context, &wait_context, |_| ExitCode::Success)
@@ -526,15 +562,22 @@ impl ShowCommand {
 impl ListCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         super::execute_read_only_with_signals("Cloud publication list", move |control| {
-            let result = with_api(&deployment, self.options.http.transport_policy(), |api| {
-                api.list(
-                    &self.run.organization,
-                    &self.run.run_id,
-                    self.pagination.limit,
-                    self.pagination.cursor.as_deref(),
-                )
-            })?;
+            let result = with_api(
+                &deployment,
+                self.options.http.transport_policy(),
+                &self.options.authentication,
+                |api| {
+                    api.list(
+                        &self.run.organization,
+                        &self.run.run_id,
+                        self.pagination.limit,
+                        self.pagination.cursor.as_deref(),
+                    )
+                },
+            )?;
             super::complete_read_only_output(control, || {
+                // List and show retain separate result envelopes despite sharing run coordinates.
+                // jscpd:ignore-start
                 write_list(
                     &ReadOutputContext {
                         deployment: deployment.fingerprint().api_url(),
@@ -542,10 +585,12 @@ impl ListCommand {
                         run_id: &self.run.run_id,
                         publication_id: None,
                         idempotency_key: None,
+                        authentication: self.options.authentication.kind(),
                         json: self.options.json,
                     },
                     result,
                 )
+                // jscpd:ignore-end
                 .map_err(Into::into)
             })
         })
@@ -604,9 +649,10 @@ impl PublicationObservationFailure {
 fn observe_publication(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
     reference: PublicationObservationReference<'_>,
 ) -> Result<Publication, PublicationObservationFailure> {
-    with_api(deployment, transport_policy, |api| {
+    with_api(deployment, transport_policy, authentication, |api| {
         api.get(
             reference.organization,
             reference.run_id,
@@ -680,12 +726,17 @@ fn parse_idempotency_key(value: &str) -> Result<String, String> {
 fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
     mut operation: impl FnMut(&PublicationApi) -> Result<T, PublicationFailure>,
 ) -> anyhow::Result<Result<T, PublicationFailure>> {
     let client = super::human_session_client(transport_policy)?;
-    super::execute_required_api_operation(
-        &client,
-        deployment,
+    super::execute_selected_api_operation(
+        super::principal_api_context(
+            &client,
+            deployment,
+            authentication,
+            "acquire human session for Cloud publication",
+        ),
         |access_token| {
             let api = PublicationApi::new(
                 deployment.fingerprint().api_url(),
@@ -699,7 +750,6 @@ fn with_api<T>(
         PublicationFailure::credential_rejected,
         || PublicationFailure::Unauthenticated,
         PublicationFailure::Unreachable,
-        "acquire human session for Cloud publication",
     )
 }
 
@@ -709,6 +759,7 @@ struct CreateOutputContext<'a> {
     run_id: &'a str,
     export_name: &'a str,
     idempotency_key: &'a str,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
     dispatched: bool,
 }
@@ -719,6 +770,7 @@ struct ReadOutputContext<'a> {
     run_id: &'a str,
     publication_id: Option<&'a str>,
     idempotency_key: Option<&'a str>,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
 }
 
@@ -1023,11 +1075,14 @@ fn write_failure(
         PublicationFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            if context.dispatched {
-                "error: Cloud publication access requires sign-in\n\nSign in first, then retry with the same --idempotency-key:\n  scherzo-cloud auth login".to_owned()
-            } else {
-                "error: Cloud publication access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned()
-            },
+            context
+                .authentication
+                .rejected_error(if context.dispatched {
+                    "error: Cloud publication access requires sign-in\n\nSign in first, then retry with the same --idempotency-key:\n  scherzo-cloud auth login"
+                } else {
+                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login"
+                })
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         PublicationFailure::Forbidden => (
@@ -1117,7 +1172,11 @@ fn write_read_failure(
         PublicationFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: Cloud publication access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login"
+            context
+                .authentication
+                .rejected_error(
+                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
         ),

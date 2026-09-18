@@ -9,59 +9,64 @@ use crate::api::{
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::super::PrincipalAuthenticationArgs,
     operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
 ) -> anyhow::Result<Result<T, RunnerFailure>> {
-    with_api_retrying_rejected_result(deployment, transport_policy, operation, |_| false)
+    with_api_retrying_rejected_result(
+        deployment,
+        transport_policy,
+        authentication,
+        operation,
+        |_| false,
+    )
 }
 
 pub(super) fn with_api_retrying_rejected_result<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::super::PrincipalAuthenticationArgs,
     mut operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
     result_credential_rejected: impl Fn(&T) -> bool,
 ) -> anyhow::Result<Result<T, RunnerFailure>> {
     let client = crate::api::HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
-    match session::execute_required(
-        &client,
-        deployment,
+    super::super::execute_selected_api_operation_retrying_result(
+        super::super::principal_api_context(
+            &client,
+            deployment,
+            authentication,
+            "acquire human session",
+        ),
         |access_token| {
             let api = RunnerApi::new(
                 deployment.fingerprint().api_url(),
-                access_token.expose(),
+                access_token,
                 transport_policy,
             )
             .map_err(|error| anyhow!(error))
             .context("prepare runner administration networking")?;
             Ok(operation(&api))
         },
-        |result| {
-            result.as_ref().is_ok_and(|operation| {
-                operation
-                    .as_ref()
-                    .is_err_and(RunnerFailure::credential_rejected)
-                    || operation.as_ref().is_ok_and(&result_credential_rejected)
-            })
+        |operation| {
+            operation
+                .as_ref()
+                .is_err_and(RunnerFailure::credential_rejected)
+                || operation.as_ref().is_ok_and(&result_credential_rejected)
         },
-    ) {
-        Ok(RequiredOperation::Unauthenticated) => Ok(Err(RunnerFailure::Unauthenticated)),
-        Ok(RequiredOperation::Completed(result)) => result,
-        Err(error) => match error.unreachable_category() {
-            Some(category) => Ok(Err(RunnerFailure::Unreachable(category))),
-            None => Err(anyhow!(error).context("acquire human session")),
-        },
-    }
+        || RunnerFailure::Unauthenticated,
+        RunnerFailure::Unreachable,
+    )
 }
 
 pub(super) fn write_pool_create(
     deployment: &str,
     result: &Result<RunnerPool, RunnerFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_pool(
@@ -69,17 +74,29 @@ pub(super) fn write_pool_create(
         result,
         "created",
         "✓ Runner pool created.",
+        authentication,
         json,
     )
 }
 
+// Pool operations intentionally bind each stable machine outcome to its own command heading.
+// jscpd:ignore-start
 pub(super) fn write_pool_show(
     deployment: &str,
     result: &Result<RunnerPool, RunnerFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_pool(deployment, result, "found", "✓ Runner pool found.", json)
+    write_pool(
+        deployment,
+        result,
+        "found",
+        "✓ Runner pool found.",
+        authentication,
+        json,
+    )
 }
+// jscpd:ignore-end
 
 // Each command wrapper binds one stable machine outcome to its human verdict;
 // spelling out that binding is clearer than a second layer of callback indirection.
@@ -87,6 +104,7 @@ pub(super) fn write_pool_show(
 pub(super) fn write_pool_rename(
     deployment: &str,
     result: &Result<RunnerPool, RunnerFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_pool(
@@ -94,6 +112,7 @@ pub(super) fn write_pool_rename(
         result,
         "renamed",
         "✓ Runner pool renamed.",
+        authentication,
         json,
     )
 }
@@ -104,6 +123,7 @@ fn write_pool(
     result: &Result<RunnerPool, RunnerFailure>,
     outcome: &'static str,
     heading: &'static str,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -126,7 +146,7 @@ fn write_pool(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 
@@ -136,6 +156,7 @@ fn write_pool(
 pub(super) fn write_pool_list(
     deployment: &str,
     result: &Result<RunnerPoolList, RunnerFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -165,7 +186,7 @@ pub(super) fn write_pool_list(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 // jscpd:ignore-end
@@ -176,6 +197,7 @@ pub(super) fn write_pool_list(
 pub(super) fn write_runner_list(
     deployment: &str,
     result: &Result<RunnerRegistrationList, RunnerFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -215,7 +237,7 @@ pub(super) fn write_runner_list(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 // jscpd:ignore-end
@@ -223,34 +245,59 @@ pub(super) fn write_runner_list(
 pub(super) fn write_runner_show(
     deployment: &str,
     result: &Result<RunnerRegistration, RunnerFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_runner(deployment, result, "found", "✓ Runner found.", json)
+    write_runner(
+        deployment,
+        result,
+        "found",
+        "✓ Runner found.",
+        authentication,
+        json,
+    )
 }
 
+// Rename and show are separate public commands even though both render one registration.
+// jscpd:ignore-start
 pub(super) fn write_runner_rename(
     deployment: &str,
     result: &Result<RunnerRegistration, RunnerFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_runner(deployment, result, "renamed", "✓ Runner renamed.", json)
+    write_runner(
+        deployment,
+        result,
+        "renamed",
+        "✓ Runner renamed.",
+        authentication,
+        json,
+    )
 }
+// jscpd:ignore-end
 
+// Transition headings are caller-owned so mode, move, and future concrete transitions cannot
+// silently inherit a read-command outcome.
+// jscpd:ignore-start
 pub(super) fn write_runner_transition(
     deployment: &str,
     result: &Result<RunnerRegistration, RunnerFailure>,
     outcome: &'static str,
     heading: &'static str,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_runner(deployment, result, outcome, heading, json)
+    write_runner(deployment, result, outcome, heading, authentication, json)
 }
+// jscpd:ignore-end
 
 fn write_runner(
     deployment: &str,
     result: &Result<RunnerRegistration, RunnerFailure>,
     outcome: &'static str,
     heading: &'static str,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -267,7 +314,7 @@ fn write_runner(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 
@@ -447,17 +494,26 @@ pub(super) fn write_deletion_failure(
     deployment: &str,
     target: DeletionTarget<'_>,
     failure: &RunnerFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_failure_with_context(deployment, failure, json, Some(target), None)
+    write_failure_with_context(
+        deployment,
+        failure,
+        authentication,
+        json,
+        Some(target),
+        None,
+    )
 }
 
 pub(super) fn write_failure(
     deployment: &str,
     failure: &RunnerFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_failure_with_context(deployment, failure, json, None, None)
+    write_failure_with_context(deployment, failure, authentication, json, None, None)
 }
 
 pub(super) fn write_activation_failure(
@@ -465,11 +521,13 @@ pub(super) fn write_activation_failure(
     failure: &RunnerFailure,
     organization: &str,
     runner_id: &str,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_failure_with_context(
         deployment,
         failure,
+        authentication,
         json,
         None,
         Some(CreatedRegistration {
@@ -488,6 +546,7 @@ struct CreatedRegistration<'a> {
 fn write_failure_with_context(
     deployment: &str,
     failure: &RunnerFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
     target: Option<DeletionTarget<'_>>,
     created: Option<CreatedRegistration<'_>>,
@@ -496,7 +555,11 @@ fn write_failure_with_context(
         RunnerFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: runner administration requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            authentication
+                .rejected_error(
+                    "error: runner administration requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         RunnerFailure::Forbidden => (

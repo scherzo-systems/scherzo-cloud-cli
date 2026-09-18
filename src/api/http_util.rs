@@ -3,6 +3,7 @@ use std::io;
 use reqwest::blocking::Response as BlockingResponse;
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION, RETRY_AFTER};
 use reqwest::{Response, StatusCode, Url};
+use zeroize::Zeroizing;
 
 pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BODY_BYTES_U64: u64 = 1024 * 1024;
@@ -28,7 +29,7 @@ pub(crate) struct BufferedResponse {
     pub(crate) idempotency_key: Option<HeaderValue>,
     pub(crate) location: Option<HeaderValue>,
     pub(crate) retry_after: Option<HeaderValue>,
-    pub(crate) body: Vec<u8>,
+    pub(crate) body: Zeroizing<Vec<u8>>,
 }
 
 pub(crate) enum BufferedResponseError {
@@ -111,9 +112,18 @@ pub(crate) async fn buffer_response(
     })
 }
 
-pub(crate) async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, BoundedBodyError> {
-    let mut body =
-        bounded_body_buffer(response.content_length()).ok_or(BoundedBodyError::TooLarge)?;
+pub(crate) async fn read_bounded_body(
+    mut response: Response,
+) -> Result<Zeroizing<Vec<u8>>, BoundedBodyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES_U64)
+    {
+        return Err(BoundedBodyError::TooLarge);
+    }
+    // Reserve the full bound before reading so sensitive bytes are never moved through an
+    // ordinary Vec reallocation. reqwest retains ownership of its separate transport chunks.
+    let mut body = Zeroizing::new(Vec::with_capacity(MAX_RESPONSE_BODY_BYTES));
     while let Some(chunk) = response
         .chunk()
         .await

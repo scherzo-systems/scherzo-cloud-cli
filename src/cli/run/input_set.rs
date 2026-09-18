@@ -78,8 +78,9 @@ impl InputSetReference {
         &self,
         deployment: &Deployment,
         policy: crate::api::HttpTransportPolicy,
+        authentication: &super::super::PrincipalAuthenticationArgs,
     ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
-        super::with_api(deployment, policy, |api| {
+        super::with_api(deployment, policy, authentication, |api| {
             api.get_input_set(&self.organization, &self.input_set_id)
         })
     }
@@ -88,8 +89,9 @@ impl InputSetReference {
         &self,
         deployment: &Deployment,
         policy: crate::api::HttpTransportPolicy,
+        authentication: &super::super::PrincipalAuthenticationArgs,
     ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
-        Ok(match self.get(deployment, policy)? {
+        Ok(match self.get(deployment, policy, authentication)? {
             Ok(input_set) if input_set_is_open(&input_set) => Ok(input_set),
             Ok(_) => Err(RunFailure::Conflict),
             Err(failure) => Err(failure),
@@ -216,6 +218,7 @@ impl CreateCommand {
                     &self.organization,
                     "at least one named input is required",
                     self.options.json,
+                    self.options.authentication.uses_stdin(),
                     control,
                 )?
                 else {
@@ -227,6 +230,7 @@ impl CreateCommand {
                 let result = create_input_set(
                     &deployment,
                     self.options.http.transport_policy(),
+                    &self.options.authentication,
                     &self.organization,
                     &self.project_id,
                     &acquired,
@@ -236,6 +240,9 @@ impl CreateCommand {
                     control.update_recovery(Some(input_set.id.clone()));
                 }
                 let input_set_id = control.recovery();
+                // Creation reports an allocated input-set coordinate rather than the retained-run
+                // coordinate used by input deletion; each recovery envelope stays explicit.
+                // jscpd:ignore-start
                 super::finish_operation(control, || {
                     write_result(
                         deployment.fingerprint().api_url(),
@@ -243,9 +250,11 @@ impl CreateCommand {
                         input_set_id.as_deref(),
                         "created",
                         result,
+                        self.options.authentication.kind(),
                         self.options.json,
                     )
                 })
+                // jscpd:ignore-end
             },
             move |signal, snapshot| {
                 super::super::report_dispatched_signal(
@@ -280,6 +289,7 @@ impl CreateCommand {
 fn create_input_set(
     deployment: &Deployment,
     transport_policy: crate::api::HttpTransportPolicy,
+    authentication: &super::super::PrincipalAuthenticationArgs,
     organization: &str,
     project_id: &str,
     acquired: &AcquiredInputs,
@@ -287,7 +297,7 @@ fn create_input_set(
 ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
     let create_key = crate::idempotency::generate_idempotency_key()
         .context("generate Run Input Set request identity")?;
-    super::with_api(deployment, transport_policy, |api| {
+    super::with_api(deployment, transport_policy, authentication, |api| {
         api.create_input_set(
             organization,
             &create_key,
@@ -343,6 +353,7 @@ fn report_input_set_mutation_unknown(
 pub(super) fn stage_and_seal(
     deployment: &Deployment,
     transport_policy: crate::api::HttpTransportPolicy,
+    authentication: &super::super::PrincipalAuthenticationArgs,
     organization: &str,
     project_id: &str,
     acquired: &AcquiredInputs,
@@ -353,6 +364,7 @@ pub(super) fn stage_and_seal(
     let input_set = match create_input_set(
         deployment,
         transport_policy,
+        authentication,
         organization,
         project_id,
         acquired,
@@ -376,7 +388,7 @@ pub(super) fn stage_and_seal(
         .iter()
         .map(acquisition::AcquiredInputObject::upload)
         .collect::<Vec<RunInputUpload<'_>>>();
-    if let Err(failure) = super::with_api(deployment, transport_policy, |api| {
+    if let Err(failure) = super::with_api(deployment, transport_policy, authentication, |api| {
         api.upload_input_members(organization, &input_set, &uploads, || {
             control.begin_dispatch()
         })
@@ -386,7 +398,7 @@ pub(super) fn stage_and_seal(
     if control.is_cancelled() {
         return Ok(Err(RunFailure::Interrupted));
     }
-    super::with_api(deployment, transport_policy, |api| {
+    super::with_api(deployment, transport_policy, authentication, |api| {
         api.seal_input_set(organization, &seal_key, &input_set, || {
             control.begin_dispatch()
         })
@@ -396,9 +408,11 @@ pub(super) fn stage_and_seal(
 impl ShowCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
         super::super::execute_read_only_with_signals("Run Input Set show", move |control| {
-            let result = self
-                .input_set
-                .get(&deployment, self.options.http.transport_policy())?;
+            let result = self.input_set.get(
+                &deployment,
+                self.options.http.transport_policy(),
+                &self.options.authentication,
+            )?;
             super::super::complete_read_only_output(control, || {
                 write_result(
                     deployment.fingerprint().api_url(),
@@ -406,6 +420,7 @@ impl ShowCommand {
                     Some(&self.input_set.input_set_id),
                     "found",
                     result,
+                    self.options.authentication.kind(),
                     self.options.json,
                 )
                 .map_err(Into::into)
@@ -444,6 +459,7 @@ impl UploadCommand {
                         &self.input_set.organization,
                         &self.input_set.input_set_id,
                         result,
+                        self.options.authentication.kind(),
                         self.options.json,
                     )
                 })
@@ -468,23 +484,28 @@ fn upload_selected(
     acquired: &[acquisition::AcquiredInputObject],
     control: &super::super::OperationControl<()>,
 ) -> anyhow::Result<Result<RunInputUploadOutcome, RunFailure>> {
-    let input_set = require_run_success!(
-        command
-            .input_set
-            .get_open(deployment, command.options.http.transport_policy())?
-    );
+    let input_set = require_run_success!(command.input_set.get_open(
+        deployment,
+        command.options.http.transport_policy(),
+        &command.options.authentication,
+    )?);
     let uploads = acquired
         .iter()
         .map(acquisition::AcquiredInputObject::upload)
         .collect::<Vec<RunInputUpload<'_>>>();
-    super::with_api(deployment, command.options.http.transport_policy(), |api| {
-        api.upload_input_members(
-            &command.input_set.organization,
-            &input_set,
-            &uploads,
-            || control.begin_dispatch(),
-        )
-    })
+    super::with_api(
+        deployment,
+        command.options.http.transport_policy(),
+        &command.options.authentication,
+        |api| {
+            api.upload_input_members(
+                &command.input_set.organization,
+                &input_set,
+                &uploads,
+                || control.begin_dispatch(),
+            )
+        },
+    )
 }
 
 impl SealCommand {
@@ -497,6 +518,9 @@ impl SealCommand {
             (),
             move |control| {
                 let result = seal(&deployment, &self, control)?;
+                // Sealing and deletion have distinct success bodies and recovery semantics even
+                // though both complete through the shared mutation control.
+                // jscpd:ignore-start
                 super::finish_operation(control, || {
                     write_result(
                         deployment.fingerprint().api_url(),
@@ -504,9 +528,11 @@ impl SealCommand {
                         Some(&self.input_set.input_set_id),
                         "sealed",
                         result,
+                        self.options.authentication.kind(),
                         self.options.json,
                     )
                 })
+                // jscpd:ignore-end
             },
             move |signal, snapshot| {
                 report_input_set_mutation_unknown(
@@ -527,18 +553,23 @@ fn seal(
     command: &SealCommand,
     control: &super::super::OperationControl<()>,
 ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
-    let input_set = require_run_success!(
-        command
-            .input_set
-            .get_open(deployment, command.options.http.transport_policy())?
-    );
+    let input_set = require_run_success!(command.input_set.get_open(
+        deployment,
+        command.options.http.transport_policy(),
+        &command.options.authentication,
+    )?);
     let key = crate::idempotency::generate_idempotency_key()
         .context("generate Run Input Set seal identity")?;
-    super::with_api(deployment, command.options.http.transport_policy(), |api| {
-        api.seal_input_set(&command.input_set.organization, &key, &input_set, || {
-            control.begin_dispatch()
-        })
-    })
+    super::with_api(
+        deployment,
+        command.options.http.transport_policy(),
+        &command.options.authentication,
+        |api| {
+            api.seal_input_set(&command.input_set.organization, &key, &input_set, || {
+                control.begin_dispatch()
+            })
+        },
+    )
 }
 
 impl DeleteCommand {
@@ -553,15 +584,23 @@ impl DeleteCommand {
             "Run Input Set deletion",
             (),
             move |control| {
-                let result =
-                    super::with_api(&deployment, self.options.http.transport_policy(), |api| {
+                // Input Set deletion and retained-input deletion deliberately keep separate
+                // recovery subjects and output envelopes.
+                // jscpd:ignore-start
+                let result = super::with_api(
+                    &deployment,
+                    self.options.http.transport_policy(),
+                    &self.options.authentication,
+                    |api| {
                         api.delete_input_set(
                             &self.input_set.organization,
                             &self.input_set.input_set_id,
                             &key,
                             || control.begin_dispatch(),
                         )
-                    })?;
+                    },
+                )?;
+                // jscpd:ignore-end
                 super::finish_operation(control, || {
                     write_mutation_result(
                         deployment.fingerprint().api_url(),
@@ -569,6 +608,7 @@ impl DeleteCommand {
                         &self.input_set.input_set_id,
                         "deleted",
                         result,
+                        self.options.authentication.kind(),
                         self.options.json,
                     )
                 })
@@ -593,6 +633,7 @@ fn write_result(
     input_set_id: Option<&str>,
     outcome: &'static str,
     result: Result<RunInputSet, RunFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -625,9 +666,14 @@ fn write_result(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => {
-            write_input_set_failure(deployment, organization, input_set_id, &failure, json)
-        }
+        Err(failure) => write_input_set_failure(
+            deployment,
+            organization,
+            input_set_id,
+            &failure,
+            authentication,
+            json,
+        ),
     }
 }
 
@@ -636,6 +682,7 @@ fn write_upload_result(
     organization: &str,
     input_set_id: &str,
     result: Result<RunInputUploadOutcome, RunFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_input_set_outcome(
@@ -643,6 +690,7 @@ fn write_upload_result(
         organization,
         Some(input_set_id),
         result,
+        authentication,
         json,
         |upload| {
             let verification_required = upload.verification_required_members > 0;
@@ -679,12 +727,16 @@ fn write_upload_result(
     )
 }
 
+// Deletion has an empty success value and a mutation receipt; upload keeps member counts and a
+// verification-required outcome, so explicit closures make the two result contracts reviewable.
+// jscpd:ignore-start
 fn write_mutation_result(
     deployment: &str,
     organization: &str,
     input_set_id: &str,
     outcome: &'static str,
     result: Result<(), RunFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_input_set_outcome(
@@ -692,6 +744,7 @@ fn write_mutation_result(
         organization,
         Some(input_set_id),
         result,
+        authentication,
         json,
         |()| {
             if json {
@@ -712,17 +765,26 @@ fn write_mutation_result(
         },
     )
 }
+// jscpd:ignore-end
 
 fn write_input_set_outcome<T>(
     deployment: &str,
     organization: &str,
     input_set_id: Option<&str>,
     result: Result<T, RunFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
     write_success: impl FnOnce(T) -> anyhow::Result<()>,
 ) -> anyhow::Result<ExitCode> {
     super::write_api_outcome(result, write_success, |failure| {
-        write_input_set_failure(deployment, organization, input_set_id, failure, json)
+        write_input_set_failure(
+            deployment,
+            organization,
+            input_set_id,
+            failure,
+            authentication,
+            json,
+        )
     })
 }
 
@@ -731,9 +793,18 @@ fn write_input_set_failure(
     organization: &str,
     input_set_id: Option<&str>,
     failure: &RunFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    super::write_failure_with_input_set(deployment, organization, None, input_set_id, failure, json)
+    super::write_failure_with_input_set(
+        deployment,
+        organization,
+        None,
+        input_set_id,
+        failure,
+        authentication,
+        json,
+    )
 }
 
 fn acquire_required_inputs<R>(
@@ -742,8 +813,17 @@ fn acquire_required_inputs<R>(
     organization: &str,
     empty_diagnostic: &str,
     json: bool,
+    service_api_key_from_stdin: bool,
     control: &super::super::OperationControl<R>,
 ) -> Result<Option<AcquiredInputs>, super::super::CommandFailure> {
+    if let Err(failure) =
+        acquisition::validate_standard_input_claims(arguments, None, service_api_key_from_stdin)
+    {
+        super::finish_operation(control, || {
+            super::write_input_acquisition_failure(deployment, organization, &failure, json)
+        })?;
+        return Ok(None);
+    }
     match acquisition::acquire(arguments) {
         Ok(acquired) if !acquired.manifest.inputs.is_empty() => Ok(Some(acquired)),
         Ok(_) => {

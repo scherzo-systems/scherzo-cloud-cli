@@ -1,3 +1,6 @@
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+
 use anyhow::{Context, anyhow};
 use clap::Args;
 
@@ -20,6 +23,16 @@ pub(super) struct Command {
     json: bool,
 
     #[command(flatten)]
+    authentication: super::super::super::PrincipalAuthenticationArgs,
+
+    #[arg(
+        long,
+        value_name = "PATH|-",
+        help = "Prove a workload identity with a fresh token from a private file, or - for standard input"
+    )]
+    workload_token_file: Option<PathBuf>,
+
+    #[command(flatten)]
     http: super::super::super::HttpOptions,
 }
 
@@ -37,9 +50,18 @@ impl Command {
         deployment: &Deployment,
         cancellation: &Cancellation,
     ) -> super::super::super::CommandResult {
+        if self.authentication.service_api_key_file.is_some() {
+            return self.run_service(deployment, cancellation);
+        }
+        if self.workload_token_file.is_some() {
+            return Err(anyhow!("--workload-token-file requires --service-api-key-file").into());
+        }
         let options = OutputOptions {
             json: self.json,
-            http: self.http,
+            principal: super::super::PrincipalNetworkOptions {
+                authentication: super::super::super::PrincipalAuthenticationArgs::default(),
+                http: self.http,
+            },
         };
         let client = options.client()?;
         let mut output = output::LinkOutput::new(options.json);
@@ -61,6 +83,7 @@ impl Command {
                 return output::write_common(
                     deployment.fingerprint().api_url(),
                     &common,
+                    super::super::super::PrincipalAuthenticationKind::HumanSession,
                     options.json,
                 )
                 .map_err(Into::into);
@@ -130,11 +153,121 @@ impl Command {
                     deployment.fingerprint().api_url(),
                     &outcome,
                     credential_state,
+                    false,
                 )
                 .map_err(Into::into),
             BoundHumanSession::ActingSessionChanged => output
                 .acting_session_changed(deployment.fingerprint().api_url())
                 .map_err(Into::into),
+        }
+    }
+
+    fn run_service(
+        self,
+        deployment: &Deployment,
+        cancellation: &Cancellation,
+    ) -> super::super::super::CommandResult {
+        let workload_token_file = self.workload_token_file.ok_or_else(|| {
+            anyhow!(
+                "--workload-token-file is required when --service-api-key-file is used for identity linking"
+            )
+        })?;
+        if self.authentication.uses_stdin() && workload_token_file == Path::new("-") {
+            return Err(anyhow!(
+                "standard input cannot supply both a service API key and a workload identity token"
+            )
+            .into());
+        }
+        let mut output = output::LinkOutput::new(self.json);
+        let authentication = self.authentication;
+        let Some(api_key) = read_secret_cancellable(cancellation, move || {
+            authentication.required_service_api_key()
+        })?
+        else {
+            return output
+                .cancelled(deployment.fingerprint().api_url())
+                .map_err(Into::into);
+        };
+        let Some(workload_token) = read_secret_cancellable(cancellation, move || {
+            crate::service_auth::read_workload_token(&workload_token_file)
+                .context("read workload identity token")
+        })?
+        else {
+            return output
+                .cancelled(deployment.fingerprint().api_url())
+                .map_err(Into::into);
+        };
+        let client = crate::api::HttpClient::new(self.http.transport_policy())
+            .map_err(|error| anyhow!(error))
+            .context("prepare identity networking")?;
+        let idempotency_key = crate::idempotency::generate_idempotency_key()
+            .context("generate identity-link request identity")?;
+        // This ownership claim is the authorization boundary for dispatch. The network send
+        // cannot be atomic with an OS signal, so a claim that wins preserves bounded completion.
+        let Some(outcome) = dispatch_identity_link(cancellation, || {
+            link_identity(
+                &client,
+                deployment.fingerprint().api_url(),
+                api_key.expose(),
+                &idempotency_key,
+                workload_token.expose(),
+            )
+        }) else {
+            return output
+                .cancelled(deployment.fingerprint().api_url())
+                .map_err(Into::into);
+        };
+        let outcome = outcome
+            .map_err(|error| anyhow!(error))
+            .context("contact identity API with service credentials")?;
+        output
+            .api_outcome(
+                deployment.fingerprint().api_url(),
+                &outcome,
+                crate::human_auth::session::LocalCredentialState::Retained,
+                true,
+            )
+            .map_err(Into::into)
+    }
+}
+
+fn dispatch_identity_link<T>(
+    cancellation: &Cancellation,
+    dispatch: impl FnOnce() -> T,
+) -> Option<T> {
+    cancellation.claim_bounded_completion().then(dispatch)
+}
+
+fn read_secret_cancellable<T: Send + 'static>(
+    cancellation: &Cancellation,
+    read: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<Option<T>> {
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let read_cancellation = cancellation.clone();
+    std::thread::Builder::new()
+        .name("identity-link-secret-read".to_owned())
+        .spawn(move || {
+            let _ = sender.send(read());
+            read_cancellation.notify_change();
+        })
+        .context("start cancellable identity-link secret read")?;
+
+    loop {
+        let change = cancellation.change_token();
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        match receiver.try_recv() {
+            Ok(result) => return result.map(Some),
+            Err(mpsc::TryRecvError::Empty) => cancellation.wait_for_change(change),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!(
+                    "identity-link secret reader stopped without a result"
+                ));
+            }
         }
     }
 }
@@ -232,5 +365,76 @@ fn flow_context(deployment: &Deployment, phase: DeviceFlowPhase) -> String {
             "request identity-link proof from OAuth issuer {}",
             deployment.fingerprint().issuer()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn cancellation_that_wins_prevents_identity_link_dispatch() {
+        let cancellation = Cancellation::new();
+        let dispatched = Cell::new(false);
+        cancellation.cancel();
+
+        let result = dispatch_identity_link(&cancellation, || dispatched.set(true));
+
+        assert!(result.is_none());
+        assert!(!dispatched.get());
+    }
+
+    #[test]
+    fn identity_link_dispatch_that_wins_preserves_its_result() {
+        let cancellation = Cancellation::new();
+        let signal_cancellation = cancellation.clone();
+
+        let result = dispatch_identity_link(&cancellation, || {
+            signal_cancellation.cancel();
+            "linked"
+        });
+
+        assert_eq!(result, Some("linked"));
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_stops_a_blocked_secret_read() {
+        let cancellation = Cancellation::new();
+        let operation_cancellation = cancellation.clone();
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(0);
+        let canceller = std::thread::spawn(move || {
+            started_receiver
+                .recv()
+                .expect("secret read should report readiness");
+            operation_cancellation.cancel();
+        });
+
+        let result = read_secret_cancellable(&cancellation, move || {
+            started_sender
+                .send(())
+                .expect("secret read readiness should be observed");
+            release_receiver
+                .recv()
+                .expect("test should release the secret reader");
+            finished_sender
+                .send(())
+                .expect("secret read completion should be observed");
+            Ok(())
+        })
+        .expect("cancellable read should complete");
+
+        assert!(result.is_none());
+        release_sender
+            .send(())
+            .expect("blocked secret read should still be present");
+        finished_receiver
+            .recv()
+            .expect("secret reader should finish after release");
+        canceller.join().expect("canceller should finish");
     }
 }

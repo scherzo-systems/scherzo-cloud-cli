@@ -14,11 +14,23 @@ pub(super) struct PrincipalResult<'a> {
 
 impl<'a> PrincipalResult<'a> {
     pub(super) fn from_principal(principal: &'a HumanPrincipal) -> Self {
+        Self::new(&principal.id, "human", principal.display_name.as_deref())
+    }
+
+    pub(super) fn from_profile(principal: &'a crate::api::PrincipalProfile) -> Self {
+        Self::new(
+            &principal.id,
+            principal.r#type,
+            principal.display_name.as_deref(),
+        )
+    }
+
+    fn new(id: &'a str, principal_type: &'static str, display_name: Option<&'a str>) -> Self {
         Self {
-            id: &principal.id,
-            r#type: "human",
+            id,
+            r#type: principal_type,
             state: "active",
-            display_name: principal.display_name.as_deref(),
+            display_name,
         }
     }
 }

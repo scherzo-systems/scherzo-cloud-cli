@@ -15,9 +15,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::process::Stdio;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -73,6 +71,8 @@ mod runner_administration;
 mod runner_enrollment;
 #[path = "cli/runner_status.rs"]
 mod runner_status;
+#[path = "cli/service_principal.rs"]
+mod service_principal;
 #[path = "cli/workflow_reference.rs"]
 mod workflow_reference;
 #[path = "cli/workflow_retry.rs"]
@@ -203,6 +203,34 @@ fn run(args: &[&str]) -> Output {
 
 fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
     run_with_env_from(args, environment, None)
+}
+
+fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &[u8]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES
+        .into_iter()
+        .chain(RUNNER_TELEMETRY_VARIABLES)
+    {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    match stdin.write_all(standard_input) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("write CLI standard input: {error}"),
+    }
+    drop(stdin);
+    child.wait_with_output().unwrap()
 }
 
 fn run_with_env_in(args: &[&str], environment: &[(&str, &str)], current_dir: &Path) -> Output {

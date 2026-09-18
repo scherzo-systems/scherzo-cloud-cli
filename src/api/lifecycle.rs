@@ -72,6 +72,7 @@ pub(crate) enum CommonLifecycleFailure {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RequestDeletionOutcome {
     Scheduled(DeletionSchedule),
+    Deleted,
     Common(CommonLifecycleFailure),
     NotFound,
     HumanOwnerRequired,
@@ -200,10 +201,13 @@ impl Operation {
         }
     }
 
-    const fn success_status(self) -> StatusCode {
+    fn is_success_status(self, status: StatusCode) -> bool {
         match self {
-            Self::RequestPrincipal | Self::RequestOrganization => StatusCode::ACCEPTED,
-            Self::CancelPrincipal | Self::CancelOrganization => StatusCode::OK,
+            Self::RequestPrincipal => {
+                matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT)
+            }
+            Self::RequestOrganization => status == StatusCode::ACCEPTED,
+            Self::CancelPrincipal | Self::CancelOrganization => status == StatusCode::OK,
         }
     }
 
@@ -444,7 +448,7 @@ async fn receive_response(
     response: Response,
 ) -> Result<ReceivedResponse, AttemptError> {
     let status = response.status();
-    if status == spec.operation.success_status()
+    if spec.operation.is_success_status(status)
         && response.headers().get("Idempotency-Key") != Some(&spec.idempotency_key)
     {
         return Err(AttemptError::Protocol(LifecycleApiError::protocol(
@@ -481,7 +485,7 @@ async fn receive_response(
                 ))
             }
             BufferedResponseError::Transport { status, source }
-                if status == spec.operation.success_status() =>
+                if spec.operation.is_success_status(status) =>
             {
                 AttemptError::Ambiguous(classify_reqwest_error(&source))
             }
@@ -504,6 +508,17 @@ fn decode_request_response(
         StatusCode::ACCEPTED => {
             require_response_idempotency_key(operation, &response, expected_idempotency_key)?;
             decode_schedule(operation, &response).map(RequestDeletionOutcome::Scheduled)
+        }
+        StatusCode::NO_CONTENT if matches!(operation, Operation::RequestPrincipal) => {
+            require_response_idempotency_key(operation, &response, expected_idempotency_key)?;
+            if !response.body.is_empty() {
+                return Err(LifecycleApiError::protocol(
+                    operation,
+                    "the successful response contains a body",
+                    false,
+                ));
+            }
+            Ok(RequestDeletionOutcome::Deleted)
         }
         StatusCode::FORBIDDEN => {
             require_problem(operation, &response, FORBIDDEN, false)?;

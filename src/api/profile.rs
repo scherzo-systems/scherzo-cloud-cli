@@ -8,7 +8,7 @@ use reqwest::{Response, StatusCode, Url};
 use super::generated::models;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
-use super::human_principal::{self, HumanPrincipal};
+use super::principal_profile::{self, PrincipalProfile};
 use super::problem::{
     self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, UNAUTHORIZED,
 };
@@ -24,7 +24,7 @@ const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupport
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum UpdateProfileOutcome {
-    Updated(HumanPrincipal),
+    Updated(PrincipalProfile),
     InvalidDisplayName,
     Unauthenticated,
     Forbidden,
@@ -345,7 +345,7 @@ async fn decode_response(
 fn decode_principal(
     body: &[u8],
     expects_display_name: bool,
-) -> Result<HumanPrincipal, UpdateProfileError> {
+) -> Result<PrincipalProfile, UpdateProfileError> {
     let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
         UpdateProfileError::protocol("the principal response body is not valid JSON", false)
     })?;
@@ -360,7 +360,7 @@ fn decode_principal(
     }
     let principal: models::Principal = serde_json::from_value(value)
         .map_err(|_| UpdateProfileError::protocol("the principal fields are invalid", false))?;
-    let principal = human_principal::from_api(principal)
+    let principal = principal_profile::from_api(principal)
         .map_err(|reason| UpdateProfileError::protocol(reason, false))?;
     if principal.display_name.is_some() != expects_display_name {
         return Err(UpdateProfileError::protocol(

@@ -4,6 +4,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::api::http_util::{self, BoundedBodyError};
 use crate::api::{
@@ -293,7 +294,7 @@ impl fmt::Display for AuthorizationLocalError {
 pub(super) struct RawResponse {
     pub(super) status: StatusCode,
     pub(super) content_type: Option<String>,
-    pub(super) body: Vec<u8>,
+    pub(super) body: Zeroizing<Vec<u8>>,
 }
 
 pub(super) fn post_form(

@@ -2,6 +2,8 @@ use super::*;
 
 const TOKEN: &str = "unique-publication-access-token-sentinel";
 const REFRESHED_TOKEN: &str = "unique-publication-refreshed-token-sentinel";
+const SERVICE_API_KEY: &str =
+    "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const ORGANIZATION: &str = "acme-research";
 const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
 const PROJECT_ID: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -275,6 +277,95 @@ fn publication_timeout_requires_wait_on_create_and_show() {
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
     }
+}
+
+#[test]
+fn publication_commands_use_only_the_explicit_service_api_key() {
+    let directory = private_credential_directory();
+    let service_key_path = directory.path().join("service.key");
+    fs::write(&service_key_path, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::set_permissions(&service_key_path, Permissions::from_mode(0o600)).unwrap();
+    let service_key_path = service_key_path.to_str().unwrap();
+    let missing_human_store = directory.path().join("missing-human.json");
+    let missing_human_store = missing_human_store.to_str().unwrap();
+
+    let run_service_command = |args: Vec<&str>, response: Vec<u8>| {
+        let mut args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        args.extend([
+            "--service-api-key-file".to_owned(),
+            service_key_path.to_owned(),
+            "--json".to_owned(),
+            "--allow-insecure-http".to_owned(),
+        ]);
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let server = ScriptedServer::respond(vec![response]);
+        let environment = deployment_environment(&server.api_url, missing_human_store);
+        let output = run_with_env(&args, &environment);
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert_no_publication_secret(&output, &[SERVICE_API_KEY]);
+        assert!(!Path::new(missing_human_store).exists());
+        let request = server.finish().remove(0);
+        assert_eq!(
+            header_value(&request, "authorization"),
+            format!("Bearer {SERVICE_API_KEY}")
+        );
+        request
+    };
+
+    let create = run_service_command(
+        vec![
+            "publication",
+            "create",
+            ORGANIZATION,
+            RUN_ID,
+            "--export",
+            EXPORT_NAME,
+            "--idempotency-key",
+            CALLER_KEY,
+        ],
+        accepted_response(&publication_body()),
+    );
+    assert!(create.starts_with(&format!(
+        "POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications HTTP/1.1\r\n"
+    )));
+
+    let show = run_service_command(
+        vec!["publication", "show", ORGANIZATION, RUN_ID, PUBLICATION_ID],
+        ok_publication_response(&publication_body()),
+    );
+    assert!(show.starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications/{PUBLICATION_ID} HTTP/1.1\r\n"
+    )));
+
+    let show_wait = run_service_command(
+        vec![
+            "publication",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            PUBLICATION_ID,
+            "--wait",
+        ],
+        ok_publication_response(&succeeded_publication("no_changes")),
+    );
+    assert!(show_wait.starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications/{PUBLICATION_ID} HTTP/1.1\r\n"
+    )));
+
+    let list = run_service_command(
+        vec!["publication", "list", ORGANIZATION, RUN_ID],
+        ok_publication_response(&serde_json::json!({"items": []})),
+    );
+    assert!(list.starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/publications HTTP/1.1\r\n"
+    )));
 }
 
 #[test]

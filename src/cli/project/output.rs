@@ -17,6 +17,7 @@ pub(super) fn write_project(
     result: Result<Project, ProjectFailure>,
     outcome: &'static str,
     heading: &'static str,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -33,13 +34,14 @@ pub(super) fn write_project(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 
 pub(super) fn write_project_list(
     deployment: &str,
     result: Result<ProjectList, ProjectFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -74,13 +76,14 @@ pub(super) fn write_project_list(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 
 pub(super) fn write_repository(
     deployment: &str,
     result: Result<ProjectRepository, ProjectFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -121,13 +124,14 @@ pub(super) fn write_repository(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 
 pub(super) fn write_installations(
     deployment: &str,
     result: Result<GitHubInstallationList, ProjectFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -156,13 +160,14 @@ pub(super) fn write_installations(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
 
 pub(super) fn write_repositories(
     deployment: &str,
     result: Result<GitHubRepositoryList, ProjectFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -195,7 +200,7 @@ pub(super) fn write_repositories(
             }
             Ok(ExitCode::Success)
         }
-        Err(failure) => write_failure(deployment, failure, json),
+        Err(failure) => write_failure(deployment, failure, authentication, json),
     }
     // jscpd:ignore-end
 }
@@ -293,13 +298,18 @@ fn enum_text(value: &impl Serialize) -> anyhow::Result<String> {
 fn write_failure(
     deployment: &str,
     failure: ProjectFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, class) = match failure {
         ProjectFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: Scherzo Cloud access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            authentication
+                .rejected_error(
+                    "error: Scherzo Cloud access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         ProjectFailure::Forbidden => (
@@ -384,17 +394,16 @@ fn write_failure(
         ProjectFailure::RateLimited { retry_after } => Some(retry_after),
         _ => None,
     };
-    if json {
-        write_json(&super::super::ApiFailureResult::with_retry_after(
-            deployment,
-            outcome,
-            category,
-            retry_after,
-        ))?;
-    } else {
-        writeln!(io::stderr().lock(), "{human}")?;
-    }
-    Ok(class.exit_code())
+    super::super::write_api_failure(
+        deployment,
+        outcome,
+        category,
+        retry_after,
+        &human,
+        class,
+        json,
+    )
+    .context("write project failure")
 }
 
 fn write_json(value: &impl Serialize) -> anyhow::Result<()> {

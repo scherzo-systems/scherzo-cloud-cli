@@ -9,6 +9,7 @@ mod human_principal;
 mod identities;
 mod lifecycle;
 mod organizations;
+mod principal_profile;
 mod problem;
 mod profile;
 mod projects;
@@ -16,6 +17,7 @@ mod publications;
 mod run_inputs;
 mod runners;
 mod runs;
+mod service_principals;
 mod signup;
 
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
@@ -96,12 +98,14 @@ pub(crate) use organizations::{
     OrganizationAuditSubjectKind, OrganizationError, OrganizationMembershipDirectoryEntry,
     OrganizationMembershipHistoryEntry, OrganizationState, PreviewInvitationOutcome, PrincipalType,
     UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome, accept_invitation,
-    create_organization, decline_invitation, end_organization_membership, get_organization,
-    issue_invitation, leave_organization, list_current_principal_memberships,
-    list_invitation_inbox, list_organization_audit_records, list_organization_invitations,
-    list_organization_membership_history, list_organization_memberships, preview_invitation,
-    revoke_invitation, update_organization, update_organization_membership_role,
+    create_organization, create_organization_with_delegator, decline_invitation,
+    end_organization_membership, get_organization, issue_invitation, leave_organization,
+    list_current_principal_memberships, list_invitation_inbox, list_organization_audit_records,
+    list_organization_invitations, list_organization_membership_history,
+    list_organization_memberships, preview_invitation, revoke_invitation, update_organization,
+    update_organization_membership_role,
 };
+pub(crate) use principal_profile::PrincipalProfile;
 pub(crate) use profile::{UpdateProfileError, UpdateProfileOutcome, update_current_principal};
 pub(crate) use projects::{
     CreateProjectInput, GitHubInstallation as ProjectGitHubInstallation,
@@ -127,6 +131,12 @@ pub(crate) use runners::{
 pub(crate) use runs::{
     CreateRunInput, Run, RunApi, RunCreationAcceptance, RunFailure, RunState,
     valid_integration_context,
+};
+pub(crate) use service_principals::{
+    CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceCredential,
+    ListServiceCredentialsOutcome, RevokeServiceCredentialOutcome, ServiceCredential,
+    ServiceCredentialPage, ServicePrincipal, ServicePrincipalApiError, create_service_principal,
+    issue_service_credential, list_service_credentials, revoke_service_credential,
 };
 pub(crate) use signup::{SignupError, SignupOutcome, signup_human};
 

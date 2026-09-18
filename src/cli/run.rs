@@ -48,11 +48,17 @@ struct RunOptions {
     json: bool,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     http: super::HttpOptions,
 }
 
 #[derive(Debug, Args)]
 struct CloudInputOptions {
+    #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
     #[command(flatten)]
     http: super::HttpOptions,
 
@@ -293,6 +299,7 @@ fn finish_create(
     organization: &str,
     input_set_id: Option<&str>,
     result: Result<crate::api::RunCreationAcceptance, RunFailure>,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
     control: &super::OperationControl<CreateRecoveryState>,
 ) -> super::CommandResult {
@@ -302,6 +309,7 @@ fn finish_create(
             organization,
             input_set_id,
             result,
+            authentication,
             json,
         )
     })
@@ -357,6 +365,7 @@ impl CreateCommand {
         if let Err(error) = acquisition::validate_standard_input_claims(
             &self.inputs,
             self.integration_context_file.as_deref(),
+            self.options.authentication.uses_stdin(),
         ) {
             return finish_operation(control, || {
                 write_input_acquisition_failure(
@@ -409,6 +418,7 @@ impl CreateCommand {
             let staged = input_set::stage_and_seal(
                 deployment,
                 self.options.http.transport_policy(),
+                &self.options.authentication,
                 &self.organization,
                 &self.project_id,
                 acquired,
@@ -423,6 +433,7 @@ impl CreateCommand {
                         &self.organization,
                         recovery.input_set_id(),
                         Err(failure),
+                        self.options.authentication.kind(),
                         self.options.json,
                         control,
                     );
@@ -437,26 +448,36 @@ impl CreateCommand {
         }
 
         let dispatch_recovery = control.recovery().run_dispatched();
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.create(
-                &self.organization,
-                &run_idempotency_key,
-                CreateRunInput {
-                    project_id: &self.project_id,
-                    workflow_path: &self.workflow_path,
-                    source_branch: self.source_branch.as_deref(),
-                    display_name: self.display_name.as_deref(),
-                    input_set_id: input_set_id.as_deref(),
-                    integration_context: integration_context.as_ref(),
-                },
-                || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
-            )
-        })?;
+        // Run dispatch owns cancellation recovery and a run-specific request envelope; it stays
+        // explicit rather than sharing project creation's superficially similar API call.
+        // jscpd:ignore-start
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.create(
+                    &self.organization,
+                    &run_idempotency_key,
+                    CreateRunInput {
+                        project_id: &self.project_id,
+                        workflow_path: &self.workflow_path,
+                        source_branch: self.source_branch.as_deref(),
+                        display_name: self.display_name.as_deref(),
+                        input_set_id: input_set_id.as_deref(),
+                        integration_context: integration_context.as_ref(),
+                    },
+                    || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
+                )
+            },
+        )?;
+        // jscpd:ignore-end
         finish_create(
             deployment,
             &self.organization,
             input_set_id.as_deref(),
             result,
+            self.options.authentication.kind(),
             self.options.json,
             control,
         )
@@ -475,15 +496,19 @@ impl ShowCommand {
         deployment: &Deployment,
         control: &super::OperationControl<()>,
     ) -> super::CommandResult {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.get(&self.run.organization, &self.run.run_id)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.get(&self.run.organization, &self.run.run_id),
+        )?;
         super::complete_read_only_output(control, || {
             write_show(
                 deployment.fingerprint().api_url(),
                 &self.run.organization,
                 &self.run.run_id,
                 result,
+                self.options.authentication.kind(),
                 self.options.json,
             )
             .map_err(Into::into)
@@ -521,16 +546,21 @@ impl WaitCommand {
         control: &super::BlockingObservationControl,
     ) -> super::CommandResult {
         let clock = super::SystemObservationClock;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            wait_for_terminal_run(
-                api,
-                &self.run.organization,
-                &self.run.run_id,
-                self.wait.timeout,
-                control,
-                &clock,
-            )
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                wait_for_terminal_run(
+                    api,
+                    &self.run.organization,
+                    &self.run.run_id,
+                    self.wait.timeout,
+                    control,
+                    &clock,
+                )
+            },
+        )?;
         if !control.begin_completion() {
             return Ok(ExitCode::GeneralFailure);
         }
@@ -553,6 +583,7 @@ impl WaitCommand {
                 &self.run.organization,
                 Some(&self.run.run_id),
                 &failure,
+                self.options.authentication.kind(),
                 self.options.json,
             ),
         }
@@ -659,12 +690,17 @@ fn parse_input_set_id(value: &str) -> Result<String, String> {
 fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
     mut operation: impl FnMut(&RunApi<'_>) -> Result<T, RunFailure>,
 ) -> anyhow::Result<Result<T, RunFailure>> {
     let client = super::human_session_client(transport_policy)?;
-    super::execute_required_api_operation(
-        &client,
-        deployment,
+    super::execute_selected_api_operation(
+        super::principal_api_context(
+            &client,
+            deployment,
+            authentication,
+            "acquire human session for Cloud run operation",
+        ),
         |access_token| {
             let api = RunApi::new(
                 deployment.fingerprint().api_url(),
@@ -679,7 +715,6 @@ fn with_api<T>(
         RunFailure::credential_rejected,
         || RunFailure::Unauthenticated,
         RunFailure::Unreachable,
-        "acquire human session for Cloud run operation",
     )
 }
 
@@ -714,6 +749,7 @@ fn write_create(
     organization: &str,
     input_set_id: Option<&str>,
     result: Result<crate::api::RunCreationAcceptance, RunFailure>,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -752,6 +788,7 @@ fn write_create(
             None,
             input_set_id,
             &failure,
+            authentication,
             json,
         ),
     }
@@ -762,6 +799,7 @@ fn write_show(
     organization: &str,
     requested_run_id: &str,
     result: Result<Run, RunFailure>,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -783,6 +821,7 @@ fn write_show(
             organization,
             Some(requested_run_id),
             &failure,
+            authentication,
             json,
         ),
     }
@@ -964,9 +1003,18 @@ fn write_failure(
     organization: &str,
     run_id: Option<&str>,
     failure: &RunFailure,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_failure_with_input_set(deployment, organization, run_id, None, failure, json)
+    write_failure_with_input_set(
+        deployment,
+        organization,
+        run_id,
+        None,
+        failure,
+        authentication,
+        json,
+    )
 }
 
 fn write_failure_with_input_set(
@@ -975,13 +1023,18 @@ fn write_failure_with_input_set(
     run_id: Option<&str>,
     input_set_id: Option<&str>,
     failure: &RunFailure,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, class) = match failure {
         RunFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: Cloud run access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            authentication
+                .rejected_error(
+                    "error: Cloud run access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         RunFailure::Forbidden => (

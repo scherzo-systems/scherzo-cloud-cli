@@ -3,6 +3,8 @@ use super::*;
 use std::process::Stdio;
 
 const TOKEN: &str = "unique-runner-command-token-sentinel";
+const SERVICE_API_KEY: &str =
+    "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const ORGANIZATION: &str = "acme-research";
 const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
 const POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -359,6 +361,54 @@ fn deletion_by_name_resolves_once_and_emits_exact_success_json() {
         let key = header_value(&requests[1], "idempotency-key");
         assert_eq!(key.len(), 64);
         assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+}
+
+#[test]
+fn runner_deletion_reads_a_service_key_from_stdin_once() {
+    let server = ScriptedServer::respond(vec![
+        json_http_response("200 OK", registration_list_body()),
+        deletion_success_response(),
+    ]);
+    let directory = private_credential_directory();
+    let missing_human_store = directory.path().join("missing-human.json");
+    let environment =
+        deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+
+    let output = run_with_stdin(
+        &[
+            "runner",
+            "delete",
+            ORGANIZATION,
+            "builder-one",
+            "--yes",
+            "--service-api-key-file",
+            "-",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+        format!("{SERVICE_API_KEY}\n").as_bytes(),
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+        "deleted"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!missing_human_store.exists());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(
+            header_value(&request, "authorization"),
+            format!("Bearer {SERVICE_API_KEY}")
+        );
     }
 }
 

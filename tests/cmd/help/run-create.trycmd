@@ -36,6 +36,8 @@ Options:
           Read private immutable integration context from a JSON file, or - for standard input
       --json
           Print the run result as JSON
+      --service-api-key-file <PATH|->
+          Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http
           Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help

@@ -8,7 +8,7 @@ use reqwest::{Response, StatusCode, Url};
 use super::bearer_authorization;
 use super::http_client::{DnsResolutionError, HttpClient, HttpEndpointError};
 use super::http_util::{self, BoundedBodyError};
-use super::human_principal::{self, HumanPrincipal};
+use super::principal_profile::{self, PrincipalProfile};
 use super::problem;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -20,7 +20,7 @@ const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedPrincipal {
-    pub(crate) principal: HumanPrincipal,
+    pub(crate) principal: PrincipalProfile,
     pub(crate) actions: Option<Vec<serde_json::Value>>,
 }
 
@@ -289,7 +289,7 @@ fn decode_authenticated(body: &[u8]) -> Result<CurrentPrincipalOutcome, CurrentP
                 false,
             )
         })?;
-    let principal = human_principal::from_api(*response.principal)
+    let principal = principal_profile::from_api(*response.principal)
         .map_err(|reason| CurrentPrincipalError::protocol(reason, false))?;
     Ok(CurrentPrincipalOutcome::Authenticated(
         AuthenticatedPrincipal {

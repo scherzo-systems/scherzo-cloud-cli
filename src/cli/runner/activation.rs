@@ -95,11 +95,26 @@ impl CreateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         validate_activation_destination(&self.activation_file, self.options.json)?;
         let key = generate_idempotency_key().context("generate activation request identity")?;
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.target.organization, &self.target.runner)?;
-            api.create_activation(&self.target.organization, &runner.id, &key)
-        })?;
-        let issuance = match completed_cloud_result(deployment, result, self.options.json)? {
+        // Activation creation has one-time secret delivery semantics that must remain separate
+        // from activation revocation despite their shared runner lookup.
+        // jscpd:ignore-start
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                let runner =
+                    api.get_registration(&self.target.organization, &self.target.runner)?;
+                api.create_activation(&self.target.organization, &runner.id, &key)
+            },
+        )?;
+        // jscpd:ignore-end
+        let issuance = match completed_cloud_result(
+            deployment,
+            result,
+            self.options.authentication.kind(),
+            self.options.json,
+        )? {
             Ok(issuance) => issuance,
             Err(exit_code) => return Ok(exit_code),
         };
@@ -140,18 +155,24 @@ impl CreateCommand {
 
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.target.organization, &self.target.runner)?;
-            api.list_activations(
-                &self.target.organization,
-                &runner.id,
-                self.pagination.limit,
-                self.pagination.cursor.as_deref(),
-            )
-        })?;
-        // List and revoke retain concrete success documents and human reports;
-        // only their common Cloud failure renderer is intentionally parallel.
+        // Activation, pool, and credential listings retain distinct target resolution and
+        // output schemas even though they share pagination mechanics.
         // jscpd:ignore-start
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                let runner =
+                    api.get_registration(&self.target.organization, &self.target.runner)?;
+                api.list_activations(
+                    &self.target.organization,
+                    &runner.id,
+                    self.pagination.limit,
+                    self.pagination.cursor.as_deref(),
+                )
+            },
+        )?;
         match result {
             Ok(page) => {
                 if self.options.json {
@@ -182,6 +203,7 @@ impl ListCommand {
             Err(failure) => cloud::write_failure(
                 deployment.fingerprint().api_url(),
                 &failure,
+                self.options.authentication.kind(),
                 self.options.json,
             ),
         }
@@ -192,15 +214,21 @@ impl ListCommand {
 impl RevokeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = generate_idempotency_key().context("generate activation revocation identity")?;
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.target.organization, &self.target.runner)?;
-            api.revoke_activation(
-                &self.target.organization,
-                &runner.id,
-                &self.activation,
-                &key,
-            )
-        })?;
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                let runner =
+                    api.get_registration(&self.target.organization, &self.target.runner)?;
+                api.revoke_activation(
+                    &self.target.organization,
+                    &runner.id,
+                    &self.activation,
+                    &key,
+                )
+            },
+        )?;
         match result {
             Ok(activation) => {
                 if self.options.json {
@@ -225,6 +253,7 @@ impl RevokeCommand {
             Err(failure) => cloud::write_failure(
                 deployment.fingerprint().api_url(),
                 &failure,
+                self.options.authentication.kind(),
                 self.options.json,
             ),
         }

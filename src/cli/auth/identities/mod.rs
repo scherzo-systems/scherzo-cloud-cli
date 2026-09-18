@@ -68,14 +68,12 @@ struct OutputOptions {
     json: bool,
 
     #[command(flatten)]
-    http: super::super::HttpOptions,
+    principal: super::PrincipalNetworkOptions,
 }
 
 impl OutputOptions {
     fn client(&self) -> anyhow::Result<HttpClient> {
-        HttpClient::new(self.http.transport_policy())
-            .map_err(|error| anyhow!(error))
-            .context("prepare identity networking")
+        self.principal.client()
     }
 }
 
@@ -134,6 +132,24 @@ where
         },
         identity_api_context(deployment),
     )
+}
+
+fn with_principal_credential<O>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    authentication: &super::super::PrincipalAuthenticationArgs,
+    mut operation: impl FnMut(&str) -> Result<O, IdentityApiError>,
+) -> anyhow::Result<O>
+where
+    O: HumanIdentityOutcome,
+{
+    if let Some(api_key) = authentication.service_api_key()? {
+        operation(api_key.expose())
+            .map_err(identity_api_error)
+            .context(identity_api_context(deployment))
+    } else {
+        with_human_session(client, deployment, operation)
+    }
 }
 
 fn with_human_session_binding<O>(

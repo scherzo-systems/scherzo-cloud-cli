@@ -26,6 +26,9 @@ const IDENTITY_REMOVAL_UNAVAILABLE: &str =
 const REAUTHENTICATION_REQUIRED: &str =
     "https://api.scherzo.dev/problems/reauthentication-required";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
+const QUANTITY_LIMIT_REACHED: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
+const WORKLOAD_IDENTITY_LINKING_NOT_PERMITTED: &str =
+    "https://api.scherzo.dev/problems/workload-identity-linking-not-permitted";
 const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
 const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupported-media-type";
 
@@ -48,6 +51,7 @@ pub(crate) struct OidcIdentity {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum IdentityKind {
     Oidc,
+    WorkloadOidc,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -78,6 +82,8 @@ pub(crate) enum LinkIdentityOutcome {
     Common(CommonIdentityFailure),
     InvalidProof,
     IdentityUnavailable,
+    WorkloadIdentityLinkingNotPermitted,
+    QuantityLimitReached,
     IdempotencyConflict,
 }
 
@@ -85,6 +91,7 @@ pub(crate) enum LinkIdentityOutcome {
 pub(crate) enum RemoveIdentityOutcome {
     Removed,
     Common(CommonIdentityFailure),
+    WorkloadIdentityLinkingNotPermitted,
     ReauthenticationRequired,
     NotFound,
     RemovalUnavailable,
@@ -492,16 +499,28 @@ fn decode_link_response(
             ))
         }
         StatusCode::FORBIDDEN => {
-            require_problem(Operation::Link, &response, FORBIDDEN, false)?;
-            Ok(LinkIdentityOutcome::Common(
-                CommonIdentityFailure::Forbidden,
-            ))
+            let problem_type = problem::decode_type(&response)
+                .map_err(|reason| IdentityApiError::protocol(Operation::Link, reason, false))?;
+            match problem_type.as_str() {
+                FORBIDDEN => Ok(LinkIdentityOutcome::Common(
+                    CommonIdentityFailure::Forbidden,
+                )),
+                WORKLOAD_IDENTITY_LINKING_NOT_PERMITTED => {
+                    Ok(LinkIdentityOutcome::WorkloadIdentityLinkingNotPermitted)
+                }
+                _ => Err(IdentityApiError::protocol(
+                    Operation::Link,
+                    "a 403 response has an unrecognized problem type",
+                    false,
+                )),
+            }
         }
         StatusCode::CONFLICT => {
             let problem_type = problem::decode_type(&response)
                 .map_err(|reason| IdentityApiError::protocol(Operation::Link, reason, false))?;
             match problem_type.as_str() {
                 IDENTITY_UNAVAILABLE => Ok(LinkIdentityOutcome::IdentityUnavailable),
+                QUANTITY_LIMIT_REACHED => Ok(LinkIdentityOutcome::QuantityLimitReached),
                 IDEMPOTENCY_CONFLICT => Ok(LinkIdentityOutcome::IdempotencyConflict),
                 _ => Err(IdentityApiError::protocol(
                     Operation::Link,
@@ -573,6 +592,9 @@ fn decode_remove_response(
                 FORBIDDEN => Ok(RemoveIdentityOutcome::Common(
                     CommonIdentityFailure::Forbidden,
                 )),
+                WORKLOAD_IDENTITY_LINKING_NOT_PERMITTED => {
+                    Ok(RemoveIdentityOutcome::WorkloadIdentityLinkingNotPermitted)
+                }
                 REAUTHENTICATION_REQUIRED => Ok(RemoveIdentityOutcome::ReauthenticationRequired),
                 _ => Err(IdentityApiError::protocol(
                     Operation::Remove,
@@ -720,9 +742,7 @@ impl TryFrom<generated_models::OidcIdentityLink> for OidcIdentity {
         }
         let kind = match value.kind {
             generated_models::oidc_identity_link::Kind::Oidc => IdentityKind::Oidc,
-            generated_models::oidc_identity_link::Kind::WorkloadOidc => {
-                return Err("the human identity kind is not OIDC");
-            }
+            generated_models::oidc_identity_link::Kind::WorkloadOidc => IdentityKind::WorkloadOidc,
         };
         Ok(Self {
             id: value.id,

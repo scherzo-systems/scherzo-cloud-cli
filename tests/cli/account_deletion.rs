@@ -3,6 +3,8 @@ use std::process::Stdio;
 use super::*;
 
 const ACCOUNT_TOKEN: &str = "unique-account-deletion-session-token";
+const SERVICE_API_KEY: &str =
+    "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const PRINCIPAL_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
 fn schedule_response() -> Vec<u8> {
@@ -154,6 +156,56 @@ fn account_deletion_request_schedules_thirty_days_and_removes_the_local_session(
     assert_eq!(
         header_value(&requests[0], "idempotency-key"),
         header_value(&requests[1], "idempotency-key")
+    );
+}
+
+#[test]
+fn service_account_deletion_reports_immediate_completion_without_human_cleanup() {
+    let response = http_response_with_headers(
+        "204 No Content",
+        None,
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &[],
+    );
+    let server = ScriptedServer::respond(vec![response]);
+    let directory = private_credential_directory();
+    let service_key_path = directory.path().join("service.key");
+    fs::write(&service_key_path, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::set_permissions(&service_key_path, Permissions::from_mode(0o600)).unwrap();
+    let missing_human_store = directory.path().join("missing-human.json");
+    let environment =
+        deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+
+    let output = run_with_env(
+        &[
+            "account",
+            "deletion",
+            "request",
+            "--yes",
+            "--service-api-key-file",
+            service_key_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "deleted"
+        })
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!missing_human_store.exists());
+    let request = server.finish().pop().unwrap();
+    assert!(request.starts_with("POST /api/v1/me/deletion HTTP/1.1\r\n"));
+    assert_eq!(
+        header_value(&request, "authorization"),
+        format!("Bearer {SERVICE_API_KEY}")
     );
 }
 

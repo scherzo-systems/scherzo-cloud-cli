@@ -62,6 +62,24 @@ pub(crate) fn check(
         },
     };
 
+    Ok(status_from_outcome(deployment, outcome))
+}
+
+pub(crate) fn check_with_service_api_key(
+    client: &HttpClient,
+    deployment: &Deployment,
+    api_key: &str,
+) -> Result<AuthenticationStatus, StatusError> {
+    let outcome =
+        api::get_current_principal(client, deployment.fingerprint().api_url(), Some(api_key))
+            .map_err(StatusError::PublicApi)?;
+    Ok(status_from_outcome(deployment, outcome))
+}
+
+fn status_from_outcome(
+    deployment: &Deployment,
+    outcome: CurrentPrincipalOutcome,
+) -> AuthenticationStatus {
     let state = match outcome {
         CurrentPrincipalOutcome::Authenticated(authenticated) => {
             AuthenticationState::Authenticated(authenticated)
@@ -75,10 +93,10 @@ pub(crate) fn check(
         }
     };
 
-    Ok(AuthenticationStatus {
+    AuthenticationStatus {
         deployment: deployment.fingerprint().api_url().to_owned(),
         state,
-    })
+    }
 }
 
 #[derive(Debug)]

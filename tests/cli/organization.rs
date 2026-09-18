@@ -300,6 +300,85 @@ fn human_create_has_exact_output_and_request_contract() {
 }
 
 #[test]
+fn service_create_sends_explicit_delegator_without_using_human_credentials() {
+    const SERVICE_KEY: &str =
+        "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const DELEGATOR: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let server = ScriptedServer::respond(vec![organization_success("201 Created")]);
+    let directory = private_credential_directory();
+    let key_path = directory.path().join("service.key");
+    fs::write(&key_path, format!("{SERVICE_KEY}\n")).unwrap();
+    fs::set_permissions(&key_path, Permissions::from_mode(0o600)).unwrap();
+    let human_credentials = directory.path().join("unused-human.json");
+    let environment = deployment_environment(&server.api_url, human_credentials.to_str().unwrap());
+
+    let output = run_with_env(
+        &[
+            "organization",
+            "create",
+            "--display-name",
+            "Acme Research",
+            "--delegator-principal-id",
+            DELEGATOR,
+            "--service-api-key-file",
+            key_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(SERVICE_KEY));
+    assert!(output.stderr.is_empty());
+    let request = server.finish().pop().unwrap();
+    assert_eq!(
+        header_value(&request, "authorization"),
+        format!("Bearer {SERVICE_KEY}")
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request_body(&request)).unwrap(),
+        serde_json::json!({
+            "displayName": "Acme Research",
+            "delegatorPrincipalId": DELEGATOR
+        })
+    );
+}
+
+#[test]
+fn service_create_requires_explicit_human_delegator() {
+    const SERVICE_KEY: &str =
+        "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let server = ScriptedServer::respond(Vec::new());
+    let directory = private_credential_directory();
+    let key_path = directory.path().join("service.key");
+    fs::write(&key_path, format!("{SERVICE_KEY}\n")).unwrap();
+    fs::set_permissions(&key_path, Permissions::from_mode(0o600)).unwrap();
+    let human_credentials = directory.path().join("unused-human.json");
+    let environment = deployment_environment(&server.api_url, human_credentials.to_str().unwrap());
+
+    let output = run_with_env(
+        &[
+            "organization",
+            "create",
+            "--display-name",
+            "Acme Research",
+            "--service-api-key-file",
+            key_path.to_str().unwrap(),
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--delegator-principal-id is required when --service-api-key-file is used")
+    );
+    assert!(server.finish().is_empty());
+}
+
+#[test]
 fn json_create_reports_schema_one_and_supplied_slug() {
     let (server, _directory, _path, credential_path) =
         prepared_organization(vec![organization_success("201 Created")], TOKEN);

@@ -57,6 +57,9 @@ struct LeafOptions {
     json: bool,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     http: super::HttpOptions,
 }
 
@@ -65,27 +68,46 @@ impl LeafOptions {
         self,
         deployment: &Deployment,
         operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
-        write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
+        write: impl FnOnce(
+            &str,
+            &O,
+            super::PrincipalAuthenticationKind,
+            bool,
+        ) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        let outcome = super::execute_with_human_credential(
+        let outcome = super::execute_with_principal_credential(
             deployment,
             self.http.transport_policy(),
+            &self.authentication,
             "prepare organization networking",
             "contact organization API at",
             operation,
         )?;
-        write(deployment.fingerprint().api_url(), &outcome, self.json)
-            .context("write organization result")
+        write(
+            deployment.fingerprint().api_url(),
+            &outcome,
+            self.authentication.kind(),
+            self.json,
+        )
+        .context("write organization result")
     }
 
+    // Organization mutations add request identity before delegating to the same domain-specific
+    // renderer; keeping that boundary explicit is clearer than callback-shaping the read path.
+    // jscpd:ignore-start
     fn execute_mutation<O>(
         self,
         deployment: &Deployment,
         mut operation: impl FnMut(&HttpClient, &str, &str, &str) -> Result<O, OrganizationError>,
-        write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
+        write: impl FnOnce(
+            &str,
+            &O,
+            super::PrincipalAuthenticationKind,
+            bool,
+        ) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
@@ -100,6 +122,7 @@ impl LeafOptions {
             write,
         )
     }
+    // jscpd:ignore-end
 }
 
 impl Command {

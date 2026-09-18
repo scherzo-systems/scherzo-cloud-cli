@@ -54,6 +54,7 @@ impl super::RemoteArtifactOperation for Operation {
         let super::RemoteArtifactResult {
             deployment,
             run,
+            authentication,
             result,
         } = output;
         match result {
@@ -99,7 +100,7 @@ impl super::RemoteArtifactOperation for Operation {
                 };
                 let remedy = match &error {
                     ArtifactAssemblyError::Api(ArtifactApiError::Unauthenticated) => {
-                        "Sign in first:\n  scherzo-cloud auth login"
+                        authentication.rejected_remedy("Sign in first:\n  scherzo-cloud auth login")
                     }
                     ArtifactAssemblyError::DestinationExists => {
                         "Choose an output path that does not exist, then try again."

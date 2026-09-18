@@ -16,6 +16,7 @@ use crate::human_auth::session::LocalCredentialState;
 pub(super) fn write_list(
     deployment: &str,
     outcome: &ListIdentitiesOutcome,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -37,7 +38,9 @@ pub(super) fn write_list(
             Ok(ExitCode::Success)
         }
         // jscpd:ignore-end
-        ListIdentitiesOutcome::Common(common) => write_common(deployment, common, json),
+        ListIdentitiesOutcome::Common(common) => {
+            write_common(deployment, common, authentication, json)
+        }
     }
 }
 
@@ -45,6 +48,7 @@ pub(super) fn write_remove(
     deployment: &str,
     identity_id: &str,
     outcome: &RemoveIdentityOutcome,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -67,12 +71,24 @@ pub(super) fn write_remove(
             }
             Ok(ExitCode::Success)
         }
-        RemoveIdentityOutcome::Common(common) => write_common(deployment, common, json),
+        RemoveIdentityOutcome::Common(common) => {
+            write_common(deployment, common, authentication, json)
+        }
+        RemoveIdentityOutcome::WorkloadIdentityLinkingNotPermitted => write_failure(
+            deployment,
+            "workload_identity_linking_not_permitted",
+            None,
+            "! Workload identity management is not permitted by this deployment.\n\nAsk the deployment operator to enable workload identity linking.",
+            OutcomeClass::Forbidden,
+            json,
+        ),
         RemoveIdentityOutcome::ReauthenticationRequired => write_failure(
             deployment,
             "reauthentication_required",
             None,
-            "! Recent sign-in is required before removing a linked identity.\n\nSign in again with a linked identity that will remain:\n  scherzo-cloud auth login --force",
+            authentication.rejected_notice(
+                "! Recent sign-in is required before removing a linked identity.\n\nSign in again with a linked identity that will remain:\n  scherzo-cloud auth login --force",
+            ),
             OutcomeClass::Forbidden,
             json,
         ),
@@ -212,6 +228,7 @@ impl LinkOutput {
         deployment: &str,
         outcome: &LinkIdentityOutcome,
         credential_state: LocalCredentialState,
+        service_authentication: bool,
     ) -> anyhow::Result<ExitCode> {
         match outcome {
             LinkIdentityOutcome::Linked(identity) => self.write_terminal(
@@ -232,7 +249,11 @@ impl LinkOutput {
                     deployment,
                     LinkTerminal::new("unauthenticated")
                         .with_credential_state(credential_state),
-                    "! You must sign in before linking another identity.\n\nRun:\n  scherzo-cloud auth login",
+                    if service_authentication {
+                        "! The service API key was rejected.\n\nUse a different active service API key."
+                    } else {
+                        "! You must sign in before linking another identity.\n\nRun:\n  scherzo-cloud auth login"
+                    },
                     OutcomeClass::Unauthenticated,
                 ),
                 CommonIdentityFailure::Forbidden => self.write_terminal(
@@ -265,7 +286,11 @@ impl LinkOutput {
                 deployment,
                 LinkTerminal::new("invalid_identity_proof")
                     .with_credential_state(credential_state),
-                "! The newly authorized identity proof was rejected.\n\nStart the linking flow again.",
+                if service_authentication {
+                    "! The workload identity proof was rejected.\n\nObtain a fresh token from a configured workload issuer."
+                } else {
+                    "! The newly authorized identity proof was rejected.\n\nStart the linking flow again."
+                },
                 OutcomeClass::GeneralFailure,
             ),
             LinkIdentityOutcome::IdentityUnavailable => self.write_terminal(
@@ -273,6 +298,20 @@ impl LinkOutput {
                 LinkTerminal::new("identity_unavailable")
                     .with_credential_state(credential_state),
                 "! That identity cannot be linked to this account.\n\nChoose a different identity or list the identities already linked.",
+                OutcomeClass::GeneralFailure,
+            ),
+            LinkIdentityOutcome::WorkloadIdentityLinkingNotPermitted => self.write_terminal(
+                deployment,
+                LinkTerminal::new("workload_identity_linking_not_permitted")
+                    .with_credential_state(credential_state),
+                "! Workload identity linking is not permitted by this deployment.\n\nAsk the deployment operator to enable workload identity linking.",
+                OutcomeClass::Forbidden,
+            ),
+            LinkIdentityOutcome::QuantityLimitReached => self.write_terminal(
+                deployment,
+                LinkTerminal::new("quantity_limit_reached")
+                    .with_credential_state(credential_state),
+                "! The workload identity quantity limit has been reached.\n\nRemove an unused workload identity or ask the deployment operator to raise the limit.",
                 OutcomeClass::GeneralFailure,
             ),
             LinkIdentityOutcome::IdempotencyConflict => self.write_terminal(
@@ -349,6 +388,7 @@ impl LinkOutput {
 pub(super) fn write_common(
     deployment: &str,
     common: &CommonIdentityFailure,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match common {
@@ -356,7 +396,9 @@ pub(super) fn write_common(
             deployment,
             "unauthenticated",
             None,
-            "! You must sign in before managing linked identities.\n\nRun:\n  scherzo-cloud auth login",
+            authentication.rejected_notice(
+                "! You must sign in before managing linked identities.\n\nRun:\n  scherzo-cloud auth login",
+            ),
             OutcomeClass::Unauthenticated,
             json,
         ),

@@ -5,7 +5,7 @@ use crate::api::remove_identity;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 
-use super::{OutputOptions, output, with_human_session};
+use super::{OutputOptions, output, with_principal_credential};
 
 pub(super) const ABOUT: &str = "Remove a linked sign-in identity";
 
@@ -27,19 +27,25 @@ impl Command {
         // jscpd:ignore-end
         let idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate identity-removal request identity")?;
-        let outcome = with_human_session(&client, deployment, |access_token| {
-            remove_identity(
-                &client,
-                deployment.fingerprint().api_url(),
-                access_token,
-                &self.identity_id,
-                &idempotency_key,
-            )
-        })?;
+        let outcome = with_principal_credential(
+            &client,
+            deployment,
+            &self.options.principal.authentication,
+            |access_token| {
+                remove_identity(
+                    &client,
+                    deployment.fingerprint().api_url(),
+                    access_token,
+                    &self.identity_id,
+                    &idempotency_key,
+                )
+            },
+        )?;
         output::write_remove(
             deployment.fingerprint().api_url(),
             &self.identity_id,
             &outcome,
+            self.options.principal.authentication.kind(),
             self.options.json,
         )
     }

@@ -69,7 +69,25 @@ struct CloudOptions {
     json: bool,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     http: super::HttpOptions,
+}
+
+impl CloudOptions {
+    fn write_failure(
+        &self,
+        deployment: &Deployment,
+        failure: &crate::api::RunnerFailure,
+    ) -> anyhow::Result<ExitCode> {
+        cloud::write_failure(
+            deployment.fingerprint().api_url(),
+            failure,
+            self.authentication.kind(),
+            self.json,
+        )
+    }
 }
 
 // Registration creation and standalone activation issuance intentionally keep
@@ -267,6 +285,7 @@ impl CreateCommand {
         let result = cloud::with_api_retrying_rejected_result(
             deployment,
             self.options.http.transport_policy(),
+            &self.options.authentication,
             |api| {
                 let pool = api.get_pool(&self.organization, &self.pool)?;
                 let registration = api.create_registration(
@@ -302,7 +321,12 @@ impl CreateCommand {
             }),
             (result, _) => result,
         };
-        let outcome = match completed_cloud_result(deployment, result, self.options.json)? {
+        let outcome = match completed_cloud_result(
+            deployment,
+            result,
+            self.options.authentication.kind(),
+            self.options.json,
+        )? {
             Ok(outcome) => outcome,
             Err(exit_code) => return Ok(exit_code),
         };
@@ -320,6 +344,7 @@ impl CreateCommand {
                     &failure,
                     &self.organization,
                     &registration.id,
+                    self.options.authentication.kind(),
                     self.options.json,
                 );
             }
@@ -359,6 +384,7 @@ impl CreateCommand {
 fn completed_cloud_result<T>(
     deployment: &Deployment,
     result: Result<T, crate::api::RunnerFailure>,
+    authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<Result<T, ExitCode>> {
     match result {
@@ -366,6 +392,7 @@ fn completed_cloud_result<T>(
         Err(failure) => Ok(Err(cloud::write_failure(
             deployment.fingerprint().api_url(),
             &failure,
+            authentication,
             json,
         )?)),
     }
@@ -424,24 +451,42 @@ impl ListCommand {
             pagination,
             options,
         } = self;
-        let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
-            api.list_registrations(
-                &organization,
-                pagination.limit,
-                pagination.cursor.as_deref(),
-            )
-        })?;
-        cloud::write_runner_list(deployment.fingerprint().api_url(), &result, options.json)
+        let result = cloud::with_api(
+            deployment,
+            options.http.transport_policy(),
+            &options.authentication,
+            |api| {
+                api.list_registrations(
+                    &organization,
+                    pagination.limit,
+                    pagination.cursor.as_deref(),
+                )
+            },
+        )?;
+        cloud::write_runner_list(
+            deployment.fingerprint().api_url(),
+            &result,
+            options.authentication.kind(),
+            options.json,
+        )
     }
 }
 
 impl ShowCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let Self { target, options } = self;
-        let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
-            api.get_registration(&target.organization, &target.runner)
-        })?;
-        cloud::write_runner_show(deployment.fingerprint().api_url(), &result, options.json)
+        let result = cloud::with_api(
+            deployment,
+            options.http.transport_policy(),
+            &options.authentication,
+            |api| api.get_registration(&target.organization, &target.runner),
+        )?;
+        cloud::write_runner_show(
+            deployment.fingerprint().api_url(),
+            &result,
+            options.authentication.kind(),
+            options.json,
+        )
     }
 }
 
@@ -455,14 +500,18 @@ impl ModeCommand {
     ) -> anyhow::Result<ExitCode> {
         let Self { target, options } = self;
         let key = generate_idempotency_key().context("generate runner mode request identity")?;
-        let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
-            api.update_registration_mode(&target.organization, &target.runner, &key, mode)
-        })?;
+        let result = cloud::with_api(
+            deployment,
+            options.http.transport_policy(),
+            &options.authentication,
+            |api| api.update_registration_mode(&target.organization, &target.runner, &key, mode),
+        )?;
         cloud::write_runner_transition(
             deployment.fingerprint().api_url(),
             &result,
             outcome,
             heading,
+            options.authentication.kind(),
             options.json,
         )
     }
@@ -476,14 +525,18 @@ impl MoveCommand {
             options,
         } = self;
         let key = generate_idempotency_key().context("generate runner move request identity")?;
-        let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
-            api.move_registration(&target.organization, &target.runner, &pool, &key)
-        })?;
+        let result = cloud::with_api(
+            deployment,
+            options.http.transport_policy(),
+            &options.authentication,
+            |api| api.move_registration(&target.organization, &target.runner, &pool, &key),
+        )?;
         cloud::write_runner_transition(
             deployment.fingerprint().api_url(),
             &result,
             "moved",
             "✓ Runner moved.",
+            options.authentication.kind(),
             options.json,
         )
     }
@@ -498,10 +551,18 @@ impl RenameCommand {
             options,
         } = self;
         let key = generate_idempotency_key().context("generate runner rename request identity")?;
-        let result = cloud::with_api(deployment, options.http.transport_policy(), |api| {
-            api.rename_registration(&organization, &runner, &key, &name)
-        })?;
-        cloud::write_runner_rename(deployment.fingerprint().api_url(), &result, options.json)
+        let result = cloud::with_api(
+            deployment,
+            options.http.transport_policy(),
+            &options.authentication,
+            |api| api.rename_registration(&organization, &runner, &key, &name),
+        )?;
+        cloud::write_runner_rename(
+            deployment.fingerprint().api_url(),
+            &result,
+            options.authentication.kind(),
+            options.json,
+        )
     }
 }
 
@@ -585,14 +646,19 @@ fn execute_deletion_blocking(
     control: &super::OperationControl<Option<String>>,
 ) -> super::CommandResult {
     let transport = invocation.options.http.transport_policy();
-    let resolved = cloud::with_api(deployment, transport, |api| match invocation.kind {
-        DeletionKind::Runner => api
-            .get_registration(&invocation.organization, &invocation.resource_ref)
-            .map(|runner| runner.id),
-        DeletionKind::Pool => api
-            .get_pool(&invocation.organization, &invocation.resource_ref)
-            .map(|pool| pool.id),
-    })?;
+    let resolved = cloud::with_api(
+        deployment,
+        transport,
+        &invocation.options.authentication,
+        |api| match invocation.kind {
+            DeletionKind::Runner => api
+                .get_registration(&invocation.organization, &invocation.resource_ref)
+                .map(|runner| runner.id),
+            DeletionKind::Pool => api
+                .get_pool(&invocation.organization, &invocation.resource_ref)
+                .map(|pool| pool.id),
+        },
+    )?;
     let resource_id = match resolved {
         Ok(resource_id) => resource_id,
         Err(failure) => {
@@ -600,6 +666,7 @@ fn execute_deletion_blocking(
                 cloud::write_failure(
                     deployment.fingerprint().api_url(),
                     &failure,
+                    invocation.options.authentication.kind(),
                     invocation.options.json,
                 )
                 .map_err(Into::into)
@@ -611,19 +678,24 @@ fn execute_deletion_blocking(
         return Ok(ExitCode::GeneralFailure);
     }
     let key = generate_idempotency_key().context("generate runner deletion request identity")?;
-    let result = cloud::with_api(deployment, transport, |api| {
-        if !control.begin_dispatch() {
-            return Err(crate::api::RunnerFailure::Unreachable(
-                crate::api::UnreachableCategory::Connection,
-            ));
-        }
-        match invocation.kind {
-            DeletionKind::Runner => {
-                api.delete_registration(&invocation.organization, &resource_id, &key)
+    let result = cloud::with_api(
+        deployment,
+        transport,
+        &invocation.options.authentication,
+        |api| {
+            if !control.begin_dispatch() {
+                return Err(crate::api::RunnerFailure::Unreachable(
+                    crate::api::UnreachableCategory::Connection,
+                ));
             }
-            DeletionKind::Pool => api.delete_pool(&invocation.organization, &resource_id, &key),
-        }
-    })?;
+            match invocation.kind {
+                DeletionKind::Runner => {
+                    api.delete_registration(&invocation.organization, &resource_id, &key)
+                }
+                DeletionKind::Pool => api.delete_pool(&invocation.organization, &resource_id, &key),
+            }
+        },
+    )?;
     let target = deletion_target(invocation.kind, &resource_id);
     super::complete_operation(control, || {
         match result {
@@ -648,6 +720,7 @@ fn execute_deletion_blocking(
                 deployment.fingerprint().api_url(),
                 target,
                 &failure,
+                invocation.options.authentication.kind(),
                 invocation.options.json,
             ),
         }

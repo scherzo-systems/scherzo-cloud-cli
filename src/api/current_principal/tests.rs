@@ -78,8 +78,9 @@ fn authenticated_response_preserves_opaque_actions_and_ignores_additive_fields()
     assert_eq!(
         outcome,
         CurrentPrincipalOutcome::Authenticated(AuthenticatedPrincipal {
-            principal: HumanPrincipal {
+            principal: PrincipalProfile {
                 id: "prn_fixture".to_owned(),
+                r#type: "human",
                 display_name: Some("Ada".to_owned()),
             },
             actions: Some(actions.as_array().unwrap().to_owned()),
@@ -92,22 +93,23 @@ fn authenticated_response_preserves_opaque_actions_and_ignores_additive_fields()
 }
 
 #[test]
-fn service_principal_response_is_not_accepted_as_a_human_credential() {
+fn service_principal_response_is_accepted() {
     let body = br#"{"principal":{"id":"prn_service","type":"service","state":"active"}}"#;
     let server = TestServer::respond(response("200 OK", Some("application/json"), body));
 
-    let error = get_current_principal(
-        &http_client(),
-        &server.api_url,
-        Some("synthetic-access-token"),
-    )
-    .unwrap_err();
+    let outcome =
+        get_current_principal(&http_client(), &server.api_url, Some("synthetic-api-key")).unwrap();
 
-    assert!(!error.is_local());
-    assert!(!error.credential_rejected());
     assert_eq!(
-        error.to_string(),
-        "current-principal response violates the public API contract: the principal type is not human"
+        outcome,
+        CurrentPrincipalOutcome::Authenticated(AuthenticatedPrincipal {
+            principal: PrincipalProfile {
+                id: "prn_service".to_owned(),
+                r#type: "service",
+                display_name: None,
+            },
+            actions: None,
+        })
     );
     server.finish_one();
 }

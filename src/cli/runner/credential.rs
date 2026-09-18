@@ -81,15 +81,24 @@ impl CredentialCommand {
 
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.organization, &self.runner)?;
-            api.list_credentials(
-                &self.organization,
-                &runner.id,
-                self.pagination.limit,
-                self.pagination.cursor.as_deref(),
-            )
-        })?;
+        // Credential and pool listings resolve different resource hierarchies and retain
+        // separate output schemas despite sharing pagination fields.
+        // jscpd:ignore-start
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                let runner = api.get_registration(&self.organization, &self.runner)?;
+                api.list_credentials(
+                    &self.organization,
+                    &runner.id,
+                    self.pagination.limit,
+                    self.pagination.cursor.as_deref(),
+                )
+            },
+        )?;
+        // jscpd:ignore-end
         match result {
             Ok(page) => {
                 if self.options.json {
@@ -131,7 +140,7 @@ impl ListCommand {
                 }
                 Ok(ExitCode::Success)
             }
-            Err(failure) => write_failure(deployment, &failure, self.options.json),
+            Err(failure) => self.options.write_failure(deployment, &failure),
         }
     }
 }
@@ -152,17 +161,28 @@ impl MutationCommand {
             CredentialMutation::Retire => "generate credential retirement identity",
             CredentialMutation::Revoke => "generate credential revocation identity",
         })?;
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            let runner = api.get_registration(&self.organization, &self.runner)?;
-            match mutation {
-                CredentialMutation::Retire => {
-                    api.retire_credential(&self.organization, &runner.id, &self.credential, &key)
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                let runner = api.get_registration(&self.organization, &self.runner)?;
+                match mutation {
+                    CredentialMutation::Retire => api.retire_credential(
+                        &self.organization,
+                        &runner.id,
+                        &self.credential,
+                        &key,
+                    ),
+                    CredentialMutation::Revoke => api.revoke_credential(
+                        &self.organization,
+                        &runner.id,
+                        &self.credential,
+                        &key,
+                    ),
                 }
-                CredentialMutation::Revoke => {
-                    api.revoke_credential(&self.organization, &runner.id, &self.credential, &key)
-                }
-            }
-        })?;
+            },
+        )?;
         match result {
             Ok(credential) => {
                 let outcome = match mutation {
@@ -198,17 +218,9 @@ impl MutationCommand {
                 }
                 Ok(ExitCode::Success)
             }
-            Err(failure) => write_failure(deployment, &failure, self.options.json),
+            Err(failure) => self.options.write_failure(deployment, &failure),
         }
     }
-}
-
-fn write_failure(
-    deployment: &Deployment,
-    failure: &crate::api::RunnerFailure,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    cloud::write_failure(deployment.fingerprint().api_url(), failure, json)
 }
 
 fn stored_state_label(state: crate::api::RunnerCredentialStoredState) -> &'static str {

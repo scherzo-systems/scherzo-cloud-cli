@@ -74,6 +74,9 @@ struct InvitationOptions {
     json: bool,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     http: super::HttpOptions,
 }
 
@@ -82,27 +85,43 @@ impl InvitationOptions {
         self,
         deployment: &Deployment,
         operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, OrganizationError>,
-        write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
+        write: impl FnOnce(
+            &str,
+            &O,
+            super::PrincipalAuthenticationKind,
+            bool,
+        ) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        let outcome = super::execute_with_human_credential(
+        let outcome = super::execute_with_principal_credential(
             deployment,
             self.http.transport_policy(),
+            &self.authentication,
             "prepare invitation networking",
             "contact invitation API at",
             operation,
         )?;
-        write(deployment.fingerprint().api_url(), &outcome, self.json)
-            .context("write invitation result")
+        write(
+            deployment.fingerprint().api_url(),
+            &outcome,
+            self.authentication.kind(),
+            self.json,
+        )
+        .context("write invitation result")
     }
 
     fn execute_mutation<O>(
         self,
         deployment: &Deployment,
         mut operation: impl FnMut(&HttpClient, &str, &str, &str) -> Result<O, OrganizationError>,
-        write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
+        write: impl FnOnce(
+            &str,
+            &O,
+            super::PrincipalAuthenticationKind,
+            bool,
+        ) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
@@ -309,7 +328,9 @@ impl AccessCommand {
         self.execute(
             deployment,
             preview_invitation,
-            |deployment, _, outcome, json| output::write_preview(deployment, outcome, json),
+            |deployment, _, outcome, authentication, json| {
+                output::write_preview(deployment, outcome, authentication, json)
+            },
         )
     }
 
@@ -317,10 +338,15 @@ impl AccessCommand {
         self.execute_mutation(
             deployment,
             accept_invitation,
-            |deployment, _, outcome, json| output::write_accept(deployment, outcome, json),
+            |deployment, _, outcome, authentication, json| {
+                output::write_accept(deployment, outcome, authentication, json)
+            },
         )
     }
 
+    // Read access and mutation access intentionally keep different capability and request-
+    // identity signatures even though their final renderer forwarding is parallel.
+    // jscpd:ignore-start
     fn execute<O>(
         self,
         deployment: &Deployment,
@@ -331,7 +357,13 @@ impl AccessCommand {
             &str,
             Option<&str>,
         ) -> Result<O, OrganizationError>,
-        write: impl FnOnce(&str, &str, &O, bool) -> anyhow::Result<ExitCode>,
+        write: impl FnOnce(
+            &str,
+            &str,
+            &O,
+            super::PrincipalAuthenticationKind,
+            bool,
+        ) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
@@ -348,9 +380,12 @@ impl AccessCommand {
                         capability.as_ref().map(SecretToken::expose),
                     )
                 },
-                |deployment, outcome, json| write(deployment, &invitation_id, outcome, json),
+                |deployment, outcome, authentication, json| {
+                    write(deployment, &invitation_id, outcome, authentication, json)
+                },
             )
         })
+        // jscpd:ignore-end
     }
 
     // The mutation variant stays separate because its operation receives the generated
@@ -367,12 +402,17 @@ impl AccessCommand {
             Option<&str>,
             &str,
         ) -> Result<O, OrganizationError>,
-        write: impl FnOnce(&str, &str, &O, bool) -> anyhow::Result<ExitCode>,
+        write: impl FnOnce(
+            &str,
+            &str,
+            &O,
+            super::PrincipalAuthenticationKind,
+            bool,
+        ) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        // jscpd:ignore-end
         self.with_access(deployment, |options, invitation_id, capability| {
             options.execute_mutation(
                 deployment,
@@ -386,9 +426,12 @@ impl AccessCommand {
                         idempotency_key,
                     )
                 },
-                |deployment, outcome, json| write(deployment, &invitation_id, outcome, json),
+                |deployment, outcome, authentication, json| {
+                    write(deployment, &invitation_id, outcome, authentication, json)
+                },
             )
         })
+        // jscpd:ignore-end
     }
 
     fn with_access(
@@ -396,6 +439,13 @@ impl AccessCommand {
         deployment: &Deployment,
         execute: impl FnOnce(InvitationOptions, String, Option<SecretToken>) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode> {
+        if self.options.authentication.uses_stdin()
+            && self.access.capability_file.as_deref() == Some(Path::new("-"))
+        {
+            return Err(anyhow::anyhow!(
+                "standard input cannot supply both a service API key and an invitation capability"
+            ));
+        }
         match self.access.read_capability() {
             Ok(capability) => execute(self.options, self.access.invitation_id, capability),
             Err(error) => output::write_capability_error(
@@ -416,12 +466,13 @@ impl DeclineCommand {
         .execute_mutation(
             deployment,
             decline_invitation,
-            |deployment, invitation_id, outcome, json| {
+            |deployment, invitation_id, outcome, authentication, json| {
                 output::write_termination(
                     deployment,
                     invitation_id,
                     outcome,
                     output::TerminationAction::Decline,
+                    authentication,
                     json,
                 )
             },
@@ -492,7 +543,7 @@ impl RevokeCommand {
                     idempotency_key,
                 )
             },
-            |deployment, outcome, json| {
+            |deployment, outcome, authentication, json| {
                 output::write_termination(
                     deployment,
                     &invitation_id,
@@ -500,6 +551,7 @@ impl RevokeCommand {
                     output::TerminationAction::Revoke {
                         organization: &organization,
                     },
+                    authentication,
                     json,
                 )
             },

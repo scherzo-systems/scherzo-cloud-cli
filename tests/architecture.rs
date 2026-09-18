@@ -45,7 +45,16 @@ use std::path::{Path, PathBuf};
 /// `ARCHITECTURE.md` in the same change when the prose no longer matches.
 fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     let entries: &[(&str, &[&str])] = &[
-        ("api", &["public_id", "tls", "timing", "workflow_contract"]),
+        (
+            "api",
+            &[
+                "public_id",
+                "service_auth",
+                "tls",
+                "timing",
+                "workflow_contract",
+            ],
+        ),
         (
             "cli",
             &[
@@ -57,6 +66,7 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "idempotency",
                 "public_id",
                 "runner",
+                "service_auth",
                 "timing",
                 "workflow_contract",
             ],
@@ -95,6 +105,9 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ),
         // The runner protocol module is a leaf: DTOs and codecs only.
         ("runner_protocol", &[]),
+        // Explicit caller-managed platform secrets stay separate from both local human
+        // sessions and persisted runner credentials.
+        ("service_auth", &["public_id"]),
         // Crate-root test support is a test-only leaf with restricted consumers below.
         ("test_support", &[]),
         ("timing", &[]),

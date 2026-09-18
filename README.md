@@ -166,6 +166,7 @@ The current release supports:
   archived inspection;
 - portable Artifact Set V1 validation without the original run or source checkout;
 - OAuth device login, renewable human sessions, linked sign-in identity management,
+  explicit service API-key authentication, service-principal creation and credential rotation,
   logout, account signup, display-name management, account and organization deletion
   scheduling, organization discovery, profile management and owner audit history,
   invitation issuance and lifecycle management, the
@@ -184,6 +185,78 @@ discover authorized repositories, manage projects and runner pools, create mixed
 or inputless runs for a ready project, administer Run Input Sets, inspect/download/delete
 retained run inputs, wait for terminal status, and download verified Artifact Sets. It
 does not yet guide the rest of Cloud onboarding.
+
+## Service principals and API keys
+
+Create a service principal while signed in as a human, and direct its show-once initial
+API key to a new private file:
+
+```sh
+scherzo-cloud service-principal create \
+  --display-name "Build agent" \
+  --api-key-file ./build-agent.key
+```
+
+The destination is created with mode `0600` and is never overwritten. Use
+`--api-key-file -` only for a deliberate secret pipeline; it writes only the API key to
+standard output and sends status to standard error. `--json` cannot be combined with
+that stdout form, and JSON output never contains an API key. A signal before request
+dispatch stops creation or issuance; after dispatch, the CLI completes the bounded
+request and key delivery despite a later `SIGINT` or `SIGTERM` so a committed one-time
+key is not discarded. If destination write or synchronization fails,
+`api_key_delivery_failed` preserves the known non-secret metadata, destination, and safe
+recovery classification. The receipt reports destination cleanup as `removed`,
+`not_applicable` for standard output, or `uncertain`. File cleanup is attempted immediately; `uncertain` means the key may remain
+at the destination and the operator must protect, inspect, and remove it before deciding
+whether to revoke the known credential. The CLI does not revoke it automatically. If an
+idempotent replay returns credential metadata without the show-once key, the CLI reports
+`api_key_unavailable`, preserves the metadata in JSON, attempts to remove the reserved
+output file, and does not issue or invent a replacement.
+
+Service credentials are explicit per invocation. The CLI does not persist a service API
+key or fall back between a service key and the human credential store:
+
+```sh
+scherzo-cloud service-principal credential list \
+  --service-api-key-file ./build-agent.key
+
+scherzo-cloud service-principal credential issue \
+  --service-api-key-file ./build-agent.key \
+  --api-key-file ./build-agent-next.key
+
+scherzo-cloud service-principal credential revoke \
+  crd_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --service-api-key-file ./build-agent-next.key
+```
+
+Input key files must be regular, non-symbolic-link files owned by the current user with
+mode exactly `0600`. A trailing newline is accepted. `--service-api-key-file -` reads one
+key from standard input. Keys are redacted from debug values and are never emitted in
+JSON, diagnostics, or ordinary logs. Credential listing returns non-secret metadata
+only; issuance requires an existing platform API key, and revocation requires a
+different active key because a credential cannot revoke itself.
+
+Cloud-management leaves whose public API operation permits a service actor also accept
+`--service-api-key-file PATH|-`. This includes service-capable account profile and
+self-deletion operations; current-principal status and identity management;
+organization, invitation, GitHub, project, publication, run, retained-input, Artifact
+Set, runner-pool, and runner-administration operations. Identity linking by a service
+also requires `--workload-token-file PATH|-` containing a fresh token from a configured
+workload issuer. Both files use the same private-file checks and cannot both consume
+standard input.
+
+Human-only operations remain human-only: login, logout, signup, service-principal
+creation, account-deletion cancellation, and organization-deletion request or
+cancellation do not accept service API-key authentication. A service creating an
+organization must additionally pass `--delegator-principal-id` with the exact human
+principal from an active delegation. Delegation is attribution only: the service must
+still hold its own required organization membership and role for every organization
+operation, and the CLI never borrows authority from the human credential store.
+
+Service API keys are also separate from runner credentials. They can authorize runner
+administration when the service has the required organization role, but they cannot
+enroll a runner, start `runner serve`, authenticate the runner connection, or replace a
+runner activation or runner credential.
 
 ## Public API contract
 
@@ -635,8 +708,8 @@ enforces the proof audience, approved issuer, identity type, and ten-minute issu
 window. An identity already linked to any account produces the same
 identity-unavailable result; linking never merges accounts.
 
-Identity removal uses the current local session and never starts a weaker proof path.
-The deployment requires that session's access token to have been issued within ten
+Human-authenticated identity removal uses the current local session and never starts a
+weaker proof path. The deployment requires that session's access token to have been issued within ten
 minutes and refuses to remove either its exact identity or the last usable identity. To
 remove the identity currently used on this device, first find the item marked `current`
 in `list`. Listing is oldest-first and returns one page, so follow each `nextCursor` with
@@ -644,7 +717,10 @@ in `list`. Listing is oldest-first and returns one page, so follow each `nextCur
 `scherzo-cloud auth login --force`, and choose a different identity already linked to
 the same account. That fresh login replaces the local session. Removing the former
 identity then leaves the replacement local session signed in and unchanged. A removal
-command never deletes or revokes the current local credential.
+command never deletes or revokes the current local credential. With
+`--service-api-key-file`, removal instead uses the selected service authority and never
+reads or changes the local human session. Deployment workload-identity policy and
+service-actor authorization still apply.
 
 Identity list and remove use one schema-version-1 JSON document with `--json`. Linking
 uses newline-delimited schema-version-1 activation and terminal-result events because it
@@ -712,6 +788,11 @@ showing the confirmed schedule, and directs the user to local sign-out. An uncon
 API request retains the local credential and must not be repeated
 until the lifecycle state has been confirmed with the deployment operator.
 
+Supplying `--service-api-key-file PATH|-` to the request deletes the authenticated
+service principal immediately instead of creating a schedule. A successful JSON result
+reports `outcome: "deleted"`; the command does not read, remove, or update a human
+credential store.
+
 Cancel before the deadline with a fresh browser proof from the same still-linked identity:
 
 ```sh
@@ -739,9 +820,13 @@ checks.
 
 ## Organization management
 
-Organization commands use only human OAuth authority and never read runner credentials.
-Except for deletion cancellation's explicit fresh proof flow below, they use the selected
-local credential and do not start login or signup. Organization references must be an
+Organization commands default to the selected local human OAuth credential. Supported
+commands accept `--service-api-key-file` to use explicit service authority instead,
+without reading the human credential store; runner credentials are never used. Service
+organization creation also requires `--delegator-principal-id` naming an authorized human
+principal, and the deployment enforces the delegation contract. Organization deletion
+request and cancellation remain human-only; cancellation uses the fresh proof flow
+below. Other operations do not start login or signup. Organization references must be an
 exact `org_` ID or lowercase URL-safe slug. The CLI rejects invalid references locally
 and passes accepted references to the deployment without normalization.
 
@@ -796,7 +881,7 @@ scherzo-cloud organization leave acme-labs --yes
 ```
 
 Add `--json` to any of these leaves for its schema-version-1 result. Organization
-listing returns one oldest-first page of the signed-in principal's membership history.
+listing returns one oldest-first page of the selected principal's membership history.
 Every row includes the membership and organization IDs plus lifecycle state. The
 organization name and slug appear only while both the organization and membership are
 active; suspended and ended rows retain history without exposing mutable organization
@@ -846,14 +931,17 @@ it reports `unreachable` because the mutation result cannot be confirmed. It doe
 persist the key or retry a contracted HTTP response. Do not issue a new mutation merely
 because an earlier result was unconfirmed.
 
-These commands are a direct human management surface. Authentication status may carry a
-server-advertised `organization.create` action, but the CLI only transports that value;
-a trusted external guide owns action selection, explanation, and approval.
+These commands use the selected human or explicitly supplied service authority within
+the API's actor restrictions. Authentication status may carry a server-advertised
+`organization.create` action, but the CLI only transports that value; a trusted external
+guide owns action selection, explanation, and approval.
 
 ## Organization invitations
 
-Invitation commands use the selected human OAuth credential. Active organization owners
-can issue invitations to either an active principal ID or an email address, inspect retained
+Invitation commands use the selected human OAuth credential by default and accept
+`--service-api-key-file PATH|-` when an API operation permits a service actor. The
+deployment authorizes the exact acting principal. Active organization owners can issue
+invitations to either an active principal ID or an email address, inspect retained
 invitation history, and revoke an outstanding invitation:
 
 ```sh
@@ -913,10 +1001,11 @@ or rate limited, and exit 1 for other rejected or unavailable outcomes.
 
 ## GitHub connections
 
-GitHub commands use only the selected human OAuth credential. The deployment requires
-the exact acting principal to be a current active organization owner; the CLI does not
-use a runner credential, service credential, GitHub personal access token, or local Git
-credential.
+GitHub commands use the selected human OAuth credential by default and accept
+`--service-api-key-file PATH|-` when the operation permits a service actor. The deployment
+requires the exact acting principal to be a current active organization owner. The CLI
+uses a service credential only when explicitly selected and never substitutes a runner
+credential, GitHub personal access token, or local Git credential.
 
 Setup is deliberately split around browser consent. The CLI neither opens a browser nor
 listens for an inbound callback. Begin a ten-minute, single-use setup session:
@@ -927,7 +1016,7 @@ scherzo-cloud github setup begin acme-labs
 
 Open the reported URL in a browser and approve the GitHub account and repositories.
 After GitHub returns from setup, copy the decimal installation ID from the browser return
-URL and complete the same session while signed in as the same Scherzo Cloud principal:
+URL and complete the same session as the same Scherzo Cloud principal:
 
 ```sh
 scherzo-cloud github setup complete \
@@ -936,10 +1025,11 @@ scherzo-cloud github setup complete \
   --provider-installation-id 12345678
 ```
 
-Completion reauthenticates the current human session, while the deployment enforces the
-setup session's exact actor and organization binding and verifies the installation with
-the platform GitHub App credential. An expired or rejected completion does not let the
-CLI substitute another actor, account, repository list, or provider credential. Begin a
+Completion uses the explicitly selected principal credential, while the deployment
+enforces the setup session's exact actor and organization binding and verifies the
+installation with the platform GitHub App credential. An expired or rejected completion
+does not let the CLI substitute another actor, account, repository list, or provider
+credential. Begin a
 new setup session when the old session has expired.
 
 List the organization's stable installation bindings and their current `active`,
@@ -983,10 +1073,11 @@ installation ID.
 
 ## Project management
 
-Project commands use the selected human OAuth credential and existing public API
-operations. Project IDs, GitHub installation binding IDs, provider repository IDs, and
-runner pool IDs remain exact authority inputs; repository full names are display metadata
-only. Start by discovering those values:
+Project commands use the selected human OAuth credential by default and accept
+`--service-api-key-file PATH|-` when an API operation permits a service actor. Project
+IDs, GitHub installation binding IDs, provider repository IDs, and runner pool IDs remain
+exact authority inputs; repository full names are display metadata only. Start by
+discovering those values:
 
 ```sh
 # Discover the current account's organization memberships.
@@ -1064,9 +1155,10 @@ same-organization repository and runner-pool checks remain server-enforced.
 
 ## Cloud runs
 
-Run commands use the selected human OAuth credential and the configured Scherzo Cloud
-deployment. They are separate from `scherzo-cloud workflow`, which runs and inspects
-local workflow definitions and run directories.
+Run commands use the selected human OAuth credential by default and accept
+`--service-api-key-file PATH|-` when an API operation permits a service actor. They use
+the configured Scherzo Cloud deployment and remain separate from `scherzo-cloud workflow`,
+which runs and inspects local workflow definitions and run directories.
 
 ```sh
 # Admit an inputless run without waiting for execution.
@@ -1253,10 +1345,11 @@ Set has been downloaded, verified, and committed at the requested destination.
 
 ## GitHub artifact publications
 
-Publication commands use the selected human OAuth credential to turn one available
-`git_branch` export from a succeeded Cloud run into a ready-for-review pull request.
-Publication is always explicit: run success and export declaration do not publish
-anything automatically.
+Publication commands use the selected human OAuth credential by default and accept
+`--service-api-key-file PATH|-` when the operation permits a service actor. They turn one
+available `git_branch` export from a succeeded Cloud run into a ready-for-review pull
+request. Publication is always explicit: run success and export declaration do not
+publish anything automatically.
 
 The complete Publication command surface is:
 

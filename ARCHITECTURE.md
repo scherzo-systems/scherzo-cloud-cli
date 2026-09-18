@@ -4,8 +4,9 @@
 
 This repository defines the public source boundary for the Rust `scherzo-cloud`
 executable. The current binary provides help, version output, deployment selection, a
-secure local human credential store, OAuth Device Authorization, server-confirmed
-authentication status, explicit human-principal signup, revoking logout, organization
+secure local human credential store, caller-managed service API-key input, OAuth Device
+Authorization, server-confirmed authentication status, explicit human-principal signup,
+service-principal and credential lifecycle management, revoking logout, organization
 profile and membership management, one-page active member-directory and owner-only membership-history reads, inputless Cloud run creation
 and current projection reads, local Workflow V1 definition validation, and an outbound,
 enrolled runner transport.
@@ -158,7 +159,8 @@ isolation, artifact size, or independent release cadence creates a demonstrated 
 
 ## Credential separation
 
-Human commands and the runner use different security identities.
+Human sessions, service-principal credentials, and runners use distinct security
+identities and storage rules.
 
 Human commands use the credential implementation beneath `src/human_auth/`. The store
 binds each renewable access-and-refresh credential to the exact API URL, issuer,
@@ -190,10 +192,14 @@ one opaque idempotency key per invocation, and retries an ambiguous transport fa
 once with that same key. It reports an authenticated principal only from the signup
 response and never begins another device authorization transaction.
 
-The status, signup, organization, and runner cloud-administration commands use that same
-human-session acquisition path and no other identity source. It silently refreshes
-expired or near-expiry access tokens, refreshes once after HTTP 401, and retries the API
-operation once. A refresher holds deployment-specific authority, re-reads current state,
+Human-only operations, including login, logout, signup, service-principal creation,
+account-deletion cancellation, and organization-deletion request or cancellation, use
+that same human-session acquisition path and no other identity source. Service-capable
+operations select either that path or an explicit per-invocation service API-key file;
+they never infer service credentials from the environment or fall back from a rejected
+service credential to the human store. The human path silently refreshes expired or
+near-expiry access tokens, refreshes once after HTTP 401, and retries the API operation
+once. A refresher holds deployment-specific authority, re-reads current state,
 and conditionally commits only a rotation of the token it exchanged. One ambiguous
 refresh response may be retried once inside Auth0's bounded overlap. Terminal OAuth
 rejection removes the matching session; transient failures preserve it. Organization creation, profile updates, membership role updates, membership removal,
@@ -206,6 +212,16 @@ last-human-owner enforcement rather than making stale client-side preflight deci
 token, reporting when server revocation cannot be confirmed. These commands do not
 interpret status actions; action selection and approval remain responsibilities of the
 governing agent guide.
+
+Caller-managed service credentials live beneath `src/service_auth.rs`. That boundary
+accepts only canonical service keys from standard input or regular, non-symlink,
+current-user-owned mode-`0600` files, bounds every read, and retains secret values in
+zeroizing, redacted types. It writes show-once issued keys only to an explicitly selected
+new mode-`0600` file or directly to standard output. It has no credential store,
+environment discovery, refresh path, or runner-state access. Service workload identity
+linking accepts a separate protected workload-token input; it never treats that token as
+organization authority. The API boundary may carry redacted service-key values only for
+show-once delivery, while the command boundary owns secret destination policy.
 
 The runner uses the current `rrc_` machine credential and Cloud-issued connection URL
 from protected enrollment state. `runner enroll` and `runner serve` consume one closed
@@ -347,7 +363,10 @@ of `api::generated` within the API boundary, and the confinement of command pars
 HTTP, WebSocket, telemetry, and terminal dependencies to their owning modules. The
 crate-root `src/test_support.rs` module is a `cfg(test)`-only leaf shared exclusively by
 execution and runner tests for hermetic Git command construction; it is not a production
-component or a general cross-component utility. Changing a module boundary requires
+component or a general cross-component utility. The `src/service_auth.rs` boundary
+depends only on public-ID syntax and is consumed only by the handwritten API and CLI
+boundaries; this keeps caller-managed platform secrets out of human session and runner
+credential ownership. Changing a module boundary requires
 updating that test and this document in the same change.
 
 The CLI uses a typed `clap` command tree. Each command module owns its arguments, help

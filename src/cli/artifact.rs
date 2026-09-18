@@ -8,7 +8,6 @@ use clap::{Args, Subcommand};
 
 use crate::api::{ArtifactApi, ArtifactApiError, HttpClient, HttpTransportPolicy};
 use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
 
 pub(super) const ABOUT: &str = "Work with portable workflow artifacts";
 const NAME: &str = "artifact";
@@ -44,6 +43,9 @@ struct RemoteArtifactOptions {
     run: RunArtifactReference,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     http: super::HttpOptions,
 }
 
@@ -72,6 +74,7 @@ impl RemoteArtifactError for ArtifactApiError {
 pub(super) struct RemoteArtifactResult<'a, T, E> {
     deployment: &'a str,
     run: &'a RunArtifactReference,
+    authentication: super::PrincipalAuthenticationKind,
     result: Result<T, E>,
 }
 
@@ -97,6 +100,7 @@ impl<O: RemoteArtifactOperation + Args> RemoteArtifactCommand<O> {
         execute_with_api(
             deployment,
             self.remote.http.transport_policy(),
+            &self.remote.authentication,
             O::SESSION_CONTEXT,
             |api| self.operation.request(api, &self.remote.run),
             RemoteArtifactError::credential_rejected,
@@ -104,6 +108,7 @@ impl<O: RemoteArtifactOperation + Args> RemoteArtifactCommand<O> {
                 self.operation.write_result(RemoteArtifactResult {
                     deployment,
                     run: &self.remote.run,
+                    authentication: self.remote.authentication.kind(),
                     result,
                 })
             },
@@ -142,6 +147,7 @@ fn execute_remote<O: RemoteArtifactOperation + Args>(
 fn execute_with_api<T, E>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
     session_context: &'static str,
     operation: impl FnMut(&mut ArtifactApi) -> Result<T, E>,
     credential_rejected: impl Fn(&E) -> bool,
@@ -153,6 +159,7 @@ where
     let result = with_api(
         deployment,
         transport_policy,
+        authentication,
         session_context,
         operation,
         credential_rejected,
@@ -163,6 +170,7 @@ where
 fn with_api<T, E>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
     session_context: &'static str,
     mut operation: impl FnMut(&mut ArtifactApi) -> Result<T, E>,
     credential_rejected: impl Fn(&E) -> bool,
@@ -173,27 +181,21 @@ where
     let session_client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare Artifact Set networking")?;
-    match session::execute_required(
-        &session_client,
-        deployment,
+    super::execute_selected_api_operation(
+        super::principal_api_context(&session_client, deployment, authentication, session_context),
         |access_token| {
-            let mut api = ArtifactApi::new(
+            let mut api = match ArtifactApi::new(
                 deployment.fingerprint().api_url(),
-                access_token.expose(),
+                access_token,
                 transport_policy,
-            )
-            .map_err(E::from)?;
-            operation(&mut api)
+            ) {
+                Ok(api) => api,
+                Err(error) => return Ok(Err(E::from(error))),
+            };
+            Ok(operation(&mut api))
         },
-        |result| result.as_ref().is_err_and(&credential_rejected),
-    ) {
-        Ok(RequiredOperation::Unauthenticated) => {
-            Ok(Err(E::from(ArtifactApiError::Unauthenticated)))
-        }
-        Ok(RequiredOperation::Completed(result)) => Ok(result),
-        Err(error) => match error.unreachable_category() {
-            Some(category) => Ok(Err(E::from(ArtifactApiError::Unreachable(category)))),
-            None => Err(anyhow!(error).context(session_context)),
-        },
-    }
+        credential_rejected,
+        || E::from(ArtifactApiError::Unauthenticated),
+        |category| E::from(ArtifactApiError::Unreachable(category)),
+    )
 }

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::api::{HumanPrincipal, UpdateProfileError, UpdateProfileOutcome};
+use crate::api::{PrincipalProfile, UpdateProfileError, UpdateProfileOutcome};
 use crate::exit_code::{ExitCode, OutcomeClass};
 
 use super::super::principal::PrincipalResult;
@@ -14,6 +14,7 @@ impl_authenticated_account_outcome!(UpdateProfileOutcome, UpdateProfileError);
 
 pub(super) fn write_outcome(
     json: bool,
+    service_authentication: bool,
     clear_display_name: bool,
     deployment: &str,
     outcome: &UpdateProfileOutcome,
@@ -26,7 +27,7 @@ pub(super) fn write_outcome(
     if json {
         write_json_result(deployment, operation, outcome)?;
     } else {
-        write_human_result(deployment, operation, outcome)?;
+        write_human_result(deployment, operation, outcome, service_authentication)?;
     }
     Ok(outcome_class(outcome).exit_code())
 }
@@ -93,10 +94,10 @@ impl<'a> UpdateResult<'a> {
         let body = match outcome {
             UpdateProfileOutcome::Updated(principal) => match operation {
                 DisplayNameOperation::Set => UpdateResultBody::Set {
-                    principal: PrincipalResult::from_principal(principal),
+                    principal: PrincipalResult::from_profile(principal),
                 },
                 DisplayNameOperation::Clear => UpdateResultBody::Cleared {
-                    principal: PrincipalResult::from_principal(principal),
+                    principal: PrincipalResult::from_profile(principal),
                 },
             },
             UpdateProfileOutcome::InvalidDisplayName => UpdateResultBody::InvalidDisplayName,
@@ -134,6 +135,7 @@ fn write_human_result(
     deployment: &str,
     operation: DisplayNameOperation,
     outcome: &UpdateProfileOutcome,
+    service_authentication: bool,
 ) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -144,6 +146,10 @@ fn write_human_result(
         UpdateProfileOutcome::InvalidDisplayName => writeln!(
             stdout,
             "! Your display name was rejected.\n\nUse a name that normalizes to 1 through 200 Unicode scalar values and contains no control characters."
+        ),
+        UpdateProfileOutcome::Unauthenticated if service_authentication => writeln!(
+            stdout,
+            "! The service API key was rejected.\n\nUse a different active service API key."
         ),
         UpdateProfileOutcome::Unauthenticated => writeln!(
             stdout,
@@ -178,7 +184,7 @@ fn write_updated_account(
     output: &mut impl Write,
     deployment: &str,
     operation: DisplayNameOperation,
-    principal: &HumanPrincipal,
+    principal: &PrincipalProfile,
 ) -> io::Result<()> {
     writeln!(
         output,

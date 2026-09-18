@@ -72,6 +72,9 @@ struct UpdateCommand {
     clear_display_name: bool,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     options: LeafOptions,
 }
 
@@ -128,24 +131,27 @@ fn execute_update(
     command: UpdateCommand,
     deployment: &Deployment,
 ) -> anyhow::Result<crate::exit_code::ExitCode> {
-    let outcome = execute_mutation(
+    let idempotency_key =
+        generate_idempotency_key().context("create account update request identity")?;
+    let outcome = super::execute_with_principal_credential(
         deployment,
         command.options.http.transport_policy(),
-        "create account update request identity",
+        &command.authentication,
         "prepare account update networking",
         "update Scherzo Cloud account through",
-        |client, api_url, access_token, idempotency_key| {
+        |client, api_url, access_token| {
             update_current_principal(
                 client,
                 api_url,
                 access_token,
-                idempotency_key,
+                &idempotency_key,
                 command.display_name.as_deref(),
             )
         },
     )?;
     update::write_outcome(
         command.options.json,
+        command.authentication.service_api_key_file.is_some(),
         command.clear_display_name,
         deployment.fingerprint().api_url(),
         &outcome,

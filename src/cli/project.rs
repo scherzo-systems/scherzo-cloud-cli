@@ -6,7 +6,6 @@ use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use crate::api::{CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
 
 use super::OrganizationRef;
 
@@ -42,6 +41,9 @@ enum ProjectCommand {
 struct Options {
     #[arg(long, help = "Print the project result as JSON")]
     json: bool,
+
+    #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
 
     #[command(flatten)]
     http: super::HttpOptions,
@@ -366,24 +368,30 @@ impl CreateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project creation request identity")?;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.create(
-                &self.organization,
-                &key,
-                CreateProjectInput {
-                    name: &self.name,
-                    installation_id: &self.repository.installation_id,
-                    repository_id: &self.repository.repository_id,
-                    default_branch: self.repository.default_branch.as_deref(),
-                    runner_pool_id: self.runner_pool_id.as_deref(),
-                },
-            )
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.create(
+                    &self.organization,
+                    &key,
+                    CreateProjectInput {
+                        name: &self.name,
+                        installation_id: &self.repository.installation_id,
+                        repository_id: &self.repository.repository_id,
+                        default_branch: self.repository.default_branch.as_deref(),
+                        runner_pool_id: self.runner_pool_id.as_deref(),
+                    },
+                )
+            },
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "created",
             "✓ Project created.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -394,16 +402,22 @@ impl CreateCommand {
 // jscpd:ignore-start
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.list(
-                &self.organization,
-                self.pagination.limit,
-                self.pagination.cursor.as_deref(),
-            )
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.list(
+                    &self.organization,
+                    self.pagination.limit,
+                    self.pagination.cursor.as_deref(),
+                )
+            },
+        )?;
         output::write_project_list(
             deployment.fingerprint().api_url(),
             result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -411,14 +425,18 @@ impl ListCommand {
 
 impl ShowCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.get(&self.project.organization, &self.project.project_id)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.get(&self.project.organization, &self.project.project_id),
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "found",
             "✓ Project found.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -428,19 +446,25 @@ impl RenameCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project rename request identity")?;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.rename(
-                &self.project.organization,
-                &self.project.project_id,
-                &key,
-                &self.name,
-            )
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.rename(
+                    &self.project.organization,
+                    &self.project.project_id,
+                    &key,
+                    &self.name,
+                )
+            },
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "renamed",
             "✓ Project renamed.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -449,12 +473,16 @@ impl RenameCommand {
 
 impl InstallationListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.list_installations(&self.organization)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.list_installations(&self.organization),
+        )?;
         output::write_installations(
             deployment.fingerprint().api_url(),
             result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -462,12 +490,16 @@ impl InstallationListCommand {
 
 impl RepositoryListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.list_repositories(&self.organization, &self.installation_id)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.list_repositories(&self.organization, &self.installation_id),
+        )?;
         output::write_repositories(
             deployment.fingerprint().api_url(),
             result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -475,12 +507,16 @@ impl RepositoryListCommand {
 
 impl RepositoryShowCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.get_repository(&self.project.organization, &self.project.project_id)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.get_repository(&self.project.organization, &self.project.project_id),
+        )?;
         output::write_repository(
             deployment.fingerprint().api_url(),
             result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -490,21 +526,27 @@ impl RepositorySetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project repository request identity")?;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.set_repository(
-                &self.project.organization,
-                &self.project.project_id,
-                &key,
-                &self.repository.installation_id,
-                &self.repository.repository_id,
-                self.repository.default_branch.as_deref(),
-            )
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.set_repository(
+                    &self.project.organization,
+                    &self.project.project_id,
+                    &key,
+                    &self.repository.installation_id,
+                    &self.repository.repository_id,
+                    self.repository.default_branch.as_deref(),
+                )
+            },
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "repository_set",
             "✓ Project repository set.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -514,19 +556,25 @@ impl RepositoryUpdateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project repository update request identity")?;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.update_repository(
-                &self.project.organization,
-                &self.project.project_id,
-                &key,
-                &self.default_branch,
-            )
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.update_repository(
+                    &self.project.organization,
+                    &self.project.project_id,
+                    &key,
+                    &self.default_branch,
+                )
+            },
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "repository_updated",
             "✓ Project repository updated.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -536,14 +584,18 @@ impl RepositoryDetachCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project repository detachment request identity")?;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.detach_repository(&self.project.organization, &self.project.project_id, &key)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.detach_repository(&self.project.organization, &self.project.project_id, &key),
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "repository_detached",
             "✓ Project repository detached.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -553,19 +605,25 @@ impl RunnerPoolSetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project runner pool request identity")?;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.set_runner_pool(
-                &self.project.organization,
-                &self.project.project_id,
-                &key,
-                &self.runner_pool_id,
-            )
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.set_runner_pool(
+                    &self.project.organization,
+                    &self.project.project_id,
+                    &key,
+                    &self.runner_pool_id,
+                )
+            },
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "runner_pool_set",
             "✓ Project runner pool set.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -575,14 +633,20 @@ impl RunnerPoolRemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project runner pool removal request identity")?;
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.remove_runner_pool(&self.project.organization, &self.project.project_id, &key)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.remove_runner_pool(&self.project.organization, &self.project.project_id, &key)
+            },
+        )?;
         output::write_project(
             deployment.fingerprint().api_url(),
             result,
             "runner_pool_removed",
             "✓ Project runner pool removed.",
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -594,38 +658,32 @@ impl RunnerPoolRemoveCommand {
 pub(in crate::cli) fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
     mut operation: impl FnMut(&ProjectApi) -> Result<T, ProjectFailure>,
 ) -> anyhow::Result<Result<T, ProjectFailure>> {
     let client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
-    match session::execute_required(
-        &client,
-        deployment,
+    super::execute_selected_api_operation(
+        super::principal_api_context(
+            &client,
+            deployment,
+            authentication,
+            "acquire human session for project operation",
+        ),
         |access_token| {
             let api = ProjectApi::new(
                 deployment.fingerprint().api_url(),
-                access_token.expose(),
+                access_token,
                 transport_policy,
             )
             .map_err(|error| anyhow!(error))
             .context("prepare project management networking")?;
             Ok(operation(&api))
         },
-        |result| {
-            result.as_ref().is_ok_and(|operation| {
-                operation
-                    .as_ref()
-                    .is_err_and(ProjectFailure::credential_rejected)
-            })
-        },
-    ) {
-        Ok(RequiredOperation::Unauthenticated) => Ok(Err(ProjectFailure::Unauthenticated)),
-        Ok(RequiredOperation::Completed(result)) => result,
-        Err(error) => match error.unreachable_category() {
-            Some(category) => Ok(Err(ProjectFailure::Unreachable(category))),
-            None => Err(anyhow!(error).context("acquire human session for project operation")),
-        },
-    }
+        ProjectFailure::credential_rejected,
+        || ProjectFailure::Unauthenticated,
+        ProjectFailure::Unreachable,
+    )
 }
 // jscpd:ignore-end

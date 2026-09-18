@@ -1,6 +1,8 @@
 use super::*;
 
 const CURRENT_TOKEN: &str = "unique-current-identity-session-token";
+const SERVICE_API_KEY: &str =
+    "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const CURRENT_IDENTITY_ID: &str = "idn_01k0z6r1w8f4jy2m7q9v3x5abc";
 const LINKED_IDENTITY_ID: &str = "idn_01k0z6r1w8f4jy2m7q9v3x5abd";
 
@@ -14,6 +16,17 @@ fn identity(id: &str, issuer: &str, subject: &str, current: bool) -> serde_json:
         "emailVerified": true,
         "createdAt": "2026-09-05T12:00:00Z",
         "current": current
+    })
+}
+
+fn workload_identity(id: &str, issuer: &str, subject: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "kind": "workload_oidc",
+        "issuer": issuer,
+        "subject": subject,
+        "createdAt": "2026-09-05T12:00:00Z",
+        "current": false
     })
 }
 
@@ -175,6 +188,81 @@ fn list_returns_one_exact_page_with_current_and_provenance_fields() {
         header_value(&request, "authorization"),
         format!("Bearer {CURRENT_TOKEN}")
     );
+}
+
+#[test]
+fn service_link_reports_the_committed_result_when_interrupted_after_dispatch() {
+    let linked = workload_identity(
+        LINKED_IDENTITY_ID,
+        "https://workload.example/",
+        "deployment-worker",
+    );
+    let mut server =
+        ScriptedServer::respond_with_paused_last_response(vec![link_success(linked.clone())]);
+    let directory = private_credential_directory();
+    let service_key_path = directory.path().join("service.key");
+    fs::write(&service_key_path, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::set_permissions(&service_key_path, Permissions::from_mode(0o600)).unwrap();
+    let workload_token_path = directory.path().join("workload.token");
+    fs::write(&workload_token_path, b"private-workload-token\n").unwrap();
+    fs::set_permissions(&workload_token_path, Permissions::from_mode(0o600)).unwrap();
+    let missing_human_store = directory.path().join("missing-human.json");
+    let environment =
+        deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args([
+            "auth",
+            "identities",
+            "link",
+            "--service-api-key-file",
+            service_key_path.to_str().unwrap(),
+            "--workload-token-file",
+            workload_token_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let child = command.spawn().unwrap();
+
+    let request = server.next_request();
+    assert!(request.starts_with("POST /api/v1/me/identities HTTP/1.1\r\n"));
+    assert_eq!(
+        header_value(&request, "authorization"),
+        format!("Bearer {SERVICE_API_KEY}")
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    server.release_paused_response();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "event": "result",
+            "deployment": server.api_url,
+            "outcome": "linked",
+            "identity": linked,
+            "localSessionIdentity": "unchanged"
+        })
+    );
+    assert!(!missing_human_store.exists());
+    assert!(server.finish().is_empty());
 }
 
 #[test]
@@ -408,6 +496,73 @@ fn link_reports_identity_unavailable_without_exposing_or_replacing_credentials()
 }
 
 #[test]
+fn service_link_reports_workload_policy_and_quantity_failures() {
+    let directory = private_credential_directory();
+    let service_key_path = directory.path().join("service.key");
+    fs::write(&service_key_path, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::set_permissions(&service_key_path, Permissions::from_mode(0o600)).unwrap();
+    let workload_token_path = directory.path().join("workload.token");
+    fs::write(&workload_token_path, b"private-workload-token\n").unwrap();
+    fs::set_permissions(&workload_token_path, Permissions::from_mode(0o600)).unwrap();
+    let missing_human_store = directory.path().join("missing-human.json");
+
+    let cases = [
+        (
+            "403 Forbidden",
+            403,
+            "https://api.scherzo.dev/problems/workload-identity-linking-not-permitted",
+            "workload_identity_linking_not_permitted",
+        ),
+        (
+            "409 Conflict",
+            409,
+            "https://api.scherzo.dev/problems/quantity-limit-reached",
+            "quantity_limit_reached",
+        ),
+    ];
+    for (status, code, problem_type, expected_outcome) in cases {
+        let server = ScriptedServer::respond(vec![identity_problem(status, code, problem_type)]);
+        let environment =
+            deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+
+        let output = run_with_env(
+            &[
+                "auth",
+                "identities",
+                "link",
+                "--service-api-key-file",
+                service_key_path.to_str().unwrap(),
+                "--workload-token-file",
+                workload_token_path.to_str().unwrap(),
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "event": "result",
+                "deployment": server.api_url,
+                "outcome": expected_outcome,
+                "localSessionIdentity": "unchanged"
+            })
+        );
+        assert!(output.stderr.is_empty());
+        assert!(!missing_human_store.exists());
+        let request = server.finish().pop().unwrap();
+        assert!(request.starts_with("POST /api/v1/me/identities HTTP/1.1\r\n"));
+        assert_eq!(
+            header_value(&request, "authorization"),
+            format!("Bearer {SERVICE_API_KEY}")
+        );
+    }
+}
+
+#[test]
 fn link_does_not_report_an_unchanged_session_after_rejected_credential_cleanup() {
     let rejected = identity_problem(
         "401 Unauthorized",
@@ -602,4 +757,116 @@ fn remove_reports_freshness_and_retention_outcomes() {
         assert!(output.stderr.is_empty());
         server.finish();
     }
+}
+
+#[test]
+fn service_remove_reports_disabled_workload_identity_linking() {
+    let server = ScriptedServer::respond(vec![identity_problem(
+        "403 Forbidden",
+        403,
+        "https://api.scherzo.dev/problems/workload-identity-linking-not-permitted",
+    )]);
+    let directory = private_credential_directory();
+    let service_key_path = directory.path().join("service.key");
+    fs::write(&service_key_path, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::set_permissions(&service_key_path, Permissions::from_mode(0o600)).unwrap();
+    let missing_human_store = directory.path().join("missing-human.json");
+    let environment =
+        deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+
+    let output = run_with_env(
+        &[
+            "auth",
+            "identities",
+            "remove",
+            LINKED_IDENTITY_ID,
+            "--service-api-key-file",
+            service_key_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "workload_identity_linking_not_permitted"
+        })
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!missing_human_store.exists());
+    let request = server.finish().pop().unwrap();
+    assert!(request.starts_with(&format!(
+        "DELETE /api/v1/me/identities/{LINKED_IDENTITY_ID} HTTP/1.1\r\n"
+    )));
+    assert_eq!(
+        header_value(&request, "authorization"),
+        format!("Bearer {SERVICE_API_KEY}")
+    );
+}
+
+#[test]
+fn service_identity_link_uses_explicit_private_key_and_workload_token_files() {
+    const SERVICE_KEY: &str =
+        "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const WORKLOAD_TOKEN: &str = "fresh-workload-token-sentinel";
+    let linked = workload_identity(
+        LINKED_IDENTITY_ID,
+        "https://workload.example/",
+        "build-agent",
+    );
+    let server = ScriptedServer::respond(vec![link_success(linked)]);
+    let directory = private_credential_directory();
+    let service_key_path = directory.path().join("service.key");
+    let workload_token_path = directory.path().join("workload.token");
+    for (path, value) in [
+        (&service_key_path, SERVICE_KEY),
+        (&workload_token_path, WORKLOAD_TOKEN),
+    ] {
+        fs::write(path, format!("{value}\n")).unwrap();
+        fs::set_permissions(path, Permissions::from_mode(0o600)).unwrap();
+    }
+    let human_credentials = directory.path().join("unused-human.json");
+    let environment = deployment_environment(&server.api_url, human_credentials.to_str().unwrap());
+
+    let output = run_with_env(
+        &[
+            "auth",
+            "identities",
+            "link",
+            "--service-api-key-file",
+            service_key_path.to_str().unwrap(),
+            "--workload-token-file",
+            workload_token_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "linked");
+    assert_eq!(result["identity"]["id"], LINKED_IDENTITY_ID);
+    assert_eq!(result["identity"]["kind"], "workload_oidc");
+    assert!(result["identity"].get("assertedEmail").is_none());
+    assert!(result["identity"].get("emailVerified").is_none());
+    for secret in [SERVICE_KEY, WORKLOAD_TOKEN] {
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+    let request = server.finish().pop().unwrap();
+    assert_eq!(
+        header_value(&request, "authorization"),
+        format!("Bearer {SERVICE_KEY}")
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request.split_once("\r\n\r\n").unwrap().1)
+            .unwrap(),
+        serde_json::json!({"proposedIdentityAccessToken": WORKLOAD_TOKEN})
+    );
 }

@@ -20,6 +20,7 @@ use super::super::{membership_role, membership_state, write_page_footer};
 pub(super) fn write_create(
     deployment: &str,
     outcome: &CreateOrganizationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -30,6 +31,7 @@ pub(super) fn write_create(
         CreateOrganizationOutcome::Common(common) => write_common(
             deployment,
             common,
+            authentication,
             json,
             "Organization creation could not be confirmed",
         ),
@@ -86,6 +88,7 @@ pub(super) fn write_create(
 pub(super) fn write_show(
     deployment: &str,
     outcome: &GetOrganizationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -96,6 +99,7 @@ pub(super) fn write_show(
         GetOrganizationOutcome::Common(common) => write_common(
             deployment,
             common,
+            authentication,
             json,
             "The Scherzo Cloud deployment could not be reached",
         ),
@@ -106,6 +110,7 @@ pub(super) fn write_show(
 pub(super) fn write_update(
     deployment: &str,
     outcome: &UpdateOrganizationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -116,6 +121,7 @@ pub(super) fn write_update(
         UpdateOrganizationOutcome::Common(common) => write_common(
             deployment,
             common,
+            authentication,
             json,
             "Organization update could not be confirmed",
         ),
@@ -144,6 +150,7 @@ pub(super) fn write_update(
 pub(super) fn write_list(
     deployment: &str,
     outcome: &ListCurrentPrincipalMembershipsOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -160,7 +167,7 @@ pub(super) fn write_list(
             Ok(ExitCode::Success)
         }
         ListCurrentPrincipalMembershipsOutcome::Common(common) => {
-            write_current_membership_failure(deployment, common, json)
+            write_current_membership_failure(deployment, common, authentication, json)
         }
     }
 }
@@ -168,6 +175,7 @@ pub(super) fn write_list(
 pub(super) fn write_members_list(
     deployment: &str,
     outcome: &ListOrganizationMembershipsOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -182,6 +190,7 @@ pub(super) fn write_members_list(
         ListOrganizationMembershipsOutcome::Common(common) => write_common(
             deployment,
             common,
+            authentication,
             json,
             "The Scherzo Cloud deployment could not be reached",
         ),
@@ -192,6 +201,7 @@ pub(super) fn write_members_list(
 pub(super) fn write_members_history(
     deployment: &str,
     outcome: &ListOrganizationMembershipHistoryOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -209,7 +219,7 @@ pub(super) fn write_members_history(
             Ok(ExitCode::Success)
         }
         ListOrganizationMembershipHistoryOutcome::Common(common) => {
-            write_membership_common_failure(deployment, common, json)
+            write_membership_common_failure(deployment, common, authentication, json)
         }
         ListOrganizationMembershipHistoryOutcome::NotFound => {
             write_membership_not_found(deployment, json)
@@ -220,6 +230,7 @@ pub(super) fn write_members_history(
 pub(super) fn write_audit_list(
     deployment: &str,
     outcome: &ListOrganizationAuditRecordsOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -244,7 +255,13 @@ pub(super) fn write_audit_list(
             Ok(ExitCode::Success)
         }
         ListOrganizationAuditRecordsOutcome::Common(common) => {
-            write_audit_common_failure(deployment, common, json)
+            write_common_organization_operation_failure(
+                deployment,
+                common,
+                &AUDIT_FAILURE_PRESENTATION,
+                authentication,
+                json,
+            )
         }
         ListOrganizationAuditRecordsOutcome::NotFound => write_organization_operation_failure(
             deployment,
@@ -260,6 +277,7 @@ pub(super) fn write_audit_list(
 pub(super) fn write_members_update(
     deployment: &str,
     outcome: &UpdateOrganizationMembershipOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match outcome {
@@ -282,7 +300,7 @@ pub(super) fn write_members_update(
             Ok(ExitCode::Success)
         }
         UpdateOrganizationMembershipOutcome::Common(common) => {
-            write_membership_common_failure(deployment, common, json)
+            write_membership_common_failure(deployment, common, authentication, json)
         }
         UpdateOrganizationMembershipOutcome::NotFound => {
             write_membership_not_found(deployment, json)
@@ -304,35 +322,47 @@ pub(super) fn write_member_removal(
     organization: &str,
     membership_id: &str,
     outcome: &MembershipTerminationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_membership_termination(
-        deployment,
-        organization,
-        Some(membership_id),
-        "removed",
-        "✓ Organization member removed.",
+        MembershipTerminationOutput {
+            deployment,
+            organization,
+            membership_id: Some(membership_id),
+            success_outcome: "removed",
+            heading: "✓ Organization member removed.",
+            authentication,
+            json,
+        },
         outcome,
-        json,
     )
 }
 
+// Leaving omits a membership ID while owner removal requires one; explicit wrappers keep each
+// machine outcome and human heading attached to the command that owns it.
+// jscpd:ignore-start
 pub(super) fn write_leave(
     deployment: &str,
     organization: &str,
     outcome: &MembershipTerminationOutcome,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_membership_termination(
-        deployment,
-        organization,
-        None,
-        "left",
-        "✓ Organization membership ended.",
+        MembershipTerminationOutput {
+            deployment,
+            organization,
+            membership_id: None,
+            success_outcome: "left",
+            heading: "✓ Organization membership ended.",
+            authentication,
+            json,
+        },
         outcome,
-        json,
     )
 }
+// jscpd:ignore-end
 
 fn write_audit_records_human(
     deployment: &str,
@@ -465,28 +495,29 @@ const MEMBERSHIP_FAILURE_PRESENTATION: CommonFailurePresentation = CommonFailure
     invalid_input_remedy: "Check the organization reference, membership ID, and cursor, then try again.",
 };
 
-fn write_audit_common_failure(
-    deployment: &str,
-    failure: &CommonOrganizationFailure,
+struct MembershipTerminationOutput<'a> {
+    deployment: &'a str,
+    organization: &'a str,
+    membership_id: Option<&'a str>,
+    success_outcome: &'static str,
+    heading: &'static str,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
-) -> anyhow::Result<ExitCode> {
-    write_common_organization_operation_failure(
-        deployment,
-        failure,
-        &AUDIT_FAILURE_PRESENTATION,
-        json,
-    )
 }
 
 fn write_membership_termination(
-    deployment: &str,
-    organization: &str,
-    membership_id: Option<&str>,
-    success_outcome: &'static str,
-    heading: &'static str,
+    output: MembershipTerminationOutput<'_>,
     outcome: &MembershipTerminationOutcome,
-    json: bool,
 ) -> anyhow::Result<ExitCode> {
+    let MembershipTerminationOutput {
+        deployment,
+        organization,
+        membership_id,
+        success_outcome,
+        heading,
+        authentication,
+        json,
+    } = output;
     match outcome {
         MembershipTerminationOutcome::Ended => {
             if json {
@@ -509,7 +540,7 @@ fn write_membership_termination(
             Ok(ExitCode::Success)
         }
         MembershipTerminationOutcome::Common(common) => {
-            write_membership_common_failure(deployment, common, json)
+            write_membership_common_failure(deployment, common, authentication, json)
         }
         MembershipTerminationOutcome::NotFound => write_membership_not_found(deployment, json),
         MembershipTerminationOutcome::TransitionUnavailable => {
@@ -527,12 +558,14 @@ fn write_membership_termination(
 fn write_membership_common_failure(
     deployment: &str,
     failure: &CommonOrganizationFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_common_organization_operation_failure(
         deployment,
         failure,
         &MEMBERSHIP_FAILURE_PRESENTATION,
+        authentication,
         json,
     )
 }
@@ -541,13 +574,16 @@ fn write_common_organization_operation_failure(
     deployment: &str,
     failure: &CommonOrganizationFailure,
     presentation: &CommonFailurePresentation,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, message, class) = match failure {
         CommonOrganizationFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            presentation.unauthenticated.to_owned(),
+            authentication
+                .rejected_error(presentation.unauthenticated)
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         CommonOrganizationFailure::Forbidden => (
@@ -665,6 +701,7 @@ fn write_not_found(deployment: &str, json: bool) -> anyhow::Result<ExitCode> {
 fn write_common(
     deployment: &str,
     outcome: &CommonOrganizationFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
     unreachable_message: &'static str,
 ) -> anyhow::Result<ExitCode> {
@@ -674,7 +711,9 @@ fn write_common(
             "unauthenticated",
             None,
             None,
-            "! You must sign in before managing Scherzo Cloud organizations.\n\nRun:\n  scherzo-cloud auth login",
+            authentication.rejected_notice(
+                "! You must sign in before managing Scherzo Cloud organizations.\n\nRun:\n  scherzo-cloud auth login",
+            ),
             OutcomeClass::Unauthenticated,
             json,
         ),
@@ -893,13 +932,18 @@ fn write_membership_history_human(
 fn write_current_membership_failure(
     deployment: &str,
     failure: &CommonOrganizationFailure,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, outcome_class) = match failure {
         CommonOrganizationFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: organization membership history requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            authentication
+                .rejected_error(
+                    "error: organization membership history requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         CommonOrganizationFailure::Forbidden => (
@@ -930,6 +974,9 @@ fn write_current_membership_failure(
     Ok(outcome_class.exit_code())
 }
 
+// Organization mutation failures retain their established stdout human-report contract;
+// the shared service/project failure renderer writes human diagnostics to stderr.
+// jscpd:ignore-start
 fn write_failure(
     deployment: &str,
     outcome: &'static str,
@@ -953,6 +1000,7 @@ fn write_failure(
     }
     Ok(outcome_class.exit_code())
 }
+// jscpd:ignore-end
 
 fn write_cloud_failure_json(
     deployment: &str,

@@ -8,9 +8,10 @@ Arguments:
   <ORGANIZATION>  Organization ID or exact slug
 
 Options:
-      --yes                  Confirm permanent organization departure
-      --json                 Print the organization result as JSON
-      --allow-insecure-http  Allow this command's Scherzo Cloud requests over insecure HTTP connections
-  -h, --help                 Print help
+      --yes                            Confirm permanent organization departure
+      --json                           Print the organization result as JSON
+      --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
+      --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                           Print help
 
 ```

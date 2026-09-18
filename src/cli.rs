@@ -41,6 +41,7 @@ mod project;
 mod publication;
 mod run;
 mod runner;
+mod service_principal;
 mod version;
 mod workflow;
 
@@ -49,7 +50,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,6 +67,7 @@ use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
+use crate::service_auth::{ServiceApiKey, read_api_key};
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
@@ -285,6 +287,88 @@ impl HttpOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrincipalAuthenticationKind {
+    HumanSession,
+    ServiceApiKey,
+}
+
+impl PrincipalAuthenticationKind {
+    const fn rejected_error(self, human_session: &'static str) -> &'static str {
+        match self {
+            Self::HumanSession => human_session,
+            Self::ServiceApiKey => {
+                "error: service API key rejected\n\nUse a different active service API key."
+            }
+        }
+    }
+
+    const fn rejected_remedy(self, human_session: &'static str) -> &'static str {
+        match self {
+            Self::HumanSession => human_session,
+            Self::ServiceApiKey => "Use a different active service API key.",
+        }
+    }
+
+    const fn rejected_notice(self, human_session: &'static str) -> &'static str {
+        match self {
+            Self::HumanSession => human_session,
+            Self::ServiceApiKey => {
+                "! The service API key was rejected.\n\nUse a different active service API key."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Args, Default)]
+struct PrincipalAuthenticationArgs {
+    #[arg(
+        long,
+        value_name = "PATH|-",
+        help = "Authenticate with a service API key from a private file, or - for standard input"
+    )]
+    service_api_key_file: Option<PathBuf>,
+
+    #[arg(skip)]
+    resolved_service_api_key: Mutex<Option<Arc<ServiceApiKey>>>,
+}
+
+impl PrincipalAuthenticationArgs {
+    const fn kind(&self) -> PrincipalAuthenticationKind {
+        if self.service_api_key_file.is_some() {
+            PrincipalAuthenticationKind::ServiceApiKey
+        } else {
+            PrincipalAuthenticationKind::HumanSession
+        }
+    }
+
+    fn service_api_key(&self) -> anyhow::Result<Option<Arc<ServiceApiKey>>> {
+        let Some(path) = self.service_api_key_file.as_deref() else {
+            return Ok(None);
+        };
+        let mut resolved = self
+            .resolved_service_api_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(api_key) = resolved.as_ref() {
+            return Ok(Some(Arc::clone(api_key)));
+        }
+        let api_key = Arc::new(read_api_key(path).context("read service API key")?);
+        *resolved = Some(Arc::clone(&api_key));
+        Ok(Some(api_key))
+    }
+
+    fn required_service_api_key(&self) -> anyhow::Result<Arc<ServiceApiKey>> {
+        self.service_api_key()?.ok_or_else(|| {
+            anyhow!("--service-api-key-file is required for service credential management")
+        })
+    }
+
+    fn uses_stdin(&self) -> bool {
+        self.service_api_key_file.as_deref() == Some(Path::new("-"))
+    }
+}
+
 #[derive(Debug, Args)]
 struct WaitTimeoutArgs {
     #[arg(
@@ -333,6 +417,8 @@ enum Command {
     Version(version::Command),
     #[command(about = runner::ABOUT)]
     Runner(runner::Command),
+    #[command(about = service_principal::ABOUT)]
+    ServicePrincipal(service_principal::Command),
     #[command(about = workflow::ABOUT)]
     Workflow(workflow::Command),
 }
@@ -360,6 +446,7 @@ impl Cli {
             Some(Command::Run(command)) => command.execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
+            Some(Command::ServicePrincipal(command)) => command.execute(),
             Some(Command::Workflow(command)) => command.execute(),
         }
     }
@@ -455,6 +542,28 @@ fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
     let mut stdout = stdout.lock();
     stdout.write_all(&bytes)?;
     stdout.flush()
+}
+
+fn write_api_failure(
+    deployment: &str,
+    outcome: &'static str,
+    category: Option<&'static str>,
+    retry_after: Option<u64>,
+    human: &str,
+    outcome_class: OutcomeClass,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_pretty_json(&ApiFailureResult::with_retry_after(
+            deployment,
+            outcome,
+            category,
+            retry_after,
+        ))?;
+    } else {
+        writeln!(io::stderr().lock(), "{human}")?;
+    }
+    Ok(outcome_class.exit_code())
 }
 
 fn write_cloud_list_json(
@@ -602,6 +711,18 @@ fn execute_cancellable_mutation_with_signals(
             result = &mut running => finish_read_only_operation(context, result),
         }
     })
+}
+
+fn execute_bounded_mutation_with_signals(
+    context: &'static str,
+    operation: impl FnOnce(&OperationControl<()>) -> CommandResult + Send + 'static,
+) -> CommandResult {
+    execute_cancellable_mutation_with_signals(
+        context,
+        move |_, control| operation(control),
+        || false,
+        |signal, _| Ok(signal),
+    )
 }
 
 // A terminal result and a local stop compete for one output claim so timeout/signal
@@ -932,9 +1053,10 @@ fn execute_observation_with_signals_and_timeout(
 }
 
 // Dispatch, recovery, and output ownership are linearized by one state lock. Mutations claim
-// Completion before rendering so a signal cannot add a second receipt. Read-only commands enter
-// ReadOnlyOutput instead: a signal may abandon a blocked writer until output finishes and claims
-// Completion. The lock is released before requests, joins, rendering, and callbacks.
+// Completion before rendering so a signal cannot add a second receipt. A bounded one-time-secret
+// mutation may claim Completion at dispatch and retain it through delivery. Read-only commands
+// enter ReadOnlyOutput instead: a signal may abandon a blocked writer until output finishes and
+// claims Completion. The lock is released before requests, joins, rendering, and callbacks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OperationOwner {
     Active,
@@ -1017,6 +1139,24 @@ impl<R> OperationControl<R> {
         };
         state.dispatched = true;
         true
+    }
+
+    fn begin_bounded_dispatch(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.owner {
+            OperationOwner::Active => {
+                state.owner = OperationOwner::Completion;
+                state.dispatched = true;
+                true
+            }
+            OperationOwner::Completion if state.dispatched => true,
+            OperationOwner::ReadOnlyOutput
+            | OperationOwner::Completion
+            | OperationOwner::Signal => false,
+        }
     }
 
     fn dispatched(&self) -> bool {
@@ -1205,11 +1345,70 @@ fn human_session_client(transport_policy: HttpTransportPolicy) -> anyhow::Result
         .context("prepare human session networking")
 }
 
-fn execute_required_api_operation<T, E>(
+struct PrincipalApiContext<'a> {
+    client: &'a HttpClient,
+    deployment: &'a Deployment,
+    authentication: &'a PrincipalAuthenticationArgs,
+    session_context: &'static str,
+}
+
+fn principal_api_context<'a>(
+    client: &'a HttpClient,
+    deployment: &'a Deployment,
+    authentication: &'a PrincipalAuthenticationArgs,
+    session_context: &'static str,
+) -> PrincipalApiContext<'a> {
+    PrincipalApiContext {
+        client,
+        deployment,
+        authentication,
+        session_context,
+    }
+}
+
+fn execute_selected_api_operation<T, E>(
+    context: PrincipalApiContext<'_>,
+    operation: impl FnMut(&str) -> anyhow::Result<Result<T, E>>,
+    credential_rejected: impl Fn(&E) -> bool,
+    unauthenticated: impl Fn() -> E,
+    unreachable: impl Fn(UnreachableCategory) -> E,
+) -> anyhow::Result<Result<T, E>> {
+    execute_selected_api_operation_retrying_result(
+        context,
+        operation,
+        |operation| operation.as_ref().is_err_and(&credential_rejected),
+        unauthenticated,
+        unreachable,
+    )
+}
+
+fn execute_selected_api_operation_retrying_result<T, E>(
+    context: PrincipalApiContext<'_>,
+    mut operation: impl FnMut(&str) -> anyhow::Result<Result<T, E>>,
+    credential_rejected: impl Fn(&Result<T, E>) -> bool,
+    unauthenticated: impl Fn() -> E,
+    unreachable: impl Fn(UnreachableCategory) -> E,
+) -> anyhow::Result<Result<T, E>> {
+    if let Some(api_key) = context.authentication.service_api_key()? {
+        operation(api_key.expose())
+    } else {
+        execute_required_api_operation_retrying_result(
+            context.client,
+            context.deployment,
+            operation,
+            credential_rejected,
+            unauthenticated,
+            unreachable,
+            context.session_context,
+        )
+    }
+}
+
+fn execute_required_api_operation_retrying_result<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
     mut operation: impl FnMut(&str) -> anyhow::Result<Result<T, E>>,
-    credential_rejected: impl Fn(&E) -> bool,
+    credential_rejected: impl Fn(&Result<T, E>) -> bool,
     unauthenticated: impl Fn() -> E,
     unreachable: impl Fn(UnreachableCategory) -> E,
     session_context: &'static str,
@@ -1218,11 +1417,7 @@ fn execute_required_api_operation<T, E>(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
-        |result| {
-            result
-                .as_ref()
-                .is_ok_and(|operation| operation.as_ref().is_err_and(&credential_rejected))
-        },
+        |result| result.as_ref().is_ok_and(&credential_rejected),
     ) {
         Ok(RequiredOperation::Unauthenticated) => Ok(Err(unauthenticated())),
         Ok(RequiredOperation::Completed(result)) => result,
@@ -1272,6 +1467,27 @@ fn execute_with_human_credential<O>(
     transport_policy: HttpTransportPolicy,
     network_context: &'static str,
     api_context: &'static str,
+    operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, O::Error>,
+) -> anyhow::Result<O>
+where
+    O: HumanCredentialOutcome,
+{
+    execute_with_principal_credential(
+        deployment,
+        transport_policy,
+        &PrincipalAuthenticationArgs::default(),
+        network_context,
+        api_context,
+        operation,
+    )
+}
+
+fn execute_with_principal_credential<O>(
+    deployment: &Deployment,
+    transport_policy: HttpTransportPolicy,
+    authentication: &PrincipalAuthenticationArgs,
+    network_context: &'static str,
+    api_context: &'static str,
     mut operation: impl FnMut(&HttpClient, &str, &str) -> Result<O, O::Error>,
 ) -> anyhow::Result<O>
 where
@@ -1280,6 +1496,15 @@ where
     let client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context(network_context)?;
+    if let Some(api_key) = authentication.service_api_key()? {
+        return operation(
+            &client,
+            deployment.fingerprint().api_url(),
+            api_key.expose(),
+        )
+        .map_err(|error| anyhow!(error))
+        .with_context(|| format!("{api_context} {}", deployment.fingerprint().api_url()));
+    }
     execute_human_api_operation(
         &client,
         deployment,
@@ -1416,6 +1641,20 @@ mod tests {
                 assert_eq!(document["outcome"], "completed");
             }
         }
+    }
+
+    #[test]
+    fn bounded_dispatch_and_signal_have_one_ordered_owner() {
+        let signal_first = super::OperationControl::new(());
+        assert!(signal_first.claim_signal().is_some());
+        assert!(!signal_first.begin_bounded_dispatch());
+        assert!(!signal_first.dispatched());
+
+        let dispatch_first = super::OperationControl::new(());
+        assert!(dispatch_first.begin_bounded_dispatch());
+        assert!(dispatch_first.begin_bounded_dispatch());
+        assert!(dispatch_first.dispatched());
+        assert!(dispatch_first.claim_signal().is_none());
     }
 
     #[test]
@@ -1588,6 +1827,59 @@ mod tests {
     }
 
     #[test]
+    fn service_authentication_is_explicit_and_human_only_leaves_reject_it() {
+        assert!(
+            parse([
+                "scherzo-cloud",
+                "service-principal",
+                "credential",
+                "list",
+                "--service-api-key-file",
+                "service.key",
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse([
+                "scherzo-cloud",
+                "organization",
+                "show",
+                "example",
+                "--service-api-key-file",
+                "service.key",
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse([
+                "scherzo-cloud",
+                "service-principal",
+                "create",
+                "--display-name",
+                "Build agent",
+                "--api-key-file",
+                "new.key",
+                "--service-api-key-file",
+                "service.key",
+            ])
+            .is_err()
+        );
+        assert!(
+            parse([
+                "scherzo-cloud",
+                "organization",
+                "deletion",
+                "request",
+                "example",
+                "--yes",
+                "--service-api-key-file",
+                "service.key",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn customer_command_surface_is_exact_and_has_no_operator_entrypoint() {
         let actual = customer_command_paths();
         let expected = [
@@ -1705,6 +1997,12 @@ mod tests {
             "runner serve",
             "runner show",
             "runner status",
+            "service-principal",
+            "service-principal create",
+            "service-principal credential",
+            "service-principal credential issue",
+            "service-principal credential list",
+            "service-principal credential revoke",
             "version",
             "workflow",
             "workflow reference",

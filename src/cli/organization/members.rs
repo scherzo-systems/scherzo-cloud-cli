@@ -105,7 +105,12 @@ impl PageCommand {
             &str,
             &PaginationArgs,
         ) -> Result<O, OrganizationError>,
-        write: impl FnOnce(&str, &O, bool) -> anyhow::Result<ExitCode>,
+        write: impl FnOnce(
+            &str,
+            &O,
+            super::super::PrincipalAuthenticationKind,
+            bool,
+        ) -> anyhow::Result<ExitCode>,
     ) -> anyhow::Result<ExitCode>
     where
         O: super::super::HumanCredentialOutcome<Error = OrganizationError>,
@@ -235,12 +240,13 @@ impl RemoveCommand {
                     idempotency_key,
                 )
             },
-            |deployment, outcome, json| {
+            |deployment, outcome, authentication, json| {
                 output::write_member_removal(
                     deployment,
                     &target.organization_ref,
                     &target.membership_id,
                     outcome,
+                    authentication,
                     json,
                 )
             },

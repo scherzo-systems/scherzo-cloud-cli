@@ -6,7 +6,6 @@ use clap::{Args, Subcommand};
 use crate::api::{GitHubApi, GitHubFailure, HttpClient, HttpTransportPolicy};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
 
 use super::OrganizationRef;
 
@@ -70,14 +69,21 @@ enum RepositoryLeaf {
     List(InstallationTarget),
 }
 
+// GitHub and run leaves keep domain-specific JSON help and result contracts even though
+// both flatten the same explicit principal-authentication controls.
+// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct GitHubOptions {
     #[arg(long, help = "Print the GitHub result as JSON")]
     json: bool,
 
     #[command(flatten)]
+    authentication: super::PrincipalAuthenticationArgs,
+
+    #[command(flatten)]
     http: super::HttpOptions,
 }
+// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct OrganizationTarget {
@@ -189,13 +195,17 @@ impl RepositoryCommand {
 
 impl OrganizationTarget {
     fn begin_setup(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.begin_setup(&self.organization)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.begin_setup(&self.organization),
+        )?;
         output::write_setup_begin(
             deployment.fingerprint().api_url(),
             &self.organization,
             &result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -203,18 +213,28 @@ impl OrganizationTarget {
 
 impl CompleteCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.complete_setup(
-                &self.organization,
-                &self.setup_session,
-                &self.provider_installation_id,
-            )
-        })?;
+        // GitHub setup keeps its multi-field completion request explicit rather than sharing
+        // project repository mutation plumbing with a different failure and output contract.
+        // jscpd:ignore-start
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.complete_setup(
+                    &self.organization,
+                    &self.setup_session,
+                    &self.provider_installation_id,
+                )
+            },
+        )?;
+        // jscpd:ignore-end
         output::write_installation(
             deployment.fingerprint().api_url(),
             &self.organization,
             &result,
             output::InstallationAction::SetupCompleted,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -222,13 +242,17 @@ impl CompleteCommand {
 
 impl OrganizationTarget {
     fn list_installations(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.list_installations(&self.organization)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.list_installations(&self.organization),
+        )?;
         output::write_installation_list(
             deployment.fingerprint().api_url(),
             &self.organization,
             &result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -236,14 +260,18 @@ impl OrganizationTarget {
 
 impl InstallationTarget {
     fn disconnect(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.disconnect_installation(&self.organization, &self.installation)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.disconnect_installation(&self.organization, &self.installation),
+        )?;
         output::write_installation(
             deployment.fingerprint().api_url(),
             &self.organization,
             &result,
             output::InstallationAction::Disconnected,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -251,13 +279,17 @@ impl InstallationTarget {
 
 impl InstallationTarget {
     fn list_repositories(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.list_repositories(&self.organization, &self.installation)
-        })?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.list_repositories(&self.organization, &self.installation),
+        )?;
         output::write_repository_list(
             deployment.fingerprint().api_url(),
             &self.organization,
             &result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -266,37 +298,31 @@ impl InstallationTarget {
 fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
     mut operation: impl FnMut(&GitHubApi) -> Result<T, GitHubFailure>,
 ) -> anyhow::Result<Result<T, GitHubFailure>> {
     let session_client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
-    match session::execute_required(
-        &session_client,
-        deployment,
+    super::execute_selected_api_operation(
+        super::principal_api_context(
+            &session_client,
+            deployment,
+            authentication,
+            "acquire human session",
+        ),
         |access_token| {
             let api = GitHubApi::new(
                 deployment.fingerprint().api_url(),
-                access_token.expose(),
+                access_token,
                 transport_policy,
             )
             .map_err(|error| anyhow!(error))
             .context("prepare GitHub connection networking")?;
             Ok(operation(&api))
         },
-        |result| {
-            result.as_ref().is_ok_and(|operation| {
-                operation
-                    .as_ref()
-                    .is_err_and(GitHubFailure::credential_rejected)
-            })
-        },
-    ) {
-        Ok(RequiredOperation::Unauthenticated) => Ok(Err(GitHubFailure::Unauthenticated)),
-        Ok(RequiredOperation::Completed(result)) => result,
-        Err(error) => match error.unreachable_category() {
-            Some(category) => Ok(Err(GitHubFailure::Unreachable(category))),
-            None => Err(anyhow!(error).context("acquire human session")),
-        },
-    }
+        GitHubFailure::credential_rejected,
+        || GitHubFailure::Unauthenticated,
+        GitHubFailure::Unreachable,
+    )
 }

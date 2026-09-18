@@ -123,29 +123,42 @@ impl CreateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key =
             generate_idempotency_key().context("generate runner pool creation request identity")?;
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.create_pool(&self.organization, &key, &self.name)
-        })?;
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.create_pool(&self.organization, &key, &self.name),
+        )?;
+        // Pool creation uses the shared runner failure contract but retains its own result body.
+        // jscpd:ignore-start
         cloud::write_pool_create(
             deployment.fingerprint().api_url(),
             &result,
+            self.options.authentication.kind(),
             self.options.json,
         )
+        // jscpd:ignore-end
     }
 }
 
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.list_pools(
-                &self.organization,
-                self.pagination.limit,
-                self.pagination.cursor.as_deref(),
-            )
-        })?;
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                api.list_pools(
+                    &self.organization,
+                    self.pagination.limit,
+                    self.pagination.cursor.as_deref(),
+                )
+            },
+        )?;
         cloud::write_pool_list(
             deployment.fingerprint().api_url(),
             &result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -153,12 +166,16 @@ impl ListCommand {
 
 impl ShowCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.get_pool(&self.organization, &self.pool)
-        })?;
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.get_pool(&self.organization, &self.pool),
+        )?;
         cloud::write_pool_show(
             deployment.fingerprint().api_url(),
             &result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }
@@ -168,12 +185,16 @@ impl RenameCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key =
             generate_idempotency_key().context("generate runner pool rename request identity")?;
-        let result = cloud::with_api(deployment, self.options.http.transport_policy(), |api| {
-            api.rename_pool(&self.organization, &self.pool, &key, &self.name)
-        })?;
+        let result = cloud::with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| api.rename_pool(&self.organization, &self.pool, &key, &self.name),
+        )?;
         cloud::write_pool_rename(
             deployment.fingerprint().api_url(),
             &result,
+            self.options.authentication.kind(),
             self.options.json,
         )
     }

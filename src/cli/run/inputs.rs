@@ -114,16 +114,19 @@ impl Command {
 impl ShowCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
         super::super::execute_read_only_with_signals("retained input show", move |control| {
-            let result =
-                super::with_api(&deployment, self.options.http.transport_policy(), |api| {
-                    api.get_retained_inputs(&self.run.organization, &self.run.run_id)
-                })?;
+            let result = super::with_api(
+                &deployment,
+                self.options.http.transport_policy(),
+                &self.options.authentication,
+                |api| api.get_retained_inputs(&self.run.organization, &self.run.run_id),
+            )?;
             super::super::complete_read_only_output(control, || {
                 write_inventory(
                     deployment.fingerprint().api_url(),
                     &self.run.organization,
                     &self.run.run_id,
                     result,
+                    self.options.authentication.kind(),
                     self.options.json,
                 )
                 .map_err(Into::into)
@@ -203,9 +206,12 @@ impl DownloadCommand {
                         deployment.fingerprint().api_url(),
                         &self.run.organization,
                         &self.run.run_id,
-                        &self.output,
-                        &json_destination,
+                        ReportedDestination {
+                            path: &self.output,
+                            json: &json_destination,
+                        },
                         result,
+                        self.options.authentication.kind(),
                         self.options.json,
                     )
                     .map_err(Into::into)
@@ -262,13 +268,15 @@ fn download_selected(
     if std::fs::symlink_metadata(&command.output).is_ok() {
         return Ok(Err(DownloadFailure::DestinationExists));
     }
-    let inventory =
-        match super::with_api(deployment, command.options.http.transport_policy(), |api| {
-            api.get_retained_inputs(&command.run.organization, &command.run.run_id)
-        })? {
-            Ok(inventory) => inventory,
-            Err(failure) => return Ok(Err(download_api_failure(failure, None))),
-        };
+    let inventory = match super::with_api(
+        deployment,
+        command.options.http.transport_policy(),
+        &command.options.authentication,
+        |api| api.get_retained_inputs(&command.run.organization, &command.run.run_id),
+    )? {
+        Ok(inventory) => inventory,
+        Err(failure) => return Ok(Err(download_api_failure(failure, None))),
+    };
     let manifest = match retained_manifest(&inventory) {
         Ok(manifest) => manifest,
         Err(failure) => {
@@ -310,14 +318,19 @@ fn download_selected(
                         Some(&inventory.input_set_id),
                     )));
                 }
-                match super::with_api(deployment, command.options.http.transport_policy(), |api| {
-                    api.issue_input_download_capabilities(
-                        &command.run.organization,
-                        &command.run.run_id,
-                        &inventory,
-                        remaining,
-                    )
-                }) {
+                match super::with_api(
+                    deployment,
+                    command.options.http.transport_policy(),
+                    &command.options.authentication,
+                    |api| {
+                        api.issue_input_download_capabilities(
+                            &command.run.organization,
+                            &command.run.run_id,
+                            &inventory,
+                            remaining,
+                        )
+                    },
+                ) {
                     Ok(Ok(capabilities)) => Ok(capabilities),
                     Ok(Err(failure)) => Err(DownloadTransferFailure::Download(
                         download_api_failure(failure, Some(&inventory.input_set_id)),
@@ -343,6 +356,7 @@ fn download_selected(
                 let bytes = match super::with_api(
                     deployment,
                     command.options.http.transport_policy(),
+                    &command.options.authentication,
                     |api| api.download_input_member(capability, cancellation),
                 ) {
                     Ok(Ok(bytes)) => bytes,
@@ -490,21 +504,26 @@ impl DeleteCommand {
             "retained input deletion",
             (),
             move |control| {
-                let result =
-                    super::with_api(&deployment, self.options.http.transport_policy(), |api| {
+                let result = super::with_api(
+                    &deployment,
+                    self.options.http.transport_policy(),
+                    &self.options.authentication,
+                    |api| {
                         api.delete_retained_inputs(
                             &self.run.organization,
                             &self.run.run_id,
                             &key,
                             || control.begin_dispatch(),
                         )
-                    })?;
+                    },
+                )?;
                 super::finish_operation(control, || {
                     write_delete(
                         deployment.fingerprint().api_url(),
                         &self.run.organization,
                         &self.run.run_id,
                         result,
+                        self.options.authentication.kind(),
                         self.options.json,
                     )
                 })
@@ -532,6 +551,7 @@ fn write_inventory(
     organization: &str,
     run_id: &str,
     result: Result<RetainedRunInputs, RunFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_run_outcome(
@@ -539,6 +559,7 @@ fn write_inventory(
         organization,
         run_id,
         result,
+        authentication,
         json,
         |inventory| {
             if json {
@@ -577,9 +598,9 @@ fn write_download(
     deployment: &str,
     organization: &str,
     run_id: &str,
-    destination: &Path,
-    json_destination: &str,
+    destination: ReportedDestination<'_>,
     result: Result<DownloadedInputs, DownloadFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -592,7 +613,7 @@ fn write_download(
                     organization_ref: organization,
                     run_id,
                     input_set_id: &downloaded.input_set_id,
-                    destination: json_destination,
+                    destination: destination.json,
                     member_count: downloaded.member_count,
                     total_size_bytes: downloaded.total_size_bytes,
                 })?;
@@ -603,7 +624,7 @@ fn write_download(
                     downloaded.input_set_id,
                     downloaded.member_count,
                     downloaded.total_size_bytes,
-                    destination.display()
+                    destination.path.display()
                 )?;
             }
             Ok(ExitCode::Success)
@@ -617,6 +638,7 @@ fn write_download(
             Some(run_id),
             input_set_id.as_deref(),
             &failure,
+            authentication,
             json,
         ),
         Err(failure) => {
@@ -635,19 +657,19 @@ fn write_download(
                     outcome,
                     organization_ref: organization,
                     run_id,
-                    destination: json_destination,
+                    destination: destination.json,
                 })?;
             } else if matches!(failure, DownloadFailure::CommitUnconfirmed) {
                 writeln!(
                     io::stderr().lock(),
                     "error: retained input download commit is unconfirmed\n\ndestination: {}\n\nInspect the destination before retrying.",
-                    destination.display()
+                    destination.path.display()
                 )?;
             } else {
                 writeln!(
                     io::stderr().lock(),
                     "error: retained input download failed: {outcome}\n\ndestination: {}\n\nNo downloaded result was committed. Check the new destination path and try again.",
-                    destination.display()
+                    destination.path.display()
                 )?;
             }
             Ok(ExitCode::GeneralFailure)
@@ -699,42 +721,63 @@ fn write_download_interrupted(
     Ok(exit_code)
 }
 
+// Retained-input deletion emits a mutation receipt while inventory emits the full retained-input
+// projection; each closure stays next to its machine contract.
+// jscpd:ignore-start
 fn write_delete(
     deployment: &str,
     organization: &str,
     run_id: &str,
     result: Result<(), RunFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    write_run_outcome(deployment, organization, run_id, result, json, |()| {
-        if json {
-            super::write_json(&DeleteResult {
-                schema_version: 1,
-                deployment,
-                outcome: "deleted",
-                organization_ref: organization,
-                run_id,
-            })?;
-        } else {
-            writeln!(
-                io::stdout().lock(),
-                "✓ Retained input content made logically unavailable; cleanup scheduled.\n\nrun: {run_id}\norganization: {organization}\ndeployment: {deployment}"
-            )?;
-        }
-        Ok(())
-    })
+    write_run_outcome(
+        deployment,
+        organization,
+        run_id,
+        result,
+        authentication,
+        json,
+        |()| {
+            if json {
+                super::write_json(&DeleteResult {
+                    schema_version: 1,
+                    deployment,
+                    outcome: "deleted",
+                    organization_ref: organization,
+                    run_id,
+                })?;
+            } else {
+                writeln!(
+                    io::stdout().lock(),
+                    "✓ Retained input content made logically unavailable; cleanup scheduled.\n\nrun: {run_id}\norganization: {organization}\ndeployment: {deployment}"
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
+// jscpd:ignore-end
 
 fn write_run_outcome<T>(
     deployment: &str,
     organization: &str,
     run_id: &str,
     result: Result<T, RunFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
     write_success: impl FnOnce(T) -> anyhow::Result<()>,
 ) -> anyhow::Result<ExitCode> {
     super::write_api_outcome(result, write_success, |failure| {
-        super::write_failure(deployment, organization, Some(run_id), failure, json)
+        super::write_failure(
+            deployment,
+            organization,
+            Some(run_id),
+            failure,
+            authentication,
+            json,
+        )
     })
 }
 

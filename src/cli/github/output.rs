@@ -28,6 +28,7 @@ pub(super) fn write_setup_begin(
     deployment: &str,
     organization: &str,
     result: &Result<GitHubSetupSession, GitHubFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -65,6 +66,7 @@ pub(super) fn write_setup_begin(
             organization,
             failure,
             FailureAction::BeginSetup,
+            authentication,
             json,
         ),
     }
@@ -74,6 +76,7 @@ pub(super) fn write_installation_list(
     deployment: &str,
     organization: &str,
     result: &Result<Vec<GitHubInstallation>, GitHubFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -113,6 +116,7 @@ pub(super) fn write_installation_list(
             organization,
             failure,
             FailureAction::ListInstallations,
+            authentication,
             json,
         ),
     }
@@ -123,6 +127,7 @@ pub(super) fn write_installation(
     organization: &str,
     result: &Result<GitHubInstallation, GitHubFailure>,
     action: InstallationAction,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -158,6 +163,7 @@ pub(super) fn write_installation(
                 InstallationAction::SetupCompleted => FailureAction::CompleteSetup,
                 InstallationAction::Disconnected => FailureAction::DisconnectInstallation,
             },
+            authentication,
             json,
         ),
     }
@@ -167,6 +173,7 @@ pub(super) fn write_repository_list(
     deployment: &str,
     organization: &str,
     result: &Result<GitHubRepositoryList, GitHubFailure>,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -190,6 +197,7 @@ pub(super) fn write_repository_list(
             organization,
             failure,
             FailureAction::ListRepositories,
+            authentication,
             json,
         ),
     }
@@ -265,13 +273,18 @@ fn write_failure(
     organization: &str,
     failure: &GitHubFailure,
     action: FailureAction,
+    authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, class) = match failure {
         GitHubFailure::Unauthenticated => (
             "unauthenticated",
             None,
-            "error: GitHub connection management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login".to_owned(),
+            authentication
+                .rejected_error(
+                    "error: GitHub connection management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                )
+                .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
         GitHubFailure::Forbidden => (

@@ -63,7 +63,7 @@ impl HttpCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         let mut changed = self.changed.subscribe();
         if *changed.borrow() {
             return;

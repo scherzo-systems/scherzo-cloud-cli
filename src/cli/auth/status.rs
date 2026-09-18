@@ -19,7 +19,7 @@ pub(super) struct Command {
     json: bool,
 
     #[command(flatten)]
-    http: super::super::HttpOptions,
+    options: super::PrincipalNetworkOptions,
 }
 
 impl Command {
@@ -28,17 +28,24 @@ impl Command {
     }
 
     fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let client = HttpClient::new(self.http.transport_policy())
+        let client = HttpClient::new(self.options.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare status networking")?;
-        let status = status::check(&client, deployment)
-            .map_err(|error| anyhow!(error))
-            .with_context(|| {
-                format!(
-                    "check sign-in status through {}",
-                    deployment.fingerprint().api_url()
-                )
-            })?;
+        let authentication = self.options.authentication.kind();
+        let service_api_key = self.options.authentication.service_api_key()?;
+        let status = match service_api_key {
+            Some(api_key) => {
+                status::check_with_service_api_key(&client, deployment, api_key.expose())
+            }
+            None => status::check(&client, deployment),
+        }
+        .map_err(|error| anyhow!(error))
+        .with_context(|| {
+            format!(
+                "check sign-in status through {}",
+                deployment.fingerprint().api_url()
+            )
+        })?;
         let outcome = match status.state() {
             AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {
                 OutcomeClass::Success
@@ -51,7 +58,7 @@ impl Command {
         if self.json {
             write_json_status(&status)?;
         } else {
-            write_human_status(&status)?;
+            write_human_status(&status, authentication)?;
         }
         Ok(outcome.exit_code())
     }
@@ -93,7 +100,7 @@ impl<'a> StatusResult<'a> {
         let body = match status.state() {
             AuthenticationState::Authenticated(authenticated) => StatusBody::Authenticated {
                 deployment: status.deployment(),
-                principal: PrincipalResult::from_principal(&authenticated.principal),
+                principal: PrincipalResult::from_profile(&authenticated.principal),
                 actions: authenticated.actions.as_deref(),
             },
             AuthenticationState::SignupRequired { actions } => StatusBody::SignupRequired {
@@ -123,7 +130,10 @@ fn write_json_status(status: &AuthenticationStatus) -> anyhow::Result<()> {
     writeln!(stdout).context("write sign-in status")
 }
 
-pub(super) fn write_human_status(status: &AuthenticationStatus) -> anyhow::Result<()> {
+pub(super) fn write_human_status(
+    status: &AuthenticationStatus,
+    authentication: super::super::PrincipalAuthenticationKind,
+) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     match status.state() {
@@ -133,7 +143,12 @@ pub(super) fn write_human_status(status: &AuthenticationStatus) -> anyhow::Resul
                 .display_name
                 .as_ref()
                 .unwrap_or(&authenticated.principal.id);
-            writeln!(stdout, "✓ Signed in as {account}.").context("write sign-in status")?;
+            if authenticated.principal.r#type == "service" {
+                writeln!(stdout, "✓ Authenticated as service {account}.")
+                    .context("write sign-in status")?;
+            } else {
+                writeln!(stdout, "✓ Signed in as {account}.").context("write sign-in status")?;
+            }
             write_human_actions(&mut stdout, authenticated.actions.as_deref())
         }
         AuthenticationState::SignupRequired { actions } => {
@@ -145,10 +160,12 @@ pub(super) fn write_human_status(status: &AuthenticationStatus) -> anyhow::Resul
             .context("write sign-in status")?;
             write_human_actions(&mut stdout, actions.as_deref())
         }
-        AuthenticationState::Unauthenticated => {
-            writeln!(stdout, "! You're not signed in to Scherzo Cloud.")
-                .context("write sign-in status")
-        }
+        AuthenticationState::Unauthenticated => writeln!(
+            stdout,
+            "{}",
+            authentication.rejected_notice("! You're not signed in to Scherzo Cloud.")
+        )
+        .context("write sign-in status"),
         AuthenticationState::Unreachable(category) => writeln!(
             stdout,
             "! Couldn't reach Scherzo Cloud ({}).",
