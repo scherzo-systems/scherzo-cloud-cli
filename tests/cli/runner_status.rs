@@ -123,7 +123,7 @@ fn cloud_welcome() -> Message {
                     "forceStopAndReapBudgetMilliseconds": 5000,
                     "terminalReportDeliveryBudgetMilliseconds": 5000,
                     "renewalDeliveryBudgetMilliseconds": 5000,
-                    "leaseDurationMilliseconds": 320000,
+                    "leaseDurationMilliseconds": 371000,
                     "fencingMarginMilliseconds": 11000
                 }
             }

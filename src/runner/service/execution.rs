@@ -1627,6 +1627,10 @@ where
                         if wait.is_err() {
                             return fail_lease_timer(&mut execution, failure).await;
                         }
+                        let latest_authority = authority_updates.borrow_and_update().clone();
+                        if latest_authority != authority {
+                            continue;
+                        }
                         return finish_after_lease_loss(
                             &mut execution,
                             cancellation,
@@ -2979,6 +2983,8 @@ impl CoordinatorClock for RunnerExecutionClock {
 
 #[cfg(test)]
 pub(super) mod test_support {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     pub(in crate::runner::service) struct LiveLeaseExecution {
@@ -2987,6 +2993,7 @@ pub(super) mod test_support {
         cancellation: crate::execution::workflow::admission::CancellationSource,
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
+        invocations: Arc<AtomicUsize>,
     }
 
     impl LiveLeaseExecution {
@@ -2997,6 +3004,7 @@ pub(super) mod test_support {
                 cancellation,
                 fence,
                 guards,
+                invocations,
             } = self;
             completion
                 .send("completed-after-renewal")
@@ -3011,6 +3019,7 @@ pub(super) mod test_support {
                     ..
                 }
             ));
+            assert_eq!(invocations.load(Ordering::Acquire), 1);
             assert_eq!(cancellation.cancellation_reason(), None);
             assert!(!fence.is_fenced());
             assert!(!guards.forced_containment_started());
@@ -3032,9 +3041,14 @@ pub(super) mod test_support {
         let guards = AssignmentProcessGuards::new();
         let observed_guards = guards.clone();
         let (completion, completed) = tokio::sync::oneshot::channel();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let observed_invocations = Arc::clone(&invocations);
         let task = tokio::spawn(async move {
             run_under_lease(
-                async { completed.await.expect("live lease execution completion") },
+                async {
+                    observed_invocations.fetch_add(1, Ordering::Release);
+                    completed.await.expect("live lease execution completion")
+                },
                 &cancellation,
                 &lease_clock,
                 authority_updates,
@@ -3054,6 +3068,7 @@ pub(super) mod test_support {
             cancellation: observed_cancellation,
             fence: observed_fence,
             guards: observed_guards,
+            invocations,
         }
     }
 }

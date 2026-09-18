@@ -49,6 +49,7 @@ pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
 pub(super) const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 1_024_720_896;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
+const MINIMUM_RENEWAL_HEADROOM: Duration = Duration::from_secs(30);
 
 fn encoded_outbox_reservation(selected_maximum_transitions: u64) -> Option<u64> {
     selected_maximum_transitions
@@ -1178,11 +1179,12 @@ impl LeaseAuthority {
         let force_stop_start = local_expiry.checked_sub(fencing_margin)?;
         let cancellation_start = force_stop_start.checked_sub(cancellation_grace)?;
         // The advertised delivery budget is a minimum, not a scheduling target.
-        // Aim for 30 seconds of headroom, but keep at least half a short authority
-        // window before requesting again unless the policy requires an earlier request.
+        // Welcomed policies reserve two full leads in the maximum-grace window,
+        // so every admitted grace can use the ordinary 30-second target.
         let cancellation_window = cancellation_start.checked_duration_since(basis)?;
-        let renewal_lead =
-            renewal_delivery_budget.max(Duration::from_secs(30).min(cancellation_window / 2));
+        let renewal_lead = renewal_delivery_budget
+            .max(MINIMUM_RENEWAL_HEADROOM)
+            .min(cancellation_window / 2);
         let renewal_request = cancellation_start.checked_sub(renewal_lead)?;
         let force_stop_end = force_stop_start.checked_add(force_stop_reap_budget)?;
         Ok(Self {
@@ -3436,6 +3438,7 @@ pub(super) mod test_support {
         causal_lease: CausalLease,
         cancellation: CancellationSource,
         identity: AssignmentIdentity,
+        initial_cancellation_headroom: Duration,
     }
 
     impl RenewalTimingFixture {
@@ -3462,7 +3465,7 @@ pub(super) mod test_support {
                     .await
                     .expect("initial cancellation timer was not armed")
                     .expect("controlled lease clock closed before initial cancellation timer");
-            assert_eq!(cancellation_wait, Duration::from_secs(1));
+            assert_eq!(cancellation_wait, self.initial_cancellation_headroom);
             execution
         }
 
@@ -3506,12 +3509,20 @@ pub(super) mod test_support {
         manager: &mut AssignmentManager,
         offer: AssignmentOffer,
     ) -> RenewalTimingFixture {
+        install_running_renewal_fixture_after_request(manager, offer, Duration::from_secs(29))
+    }
+
+    fn install_running_renewal_fixture_after_request(
+        manager: &mut AssignmentManager,
+        offer: AssignmentOffer,
+        elapsed_since_request: Duration,
+    ) -> RenewalTimingFixture {
         let policy = ExecutionLeasePolicy {
             schema_version: 2,
             force_stop_and_reap_budget_milliseconds: 5000,
             terminal_report_delivery_budget_milliseconds: 5000,
             renewal_delivery_budget_milliseconds: 5000,
-            lease_duration_milliseconds: 320_000,
+            lease_duration_milliseconds: 371_000,
             fencing_margin_milliseconds: 11_000,
         };
         manager
@@ -3520,7 +3531,12 @@ pub(super) mod test_support {
         let (clock, control, waits) = super::super::lease_clock::controlled_lease_clock();
         manager.lease_clock = clock.clone();
         let initial_basis = clock.now().expect("read fixture lease clock");
-        let cancellation_grace = Duration::from_secs(1);
+        let cancellation_grace = Duration::from_secs(
+            offer
+                .execution_spec
+                .execution_limits
+                .cancellation_grace_seconds,
+        );
         let initial_authority =
             LeaseAuthority::derive(1, initial_basis, &policy, cancellation_grace)
                 .expect("derive initial fixture authority");
@@ -3541,11 +3557,10 @@ pub(super) mod test_support {
             .cancellation_start
             .checked_duration_since(renewal_basis)
             .expect("measure fixture cancellation headroom");
-        control.advance(
-            remaining
-                .checked_sub(Duration::from_secs(1))
-                .expect("leave one second of fixture cancellation headroom"),
-        );
+        let initial_cancellation_headroom = remaining
+            .checked_sub(elapsed_since_request)
+            .expect("fixture delay remains before cancellation");
+        control.advance(elapsed_since_request);
 
         let identity = AssignmentIdentity::from_offer(&offer);
         let response = AssignmentDecision::Accepted {
@@ -3602,6 +3617,7 @@ pub(super) mod test_support {
             causal_lease,
             cancellation,
             identity,
+            initial_cancellation_headroom,
         }
     }
 
@@ -3882,12 +3898,15 @@ fn validate_lease_policy(policy: &ExecutionLeasePolicy) -> Result<(), WelcomePol
     let maximum_cancellation_grace_milliseconds =
         u64::try_from(MAXIMUM_CANCELLATION_GRACE.as_millis())
             .map_err(|_| WelcomePolicyFailure::Invalid)?;
-    let lease_required = policy
-        .fencing_margin_milliseconds
-        .checked_add(maximum_cancellation_grace_milliseconds)
-        .and_then(|value| value.checked_add(renewal_delivery))
+    let cancellation_window = policy
+        .lease_duration_milliseconds
+        .checked_sub(policy.fencing_margin_milliseconds)
+        .and_then(|value| value.checked_sub(maximum_cancellation_grace_milliseconds))
         .ok_or(WelcomePolicyFailure::Invalid)?;
-    if policy.lease_duration_milliseconds < lease_required {
+    let minimum_renewal_headroom_milliseconds = u64::try_from(MINIMUM_RENEWAL_HEADROOM.as_millis())
+        .map_err(|_| WelcomePolicyFailure::Invalid)?;
+    let renewal_lead = renewal_delivery.max(minimum_renewal_headroom_milliseconds);
+    if cancellation_window / 2 < renewal_lead {
         return Err(WelcomePolicyFailure::Invalid);
     }
     Ok(())
@@ -4647,7 +4666,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             force_stop_and_reap_budget_milliseconds: 5000,
             terminal_report_delivery_budget_milliseconds: 5000,
             renewal_delivery_budget_milliseconds: 5000,
-            lease_duration_milliseconds: 320_000,
+            lease_duration_milliseconds: 371_000,
             fencing_margin_milliseconds: 11_000,
         }
     }
@@ -5376,6 +5395,33 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 return release;
             }
         }
+    }
+
+    async fn wait_for_renewal_request(
+        manager: &mut AssignmentManager,
+    ) -> PendingAssignmentObservation {
+        let notification = manager.notification();
+        with_watchdog(async {
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                if let Some(requested) = manager
+                    .pending_observations(&BTreeSet::new(), 10)
+                    .into_iter()
+                    .find(|pending| {
+                        matches!(
+                            pending.observation,
+                            AssignmentObservation::LeaseRenewalRequested { .. }
+                        )
+                    })
+                {
+                    break requested;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("runner did not request renewal")
     }
 
     async fn wait_for_manager_state(
@@ -6969,33 +7015,232 @@ steps:
     }
 
     #[test]
-    fn renewal_headroom_preserves_fencing_and_short_policy_windows() {
-        let (clock, _control, _waits) = controlled_lease_clock();
-        let basis = clock.now().unwrap();
-        for (grace, budget, lead_ms) in [
-            (0, 5, 30_000),
-            (30, 5, 30_000),
-            (270, 5, 19_500),
-            (300, 5, 5_000),
-            (300, 8, 8_000),
+    fn welcomed_policy_requires_two_complete_renewal_leads() {
+        for (renewal_budget_ms, lease_duration_ms, valid) in [
+            (5_000, 371_000, true),
+            (5_000, 370_999, false),
+            (40_000, 391_000, true),
+            (40_000, 390_999, false),
         ] {
-            let mut policy = policy();
-            policy.renewal_delivery_budget_milliseconds = budget * 1000;
+            let mut candidate = policy();
+            candidate.renewal_delivery_budget_milliseconds = renewal_budget_ms;
+            candidate.lease_duration_milliseconds = lease_duration_ms;
+            assert_eq!(validate_lease_policy(&candidate).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn active_policy_uses_thirty_second_headroom_for_every_grace() {
+        for grace_seconds in 1..=300 {
+            let (clock, _control, _waits) = controlled_lease_clock();
+            let basis = clock.now().unwrap();
             let authority =
-                LeaseAuthority::derive(1, basis, &policy, Duration::from_secs(grace)).unwrap();
-            let offsets = authority_offsets(&authority);
-            let lead = Duration::from_millis(lead_ms);
+                LeaseAuthority::derive(1, basis, &policy(), Duration::from_secs(grace_seconds))
+                    .unwrap();
             assert_eq!(
-                offsets,
-                vec![
-                    Duration::from_secs(309 - grace) - lead,
-                    Duration::from_secs(309 - grace),
-                    Duration::from_secs(309),
-                    Duration::from_secs(314),
-                    Duration::from_secs(320),
-                ]
+                authority
+                    .cancellation_start
+                    .checked_duration_since(authority.renewal_request)
+                    .unwrap(),
+                Duration::from_secs(30),
+            );
+            assert!(
+                authority
+                    .renewal_request
+                    .checked_duration_since(basis)
+                    .unwrap()
+                    >= Duration::from_secs(30)
             );
         }
+    }
+
+    #[test]
+    fn active_policy_boundaries_advance_during_suspend() {
+        for (grace_seconds, expected_offsets) in [
+            (
+                1,
+                [
+                    Duration::from_secs(329),
+                    Duration::from_secs(359),
+                    Duration::from_secs(360),
+                    Duration::from_secs(365),
+                    Duration::from_secs(371),
+                ],
+            ),
+            (
+                300,
+                [
+                    Duration::from_secs(30),
+                    Duration::from_secs(60),
+                    Duration::from_secs(360),
+                    Duration::from_secs(365),
+                    Duration::from_secs(371),
+                ],
+            ),
+        ] {
+            let (clock, control, _waits) = controlled_lease_clock();
+            let basis = clock.now().unwrap();
+            let authority =
+                LeaseAuthority::derive(1, basis, &policy(), Duration::from_secs(grace_seconds))
+                    .unwrap();
+            assert_eq!(authority_offsets(&authority), expected_offsets);
+            control.simulate_suspend(expected_offsets[0]);
+            assert_eq!(clock.now().unwrap(), authority.renewal_request);
+            assert_eq!(
+                authority
+                    .cancellation_start
+                    .checked_duration_since(clock.now().unwrap())
+                    .unwrap(),
+                Duration::from_secs(30),
+            );
+        }
+
+        let (clock, _control, _waits) = controlled_lease_clock();
+        let basis = clock.now().unwrap();
+        let initial =
+            LeaseAuthority::derive(1, basis, &policy(), Duration::from_secs(300)).unwrap();
+        let renewed = LeaseAuthority::derive(
+            2,
+            initial.renewal_request,
+            &policy(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        assert_eq!(
+            renewed
+                .renewal_request
+                .checked_duration_since(initial.renewal_request)
+                .unwrap(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            Duration::from_secs(60).as_secs()
+                / renewed
+                    .renewal_request
+                    .checked_duration_since(initial.renewal_request)
+                    .unwrap()
+                    .as_secs(),
+            2,
+        );
+    }
+
+    #[tokio::test]
+    async fn maximum_grace_renewal_delivery_boundary_is_fail_closed() {
+        fn fixture(
+            label: &str,
+        ) -> (
+            tempfile::TempDir,
+            AssignmentManager,
+            PathBuf,
+            PathBuf,
+            AssignmentOffer,
+        ) {
+            let placeholder = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+            let (temporary, manager) = manager_fixture(placeholder);
+            let marker = temporary.path().join(format!("{label}-invocations"));
+            let release = temporary.path().join(format!("{label}-release"));
+            let script = format!(
+                "printf 'invoked\\n' >> {}; while [ ! -e {} ]; do sleep 0.01; done",
+                marker.display(),
+                release.display()
+            );
+            let argv = serde_json::to_string(&["sh", "-c", script.as_str()]).unwrap();
+            fs::write(
+                temporary.path().join("source/workflow.yaml"),
+                format!(
+                    "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: {argv}\n"
+                ),
+            )
+            .unwrap();
+            let source = temporary.path().join("source");
+            run_fixture_git(&source, &["add", "workflow.yaml"]);
+            run_fixture_git(&source, &["commit", "--quiet", "-m", "update workflow"]);
+            let mut offered = offer(label);
+            offered
+                .execution_spec
+                .execution_limits
+                .cancellation_grace_seconds = 300;
+            (temporary, manager, marker, release, offered)
+        }
+
+        fn assert_one_invocation(marker: &Path) {
+            assert_eq!(fs::read_to_string(marker).unwrap(), "invoked\n");
+        }
+
+        let (_temporary, mut manager, marker, release, offered) = fixture("bg");
+        let (control, mut waits, job) = controlled_execution_job(&mut manager, &offered).await;
+        job.spawn();
+        wait_for_fixture_path(&marker).await;
+        lease_wait_request(&mut waits, Duration::from_secs(30))
+            .await
+            .release();
+        let _request = wait_for_renewal_request(&mut manager).await;
+        let obsolete_cancellation_wait =
+            lease_wait_request(&mut waits, Duration::from_secs(30)).await;
+        control.advance(Duration::from_millis(29_999));
+        let renewal = renewal_for(&offered);
+        let decision = manager.handle_renewal(renewal.clone()).unwrap();
+        assert_eq!(decision.disposition, RenewalDisposition::Applied);
+        assert_eq!(decision.request_age_ms, Some(29_999));
+        assert_eq!(decision.cancellation_headroom_ms, Some(1));
+        assert_eq!(
+            manager.handle_renewal(renewal).unwrap().disposition,
+            RenewalDisposition::ReplayApplied,
+        );
+        control.advance(Duration::from_millis(2));
+        obsolete_cancellation_wait.release();
+        let renewed_request_wait = with_watchdog(lease_wait_request(&mut waits, Duration::ZERO))
+            .await
+            .expect("supervisor did not replace the obsolete cancellation timer");
+        assert!(matches!(
+            &manager.slot,
+            Some(LocalSlot::Running(running))
+                if running.current_grant.sequence == 2
+                    && running.cancellation.cancellation_reason().is_none()
+        ));
+        renewed_request_wait.release();
+        assert_one_invocation(&marker);
+        fs::write(release, b"complete").unwrap();
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("renewed workflow did not finish");
+        assert_succeeded(&reports);
+        assert_one_invocation(&marker);
+
+        let (_temporary, mut boundary_manager, boundary_marker, boundary_release, boundary_offer) =
+            fixture("bh");
+        let (boundary_control, mut boundary_waits, boundary_job) =
+            controlled_execution_job(&mut boundary_manager, &boundary_offer).await;
+        boundary_job.spawn();
+        wait_for_fixture_path(&boundary_marker).await;
+        lease_wait_request(&mut boundary_waits, Duration::from_secs(30))
+            .await
+            .release();
+        let _request = wait_for_renewal_request(&mut boundary_manager).await;
+        boundary_control.advance(Duration::from_millis(30_000));
+        let late = boundary_manager
+            .handle_renewal(renewal_for(&boundary_offer))
+            .unwrap();
+        assert_eq!(late.disposition, RenewalDisposition::CancellationStarted);
+        assert_eq!(late.request_age_ms, Some(30_000));
+        assert_eq!(late.cancellation_headroom_ms, Some(0));
+        assert!(matches!(
+            &boundary_manager.slot,
+            Some(LocalSlot::Running(running))
+                if running.current_grant.sequence == 1
+                    && running.cancellation.cancellation_reason()
+                        == Some(crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired)
+                    && running.authority_updates.borrow().revoked
+        ));
+        fs::write(boundary_release, b"complete").unwrap();
+        boundary_control.advance(Duration::from_secs(300));
+        lease_wait_request(&mut boundary_waits, Duration::from_secs(30))
+            .await
+            .release();
+        with_watchdog(wait_for_terminal(&mut boundary_manager))
+            .await
+            .expect("cancelled workflow did not finish");
+        assert_one_invocation(&boundary_marker);
     }
 
     #[tokio::test]
@@ -7074,11 +7319,11 @@ steps:
         assert_eq!(
             authority_offsets(&authority),
             vec![
-                Duration::from_secs(278),
-                Duration::from_secs(308),
-                Duration::from_secs(309),
-                Duration::from_secs(314),
-                Duration::from_secs(320),
+                Duration::from_secs(329),
+                Duration::from_secs(359),
+                Duration::from_secs(360),
+                Duration::from_secs(365),
+                Duration::from_secs(371),
             ]
         );
         assert!(manager.handle_start(start).unwrap().is_none());
@@ -7119,7 +7364,7 @@ steps:
             .handle_offer(boundary_offer.clone())
             .unwrap();
         wait_for_offer_preparation(&mut boundary_manager).await;
-        boundary.advance(Duration::from_secs(308));
+        boundary.advance(Duration::from_secs(359));
         assert!(
             boundary_manager
                 .handle_start(start_for(&boundary_offer))
@@ -7474,7 +7719,7 @@ steps:
 
         let (renewal_duration, _renewal_release) =
             with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
-        assert_eq!(renewal_duration, Duration::from_secs(278));
+        assert_eq!(renewal_duration, Duration::from_secs(329));
         let notification = manager.notification();
         with_watchdog(async {
             loop {
@@ -7497,7 +7742,7 @@ steps:
 
         let (artifact_duration, _artifact_release) =
             with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
-        assert_eq!(artifact_duration, Duration::from_secs(278));
+        assert_eq!(artifact_duration, Duration::from_secs(329));
 
         let (delivery_duration, _delivery_release) =
             with_watchdog(lease_waits.recv()).await.unwrap().unwrap();
@@ -7584,7 +7829,7 @@ steps:
         let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
         manager.acknowledge_observation(acceptance);
 
-        control.advance(Duration::from_secs(308));
+        control.advance(Duration::from_secs(359));
         job.spawn();
 
         with_watchdog(wait_for_manager_state(&mut manager, |manager| {
@@ -7616,9 +7861,9 @@ steps:
             .expect("runner did not schedule a lease timer")
             .expect("lease timer channel closed");
 
-        // Cancellation starts after 308 seconds; target 30 seconds of renewal headroom.
+        // Cancellation starts after 359 seconds; target 30 seconds of renewal headroom.
         assert!(
-            duration <= Duration::from_secs(278),
+            duration <= Duration::from_secs(329),
             "first lease timer was scheduled at {duration:?}"
         );
     }
@@ -7628,7 +7873,7 @@ steps:
         let (_temporary, mut manager, mut sleep_requests, _offered, workspace) =
             controlled_running_fixture().await;
 
-        lease_wait_request(&mut sleep_requests, Duration::from_secs(278))
+        lease_wait_request(&mut sleep_requests, Duration::from_secs(329))
             .await
             .release();
         lease_wait_request(&mut sleep_requests, Duration::from_secs(30))
@@ -7717,7 +7962,7 @@ steps:
         offer_then_prepare(&mut manager, &offered).await;
         let _job = execution_job(&mut manager, &offered);
 
-        control.advance(Duration::from_secs(308));
+        control.advance(Duration::from_secs(359));
         let decision = manager.handle_renewal(renewal_for(&offered)).unwrap();
         assert_eq!(
             decision.disposition,
@@ -7750,30 +7995,9 @@ steps:
             controlled_running_fixture().await;
 
         let (duration, release) = with_watchdog(sleep_requests.recv()).await.unwrap().unwrap();
-        assert_eq!(duration, Duration::from_secs(278));
+        assert_eq!(duration, Duration::from_secs(329));
         release.release();
-        let notification = manager.notification();
-        let requested = with_watchdog(async {
-            loop {
-                let notified = notification.notified();
-                tokio::pin!(notified);
-                if let Some(requested) = manager
-                    .pending_observations(&BTreeSet::new(), 10)
-                    .into_iter()
-                    .find(|pending| {
-                        matches!(
-                            pending.observation,
-                            AssignmentObservation::LeaseRenewalRequested { .. }
-                        )
-                    })
-                {
-                    break requested;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("runner did not request renewal");
+        let requested = wait_for_renewal_request(&mut manager).await;
         encode_runner_frame(&requested.observation.runner_frame(RunnerEnvelope {
             message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -7797,7 +8021,7 @@ steps:
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(duration, Duration::from_secs(278));
+        assert_eq!(duration, Duration::from_secs(329));
 
         let mut gap = renewal_for(&offered);
         gap.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned();
