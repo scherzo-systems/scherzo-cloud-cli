@@ -7133,15 +7133,20 @@ steps:
             AssignmentManager,
             PathBuf,
             PathBuf,
+            PathBuf,
             AssignmentOffer,
         ) {
             let placeholder = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
             let (temporary, manager) = manager_fixture(placeholder);
             let marker = temporary.path().join(format!("{label}-invocations"));
+            let started = temporary.path().join(format!("{label}-started"));
             let release = temporary.path().join(format!("{label}-release"));
+            // Opening the invocation marker can expose an empty file before `printf` runs.
+            // Publish a distinct readiness boundary only after the append has completed.
             let script = format!(
-                "printf 'invoked\\n' >> {}; while [ ! -e {} ]; do sleep 0.01; done",
+                "printf 'invoked\\n' >> {} && mkdir {}; while [ ! -e {} ]; do sleep 0.01; done",
                 marker.display(),
+                started.display(),
                 release.display()
             );
             let argv = serde_json::to_string(&["sh", "-c", script.as_str()]).unwrap();
@@ -7160,17 +7165,18 @@ steps:
                 .execution_spec
                 .execution_limits
                 .cancellation_grace_seconds = 300;
-            (temporary, manager, marker, release, offered)
+            (temporary, manager, marker, started, release, offered)
         }
 
         fn assert_one_invocation(marker: &Path) {
             assert_eq!(fs::read_to_string(marker).unwrap(), "invoked\n");
         }
 
-        let (_temporary, mut manager, marker, release, offered) = fixture("bg");
+        let (_temporary, mut manager, marker, started, release, offered) = fixture("bg");
         let (control, mut waits, job) = controlled_execution_job(&mut manager, &offered).await;
         job.spawn();
-        wait_for_fixture_path(&marker).await;
+        wait_for_fixture_path(&started).await;
+        assert_one_invocation(&marker);
         lease_wait_request(&mut waits, Duration::from_secs(30))
             .await
             .release();
@@ -7207,12 +7213,19 @@ steps:
         assert_succeeded(&reports);
         assert_one_invocation(&marker);
 
-        let (_temporary, mut boundary_manager, boundary_marker, boundary_release, boundary_offer) =
-            fixture("bh");
+        let (
+            _temporary,
+            mut boundary_manager,
+            boundary_marker,
+            boundary_started,
+            boundary_release,
+            boundary_offer,
+        ) = fixture("bh");
         let (boundary_control, mut boundary_waits, boundary_job) =
             controlled_execution_job(&mut boundary_manager, &boundary_offer).await;
         boundary_job.spawn();
-        wait_for_fixture_path(&boundary_marker).await;
+        wait_for_fixture_path(&boundary_started).await;
+        assert_one_invocation(&boundary_marker);
         lease_wait_request(&mut boundary_waits, Duration::from_secs(30))
             .await
             .release();
