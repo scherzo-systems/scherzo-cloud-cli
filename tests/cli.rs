@@ -26,13 +26,8 @@ mod account_deletion;
 mod account_signup;
 #[path = "cli/account_update.rs"]
 mod account_update;
-mod api_test_support {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/api/test_support.rs"
-    ));
-}
 use api_test_support::read_request;
+use scherzo_cloud_test_support as api_test_support;
 #[path = "cli/artifact_remote.rs"]
 mod artifact_remote;
 #[path = "cli/artifact_validate.rs"]

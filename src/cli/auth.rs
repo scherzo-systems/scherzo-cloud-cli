@@ -6,8 +6,8 @@ mod status;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
-use crate::api::HttpClient;
 use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::HttpClient;
 
 pub(super) const ABOUT: &str = "Manage your Scherzo Cloud sign-in";
 const NAME: &str = "auth";

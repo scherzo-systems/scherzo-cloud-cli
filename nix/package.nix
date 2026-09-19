@@ -15,6 +15,7 @@ let
       ../.config/nextest.toml
       ../Cargo.lock
       ../Cargo.toml
+      ../crates
       ../docs/workflow-v1.md
       ../examples
       ../schemas

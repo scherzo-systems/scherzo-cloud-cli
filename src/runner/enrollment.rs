@@ -512,7 +512,7 @@ fn send_enrollment(
     journal: &EnrollmentJournal,
     request: &EnrollmentRequest<'_>,
 ) -> Result<EnrollmentHTTPOutcome, EnrollmentError> {
-    crate::tls::install_provider();
+    scherzo_cloud_support::install_provider();
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(REQUEST_TIMEOUT)
@@ -748,7 +748,7 @@ fn read_activation_artifact_allow_expired(
 
 fn require_unexpired_artifact(artifact: &ActivationArtifact) -> Result<(), EnrollmentError> {
     if parse_rfc3339(&artifact.expires_at)
-        .is_none_or(|expires_at| expires_at <= crate::timing::utc_now())
+        .is_none_or(|expires_at| expires_at <= scherzo_cloud_support::utc_now())
     {
         return Err(EnrollmentError::ExpiredArtifact);
     }
@@ -1163,12 +1163,14 @@ fn sync_directory(path: &Path) -> Result<(), EnrollmentError> {
 
 fn acquire_state_lock(path: &Path) -> Result<StateLock, EnrollmentError> {
     let file = open_or_create_private_file(path).map_err(|_| EnrollmentError::StateLock)?;
-    let start = crate::timing::monotonic_now();
+    let start = scherzo_cloud_support::monotonic_now();
     loop {
         match FileExt::try_lock(&file) {
             Ok(()) => return Ok(StateLock { file }),
-            Err(TryLockError::WouldBlock) if crate::timing::elapsed(start) < LOCK_TIMEOUT => {
-                crate::timing::sleep(LOCK_RETRY);
+            Err(TryLockError::WouldBlock)
+                if scherzo_cloud_support::elapsed(start) < LOCK_TIMEOUT =>
+            {
+                scherzo_cloud_support::sleep(LOCK_RETRY);
             }
             Err(TryLockError::WouldBlock | TryLockError::Error(_)) => {
                 return Err(EnrollmentError::StateLock);
@@ -1367,7 +1369,7 @@ fn valid_name(value: &str) -> bool {
 }
 
 fn now_rfc3339() -> Result<String, EnrollmentError> {
-    crate::timing::utc_now()
+    scherzo_cloud_support::utc_now()
         .format(&Rfc3339)
         .map_err(|_| EnrollmentError::StateWrite)
 }

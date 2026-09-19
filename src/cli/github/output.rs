@@ -3,11 +3,11 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{
     GitHubAccountType, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 #[derive(Clone, Copy)]
 pub(super) enum InstallationAction {

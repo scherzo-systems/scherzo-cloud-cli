@@ -17,7 +17,6 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation,
 };
-use crate::workflow_contract::strict_json;
 
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_CORRELATION_BYTES: u64 = 64 * 1024;
@@ -760,7 +759,7 @@ impl CodexAppServerV1Parser {
         {
             return Err(self.failure_for(CodexAppServerV1RejectionReason::FrameTooLarge));
         }
-        let value = strict_json::from_slice(frame)
+        let value = scherzo_cloud_support::strict_json_from_slice(frame)
             .map_err(|_| self.failure_for(CodexAppServerV1RejectionReason::FrameDecodeFailed))?;
         let object = value
             .as_object()
@@ -2667,7 +2666,7 @@ impl<'de> Visitor<'de> for WeakResultEnvelopeVisitor {
 
 fn parse_weak_result_envelope(text: &str) -> Result<Value, ()> {
     let envelope = serde_json::from_str::<WeakResultEnvelope>(text).map_err(|_| ())?;
-    strict_json::from_str(&envelope.0).map_err(|_| ())
+    scherzo_cloud_support::strict_json_from_str(&envelope.0).map_err(|_| ())
 }
 
 fn weak_json_schema() -> Value {

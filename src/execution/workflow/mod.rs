@@ -159,23 +159,23 @@ fn structural_validator() -> Option<&'static Validator> {
 }
 
 pub(crate) fn is_input_name(value: &str) -> bool {
-    crate::workflow_contract::is_identifier(value)
+    scherzo_cloud_support::is_identifier(value)
 }
 
 pub(crate) fn is_valid_input_display_name(value: Option<&str>) -> bool {
-    crate::workflow_contract::is_valid_input_display_name(value)
+    scherzo_cloud_support::is_valid_input_display_name(value)
 }
 
 pub(crate) fn is_lowercase_hex(value: &str, length: usize) -> bool {
-    crate::workflow_contract::is_lowercase_hex(value, length)
+    scherzo_cloud_support::is_lowercase_hex(value, length)
 }
 
 pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
-    crate::workflow_contract::lowercase_hex(bytes)
+    scherzo_cloud_support::lowercase_hex(bytes)
 }
 
 pub(crate) fn is_valid_media_type(value: &str) -> bool {
-    crate::workflow_contract::is_valid_media_type(value)
+    scherzo_cloud_support::is_valid_media_type(value)
 }
 
 #[cfg(test)]

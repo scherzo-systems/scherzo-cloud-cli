@@ -1,18 +1,21 @@
+// Command modules keep domain imports local; an import facade would obscure API ownership.
+// jscpd:ignore-start
 use std::io::{self, Write};
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{
     AcceptDelegationOutcome, CommonDelegationFailure, Delegation, DelegationApiError,
     DelegationPage, DelegationState, DelegationTerminalReason, EndDelegationOutcome,
     GetDelegationOutcome, HttpClient, ListDelegationsOutcome, ProposeDelegationOutcome,
     accept_delegation, end_delegation, get_delegation, list_current_principal_delegations,
     propose_delegation,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
+// jscpd:ignore-end
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud delegations";
 const NAME: &str = "delegation";
@@ -326,7 +329,7 @@ impl EndCommand {
 // jscpd:ignore-end
 
 fn parse_principal_id(value: &str) -> Result<String, String> {
-    if crate::public_id::valid_typed_id(value, "prn_") {
+    if scherzo_cloud_support::valid_typed_id(value, "prn_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact service principal ID".to_owned())
@@ -334,7 +337,7 @@ fn parse_principal_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_delegation_id(value: &str) -> Result<String, String> {
-    if crate::public_id::valid_typed_id(value, "dlg_") {
+    if scherzo_cloud_support::valid_typed_id(value, "dlg_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact delegation ID".to_owned())
@@ -351,7 +354,7 @@ macro_rules! impl_delegation_credential_outcome {
                     Self::Common(CommonDelegationFailure::Unauthenticated)
                 }
 
-                fn unreachable(category: crate::api::UnreachableCategory) -> Self {
+                fn unreachable(category: scherzo_cloud_api::UnreachableCategory) -> Self {
                     Self::Common(CommonDelegationFailure::Unreachable(category))
                 }
 

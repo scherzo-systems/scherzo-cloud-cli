@@ -102,7 +102,7 @@ while IFS= read -r -d '' rust_source; do
     exit 1
   fi
 done < <(
-  find src tests \
+  find src crates tests \
     -path 'tests/fixtures/lint-policy' -prune -o \
     -name '*.rs' -type f -print0
 )
@@ -123,7 +123,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp Cargo.toml Cargo.lock clippy.toml "$lint_fixture/"
+cp clippy.toml "$lint_fixture/"
+python3 - "$public_root/Cargo.toml" "$lint_fixture/Cargo.toml" <<'PY'
+import json
+from pathlib import Path
+import sys
+import tomllib
+
+source = tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+workspace = source["workspace"]
+package = workspace["package"]
+lines = [
+    "[package]",
+    'name = "scherzo-cloud-lint-policy-fixture"',
+    'version = "0.0.0"',
+    f"edition = {json.dumps(package['edition'])}",
+    f"rust-version = {json.dumps(package['rust-version'])}",
+    "publish = false",
+]
+for group in ("rust", "clippy"):
+    lines.extend(("", f"[lints.{group}]"))
+    for name, value in workspace["lints"][group].items():
+        lines.append(f"{name} = {json.dumps(value)}")
+Path(sys.argv[2]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
 mkdir -p "$lint_fixture/src"
 cp tests/fixtures/lint-policy/*.rs "$lint_fixture/src/"
 
@@ -136,7 +159,6 @@ set +e
 CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$public_root/target} \
   cargo clippy \
     --quiet \
-    --locked \
     --manifest-path "$lint_fixture/Cargo.toml" \
     --tests \
     --all-features \

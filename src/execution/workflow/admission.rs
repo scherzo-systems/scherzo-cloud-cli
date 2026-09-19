@@ -569,7 +569,7 @@ impl std::error::Error for ResolvedJsonInputError {
 impl ResolvedJsonInput {
     pub(crate) fn from_source(source: Arc<[u8]>) -> Result<Self, ResolvedJsonInputError> {
         let value = Arc::new(
-            crate::workflow_contract::strict_json::from_slice(&source)
+            scherzo_cloud_support::strict_json_from_slice(&source)
                 .map_err(ResolvedJsonInputError::InvalidSource)?,
         );
         let canonical = super::canonical_json::to_bounded_bytes(&value, u64::MAX)

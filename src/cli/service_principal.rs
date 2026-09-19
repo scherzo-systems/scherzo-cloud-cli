@@ -2,16 +2,17 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::io::{self, Write};
+use zeroize::Zeroizing;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::human_auth::deployment::Deployment;
+use crate::service_auth::{ApiKeyCleanup, ApiKeyDestination, ServiceApiKey, ServiceApiKeyError};
+use scherzo_cloud_api::{
     CreateServicePrincipalOutcome, HttpClient, IssueServiceCredentialOutcome,
     IssuedServiceCredential, ListServiceCredentialsOutcome, RevokeServiceCredentialOutcome,
     ServiceCredential, ServiceCredentialPage, ServicePrincipalApiError, create_service_principal,
     issue_service_credential, list_service_credentials, revoke_service_credential,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
-use crate::service_auth::{ApiKeyCleanup, ApiKeyDestination, ServiceApiKey, ServiceApiKeyError};
 
 use super::write_api_failure as write_failure;
 
@@ -173,7 +174,7 @@ impl super::HumanCredentialOutcome for CreateAttemptOutcome {
         Self::Completed(CreateServicePrincipalOutcome::Unauthenticated)
     }
 
-    fn unreachable(category: crate::api::UnreachableCategory) -> Self {
+    fn unreachable(category: scherzo_cloud_api::UnreachableCategory) -> Self {
         Self::Completed(CreateServicePrincipalOutcome::Unreachable(category))
     }
 
@@ -234,7 +235,10 @@ impl CreateCommand {
         };
         let delivered = match deliver_created_key(&mut destination, &outcome) {
             Ok(delivered) => delivered,
-            Err(error) => {
+            Err(ApiKeyDeliveryFailure::Invalid(error)) => {
+                return Err(invalid_returned_api_key(error).into());
+            }
+            Err(ApiKeyDeliveryFailure::Delivery(error)) => {
                 let CreateServicePrincipalOutcome::Created(created) = &outcome else {
                     return Err(anyhow!(error).into());
                 };
@@ -322,7 +326,10 @@ impl IssueCommand {
         .context("issue service credential")?;
         let delivered = match deliver_issued_key(&mut destination, &outcome) {
             Ok(delivered) => delivered,
-            Err(error) => {
+            Err(ApiKeyDeliveryFailure::Invalid(error)) => {
+                return Err(invalid_returned_api_key(error).into());
+            }
+            Err(ApiKeyDeliveryFailure::Delivery(error)) => {
                 let IssueServiceCredentialOutcome::Issued(issued) = &outcome else {
                     return Err(anyhow!(error).into());
                 };
@@ -397,36 +404,56 @@ impl ApiKeyDelivery for ApiKeyDestination {
     }
 }
 
+enum ApiKeyDeliveryFailure {
+    Invalid(ServiceApiKeyError),
+    Delivery(ServiceApiKeyError),
+}
+
+fn invalid_returned_api_key(error: ServiceApiKeyError) -> anyhow::Error {
+    anyhow!(error).context("validate returned service API key")
+}
+
+fn deliver_api_key(
+    destination: &mut impl ApiKeyDelivery,
+    api_key: &scherzo_cloud_api::IssuedServiceApiKey,
+) -> Result<(), ApiKeyDeliveryFailure> {
+    let api_key = ServiceApiKey::parse(Zeroizing::new(api_key.expose().to_owned()))
+        .map_err(ApiKeyDeliveryFailure::Invalid)?;
+    destination
+        .deliver(&api_key)
+        .map_err(ApiKeyDeliveryFailure::Delivery)
+}
+
 fn deliver_created_key(
     destination: &mut impl ApiKeyDelivery,
     outcome: &CreateServicePrincipalOutcome,
-) -> Result<bool, ServiceApiKeyError> {
+) -> Result<bool, ApiKeyDeliveryFailure> {
     let CreateServicePrincipalOutcome::Created(created) = outcome else {
         return Ok(false);
     };
     let Some(api_key) = &created.initial_credential.api_key else {
         return Ok(false);
     };
-    destination.deliver(api_key)?;
+    deliver_api_key(destination, api_key)?;
     Ok(true)
 }
 
 fn deliver_issued_key(
     destination: &mut impl ApiKeyDelivery,
     outcome: &IssueServiceCredentialOutcome,
-) -> Result<bool, ServiceApiKeyError> {
+) -> Result<bool, ApiKeyDeliveryFailure> {
     let IssueServiceCredentialOutcome::Issued(issued) = outcome else {
         return Ok(false);
     };
     let Some(api_key) = &issued.api_key else {
         return Ok(false);
     };
-    destination.deliver(api_key)?;
+    deliver_api_key(destination, api_key)?;
     Ok(true)
 }
 
 fn parse_credential_id(value: &str) -> Result<String, String> {
-    if crate::public_id::valid_typed_id(value, "crd_") {
+    if scherzo_cloud_support::valid_typed_id(value, "crd_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact service credential ID".to_owned())
@@ -439,7 +466,7 @@ struct CreateResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    principal: &'a crate::api::ServicePrincipal,
+    principal: &'a scherzo_cloud_api::ServicePrincipal,
     initial_credential: &'a ServiceCredential,
     api_key_file: &'a str,
 }
@@ -488,7 +515,7 @@ struct FailureResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    principal: Option<&'a crate::api::ServicePrincipal>,
+    principal: Option<&'a scherzo_cloud_api::ServicePrincipal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential: Option<&'a ServiceCredential>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -601,7 +628,7 @@ fn write_create_outcome(
 
 fn finish_failed_delivery(
     deployment: &str,
-    principal: Option<&crate::api::ServicePrincipal>,
+    principal: Option<&scherzo_cloud_api::ServicePrincipal>,
     issued: &IssuedServiceCredential,
     destination: ApiKeyDestination,
     error: &ServiceApiKeyError,
@@ -629,7 +656,7 @@ fn finish_failed_delivery(
 
 struct DeliveryFailure<'a> {
     deployment: &'a str,
-    principal: Option<&'a crate::api::ServicePrincipal>,
+    principal: Option<&'a scherzo_cloud_api::ServicePrincipal>,
     issued: &'a IssuedServiceCredential,
     destination: &'a str,
     recovery: &'static str,
@@ -717,7 +744,7 @@ fn write_delivery_failure(failure: DeliveryFailure<'_>, json: bool) -> anyhow::R
 
 fn write_secret_unavailable(
     deployment: &str,
-    principal: Option<&crate::api::ServicePrincipal>,
+    principal: Option<&scherzo_cloud_api::ServicePrincipal>,
     issued: &IssuedServiceCredential,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -989,7 +1016,7 @@ fn idempotency_failure(deployment: &str, json: bool) -> anyhow::Result<ExitCode>
 
 fn unreachable_failure(
     deployment: &str,
-    category: crate::api::UnreachableCategory,
+    category: scherzo_cloud_api::UnreachableCategory,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_failure(
@@ -1034,16 +1061,20 @@ mod tests {
                 created_at: "2026-01-02T03:04:05Z".to_owned(),
                 current: None,
             },
-            api_key: Some(
-                ServiceApiKey::parse(zeroize::Zeroizing::new(API_KEY.to_owned())).unwrap(),
-            ),
+            api_key: Some(scherzo_cloud_api::IssuedServiceApiKey::new(Zeroizing::new(
+                API_KEY.to_owned(),
+            ))),
         });
-        let error = deliver_issued_key(&mut FaultingDelivery, &outcome)
-            .expect_err("injected delivery should fail");
+        let ApiKeyDeliveryFailure::Delivery(error) =
+            deliver_issued_key(&mut FaultingDelivery, &outcome)
+                .expect_err("injected delivery should fail")
+        else {
+            panic!("fixture should fail during delivery");
+        };
         let IssueServiceCredentialOutcome::Issued(issued) = &outcome else {
             panic!("fixture outcome should be issued");
         };
-        let principal = crate::api::ServicePrincipal {
+        let principal = scherzo_cloud_api::ServicePrincipal {
             id: "prn_service".to_owned(),
             r#type: "service",
             state: "active",

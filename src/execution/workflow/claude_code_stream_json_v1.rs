@@ -14,7 +14,6 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
 };
-use crate::workflow_contract::strict_json;
 #[cfg(test)]
 const QUALIFICATION_VERSION: &str =
     crate::execution::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION;
@@ -612,7 +611,8 @@ impl ClaudeCodeStreamJsonV1Parser {
             );
         }
         self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::FrameDecode;
-        let value = strict_json::from_slice(frame).map_err(|_| self.protocol_failure())?;
+        let value = scherzo_cloud_support::strict_json_from_slice(frame)
+            .map_err(|_| self.protocol_failure())?;
         let Some(object) = value.as_object() else {
             return self.reject(
                 ClaudeCodeStreamJsonV1RejectionReason::FrameNotObject,
@@ -1162,7 +1162,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         {
             if name.as_ref() == STRUCTURED_OUTPUT_TOOL_NAME {
                 let candidate = if input_delta_seen {
-                    let Ok(candidate) = strict_json::from_str(&input_json) else {
+                    let Ok(candidate) = scherzo_cloud_support::strict_json_from_str(&input_json)
+                    else {
                         return self.reject(
                             ClaudeCodeStreamJsonV1RejectionReason::ContentBlockCorrelationInvalid,
                             ClaudeCodeStreamJsonV1ProtocolStage::ContentBlockStop,

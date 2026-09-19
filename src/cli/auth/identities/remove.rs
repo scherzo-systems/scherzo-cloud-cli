@@ -1,9 +1,9 @@
 use anyhow::Context;
 use clap::Args;
 
-use crate::api::remove_identity;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::remove_identity;
 
 use super::{OutputOptions, output, with_principal_credential};
 

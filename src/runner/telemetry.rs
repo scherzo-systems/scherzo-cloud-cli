@@ -376,7 +376,7 @@ impl Recorder {
                 context: Context::new().with_span(span),
                 writer: Arc::clone(&self.writer),
                 dropped_count: Arc::clone(&self.dropped_count),
-                started_at: crate::timing::monotonic_now(),
+                started_at: scherzo_cloud_support::monotonic_now(),
                 state: Mutex::new(EventState {
                     fields,
                     completed: false,
@@ -469,7 +469,7 @@ impl Event {
     }
 
     pub(crate) fn elapsed_milliseconds(&self) -> i64 {
-        integer_u128(crate::timing::elapsed(self.inner.started_at).as_millis())
+        integer_u128(scherzo_cloud_support::elapsed(self.inner.started_at).as_millis())
     }
 
     pub(crate) fn finish(&self, outcome: Outcome) {

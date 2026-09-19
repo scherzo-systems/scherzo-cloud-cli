@@ -6,12 +6,12 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
-#[cfg(test)]
-use crate::api::HttpClient;
-use crate::api::{CreateRunInput, HttpTransportPolicy, Run, RunApi, RunFailure, RunState};
 use crate::execution::workflow::presentation::visible_text;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
+#[cfg(test)]
+use scherzo_cloud_api::HttpClient;
+use scherzo_cloud_api::{CreateRunInput, HttpTransportPolicy, Run, RunApi, RunFailure, RunState};
 
 use super::OrganizationRef;
 
@@ -298,7 +298,7 @@ fn finish_create(
     deployment: &Deployment,
     organization: &str,
     input_set_id: Option<&str>,
-    result: Result<crate::api::RunCreationAcceptance, RunFailure>,
+    result: Result<scherzo_cloud_api::RunCreationAcceptance, RunFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
     control: &super::OperationControl<CreateRecoveryState>,
@@ -677,7 +677,7 @@ const fn terminal_run_state(state: RunState) -> Option<TerminalRunState> {
 }
 
 fn parse_input_set_id(value: &str) -> Result<String, String> {
-    if crate::public_id::valid_typed_id(value, "ris_") {
+    if scherzo_cloud_support::valid_typed_id(value, "ris_") {
         Ok(value.to_owned())
     } else {
         Err(
@@ -748,7 +748,7 @@ fn write_create(
     deployment: &str,
     organization: &str,
     input_set_id: Option<&str>,
-    result: Result<crate::api::RunCreationAcceptance, RunFailure>,
+    result: Result<scherzo_cloud_api::RunCreationAcceptance, RunFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -1301,7 +1301,7 @@ mod tests {
 
     use super::super::observation_test_support::ControlledObservationClock as ControlledWaitClock;
     use super::*;
-    use crate::api::{
+    use scherzo_cloud_api::{
         HttpTransportPolicy, InputScalarMetadata, NamedInputMetadata, RunCreationAcceptance,
         RunInputManifest, UnreachableCategory,
     };
@@ -1624,7 +1624,7 @@ mod tests {
                 .chain([terminal_state])
                 .map(|state| Ok(run(state)));
             let api = ScriptedObservationApi::new(responses);
-            let started_at = crate::timing::monotonic_now();
+            let started_at = scherzo_cloud_support::monotonic_now();
             let clock = ControlledWaitClock::new(started_at);
 
             let result = observe(&api, None, &clock).expect("the polling scenario should complete");
@@ -1651,7 +1651,7 @@ mod tests {
             Err(RunFailure::Unreachable(UnreachableCategory::Server)),
             Ok(run(RunState::Succeeded)),
         ]);
-        let started_at = crate::timing::monotonic_now();
+        let started_at = scherzo_cloud_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         let result = observe(&api, None, &clock)
@@ -1674,7 +1674,7 @@ mod tests {
             Ok(run(RunState::Assigned)),
             Ok(run(RunState::Running)),
         ]);
-        let started_at = crate::timing::monotonic_now();
+        let started_at = scherzo_cloud_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         let result = observe(&api, Some(Duration::from_secs(5)), &clock)
@@ -1689,7 +1689,7 @@ mod tests {
     fn wait_bounds_retries_and_preserves_the_transport_failure() {
         let failure = RunFailure::Unreachable(UnreachableCategory::Connection);
         let api = ScriptedObservationApi::new([Err(failure), Err(failure)]);
-        let started_at = crate::timing::monotonic_now();
+        let started_at = scherzo_cloud_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         let result = observe(&api, None, &clock);

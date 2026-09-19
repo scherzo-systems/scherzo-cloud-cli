@@ -1,7 +1,8 @@
 use std::fmt;
 
-use crate::api::{
-    self, AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, HttpClient,
+use scherzo_cloud_api as api;
+use scherzo_cloud_api::{
+    AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, HttpClient,
     UnreachableCategory,
 };
 

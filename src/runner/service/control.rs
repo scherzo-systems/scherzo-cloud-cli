@@ -74,7 +74,7 @@ impl LiveStatus {
     ) -> Self {
         Self {
             boot_id,
-            started_at: crate::timing::monotonic_now(),
+            started_at: scherzo_cloud_support::monotonic_now(),
             state: Mutex::new(LiveStatusState {
                 process_state: ProcessState::Running,
                 connection_state: ConnectionState::Connecting,
@@ -166,7 +166,8 @@ impl LiveStatus {
     ) -> StatusSnapshot {
         let state = self.lock();
         let uptime_milliseconds =
-            u64::try_from(crate::timing::elapsed(self.started_at).as_millis()).unwrap_or(u64::MAX);
+            u64::try_from(scherzo_cloud_support::elapsed(self.started_at).as_millis())
+                .unwrap_or(u64::MAX);
         StatusSnapshot {
             process_state: state.process_state,
             boot_id: self.boot_id.clone(),

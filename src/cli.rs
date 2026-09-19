@@ -2,20 +2,20 @@ macro_rules! impl_organization_human_credential_outcome {
     ($($outcome:ty),+ $(,)?) => {
         $(
             impl super::HumanCredentialOutcome for $outcome {
-                type Error = crate::api::OrganizationError;
+                type Error = scherzo_cloud_api::OrganizationError;
 
                 fn unauthenticated() -> Self {
-                    Self::Common(crate::api::CommonOrganizationFailure::Unauthenticated)
+                    Self::Common(scherzo_cloud_api::CommonOrganizationFailure::Unauthenticated)
                 }
 
-                fn unreachable(category: crate::api::UnreachableCategory) -> Self {
-                    Self::Common(crate::api::CommonOrganizationFailure::Unreachable(category))
+                fn unreachable(category: scherzo_cloud_api::UnreachableCategory) -> Self {
+                    Self::Common(scherzo_cloud_api::CommonOrganizationFailure::Unreachable(category))
                 }
 
                 fn is_unauthenticated(&self) -> bool {
                     matches!(
                         self,
-                        Self::Common(crate::api::CommonOrganizationFailure::Unauthenticated)
+                        Self::Common(scherzo_cloud_api::CommonOrganizationFailure::Unauthenticated)
                     )
                 }
 
@@ -61,14 +61,14 @@ use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
-use crate::api::{
-    HttpClient, HttpTransportPolicy, MembershipRole, MembershipState, UnreachableCategory,
-};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{self, RequiredOperation};
 use crate::service_auth::{ServiceApiKey, read_api_key};
+use scherzo_cloud_api::{
+    HttpClient, HttpTransportPolicy, MembershipRole, MembershipState, UnreachableCategory,
+};
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
@@ -179,7 +179,7 @@ impl FromStr for OrganizationRef {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if crate::public_id::valid_organization_ref(value) {
+        if scherzo_cloud_support::valid_organization_ref(value) {
             Ok(Self(value.to_owned()))
         } else {
             Err("must be an organization ID or lowercase organization slug".to_owned())
@@ -473,15 +473,15 @@ impl Cli {
 }
 
 pub(crate) const fn unreachable_outcome_class(
-    category: crate::api::UnreachableCategory,
+    category: scherzo_cloud_api::UnreachableCategory,
 ) -> OutcomeClass {
     match category {
-        crate::api::UnreachableCategory::RateLimited => OutcomeClass::RateLimited,
-        crate::api::UnreachableCategory::Dns
-        | crate::api::UnreachableCategory::Timeout
-        | crate::api::UnreachableCategory::Connection
-        | crate::api::UnreachableCategory::Tls
-        | crate::api::UnreachableCategory::Server => OutcomeClass::Unreachable,
+        scherzo_cloud_api::UnreachableCategory::RateLimited => OutcomeClass::RateLimited,
+        scherzo_cloud_api::UnreachableCategory::Dns
+        | scherzo_cloud_api::UnreachableCategory::Timeout
+        | scherzo_cloud_api::UnreachableCategory::Connection
+        | scherzo_cloud_api::UnreachableCategory::Tls
+        | scherzo_cloud_api::UnreachableCategory::Server => OutcomeClass::Unreachable,
     }
 }
 
@@ -702,7 +702,7 @@ fn execute_cancellable_with_signals(
 
 fn execute_cancellable_mutation_with_signals(
     context: &'static str,
-    operation: impl FnOnce(&crate::api::HttpCancellation, &OperationControl<()>) -> CommandResult
+    operation: impl FnOnce(&scherzo_cloud_api::HttpCancellation, &OperationControl<()>) -> CommandResult
     + Send
     + 'static,
     interrupt_operation: impl FnOnce() -> bool + 'static,
@@ -710,7 +710,7 @@ fn execute_cancellable_mutation_with_signals(
 ) -> CommandResult {
     run_blocking_signal_runtime(context, async move {
         let mut signals = ProcessSignals::install(context)?;
-        let cancellation = crate::api::HttpCancellation::new();
+        let cancellation = scherzo_cloud_api::HttpCancellation::new();
         let control = Arc::new(OperationControl::new(()));
         let operation_cancellation = cancellation.clone();
         let operation_control = Arc::clone(&control);
@@ -806,7 +806,7 @@ struct ObservationTimeout {
 impl ObservationTimeout {
     async fn wait(self) {
         match self.duration {
-            Some(duration) => crate::timing::async_sleep(duration).await,
+            Some(duration) => scherzo_cloud_support::async_sleep(duration).await,
             None => std::future::pending().await,
         }
     }
@@ -842,7 +842,7 @@ impl DeferredObservationTimeout {
         if self.started.await.is_err() {
             return std::future::pending().await;
         }
-        crate::timing::async_sleep(duration).await;
+        scherzo_cloud_support::async_sleep(duration).await;
     }
 }
 
@@ -858,11 +858,11 @@ struct SystemObservationClock;
 
 impl ObservationClock for SystemObservationClock {
     fn now(&self) -> Instant {
-        crate::timing::monotonic_now()
+        scherzo_cloud_support::monotonic_now()
     }
 
     fn sleep(&self, duration: Duration) {
-        crate::timing::sleep(duration);
+        scherzo_cloud_support::sleep(duration);
     }
 }
 
@@ -1355,7 +1355,7 @@ fn finish_read_only_operation(
 
 struct HumanApiOutcomeAdapters<O, E> {
     unauthenticated: fn() -> O,
-    unreachable: fn(crate::api::UnreachableCategory) -> O,
+    unreachable: fn(scherzo_cloud_api::UnreachableCategory) -> O,
     operation_error: fn(E) -> anyhow::Error,
 }
 
@@ -1449,7 +1449,7 @@ fn execute_required_api_operation_retrying_result<T, E>(
 }
 
 fn execute_human_api_operation<O, E>(
-    client: &crate::api::HttpClient,
+    client: &scherzo_cloud_api::HttpClient,
     deployment: &Deployment,
     mut operation: impl FnMut(&str) -> Result<O, E>,
     credential_rejected: impl Fn(&Result<O, E>) -> bool,
@@ -1603,8 +1603,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{Cli, parse, unreachable_outcome_class};
-    use crate::api::UnreachableCategory;
     use crate::exit_code::{ExitCode, OutcomeClass};
+    use scherzo_cloud_api::UnreachableCategory;
 
     #[test]
     fn completion_and_cancellation_each_win_one_controlled_output_race() {

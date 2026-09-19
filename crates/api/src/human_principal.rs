@@ -1,0 +1,30 @@
+use super::generated::models;
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct HumanPrincipal {
+    pub id: String,
+    pub display_name: Option<String>,
+}
+
+pub(super) fn decode(body: &[u8]) -> Result<HumanPrincipal, &'static str> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "the principal response body is not valid JSON")?;
+    if !value.is_object() {
+        return Err("the principal response body is not a JSON object");
+    }
+
+    let principal: models::Principal =
+        serde_json::from_value(value).map_err(|_| "the principal fields are invalid")?;
+    from_api(principal)
+}
+
+pub(super) fn from_api(principal: models::Principal) -> Result<HumanPrincipal, &'static str> {
+    if principal.r#type != models::principal::Type::PrincipalTypeHuman {
+        return Err("the principal type is not human");
+    }
+    let profile = super::principal_profile::from_api(principal)?;
+    Ok(HumanPrincipal {
+        id: profile.id,
+        display_name: profile.display_name,
+    })
+}

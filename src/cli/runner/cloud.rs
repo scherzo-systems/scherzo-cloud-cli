@@ -3,12 +3,12 @@ use std::io::{self, Write};
 use anyhow::{Context, anyhow};
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{
     HttpTransportPolicy, RunnerApi, RunnerDeletionBlocker, RunnerFailure, RunnerPool,
     RunnerPoolList, RunnerRegistration, RunnerRegistrationList,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
@@ -32,7 +32,7 @@ pub(super) fn with_api_retrying_rejected_result<T>(
     mut operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
     result_credential_rejected: impl Fn(&T) -> bool,
 ) -> anyhow::Result<Result<T, RunnerFailure>> {
-    let client = crate::api::HttpClient::new(transport_policy)
+    let client = scherzo_cloud_api::HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
     super::super::execute_selected_api_operation_retrying_result(

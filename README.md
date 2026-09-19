@@ -304,7 +304,7 @@ Download the customer OpenAPI contract from its stable public URL:
 
 The hosted file describes the API deployed at `https://api.scherzo.dev`. A particular CLI
 build remains self-contained: it uses the generated Rust client committed under
-`src/api/generated/` and does not fetch the hosted contract at build time or run time. Each
+`crates/api/src/generated/` and does not fetch the hosted contract at build time or run time. Each
 generated source header records the OpenAPI Generator version and SHA-256 digest of the
 canonical contract used for that client, so its provenance identifies the contract used by
 that CLI build even when the deployed API contract has since changed.

@@ -3,14 +3,14 @@ use std::io::{self, Write};
 use anyhow::{Context, anyhow};
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{
     Project, ProjectFailure, ProjectGitHubInstallation as GitHubInstallation,
     ProjectGitHubInstallationList as GitHubInstallationList,
     ProjectGitHubRepository as GitHubRepository,
     ProjectGitHubRepositoryList as GitHubRepositoryList, ProjectList, ProjectReadinessBlocker,
     ProjectRepository,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) fn write_project(
     deployment: &str,

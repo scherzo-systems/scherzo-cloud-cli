@@ -9,15 +9,27 @@ repository = "https://github.com/scherzo-systems/scherzo-cloud-cli"
 publish = false
 
 [workspace]
-members = ["."]
+members = [
+  ".",
+  "crates/api",
+  "crates/runner-protocol",
+  "crates/support",
+  "crates/test-support",
+]
 resolver = "3"
 
-[lints.rust]
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/scherzo-systems/scherzo-cloud-cli"
+
+[workspace.lints.rust]
 unsafe_code = "deny"
 unreachable_pub = "deny"
 warnings = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 # `forbid` conflicts with group-level allows emitted by Clap derives.
 allow_attributes_without_reason = "deny"
 cast_possible_truncation = "deny"
@@ -30,7 +42,7 @@ unimplemented = "deny"
 unreachable = "deny"
 unwrap_used = "deny"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"
 clap = { version = "4.6.3", features = ["derive"] }
@@ -56,12 +68,17 @@ regress = "0.10.4"
 ring = "0.17.14"
 rustix = { version = "1.1.4", features = ["fs", "net", "process", "termios"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+scherzo-cloud-api = { path = "crates/api" }
+scherzo-cloud-runner-protocol = { path = "crates/runner-protocol" }
+scherzo-cloud-support = { path = "crates/support" }
+scherzo-cloud-test-support = { path = "crates/test-support" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision", "unbounded_depth"] }
 tempfile = "3.27.0"
 time = { version = "0.3.45", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+trycmd = "1.2.1"
 ulid = "3.0.0"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
@@ -69,8 +86,47 @@ url = "2.5.8"
 yaml-rust2 = { version = "0.11.0", default-features = false }
 zeroize = "1.9.0"
 
-[dev-dependencies]
-rustix = { version = "1.1.4", features = ["event", "pty"] }
-trycmd = "1.2.1"
-tokio = { version = "1.53.1", features = ["sync"] }
+[lints]
+workspace = true
 
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+flate2.workspace = true
+fs4.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+jsonschema.workspace = true
+libc.workspace = true
+nix.workspace = true
+opentelemetry.workspace = true
+opentelemetry-proto.workspace = true
+opentelemetry_sdk.workspace = true
+prost.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rustix.workspace = true
+scherzo-cloud-api.workspace = true
+scherzo-cloud-runner-protocol.workspace = true
+scherzo-cloud-support.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+ulid.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+url.workspace = true
+yaml-rust2.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["event", "pty"] }
+scherzo-cloud-test-support.workspace = true
+trycmd.workspace = true
+tokio = { workspace = true, features = ["sync"] }

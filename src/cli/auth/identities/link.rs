@@ -4,12 +4,12 @@ use std::sync::mpsc;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use crate::api::{ListIdentitiesOutcome, link_identity, list_identities};
 use crate::exit_code::OutcomeClass;
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::device_authorization::AuthorizationError;
 use crate::human_auth::device_flow::{self, DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
+use scherzo_cloud_api::{ListIdentitiesOutcome, link_identity, list_identities};
 
 use super::{
     BoundHumanSession, OutputOptions, output, with_bound_human_session, with_human_session_binding,
@@ -197,7 +197,7 @@ impl Command {
                 .cancelled(deployment.fingerprint().api_url())
                 .map_err(Into::into);
         };
-        let client = crate::api::HttpClient::new(self.http.transport_policy())
+        let client = scherzo_cloud_api::HttpClient::new(self.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare identity networking")?;
         let idempotency_key = crate::idempotency::generate_idempotency_key()

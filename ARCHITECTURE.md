@@ -60,11 +60,12 @@ Serve connectivity. Bare `scherzo-cloud workflow` prints composed help rather th
 selecting a workflow or inferring a source boundary.
 
 The pure lexical and JSON decoding rules shared by Workflow V1 inputs and Cloud Run
-Input manifests live in `src/workflow_contract.rs` and its children. The public API,
-command, runner, and execution components may depend on this leaf for duplicate-aware
-strict JSON decoding, input identifiers, diagnostic display names, media types, and
-hexadecimal digests; the leaf owns no transport, credentials, acquisition bytes, or
-execution state.
+Input manifests live in the private `scherzo-cloud-support` package beneath
+`crates/support/`. The public API, command, runner, and execution components may depend
+on its explicit facade for duplicate-aware strict JSON decoding, input identifiers,
+diagnostic display names, media types, and hexadecimal digests; the leaf owns no
+transport, credentials, acquisition bytes, or execution state. The same package owns
+the shared clock, TLS-provider, and public-ID leaves and has no internal package edge.
 
 ## Runner diagnostics
 
@@ -306,9 +307,10 @@ access to a parent checkout. Formatting, linting, tests, dependency inspection, 
 generation checks, and builds may use only files committed here and declared external
 dependencies.
 
-The source tree may not contain symbolic links, parent-relative path dependencies,
-workspace inheritance from outside this repository, or imports of implementation
-packages that are not declared public dependencies. `scripts/check` is the canonical
+The source tree may not contain symbolic links, path dependencies outside the exported
+`cli/` workspace, workspace inheritance from outside this repository, or imports of
+implementation packages that are not declared workspace dependencies. Every path
+dependency resolves to a declared member beneath `cli/`. `scripts/check` is the canonical
 local and CI entrypoint for this invariant.
 
 ## Generated contracts
@@ -317,8 +319,8 @@ Versioned OpenAPI and runner protocol contracts define the interface with the Sc
 Cloud control plane. Generated clients, types, and codecs needed to build this
 executable will be committed here.
 
-A normal public build consumes the committed client beneath `src/api/generated` and
-does not require the contract source files or generator. The client is generated only
+A normal public build consumes the committed client beneath
+`crates/api/src/generated` and does not require the contract source files or generator. The client is generated only
 from the customer API contract; private operator routes, operation bindings, and models
 are not part of the public source. Each generated Rust file identifies OpenAPI Generator
 7.22.0, the canonical customer contract path, and its digest. Monorepo tooling regenerates
@@ -339,7 +341,7 @@ problem DTOs into handwritten domain states before the CLI renders human or stru
 output.
 
 Organization request and response DTOs follow the same boundary. The handwritten
-`src/api/organizations/` module uses generated DTOs only to serialize merge patches and
+`crates/api/src/organizations/` module uses generated DTOs only to serialize merge patches and
 decode successful API representations, then converts successes into validated
 handwritten organization and membership models. It owns route-specific outcomes,
 problem classification, opaque path and query construction, bounded responses, and the
@@ -353,21 +355,36 @@ second ID policy inside the API boundary.
 
 ## Rust source shape
 
-The implementation begins as one Cargo package and one executable. Internal Rust modules
-will separate human CLI commands, runner connectivity and assignment ownership, protocol
-DTOs, and one-run execution. Additional workspace crates are not introduced until a
-real compile-time dependency boundary requires them.
+`cli/Cargo.toml` is both the workspace root and the sole binary package. Slice 1 adds
+exactly four unpublished library members at their final roots:
 
-`tests/architecture.rs` enforces the top-level module dependency graph, the containment
-of `api::generated` within the API boundary, and the confinement of command parsing,
-HTTP, WebSocket, telemetry, and terminal dependencies to their owning modules. The
-crate-root `src/test_support.rs` module is a `cfg(test)`-only leaf shared exclusively by
-execution and runner tests for hermetic Git command construction; it is not a production
-component or a general cross-component utility. The `src/service_auth.rs` boundary
-depends only on public-ID syntax and is consumed only by the handwritten API and CLI
-boundaries; this keeps caller-managed platform secrets out of human session and runner
-credential ownership. Changing a module boundary requires
-updating that test and this document in the same change.
+- `scherzo-cloud-support` owns shared public-ID, timing, TLS-provider, and Workflow
+  contract leaves and has no internal dependency;
+- `scherzo-cloud-test-support` owns the HTTP fixture and is reachable only through dev
+  dependencies;
+- `scherzo-cloud-runner-protocol` owns runner wire DTOs, its generated codec, and its
+  embedded schema and has no internal dependency; and
+- `scherzo-cloud-api` owns the handwritten API and private generated client, depends on
+  support in production, and uses test-support only for tests.
+
+The binary depends on support, API, and runner-protocol in production and on test-support
+for tests. Commands, execution, runner service, human authentication, service
+credential files, process abstractions, build identity, and exit policy remain rooted in
+`src/`. There is no compatibility module or re-export at any moved path. This preserves
+one executable, `CARGO_BIN_EXE_scherzo-cloud`, and the existing archive shape while Cargo
+can compile and test the four leaves independently.
+
+`tests/architecture.rs` enforces the exact member and internal-edge inventories, each
+member's inherited lint policy, the residual root-module graph, private generated API,
+and confinement of command parsing, HTTP, WebSocket, telemetry, and terminal dependencies
+to their owning packages. The crate-root `src/test_support.rs` module remains a
+`cfg(test)`-only leaf shared exclusively by execution and runner tests for hermetic Git
+command construction; it is distinct from the dev-only HTTP fixture package. The
+`src/service_auth.rs` boundary depends only on support's public-ID syntax and remains a
+root-owned policy for caller-managed service secrets. The API returns issued secrets in
+a redacted zeroizing value; the root validates the canonical service-key syntax before
+delivery. Changing a package or module boundary requires updating that test and this
+document in the same change.
 
 The CLI uses a typed `clap` command tree. Each command module owns its arguments, help
 metadata, and execution dispatch; parent modules compose those commands so parsing and

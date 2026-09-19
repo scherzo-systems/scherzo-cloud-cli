@@ -9,7 +9,6 @@ use super::*;
 use crate::execution::workflow::canonical_json;
 use crate::execution::workflow::result_validation::RetainedJsonSchema;
 use crate::execution::workflow::value::{CapturedJson, CapturedText, SemanticCarrierError};
-use crate::workflow_contract::strict_json;
 
 struct CaptureFixture {
     _temporary: tempfile::TempDir,
@@ -564,7 +563,8 @@ fn semantic_outputs_text_source_equivalence() {
 
     let json_backing = fixture.capture("result.json").unwrap();
     let retained_json_source = fixture.read(&json_backing);
-    let json_value = Arc::new(strict_json::from_slice(&retained_json_source).unwrap());
+    let json_value =
+        Arc::new(scherzo_cloud_support::strict_json_from_slice(&retained_json_source).unwrap());
     let canonical = canonical_json::to_bounded_bytes(&json_value, 128).unwrap();
     let schema = retained_json_schema();
     let path_json = CapturedJson::from_bounded_carrier(

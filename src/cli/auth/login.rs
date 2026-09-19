@@ -6,7 +6,6 @@ use clap::Args;
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use crate::api::{HttpClient, UnreachableCategory};
 use crate::exit_code::OutcomeClass;
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::credentials::CredentialStore;
@@ -16,6 +15,7 @@ use crate::human_auth::device_authorization::{
 };
 use crate::human_auth::device_flow::{self, DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus, StatusError};
+use scherzo_cloud_api::{HttpClient, UnreachableCategory};
 
 use super::status::{StatusResult, write_human_status};
 
@@ -297,7 +297,7 @@ type LoginResult<T> = Result<T, super::super::CommandFailure>;
 
 fn expiration_after(duration: Duration) -> Option<OffsetDateTime> {
     let seconds = i64::try_from(duration.as_secs()).ok()?;
-    crate::timing::utc_now().checked_add(time::Duration::seconds(seconds))
+    scherzo_cloud_support::utc_now().checked_add(time::Duration::seconds(seconds))
 }
 
 #[derive(Clone, Copy)]

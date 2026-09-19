@@ -112,7 +112,7 @@ impl TestClock {
     fn fixed(value: &str) -> Self {
         let fallback = ObservationTime {
             utc: OffsetDateTime::parse(value, &Rfc3339).unwrap(),
-            monotonic: crate::timing::monotonic_now(),
+            monotonic: scherzo_cloud_support::monotonic_now(),
         };
         Self {
             values: Arc::new(Mutex::new(VecDeque::new())),
@@ -121,7 +121,7 @@ impl TestClock {
     }
 
     fn sequence(values: &[&str]) -> Self {
-        let monotonic = crate::timing::monotonic_now();
+        let monotonic = scherzo_cloud_support::monotonic_now();
         let values = values
             .iter()
             .map(|value| ObservationTime {
@@ -137,7 +137,7 @@ impl TestClock {
     }
 
     fn sequence_with_elapsed(values: &[(&str, Duration)]) -> Self {
-        let monotonic = crate::timing::monotonic_now();
+        let monotonic = scherzo_cloud_support::monotonic_now();
         let values = values
             .iter()
             .map(|(value, elapsed)| ObservationTime {

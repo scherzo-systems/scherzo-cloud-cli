@@ -260,8 +260,8 @@ impl RevokeCommand {
     }
 }
 
-fn activation_state_label(state: crate::api::RunnerActivationState) -> &'static str {
-    use crate::api::RunnerActivationState;
+fn activation_state_label(state: scherzo_cloud_api::RunnerActivationState) -> &'static str {
+    use scherzo_cloud_api::RunnerActivationState;
     match state {
         RunnerActivationState::Issued => "issued",
         RunnerActivationState::Consumed => "consumed",

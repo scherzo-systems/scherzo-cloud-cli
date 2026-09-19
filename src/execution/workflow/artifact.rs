@@ -31,7 +31,6 @@ use super::schema_common::lowercase_hex;
 #[cfg(test)]
 use super::validated::WorkflowValueType;
 use super::value::{CapturedJson, CapturedText, CapturedValue};
-use crate::workflow_contract::strict_json;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const COPY_BUFFER_BYTES_U64: u64 = 64 * 1024;
@@ -1291,7 +1290,7 @@ impl ArtifactStaging {
                         CaptureFailureKind::InvalidJson,
                     ))
                 })?;
-                if strict_json::from_slice(&source).is_err() {
+                if scherzo_cloud_support::strict_json_from_slice(&source).is_err() {
                     return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
                         Arc::clone(output_identity),
                         CaptureFailureKind::DuplicateJsonMember,

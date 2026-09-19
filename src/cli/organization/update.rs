@@ -1,8 +1,8 @@
 use clap::{ArgGroup, Args};
 
-use crate::api::update_organization;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::update_organization;
 
 use super::{LeafOptions, output};
 

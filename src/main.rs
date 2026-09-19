@@ -8,7 +8,6 @@
         reason = "unit tests use Cargo-provided fixture paths and panic shortcuts"
     )
 )]
-mod api;
 mod build_info;
 mod cli;
 mod error;
@@ -17,15 +16,10 @@ mod exit_code;
 mod human_auth;
 mod idempotency;
 mod process;
-mod public_id;
 mod runner;
-mod runner_protocol;
 mod service_auth;
 #[cfg(test)]
 mod test_support;
-mod timing;
-mod tls;
-mod workflow_contract;
 
 use std::env;
 

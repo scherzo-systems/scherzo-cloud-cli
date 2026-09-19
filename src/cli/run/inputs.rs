@@ -10,12 +10,12 @@ use anyhow::Context as _;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::ExitCode;
+use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{
     RetainedRunInputs, RunFailure, UnreachableCategory, capability_batches, retained_manifest,
     transfer_capability_batch,
 };
-use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 
 pub(super) const ABOUT: &str = "View, download, or delete retained run inputs";
 
@@ -258,7 +258,7 @@ enum DownloadTransferFailure {
 fn download_selected(
     deployment: &Deployment,
     command: &DownloadCommand,
-    cancellation: &crate::api::HttpCancellation,
+    cancellation: &scherzo_cloud_api::HttpCancellation,
     commit_control: &DownloadCommitControl,
 ) -> anyhow::Result<Result<DownloadedInputs, DownloadFailure>> {
     let (parent, destination_name) = match destination_parent(&command.output) {
@@ -383,7 +383,7 @@ fn download_selected(
                         DownloadTransferFailure::Download(DownloadFailure::StagingUnavailable)
                     })
             },
-            crate::timing::utc_now,
+            scherzo_cloud_support::utc_now,
             || {
                 DownloadTransferFailure::Download(download_api_failure(
                     RunFailure::Unreachable(UnreachableCategory::Server),
@@ -455,9 +455,9 @@ fn destination_parent(destination: &Path) -> Result<(PathBuf, &std::ffi::OsStr),
 }
 
 fn select_members(
-    all_members: Vec<crate::api::RunInputObjectMetadata>,
+    all_members: Vec<scherzo_cloud_api::RunInputObjectMetadata>,
     requested: &[String],
-) -> Result<Vec<crate::api::RunInputObjectMetadata>, RunFailure> {
+) -> Result<Vec<scherzo_cloud_api::RunInputObjectMetadata>, RunFailure> {
     if requested.is_empty() {
         return Ok(all_members);
     }

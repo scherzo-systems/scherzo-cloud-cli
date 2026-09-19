@@ -211,7 +211,7 @@ fn default_log_capacity_partitions_run_budgets_by_step_count() {
 #[test]
 fn execution_duration_excludes_time_spent_opening_the_view() {
     let (_temporary, workflow) = resolved_workflow();
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let opened_at = point(base, 0);
     let clock = ControlledClock::new(opened_at);
     let timing = RunTimingObservation::new(opened_at);
@@ -234,7 +234,7 @@ fn execution_duration_excludes_time_spent_opening_the_view() {
 #[tokio::test]
 async fn transitions_project_definition_output_cancellation_and_frozen_timing() {
     let (_temporary, workflow) = resolved_workflow();
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let view = model(&workflow, clock.clone());
     let changes = view.subscribe();
@@ -378,7 +378,7 @@ finalizers:
       argv: [\"true\"]
 ",
     );
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let view = model(&workflow, clock);
     let trigger = crate::execution::workflow::document::FinalizationTrigger::Succeeded;
@@ -450,7 +450,7 @@ finalizers:
 #[tokio::test]
 async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     let (_temporary, workflow) = resolved_workflow();
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let capacity = StepLogCapacity::new(2, MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap();
     let view = model_with_capacity(&workflow, clock.clone(), capacity);
@@ -524,7 +524,7 @@ async fn derived_capacity_retains_past_the_old_limit_then_evicts_the_oldest_suff
     const INJECTED_RECORD_CAPACITY: usize = 18;
 
     let (_temporary, workflow) = resolved_workflow();
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let capacity = StepLogCapacity::new(
         INJECTED_RECORD_CAPACITY + 1,
@@ -619,7 +619,7 @@ async fn live_view_retains_recovery_role_round_handler_state_and_decision() {
     let (_temporary, workflow) = resolve_workflow(
         "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 2\n      handler:\n        kind: cmd\n        command:\n          argv: [/bin/true]\n    command:\n      argv: [/bin/false]\n",
     );
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let view = model(&workflow, clock.clone());
     let handler = ObservedStepTransition::Recovery {
@@ -689,7 +689,7 @@ async fn live_view_retains_recovery_role_round_handler_state_and_decision() {
 #[test]
 fn lifecycle_completion_requires_matching_started_phase() {
     let (_temporary, workflow) = resolved_workflow();
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let view = model(&workflow, clock);
 
@@ -713,7 +713,7 @@ fn lifecycle_completion_requires_matching_started_phase() {
 #[test]
 fn completed_successful_lifecycle_requires_explicit_adapter_completion() {
     let (_temporary, workflow) = resolved_workflow();
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let view = model(&workflow, clock);
 
@@ -747,7 +747,7 @@ fn completed_successful_lifecycle_requires_explicit_adapter_completion() {
 #[tokio::test]
 async fn terminal_result_and_local_lifecycle_do_not_enable_quit() {
     let (_temporary, workflow) = resolved_workflow();
-    let base = crate::timing::monotonic_now();
+    let base = scherzo_cloud_support::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
     let view = model(&workflow, clock.clone());
     let cause = StepFailureCause::Execution(StepExecutionFailure::Command(

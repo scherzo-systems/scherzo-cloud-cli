@@ -3085,7 +3085,9 @@ mod tests {
     use crate::execution::workflow::validated::WorkflowNodeRole;
     use crate::runner::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
     use crate::runner::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
-    use crate::runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
+    use scherzo_cloud_runner_protocol::{
+        MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame,
+    };
     // jscpd:ignore-end
 
     fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {

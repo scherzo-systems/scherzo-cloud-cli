@@ -3,13 +3,13 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, CommonOrganizationFailure, Invitation,
     InvitationDeliveryState, InvitationInboxEntry, InvitationState, InvitationTargetKind,
     InvitationTerminationOutcome, IssueInvitationOutcome, ListInvitationInboxOutcome,
     ListOrganizationInvitationsOutcome, PreviewInvitationOutcome,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 use super::CapabilityError;
 
@@ -547,7 +547,7 @@ struct PreviewResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    invitation: &'a crate::api::InvitationPreview,
+    invitation: &'a scherzo_cloud_api::InvitationPreview,
 }
 
 #[derive(Serialize)]

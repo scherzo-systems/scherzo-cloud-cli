@@ -5,12 +5,12 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{
     HttpTransportPolicy, Publication, PublicationApi, PublicationFailure, PublicationList,
     PublicationState,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 
 use super::OrganizationRef;
 
@@ -689,7 +689,7 @@ fn terminal_publication_state(publication: &Publication) -> Option<TerminalPubli
 }
 
 fn parse_run_id(value: &str) -> Result<String, String> {
-    if crate::public_id::valid_typed_id(value, "run_") {
+    if scherzo_cloud_support::valid_typed_id(value, "run_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact Run ID (run_ followed by 26 lowercase ULID characters)".to_owned())
@@ -697,7 +697,7 @@ fn parse_run_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_publication_id(value: &str) -> Result<String, String> {
-    if crate::public_id::valid_typed_id(value, "pub_") {
+    if scherzo_cloud_support::valid_typed_id(value, "pub_") {
         Ok(value.to_owned())
     } else {
         Err(
@@ -708,7 +708,7 @@ fn parse_publication_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_export_name(value: &str) -> Result<String, String> {
-    if crate::workflow_contract::is_identifier(value) {
+    if scherzo_cloud_support::is_identifier(value) {
         Ok(value.to_owned())
     } else {
         Err("must be a lower-camel identifier of at most 64 ASCII characters".to_owned())
@@ -1431,7 +1431,7 @@ mod tests {
                 Ok(publication(PublicationState::Running)),
                 Ok(publication(terminal)),
             ]);
-            let clock = ControlledClock::new(crate::timing::monotonic_now());
+            let clock = ControlledClock::new(scherzo_cloud_support::monotonic_now());
 
             let result = observe(&api, None, &clock)
                 .expect("the scripted publication should reach terminal state");
@@ -1455,7 +1455,7 @@ mod tests {
             Ok(publication(PublicationState::Running)),
             Ok(publication(PublicationState::Running)),
         ]);
-        let clock = ControlledClock::new(crate::timing::monotonic_now());
+        let clock = ControlledClock::new(scherzo_cloud_support::monotonic_now());
 
         let result = observe(&api, Some(Duration::from_secs(5)), &clock)
             .expect("timeout should be a local observation result");
@@ -1467,9 +1467,10 @@ mod tests {
 
     #[test]
     fn wait_bounds_retryable_observation_failures() {
-        let failure = PublicationFailure::Unreachable(crate::api::UnreachableCategory::Connection);
+        let failure =
+            PublicationFailure::Unreachable(scherzo_cloud_api::UnreachableCategory::Connection);
         let api = ScriptedObservationApi::new([Err(failure), Err(failure)]);
-        let clock = ControlledClock::new(crate::timing::monotonic_now());
+        let clock = ControlledClock::new(scherzo_cloud_support::monotonic_now());
 
         let result = observe(&api, None, &clock);
 

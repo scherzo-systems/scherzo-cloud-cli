@@ -23,7 +23,7 @@ impl Command {
         self.options.execute(
             deployment,
             |client, api_url, access_token| {
-                crate::api::list_current_principal_memberships(
+                scherzo_cloud_api::list_current_principal_memberships(
                     client,
                     api_url,
                     access_token,

@@ -438,12 +438,12 @@ fn busy_lock_respects_the_configured_deadline() {
     ensure_private_directory(fixture.directory.path()).unwrap();
     let lock = open_or_create_private_file(&fixture.store.lock_path).unwrap();
     FileExt::lock(&lock).unwrap();
-    let started = crate::timing::monotonic_now();
+    let started = scherzo_cloud_support::monotonic_now();
 
     let result = fixture.store.remove(&fingerprint("primary"));
 
     assert!(matches!(result, Err(CredentialError::LockTimeout)));
-    assert!(crate::timing::elapsed(started) >= fixture.store.lock_timeout);
+    assert!(scherzo_cloud_support::elapsed(started) >= fixture.store.lock_timeout);
     FileExt::unlock(&lock).unwrap();
 }
 

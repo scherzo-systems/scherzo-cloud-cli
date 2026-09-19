@@ -1231,7 +1231,7 @@ impl StateStore {
         Deadline: DurableDeadline,
     {
         self.update(|state| {
-            let now = timestamp(crate::timing::utc_now())?;
+            let now = timestamp(scherzo_cloud_support::utc_now())?;
             let attempt_number = state.current_attempt_number;
             {
                 let attempt = current_attempt_mut(state)?;
@@ -1505,7 +1505,7 @@ fn create_with_observer(
     let manifest_bytes = encode_json(&manifest)?;
     write_new_immutable_file(&workflow_directory, WORKFLOW_MANIFEST_FILE, &manifest_bytes)?;
 
-    let created_at = timestamp(crate::timing::utc_now())?;
+    let created_at = timestamp(scherzo_cloud_support::utc_now())?;
     let local_run_id = generate_uuid()?;
     let run = LocalRunV1 {
         schema_version: 1,
@@ -2687,7 +2687,7 @@ fn settle_interrupted_attempt(
                 AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
             });
     attempt.state = AttemptStateV1::Interrupted;
-    attempt.settled_at = Some(timestamp(crate::timing::utc_now())?);
+    attempt.settled_at = Some(timestamp(scherzo_cloud_support::utc_now())?);
     attempt.interruption = Some(AttemptInterruptionV1 {
         cause,
         execution_may_have_started,
@@ -3605,7 +3605,7 @@ impl LocalQuiescenceAuthority for SystemLocalRecoveryAuthority {
     }
 
     fn wait_for_process_change(&self) {
-        crate::timing::sleep(QUIESCENCE_POLL_INTERVAL);
+        scherzo_cloud_support::sleep(QUIESCENCE_POLL_INTERVAL);
     }
 }
 
@@ -3723,7 +3723,7 @@ fn retry_attempt(
         attempt_number,
         AttemptTriggerV1::ExplicitRetry,
         Some(prior_attempt_number),
-        timestamp(crate::timing::utc_now())?,
+        timestamp(scherzo_cloud_support::utc_now())?,
     )
 }
 

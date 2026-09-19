@@ -10,15 +10,15 @@ mod update;
 use anyhow::Context;
 use clap::{Args, Subcommand};
 
-use crate::api::{
+use crate::exit_code::ExitCode;
+use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{
     CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
     ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
     ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome,
     MembershipTerminationOutcome, OrganizationError, UpdateOrganizationMembershipOutcome,
     UpdateOrganizationOutcome,
 };
-use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organizations";
 const NAME: &str = "organization";

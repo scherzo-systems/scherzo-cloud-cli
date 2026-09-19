@@ -4,7 +4,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::api::{HttpClient, HttpTransportPolicy, UnreachableCategory};
+use scherzo_cloud_api::{HttpClient, HttpTransportPolicy, UnreachableCategory};
 
 use super::credentials::{CredentialError, CredentialStore, StoredCredential};
 use super::deployment::Deployment;
@@ -275,7 +275,7 @@ fn credential_for_use(
         .selected(deployment.fingerprint())
         .map_err(SessionError::CredentialStore)?;
     match credential {
-        Some(credential) if credential.needs_refresh(crate::timing::utc_now()) => {
+        Some(credential) if credential.needs_refresh(scherzo_cloud_support::utc_now()) => {
             coordinated_refresh(store, client, deployment, RefreshReason::Expiring)
         }
         credential => Ok(credential),
@@ -322,10 +322,10 @@ fn coordinated_refresh_under_authority(
     };
 
     let should_refresh = match reason {
-        RefreshReason::Expiring => current.needs_refresh(crate::timing::utc_now()),
+        RefreshReason::Expiring => current.needs_refresh(scherzo_cloud_support::utc_now()),
         RefreshReason::Rejected(rejected) => {
             current.access_token().expose() == rejected.expose()
-                || current.needs_refresh(crate::timing::utc_now())
+                || current.needs_refresh(scherzo_cloud_support::utc_now())
         }
     };
     if !should_refresh {
@@ -407,7 +407,7 @@ fn exchange_refresh_token(
                         UnreachableCategory::Connection | UnreachableCategory::Timeout
                     ) =>
             {
-                crate::timing::sleep(crate::timing::short_retry_delay());
+                scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
                 continue;
             }
             Err(AuthorizationError::Unreachable(category)) => {
@@ -486,7 +486,7 @@ fn map_protocol_error(error: AuthorizationError) -> RefreshExchangeError {
 
 fn expiration_after(duration: std::time::Duration) -> Option<OffsetDateTime> {
     let seconds = i64::try_from(duration.as_secs()).ok()?;
-    crate::timing::utc_now().checked_add(time::Duration::seconds(seconds))
+    scherzo_cloud_support::utc_now().checked_add(time::Duration::seconds(seconds))
 }
 
 #[derive(Deserialize)]

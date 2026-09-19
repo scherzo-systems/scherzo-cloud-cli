@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::api::test_support::ScriptedHttpServer;
+use scherzo_cloud_test_support::ScriptedHttpServer;
 
 use super::*;
 
@@ -759,13 +759,13 @@ fn request_header<'a>(request: &'a str, expected_name: &str) -> &'a str {
 }
 
 fn future_time() -> String {
-    (crate::timing::utc_now() + time::Duration::days(1))
+    (scherzo_cloud_support::utc_now() + time::Duration::days(1))
         .format(&Rfc3339)
         .expect("format future time")
 }
 
 fn expired_time() -> String {
-    (crate::timing::utc_now() - time::Duration::days(3))
+    (scherzo_cloud_support::utc_now() - time::Duration::days(3))
         .format(&Rfc3339)
         .expect("format expired time")
 }

@@ -19,7 +19,7 @@ use super::assignment::{
 use super::backoff::Backoff;
 use crate::execution::workflow::artifact::{ArtifactStaging, StagedCarrier};
 use crate::execution::workflow::publication::{CloudCarrierBody, CloudResultCarrier};
-use crate::runner_protocol::{
+use scherzo_cloud_runner_protocol::{
     ArtifactConfirmationOutcome, ArtifactConfirmationResponse, ArtifactRegistrationOutcome,
     ArtifactRegistrationResponse, ArtifactResultConfirmationOutcome,
     ArtifactResultConfirmationResponse, ArtifactResultRegistrationOutcome,
@@ -953,7 +953,7 @@ impl UploadWork {
             let value = HeaderValue::from_str(value).map_err(|_| ())?;
             headers.insert(name, value);
         }
-        crate::tls::install_provider();
+        scherzo_cloud_support::install_provider();
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))

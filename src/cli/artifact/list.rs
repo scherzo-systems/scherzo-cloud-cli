@@ -4,11 +4,11 @@ use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{
     ArtifactApi, ArtifactApiError, ArtifactInventoryPage, ArtifactMember, ArtifactSource,
     HttpEndpointError,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "List a run's remote Artifact Set members";
 const DEFAULT_PAGE_LIMIT: u16 = 50;

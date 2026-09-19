@@ -24,7 +24,6 @@ use crate::execution::workflow::agent::{
 use crate::execution::workflow::coordinator::CoordinatorClock;
 use crate::execution::workflow::result_validation::{decode_uri_fragment, join_pointer};
 use crate::execution::workflow::schema_common::lowercase_hex;
-use crate::workflow_contract::strict_json;
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const RESOURCE_ID_PREFIX: &str = "https://schemas.scherzo.invalid/workflow-result/";
@@ -479,7 +478,7 @@ async fn read_request_frame<Clock: CoordinatorClock>(
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
         Ok(_) | Err(_) => return FrameRead::ProtocolFailure,
     }
-    strict_json::from_slice(&payload)
+    scherzo_cloud_support::strict_json_from_slice(&payload)
         .and_then(serde_json::from_value)
         .map(FrameRead::Request)
         .unwrap_or(FrameRead::ProtocolFailure)

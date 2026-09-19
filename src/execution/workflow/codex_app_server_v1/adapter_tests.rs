@@ -1385,7 +1385,7 @@ fn codex_process_fixture() {
         std::fs::write(std::env::var_os("CODEX_FIXTURE_READY").unwrap(), b"ready\n").unwrap();
         let proceed = PathBuf::from(std::env::var_os("CODEX_FIXTURE_PROCEED").unwrap());
         while !proceed.is_file() {
-            crate::timing::sleep(Duration::from_millis(1));
+            scherzo_cloud_support::sleep(Duration::from_millis(1));
         }
         std::thread::spawn(move || {
             for id in 0..8_000_i64 {
@@ -1413,7 +1413,7 @@ fn codex_process_fixture() {
         let released =
             PathBuf::from(std::env::var_os("CODEX_FIXTURE_WRITE_DEADLINE_RELEASED").unwrap());
         while !released.is_file() {
-            crate::timing::sleep(Duration::from_millis(1));
+            scherzo_cloud_support::sleep(Duration::from_millis(1));
         }
         #[cfg(any(target_os = "android", target_os = "linux"))]
         let close_flags = rustix::event::PollFlags::HUP | rustix::event::PollFlags::RDHUP;

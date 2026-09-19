@@ -299,13 +299,13 @@ impl CredentialStore {
         let directory = self.directory()?;
         ensure_private_directory(directory)?;
         let file = open_or_create_private_file(path)?;
-        let start = crate::timing::monotonic_now();
+        let start = scherzo_cloud_support::monotonic_now();
 
         loop {
             match FileExt::try_lock(&file) {
                 Ok(()) => return Ok(CredentialLock { file }),
                 Err(TryLockError::WouldBlock) => {
-                    let elapsed = crate::timing::elapsed(start);
+                    let elapsed = scherzo_cloud_support::elapsed(start);
                     if elapsed >= timeout {
                         return Err(if refresh {
                             CredentialError::RefreshLockTimeout
@@ -313,7 +313,9 @@ impl CredentialStore {
                             CredentialError::LockTimeout
                         });
                     }
-                    crate::timing::sleep(LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(elapsed)));
+                    scherzo_cloud_support::sleep(
+                        LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(elapsed)),
+                    );
                 }
                 Err(TryLockError::Error(source)) => {
                     return Err(CredentialError::Io {

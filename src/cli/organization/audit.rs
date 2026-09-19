@@ -1,9 +1,9 @@
 use clap::{Args, Subcommand};
 
-use crate::api::{HttpClient, list_organization_audit_records};
 use crate::cli::ContinuationCursor;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{HttpClient, list_organization_audit_records};
 
 use super::{LeafOptions, output};
 

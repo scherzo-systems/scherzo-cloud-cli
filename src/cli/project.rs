@@ -3,9 +3,11 @@ mod output;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 
-use crate::api::{CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{
+    CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure,
+};
 
 use super::OrganizationRef;
 

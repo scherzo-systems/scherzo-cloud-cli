@@ -2624,7 +2624,7 @@ mod tests {
         )
         .unwrap();
         let workflow = resolve(&source_root, Path::new("workflow.yaml")).unwrap();
-        let monotonic = crate::timing::monotonic_now();
+        let monotonic = scherzo_cloud_support::monotonic_now();
         let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
         let initialized = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
         let terminal = timing_point(monotonic, "2026-08-02T12:01:44.03Z", 530);
@@ -2673,7 +2673,7 @@ mod tests {
 
     #[tokio::test]
     async fn timing_observer_excludes_presentation_opening_and_uses_terminal_transition() {
-        let monotonic = crate::timing::monotonic_now();
+        let monotonic = scherzo_cloud_support::monotonic_now();
         let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
         let started = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
         let step_started = timing_point(monotonic, "2026-08-02T12:01:44.01Z", 510);
@@ -2720,7 +2720,7 @@ mod tests {
 
     #[tokio::test]
     async fn presentation_failure_requests_cancellation_without_replacing_a_signal() {
-        let monotonic = crate::timing::monotonic_now();
+        let monotonic = scherzo_cloud_support::monotonic_now();
         let cancellation = CancellationSource::new();
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         let observed_at = timing_point(monotonic, "2026-08-02T12:01:44Z", 0);

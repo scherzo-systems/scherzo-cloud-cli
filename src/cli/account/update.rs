@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::api::{PrincipalProfile, UpdateProfileError, UpdateProfileOutcome};
 use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{PrincipalProfile, UpdateProfileError, UpdateProfileOutcome};
 
 use super::super::principal::PrincipalResult;
 

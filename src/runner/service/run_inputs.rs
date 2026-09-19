@@ -21,7 +21,7 @@ use crate::execution::workflow::admission::{
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
 use crate::runner::credential::Credential;
-use crate::runner_protocol::RunInputProjectionV1;
+use scherzo_cloud_runner_protocol::RunInputProjectionV1;
 
 const MANIFEST_RESPONSE_LIMIT: usize = 1024 * 1024;
 const CAPABILITY_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
@@ -61,7 +61,7 @@ impl PreparationDeadline {
     }
 
     pub(super) fn remaining(self) -> Option<Duration> {
-        self.remaining_at(crate::timing::monotonic_now())
+        self.remaining_at(scherzo_cloud_support::monotonic_now())
     }
 
     pub(super) fn remaining_at(self, monotonic_now: Instant) -> Option<Duration> {
@@ -74,7 +74,7 @@ impl PreparationDeadline {
     pub(super) fn elapsed_for_test() -> Self {
         Self {
             expires_at: OffsetDateTime::UNIX_EPOCH,
-            monotonic_deadline: crate::timing::monotonic_now(),
+            monotonic_deadline: scherzo_cloud_support::monotonic_now(),
         }
     }
 
@@ -240,7 +240,7 @@ pub(super) struct HttpRunInputBroker {
 fn broker_operation_runtime(
     deadline: PreparationDeadline,
 ) -> Result<(reqwest::Client, tokio::runtime::Runtime), BrokerFailure> {
-    crate::tls::install_provider();
+    scherzo_cloud_support::install_provider();
     let timeout = deadline
         .remaining()
         .map(|remaining| remaining.min(PROVIDER_OPERATION_TIMEOUT))
@@ -362,7 +362,7 @@ impl HttpRunInputBroker {
             .await?
             {}
             ensure_current(cancellation, deadline)?;
-            crate::workflow_contract::strict_json::from_slice(&encoded)
+            scherzo_cloud_support::strict_json_from_slice(&encoded)
                 .map_err(|_| BrokerFailure::InvalidResponse)
         })
     }
@@ -466,7 +466,7 @@ pub(super) fn materialize(
         deadline,
         cancellation,
         private_root,
-        crate::timing::utc_now,
+        scherzo_cloud_support::utc_now,
     )
 }
 
@@ -559,10 +559,9 @@ fn materialize_with_clock(
 pub(super) fn validate_projection(
     projection: &RunInputProjectionV1,
 ) -> Result<(), RunInputFailure> {
-    projection
-        .input_set_id
-        .parse::<crate::runner_protocol::generated::RunInputProjectionInputSetId>()
-        .map_err(|_| RunInputFailure::InvalidProjection)?;
+    if !scherzo_cloud_runner_protocol::valid_run_input_set_id(&projection.input_set_id) {
+        return Err(RunInputFailure::InvalidProjection);
+    }
     if projection.manifest_digest.algorithm != "sha256"
         || !crate::execution::workflow::is_lowercase_hex(&projection.manifest_digest.value, 64)
     {
@@ -1175,7 +1174,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection;
+    use scherzo_cloud_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection;
 
     #[derive(Clone, Copy, Debug, Default)]
     enum CapabilityMutation {
@@ -1327,7 +1326,7 @@ mod tests {
                 .format(&Rfc3339)
                 .unwrap()),
             now,
-            crate::timing::monotonic_now(),
+            scherzo_cloud_support::monotonic_now(),
         )
         .unwrap()
     }
@@ -1462,7 +1461,7 @@ mod tests {
     #[test]
     fn preparation_deadline_is_strict_and_fixed_at_receipt() {
         let now = OffsetDateTime::parse("2099-01-01T00:00:00Z", &Rfc3339).unwrap();
-        let monotonic = crate::timing::monotonic_now();
+        let monotonic = scherzo_cloud_support::monotonic_now();
         assert!(PreparationDeadline::from_wire("2099-01-01T00:00:00Z", now, monotonic,).is_none());
         let deadline =
             PreparationDeadline::from_wire("2099-01-01T00:15:00Z", now, monotonic).unwrap();

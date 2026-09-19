@@ -7,7 +7,7 @@ macro_rules! impl_authenticated_account_outcome {
                 Self::Unauthenticated
             }
 
-            fn unreachable(category: crate::api::UnreachableCategory) -> Self {
+            fn unreachable(category: scherzo_cloud_api::UnreachableCategory) -> Self {
                 Self::Unreachable(category)
             }
 
@@ -28,9 +28,9 @@ mod update;
 use anyhow::Context;
 use clap::{ArgGroup, Args, Subcommand};
 
-use crate::api::{HttpClient, HttpTransportPolicy, signup_human, update_current_principal};
 use crate::human_auth::deployment::Deployment;
 use crate::idempotency::generate_idempotency_key;
+use scherzo_cloud_api::{HttpClient, HttpTransportPolicy, signup_human, update_current_principal};
 
 pub(super) const ABOUT: &str = "Manage your Scherzo Cloud account";
 const NAME: &str = "account";

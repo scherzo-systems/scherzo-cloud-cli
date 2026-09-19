@@ -483,15 +483,12 @@ struct AttemptRecord {
 
 impl AttemptRecord {
     fn new(assignment_id: &str, run_id: &str, attempt_id: &str) -> Result<Self, ()> {
-        assignment_id
-            .parse::<crate::runner_protocol::generated::AssignmentId>()
-            .map_err(|_| ())?;
-        run_id
-            .parse::<crate::runner_protocol::generated::RunId>()
-            .map_err(|_| ())?;
-        attempt_id
-            .parse::<crate::runner_protocol::generated::AttemptId>()
-            .map_err(|_| ())?;
+        if !scherzo_cloud_runner_protocol::valid_assignment_id(assignment_id)
+            || !scherzo_cloud_runner_protocol::valid_run_id(run_id)
+            || !scherzo_cloud_runner_protocol::valid_attempt_id(attempt_id)
+        {
+            return Err(());
+        }
         Ok(Self {
             assignment_id: assignment_id.to_owned(),
             run_id: run_id.to_owned(),
@@ -619,15 +616,11 @@ fn validate_cleanup_target(relative_path: &str) -> Result<(), ()> {
 }
 
 fn valid_boot_id(value: &str) -> bool {
-    value
-        .parse::<crate::runner_protocol::generated::BootId>()
-        .is_ok()
+    scherzo_cloud_runner_protocol::valid_boot_id(value)
 }
 
 fn valid_assignment_id(value: &str) -> bool {
-    value
-        .parse::<crate::runner_protocol::generated::AssignmentId>()
-        .is_ok()
+    scherzo_cloud_runner_protocol::valid_assignment_id(value)
 }
 
 struct CleanupAuthorityProof {
@@ -1344,10 +1337,7 @@ impl WorkRootLease {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if name
-                .parse::<crate::runner_protocol::generated::BootId>()
-                .is_err()
-            {
+            if !scherzo_cloud_runner_protocol::valid_boot_id(name) {
                 continue;
             }
             let path = work_root.join(name);

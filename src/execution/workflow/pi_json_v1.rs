@@ -16,7 +16,6 @@ use super::agent::{
     AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
 };
-use crate::workflow_contract::strict_json;
 
 const SESSION_VERSION: u64 = 3;
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
@@ -487,7 +486,8 @@ impl PiJsonV1Parser {
             );
         }
         self.rejection_context.stage = PiJsonV1ProtocolStage::FrameDecode;
-        let value = strict_json::from_slice(frame).map_err(|_| self.protocol_failure())?;
+        let value = scherzo_cloud_support::strict_json_from_slice(frame)
+            .map_err(|_| self.protocol_failure())?;
         let Some(object) = value.as_object() else {
             return self.reject(
                 PiJsonV1RejectionReason::FrameNotObject,

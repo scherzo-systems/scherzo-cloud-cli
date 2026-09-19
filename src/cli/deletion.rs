@@ -5,12 +5,6 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use crate::api::{
-    CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, HttpClient,
-    HttpTransportPolicy, LifecycleApiError, LifecycleTransition, RequestDeletionOutcome,
-    UnreachableCategory, cancel_current_principal_deletion, cancel_organization_deletion,
-    request_current_principal_deletion, request_organization_deletion,
-};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
@@ -18,6 +12,12 @@ use crate::human_auth::device_authorization::{AuthorizationError, DeviceAuthoriz
 use crate::human_auth::device_flow::{self, DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 use crate::human_auth::session::{
     self, LocalCredentialState, RequiredOperationWithBinding, SessionBinding,
+};
+use scherzo_cloud_api::{
+    CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, HttpClient,
+    HttpTransportPolicy, LifecycleApiError, LifecycleTransition, RequestDeletionOutcome,
+    UnreachableCategory, cancel_current_principal_deletion, cancel_organization_deletion,
+    request_current_principal_deletion, request_organization_deletion,
 };
 
 const ACCOUNT_ABOUT: &str = "Manage your account deletion schedule";
@@ -785,18 +785,18 @@ fn write_schedule_fields(output: &mut impl Write, schedule: &DeletionSchedule) -
     writeln!(output, "updated: {}", schedule.updated_at)
 }
 
-const fn resource_key(kind: crate::api::LifecycleResourceKind) -> &'static str {
+const fn resource_key(kind: scherzo_cloud_api::LifecycleResourceKind) -> &'static str {
     match kind {
-        crate::api::LifecycleResourceKind::Principal => "principal",
-        crate::api::LifecycleResourceKind::Organization => "organization",
+        scherzo_cloud_api::LifecycleResourceKind::Principal => "principal",
+        scherzo_cloud_api::LifecycleResourceKind::Organization => "organization",
     }
 }
 
-const fn lifecycle_state(state: crate::api::LifecycleState) -> &'static str {
+const fn lifecycle_state(state: scherzo_cloud_api::LifecycleState) -> &'static str {
     match state {
-        crate::api::LifecycleState::Active => "active",
-        crate::api::LifecycleState::Suspended => "suspended",
-        crate::api::LifecycleState::DeletionPending => "deletion_pending",
+        scherzo_cloud_api::LifecycleState::Active => "active",
+        scherzo_cloud_api::LifecycleState::Suspended => "suspended",
+        scherzo_cloud_api::LifecycleState::DeletionPending => "deletion_pending",
     }
 }
 

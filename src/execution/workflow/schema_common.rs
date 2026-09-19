@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
-pub(super) use crate::workflow_contract::{is_identifier, is_lowercase_hex, lowercase_hex};
+pub(super) use scherzo_cloud_support::{is_identifier, is_lowercase_hex, lowercase_hex};
 
 pub(super) fn utc_timestamp(value: OffsetDateTime) -> Result<String, time::error::Format> {
     value.to_offset(UtcOffset::UTC).format(&Rfc3339)

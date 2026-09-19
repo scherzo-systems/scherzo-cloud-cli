@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::api::{HumanPrincipal, SignupError, SignupOutcome};
 use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{HumanPrincipal, SignupError, SignupOutcome};
 
 use super::super::principal::PrincipalResult;
 

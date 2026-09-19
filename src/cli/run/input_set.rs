@@ -5,12 +5,12 @@ use anyhow::Context as _;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::{
     RunFailure, RunInputSet, RunInputUpload, RunInputUploadOutcome, input_set_is_open,
     input_set_state_name,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 
 use super::acquisition::{self, AcquiredInputs};
 
@@ -77,7 +77,7 @@ impl InputSetReference {
     fn get(
         &self,
         deployment: &Deployment,
-        policy: crate::api::HttpTransportPolicy,
+        policy: scherzo_cloud_api::HttpTransportPolicy,
         authentication: &super::super::PrincipalAuthenticationArgs,
     ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
         super::with_api(deployment, policy, authentication, |api| {
@@ -88,7 +88,7 @@ impl InputSetReference {
     fn get_open(
         &self,
         deployment: &Deployment,
-        policy: crate::api::HttpTransportPolicy,
+        policy: scherzo_cloud_api::HttpTransportPolicy,
         authentication: &super::super::PrincipalAuthenticationArgs,
     ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
         Ok(match self.get(deployment, policy, authentication)? {
@@ -288,7 +288,7 @@ impl CreateCommand {
 
 fn create_input_set(
     deployment: &Deployment,
-    transport_policy: crate::api::HttpTransportPolicy,
+    transport_policy: scherzo_cloud_api::HttpTransportPolicy,
     authentication: &super::super::PrincipalAuthenticationArgs,
     organization: &str,
     project_id: &str,
@@ -352,7 +352,7 @@ fn report_input_set_mutation_unknown(
 
 pub(super) fn stage_and_seal(
     deployment: &Deployment,
-    transport_policy: crate::api::HttpTransportPolicy,
+    transport_policy: scherzo_cloud_api::HttpTransportPolicy,
     authentication: &super::super::PrincipalAuthenticationArgs,
     organization: &str,
     project_id: &str,

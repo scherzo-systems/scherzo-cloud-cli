@@ -5,8 +5,8 @@ use clap::Args;
 use serde::Serialize;
 
 use super::assembly::{ArtifactAssemblyError, AssembledArtifact, assemble_artifact_set};
-use crate::api::{ArtifactApi, ArtifactApiError};
 use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{ArtifactApi, ArtifactApiError};
 pub(super) const ABOUT: &str = "Download and verify a run's Artifact Set";
 
 pub(super) type Command = super::RemoteArtifactCommand<Operation>;

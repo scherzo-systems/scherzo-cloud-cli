@@ -2082,10 +2082,6 @@ dependencies = [
  "fs4",
  "futures-util",
  "getrandom 0.4.3",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
  "jsonschema",
  "libc",
  "nix",
@@ -2094,11 +2090,13 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "ratatui",
- "regress",
  "reqwest",
  "ring",
  "rustix",
- "rustls",
+ "scherzo-cloud-api",
+ "scherzo-cloud-runner-protocol",
+ "scherzo-cloud-support",
+ "scherzo-cloud-test-support",
  "serde",
  "serde_json",
  "tempfile",
@@ -2113,6 +2111,57 @@ dependencies = [
  "yaml-rust2",
  "zeroize",
 ]
+
+[[package]]
+name = "scherzo-cloud-api"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "base64",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "reqwest",
+ "ring",
+ "rustls",
+ "scherzo-cloud-support",
+ "scherzo-cloud-test-support",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "scherzo-cloud-runner-protocol"
+version = "0.0.0-dev"
+dependencies = [
+ "jsonschema",
+ "regress",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
+name = "scherzo-cloud-support"
+version = "0.0.0-dev"
+dependencies = [
+ "getrandom 0.4.3",
+ "jsonschema",
+ "rustls",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "scherzo-cloud-test-support"
+version = "0.0.0-dev"
 
 [[package]]
 name = "scopeguard"

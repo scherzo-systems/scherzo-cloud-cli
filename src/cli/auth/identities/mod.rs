@@ -6,15 +6,15 @@ mod remove;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
-use crate::api::{
-    CommonIdentityFailure, HttpClient, IdentityApiError, LinkIdentityOutcome,
-    ListIdentitiesOutcome, RemoveIdentityOutcome, UnreachableCategory,
-};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::session::{
     self, BoundRequiredOperation, LocalCredentialState, RequiredOperationWithBinding,
     SessionBinding,
+};
+use scherzo_cloud_api::{
+    CommonIdentityFailure, HttpClient, IdentityApiError, LinkIdentityOutcome,
+    ListIdentitiesOutcome, RemoveIdentityOutcome, UnreachableCategory,
 };
 
 pub(super) const ABOUT: &str = "Manage your linked sign-in identities";

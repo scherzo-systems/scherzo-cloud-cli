@@ -79,7 +79,7 @@ impl CloudOptions {
     fn write_failure(
         &self,
         deployment: &Deployment,
-        failure: &crate::api::RunnerFailure,
+        failure: &scherzo_cloud_api::RunnerFailure,
     ) -> anyhow::Result<ExitCode> {
         cloud::write_failure(
             deployment.fingerprint().api_url(),
@@ -215,7 +215,7 @@ impl Command {
                 execute_cloud(command, |command, deployment| {
                     command.execute(
                         deployment,
-                        crate::api::RunnerRegistrationMode::Enabled,
+                        scherzo_cloud_api::RunnerRegistrationMode::Enabled,
                         "enabled",
                         "✓ Runner enabled.",
                     )
@@ -224,7 +224,7 @@ impl Command {
             Some(RunnerCommand::Drain(command)) => execute_cloud(command, |command, deployment| {
                 command.execute(
                     deployment,
-                    crate::api::RunnerRegistrationMode::Draining,
+                    scherzo_cloud_api::RunnerRegistrationMode::Draining,
                     "draining",
                     "✓ Runner draining.",
                 )
@@ -233,7 +233,7 @@ impl Command {
                 execute_cloud(command, |command, deployment| {
                     command.execute(
                         deployment,
-                        crate::api::RunnerRegistrationMode::Disabled,
+                        scherzo_cloud_api::RunnerRegistrationMode::Disabled,
                         "disabled",
                         "✓ Runner disabled.",
                     )
@@ -256,12 +256,12 @@ fn operator_config_path(path: &Path) -> anyhow::Result<PathBuf> {
 
 enum CreateOutcome {
     Complete {
-        registration: crate::api::RunnerRegistration,
-        issuance: crate::api::RunnerActivationIssuance,
+        registration: scherzo_cloud_api::RunnerRegistration,
+        issuance: scherzo_cloud_api::RunnerActivationIssuance,
     },
     ActivationFailed {
-        registration: crate::api::RunnerRegistration,
-        failure: crate::api::RunnerFailure,
+        registration: scherzo_cloud_api::RunnerRegistration,
+        failure: scherzo_cloud_api::RunnerFailure,
     },
 }
 
@@ -383,7 +383,7 @@ impl CreateCommand {
 
 fn completed_cloud_result<T>(
     deployment: &Deployment,
-    result: Result<T, crate::api::RunnerFailure>,
+    result: Result<T, scherzo_cloud_api::RunnerFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<Result<T, ExitCode>> {
@@ -409,7 +409,7 @@ fn validate_activation_destination(destination: &str, json: bool) -> anyhow::Res
 
 fn write_activation_issuance(
     destination: &str,
-    issuance: &crate::api::RunnerActivationIssuance,
+    issuance: &scherzo_cloud_api::RunnerActivationIssuance,
 ) -> anyhow::Result<crate::runner::enrollment::ActivationArtifact> {
     let api_artifact = issuance.artifact.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -494,7 +494,7 @@ impl ModeCommand {
     fn execute(
         self,
         deployment: &Deployment,
-        mode: crate::api::RunnerRegistrationMode,
+        mode: scherzo_cloud_api::RunnerRegistrationMode,
         outcome: &'static str,
         heading: &'static str,
     ) -> anyhow::Result<ExitCode> {
@@ -684,8 +684,8 @@ fn execute_deletion_blocking(
         &invocation.options.authentication,
         |api| {
             if !control.begin_dispatch() {
-                return Err(crate::api::RunnerFailure::Unreachable(
-                    crate::api::UnreachableCategory::Connection,
+                return Err(scherzo_cloud_api::RunnerFailure::Unreachable(
+                    scherzo_cloud_api::UnreachableCategory::Connection,
                 ));
             }
             match invocation.kind {
@@ -705,8 +705,8 @@ fn execute_deletion_blocking(
                 invocation.options.json,
             ),
             Err(
-                failure @ (crate::api::RunnerFailure::Unreachable(_)
-                | crate::api::RunnerFailure::Protocol),
+                failure @ (scherzo_cloud_api::RunnerFailure::Unreachable(_)
+                | scherzo_cloud_api::RunnerFailure::Protocol),
             ) => {
                 let _ = failure;
                 cloud::write_deletion_unknown(

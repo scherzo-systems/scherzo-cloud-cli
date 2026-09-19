@@ -223,8 +223,8 @@ impl MutationCommand {
     }
 }
 
-fn stored_state_label(state: crate::api::RunnerCredentialStoredState) -> &'static str {
-    use crate::api::RunnerCredentialStoredState;
+fn stored_state_label(state: scherzo_cloud_api::RunnerCredentialStoredState) -> &'static str {
+    use scherzo_cloud_api::RunnerCredentialStoredState;
     match state {
         RunnerCredentialStoredState::Active => "active",
         RunnerCredentialStoredState::Retiring => "retiring",
@@ -232,8 +232,8 @@ fn stored_state_label(state: crate::api::RunnerCredentialStoredState) -> &'stati
     }
 }
 
-fn effective_state_label(state: crate::api::RunnerCredentialEffectiveState) -> &'static str {
-    use crate::api::RunnerCredentialEffectiveState;
+fn effective_state_label(state: scherzo_cloud_api::RunnerCredentialEffectiveState) -> &'static str {
+    use scherzo_cloud_api::RunnerCredentialEffectiveState;
     match state {
         RunnerCredentialEffectiveState::Active => "active",
         RunnerCredentialEffectiveState::Retiring => "retiring",

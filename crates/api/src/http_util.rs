@@ -1,0 +1,310 @@
+use std::error::Error;
+use std::fmt;
+use std::io;
+
+use reqwest::blocking::Response as BlockingResponse;
+use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION, RETRY_AFTER};
+use reqwest::{Response, StatusCode, Url};
+use zeroize::Zeroizing;
+
+pub const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_BODY_BYTES_U64: u64 = 1024 * 1024;
+
+pub enum BoundedBodyError {
+    TooLarge,
+    Transport(reqwest::Error),
+}
+
+pub(crate) struct BufferedBlockingResponse {
+    pub status: StatusCode,
+    pub content_type: Option<HeaderValue>,
+    pub idempotency_keys: Vec<HeaderValue>,
+    pub locations: Vec<HeaderValue>,
+    pub cache_controls: Vec<HeaderValue>,
+    pub retry_afters: Vec<HeaderValue>,
+    pub body: Vec<u8>,
+}
+
+pub(crate) struct BufferedResponse {
+    pub status: StatusCode,
+    pub content_type: Option<String>,
+    pub idempotency_key: Option<HeaderValue>,
+    pub location: Option<HeaderValue>,
+    pub retry_after: Option<HeaderValue>,
+    pub body: Zeroizing<Vec<u8>>,
+}
+
+pub(crate) enum BufferedResponseError {
+    TooLarge {
+        status: StatusCode,
+    },
+    Transport {
+        status: StatusCode,
+        source: reqwest::Error,
+    },
+    InvalidContentType {
+        status: StatusCode,
+    },
+}
+
+pub(crate) enum ApiAttemptError<E> {
+    Protocol(E),
+    Transport(super::UnreachableCategory),
+}
+
+pub(crate) async fn buffer_api_response<E>(
+    response: Response,
+    protocol: impl Fn(&'static str, bool) -> E,
+) -> Result<BufferedResponse, ApiAttemptError<E>> {
+    buffer_response(response)
+        .await
+        .map_err(|error| match error {
+            BufferedResponseError::TooLarge { status } => ApiAttemptError::Protocol(protocol(
+                "the response body exceeds 1 MiB",
+                status == StatusCode::UNAUTHORIZED,
+            )),
+            BufferedResponseError::Transport { status, .. }
+                if status == StatusCode::UNAUTHORIZED =>
+            {
+                ApiAttemptError::Protocol(protocol(
+                    "the unauthorized response body could not be read",
+                    true,
+                ))
+            }
+            BufferedResponseError::Transport { source, .. } => {
+                ApiAttemptError::Transport(super::classify_reqwest_error(&source))
+            }
+            BufferedResponseError::InvalidContentType { status } => {
+                ApiAttemptError::Protocol(protocol(
+                    "the Content-Type header is not valid text",
+                    status == StatusCode::UNAUTHORIZED,
+                ))
+            }
+        })
+}
+
+pub(crate) async fn buffer_response(
+    response: Response,
+) -> Result<BufferedResponse, BufferedResponseError> {
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let idempotency_key = response.headers().get("Idempotency-Key").cloned();
+    let location = response.headers().get(LOCATION).cloned();
+    let retry_after = response.headers().get("Retry-After").cloned();
+    let body = read_bounded_body(response)
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::TooLarge => BufferedResponseError::TooLarge { status },
+            BoundedBodyError::Transport(source) => {
+                BufferedResponseError::Transport { status, source }
+            }
+        })?;
+    let content_type = content_type
+        .as_ref()
+        .map(media_type)
+        .transpose()
+        .map_err(|_| BufferedResponseError::InvalidContentType { status })?;
+    Ok(BufferedResponse {
+        status,
+        content_type,
+        idempotency_key,
+        location,
+        retry_after,
+        body,
+    })
+}
+
+pub async fn read_bounded_body(
+    mut response: Response,
+) -> Result<Zeroizing<Vec<u8>>, BoundedBodyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES_U64)
+    {
+        return Err(BoundedBodyError::TooLarge);
+    }
+    // Reserve the full bound before reading so sensitive bytes are never moved through an
+    // ordinary Vec reallocation. reqwest retains ownership of its separate transport chunks.
+    let mut body = Zeroizing::new(Vec::with_capacity(MAX_RESPONSE_BODY_BYTES));
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(BoundedBodyError::Transport)?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+            return Err(BoundedBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(crate) fn buffer_blocking_response(
+    response: BlockingResponse,
+) -> Result<BufferedBlockingResponse, BoundedBodyError> {
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let idempotency_keys = response
+        .headers()
+        .get_all("Idempotency-Key")
+        .iter()
+        .cloned()
+        .collect();
+    let locations = response
+        .headers()
+        .get_all(LOCATION)
+        .iter()
+        .cloned()
+        .collect();
+    let cache_controls = response
+        .headers()
+        .get_all(CACHE_CONTROL)
+        .iter()
+        .cloned()
+        .collect();
+    let retry_afters = response
+        .headers()
+        .get_all(RETRY_AFTER)
+        .iter()
+        .cloned()
+        .collect();
+    let body = read_bounded_blocking_body(response)?;
+    Ok(BufferedBlockingResponse {
+        status,
+        content_type,
+        idempotency_keys,
+        locations,
+        cache_controls,
+        retry_afters,
+        body,
+    })
+}
+
+pub(crate) fn read_bounded_blocking_body(
+    mut response: BlockingResponse,
+) -> Result<Vec<u8>, BoundedBodyError> {
+    let body = bounded_body_buffer(response.content_length()).ok_or(BoundedBodyError::TooLarge)?;
+    let mut writer = BoundedBodyWriter {
+        body,
+        limit_exceeded: false,
+    };
+    if let Err(error) = response.copy_to(&mut writer) {
+        return Err(if writer.limit_exceeded {
+            BoundedBodyError::TooLarge
+        } else {
+            BoundedBodyError::Transport(error)
+        });
+    }
+    Ok(writer.body)
+}
+
+struct BoundedBodyWriter {
+    body: Vec<u8>,
+    limit_exceeded: bool,
+}
+
+impl io::Write for BoundedBodyWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > MAX_RESPONSE_BODY_BYTES.saturating_sub(self.body.len()) {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("response body exceeds limit"));
+        }
+        self.body.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_body_buffer(content_length: Option<u64>) -> Option<Vec<u8>> {
+    if content_length.is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES_U64) {
+        return None;
+    }
+    let initial_capacity = content_length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(MAX_RESPONSE_BODY_BYTES);
+    Some(Vec::with_capacity(initial_capacity))
+}
+
+pub(crate) fn endpoint(base_url: &str, path: &[&str]) -> Result<Url, ()> {
+    let mut endpoint = Url::parse(base_url).map_err(|_| ())?;
+    let mut segments = endpoint.path_segments_mut()?;
+    segments.pop_if_empty();
+    for segment in path {
+        segments.push(segment);
+    }
+    drop(segments);
+    Ok(endpoint)
+}
+
+pub(crate) fn append_pagination(endpoint: &mut Url, limit: Option<u16>, cursor: Option<&str>) {
+    if limit.is_some() || cursor.is_some() {
+        let mut query = endpoint.query_pairs_mut();
+        if let Some(limit) = limit {
+            query.append_pair("limit", &limit.to_string());
+        }
+        if let Some(cursor) = cursor {
+            query.append_pair("cursor", cursor);
+        }
+    }
+}
+
+pub(crate) fn can_retry_ambiguous_mutation(
+    attempt: usize,
+    maximum_attempts: usize,
+    category: super::UnreachableCategory,
+) -> bool {
+    attempt + 1 < maximum_attempts
+        && matches!(
+            category,
+            super::UnreachableCategory::Connection | super::UnreachableCategory::Timeout
+        )
+}
+
+pub(crate) fn require_nonempty(value: &str, reason: &'static str) -> Result<(), &'static str> {
+    if value.is_empty() {
+        Err(reason)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn header_matches(header: Option<&HeaderValue>, expected: &str) -> bool {
+    header.and_then(|value| value.to_str().ok()) == Some(expected)
+}
+
+pub(crate) fn require_media_type(actual: Option<&str>, expected: &str) -> Result<(), &'static str> {
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err("the response Content-Type is not valid for its HTTP status")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidHeaderText;
+
+impl fmt::Display for InvalidHeaderText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("header value is not valid text")
+    }
+}
+
+impl Error for InvalidHeaderText {}
+
+pub fn media_type(value: &HeaderValue) -> Result<String, InvalidHeaderText> {
+    value
+        .to_str()
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .map_err(|_| InvalidHeaderText)
+}

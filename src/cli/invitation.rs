@@ -10,16 +10,16 @@ use anyhow::Context;
 use clap::{ArgGroup, Args, Subcommand, builder::NonEmptyStringValueParser};
 use zeroize::Zeroizing;
 
-use crate::api::{
+use crate::exit_code::ExitCode;
+use crate::human_auth::deployment::Deployment;
+use crate::human_auth::token::SecretToken;
+use scherzo_cloud_api::{
     AcceptInvitationOutcome, HttpClient, InvitationTarget, InvitationTerminationOutcome,
     IssueInvitationOutcome, ListInvitationInboxOutcome, ListOrganizationInvitationsOutcome,
     OrganizationError, PreviewInvitationOutcome, accept_invitation, decline_invitation,
     issue_invitation, list_invitation_inbox, list_organization_invitations, preview_invitation,
     revoke_invitation,
 };
-use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::token::SecretToken;
 
 use super::{OrganizationRef, PaginationArgs};
 
@@ -577,7 +577,7 @@ fn parse_principal_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_typed_id(value: &str, prefix: &str, name: &str) -> Result<String, String> {
-    if crate::public_id::valid_typed_id(value, prefix) {
+    if scherzo_cloud_support::valid_typed_id(value, prefix) {
         Ok(value.to_owned())
     } else {
         Err(format!("{name} must be an exact {prefix} identifier"))
@@ -682,7 +682,7 @@ fn valid_capability(value: &str, invitation_id: &str) -> bool {
         return false;
     };
     embedded_id == invitation_id
-        && crate::public_id::valid_typed_id(embedded_id, "inv_")
+        && scherzo_cloud_support::valid_typed_id(embedded_id, "inv_")
         && secret.len() == 43
         && secret
             .bytes()

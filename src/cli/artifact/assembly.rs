@@ -5,11 +5,11 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use crate::api::{
+use scherzo_cloud_api::{
     ArtifactApiError, ArtifactCapabilityMember, ArtifactInventoryPage, ArtifactMember,
     ArtifactSource,
 };
-use crate::public_id::valid_typed_id;
+use scherzo_cloud_support::valid_typed_id;
 
 use crate::execution::workflow::portable_artifact::{
     PortableArtifactValidationFailure, validate_portable_artifact_set,
@@ -76,7 +76,7 @@ pub(crate) fn assemble_artifact_set(
         organization,
         run_id,
         destination,
-        crate::timing::utc_now,
+        scherzo_cloud_support::utc_now,
     )
 }
 
@@ -374,7 +374,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::api::{ArtifactCapabilities, DownloadedMember};
+    use scherzo_cloud_api::{ArtifactCapabilities, DownloadedMember};
 
     struct FakeSource {
         inventory: VecDeque<ArtifactInventoryPage>,

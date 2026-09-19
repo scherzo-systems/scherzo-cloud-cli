@@ -65,6 +65,7 @@ expect_classification non-releaseable devenv.lock
 
 expect_classification releaseable Cargo.toml
 expect_classification releaseable src/main.rs
+expect_classification releaseable crates/api/src/lib.rs
 expect_classification releaseable changes/future.txt
 expect_classification releaseable nested/.github/workflows/check.yml
 expect_classification releaseable nested/scripts/check

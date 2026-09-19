@@ -144,7 +144,7 @@ impl Sleeper for TokioSleeper {
     }
 
     fn utc_now(&self) -> time::OffsetDateTime {
-        crate::timing::utc_now()
+        scherzo_cloud_support::utc_now()
     }
 
     #[expect(

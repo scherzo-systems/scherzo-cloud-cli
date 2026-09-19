@@ -6,9 +6,9 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::api::http_util::{self, BoundedBodyError};
-use crate::api::{
-    HttpClient, HttpEndpointError, HttpTransportPolicy, UnreachableCategory, classify_reqwest_error,
+use scherzo_cloud_api::{
+    BoundedBodyError, HttpClient, HttpEndpointError, HttpTransportPolicy, UnreachableCategory,
+    classify_reqwest_error, media_type, read_bounded_body,
 };
 
 use super::credentials::MAX_ACCESS_TOKEN_BYTES;
@@ -340,12 +340,12 @@ async fn post_form_async(
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
-        .map(http_util::media_type)
+        .map(media_type)
         .transpose()
-        .map_err(|()| AuthorizationError::Protocol {
+        .map_err(|_| AuthorizationError::Protocol {
             reason: "the response Content-Type is not valid text",
         })?;
-    let body = match http_util::read_bounded_body(response).await {
+    let body = match read_bounded_body(response).await {
         Ok(body) => body,
         Err(BoundedBodyError::TooLarge) => {
             return Err(AuthorizationError::Protocol {

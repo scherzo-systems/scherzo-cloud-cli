@@ -1,0 +1,18 @@
+[package]
+name = "scherzo-cloud-runner-protocol"
+version = "0.0.0-dev"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+jsonschema.workspace = true
+regress.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true

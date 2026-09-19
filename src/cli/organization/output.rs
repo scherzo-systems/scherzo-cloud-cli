@@ -3,7 +3,8 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::api::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_api::{
     AuditActor, AuditProjectionWarning, AuditProjectionWarningReason, CommonOrganizationFailure,
     CreateOrganizationOutcome, CurrentPrincipalMembership, GetOrganizationOutcome,
     ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
@@ -13,7 +14,6 @@ use crate::api::{
     OrganizationMembershipHistoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 use super::super::{membership_role, membership_state, write_page_footer};
 
@@ -611,7 +611,7 @@ fn write_common_organization_operation_failure(
 
 fn organization_operation_unreachable(
     deployment: &str,
-    category: crate::api::UnreachableCategory,
+    category: scherzo_cloud_api::UnreachableCategory,
 ) -> (&'static str, Option<&'static str>, String, OutcomeClass) {
     (
         "unreachable",

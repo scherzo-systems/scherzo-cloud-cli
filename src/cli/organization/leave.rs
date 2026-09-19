@@ -1,8 +1,8 @@
 use clap::Args;
 
-use crate::api::leave_organization;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_api::leave_organization;
 
 use super::{LeafOptions, output};
 

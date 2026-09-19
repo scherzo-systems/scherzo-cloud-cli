@@ -4,10 +4,10 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 
-use crate::api::HttpClient;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus};
+use scherzo_cloud_api::HttpClient;
 
 use super::super::principal::PrincipalResult;
 

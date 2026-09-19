@@ -6270,7 +6270,7 @@ mod tests {
         let clock = FixedClock {
             now: ObservationTime {
                 utc: time::OffsetDateTime::UNIX_EPOCH,
-                monotonic: crate::timing::monotonic_now(),
+                monotonic: scherzo_cloud_support::monotonic_now(),
             },
         };
         let view = WorkflowRunViewModel::new(
@@ -7277,7 +7277,7 @@ finalizers:
         let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
         let now = ObservationTime {
             utc: time::OffsetDateTime::UNIX_EPOCH,
-            monotonic: crate::timing::monotonic_now(),
+            monotonic: scherzo_cloud_support::monotonic_now(),
         };
         let clock = FixedClock { now };
         let view = WorkflowRunViewModel::new(&workflow, 1, RunTimingObservation::new(now), clock);

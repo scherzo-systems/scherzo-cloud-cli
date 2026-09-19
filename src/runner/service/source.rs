@@ -25,7 +25,7 @@ use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
 use crate::process::ManagedProcessGroup;
 use crate::runner::credential::Credential;
 use crate::runner::service::config::RepositoryUrlPolicy;
-use crate::runner_protocol::ExecutionSpecV1RunnerProjection;
+use scherzo_cloud_runner_protocol::ExecutionSpecV1RunnerProjection;
 
 const SOURCE_BROKER_RESPONSE_LIMIT: usize = 128 * 1024;
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -91,14 +91,14 @@ impl ProviderRetryWaiter for SystemProviderRetryWaiter {
         retry_after: Duration,
         cancellation: &CaptureCancellation,
     ) -> Result<(), CredentialBrokerFailure> {
-        let started = crate::timing::monotonic_now();
+        let started = scherzo_cloud_support::monotonic_now();
         loop {
             ensure_broker_current(cancellation)?;
-            let remaining = retry_after.saturating_sub(crate::timing::elapsed(started));
+            let remaining = retry_after.saturating_sub(scherzo_cloud_support::elapsed(started));
             if remaining.is_zero() {
                 return Ok(());
             }
-            crate::timing::sleep(remaining.min(PROVIDER_RETRY_POLL_INTERVAL));
+            scherzo_cloud_support::sleep(remaining.min(PROVIDER_RETRY_POLL_INTERVAL));
         }
     }
 }
@@ -327,7 +327,7 @@ impl HttpSourceCredentialBroker {
         mut body: ProviderSecret,
         cancellation: Option<&CaptureCancellation>,
     ) -> Result<BrokerResponse, CredentialBrokerFailure> {
-        crate::tls::install_provider();
+        scherzo_cloud_support::install_provider();
         let client = reqwest::Client::builder()
             .timeout(PROVIDER_OPERATION_TIMEOUT)
             .build()
@@ -484,7 +484,7 @@ impl HttpSourceCredentialBroker {
             .filter(|value| {
                 utc_spelling
                     && value.offset() == UtcOffset::UTC
-                    && *value > crate::timing::utc_now()
+                    && *value > scherzo_cloud_support::utc_now()
             })
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
         let repository_url = validate_repository_url(&repository_url, self.repository_url_policy)?;
@@ -524,7 +524,7 @@ impl HttpSourceCredentialBroker {
             .filter(|value| utc_spelling && value.offset() == UtcOffset::UTC)
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
         if parsed.schema_version != 1
-            || !crate::public_id::valid_typed_id(&parsed.issuance_id, "gti_")
+            || !scherzo_cloud_support::valid_typed_id(&parsed.issuance_id, "gti_")
         {
             return Err(CredentialBrokerFailure::InvalidResponse);
         }
@@ -640,7 +640,7 @@ fn run_broker_worker<T: Send + 'static>(
                 return result;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                crate::timing::sleep(PROCESS_POLL_INTERVAL);
+                scherzo_cloud_support::sleep(PROCESS_POLL_INTERVAL);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 return Err(CredentialBrokerFailure::Unavailable);
@@ -1456,17 +1456,17 @@ fn run_managed_git(
     cancellation: Option<&CaptureCancellation>,
 ) -> Result<ExitStatus, ManagedGitFailure> {
     let mut child = ManagedProcessGroup::spawn(command).map_err(|_| ManagedGitFailure::Spawn)?;
-    let started = crate::timing::monotonic_now();
+    let started = scherzo_cloud_support::monotonic_now();
     loop {
         if cancellation.is_some_and(CaptureCancellation::is_cancelled) {
             return Err(ManagedGitFailure::Cancelled);
         }
-        if crate::timing::elapsed(started) >= GIT_OPERATION_TIMEOUT {
+        if scherzo_cloud_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
             return Err(ManagedGitFailure::Timeout);
         }
         match child.try_wait().map_err(|_| ManagedGitFailure::Wait)? {
             Some(status) => return Ok(status),
-            None => crate::timing::sleep(PROCESS_POLL_INTERVAL),
+            None => scherzo_cloud_support::sleep(PROCESS_POLL_INTERVAL),
         }
     }
 }

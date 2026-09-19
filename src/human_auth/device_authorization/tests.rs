@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::*;
-use crate::api::http_util::MAX_RESPONSE_BODY_BYTES;
+use scherzo_cloud_api::MAX_RESPONSE_BODY_BYTES;
 
 struct ScriptedServer {
     issuer: String,

@@ -357,7 +357,7 @@ impl fmt::Debug for OtlpHttpExporter {
 
 impl OtlpHttpExporter {
     fn new(settings: ExportSettings) -> Result<Self, ()> {
-        crate::tls::install_provider();
+        scherzo_cloud_support::install_provider();
         let client = Client::builder()
             .connect_timeout(settings.timeout)
             .timeout(settings.timeout)
@@ -804,7 +804,7 @@ mod tests {
                             stream
                                 .set_nonblocking(false)
                                 .expect("make accepted OTLP connection blocking");
-                            let request = crate::api::test_support::read_request(&mut stream);
+                            let request = scherzo_cloud_test_support::read_request(&mut stream);
                             let body_start = request
                                 .windows(4)
                                 .position(|part| part == b"\r\n\r\n")

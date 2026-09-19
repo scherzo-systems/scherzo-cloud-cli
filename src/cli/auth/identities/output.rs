@@ -4,14 +4,14 @@ use anyhow::Context;
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use crate::api::{
-    CommonIdentityFailure, LinkIdentityOutcome, ListIdentitiesOutcome, OidcIdentity,
-    RemoveIdentityOutcome, UnreachableCategory,
-};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 use crate::human_auth::device_authorization::DeviceAuthorization;
 use crate::human_auth::session::LocalCredentialState;
+use scherzo_cloud_api::{
+    CommonIdentityFailure, LinkIdentityOutcome, ListIdentitiesOutcome, OidcIdentity,
+    RemoveIdentityOutcome, UnreachableCategory,
+};
 
 pub(super) fn write_list(
     deployment: &str,

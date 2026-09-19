@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, MapAccess, Visitor};
 use zeroize::Zeroizing;
 
-use crate::api::{
+use scherzo_cloud_api::{
     InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,
     RunInputManifest, RunInputUpload, digest_bytes, valid_integration_context,
 };
@@ -411,7 +411,7 @@ fn acquire_scalar(
         ScalarKind::Text if std::str::from_utf8(&bytes).is_err() => {
             return Err(InputAcquisitionFailure::InvalidUtf8 { path });
         }
-        ScalarKind::Json if crate::workflow_contract::strict_json::from_slice(&bytes).is_err() => {
+        ScalarKind::Json if scherzo_cloud_support::strict_json_from_slice(&bytes).is_err() => {
             return Err(InputAcquisitionFailure::InvalidJson { path });
         }
         ScalarKind::Text | ScalarKind::Json => {}
