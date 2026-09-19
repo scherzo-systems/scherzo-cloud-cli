@@ -17,26 +17,46 @@ use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ArtifactDigest {
-    #[serde(rename = "algorithm")]
-    pub algorithm: Algorithm,
-    #[serde(rename = "value")]
-    pub value: String,
+pub struct RunPublicationHandoff {
+    #[serde(rename = "exportName")]
+    pub export_name: String,
+    #[serde(rename = "state")]
+    pub state: State,
+    #[serde(rename = "publicationId", deserialize_with = "Option::deserialize")]
+    pub publication_id: Option<String>,
+    #[serde(rename = "failure", deserialize_with = "Option::deserialize")]
+    pub failure: Option<Box<models::RunPublicationHandoffFailure>>,
 }
 
-impl ArtifactDigest {
-    pub fn new(algorithm: Algorithm, value: String) -> ArtifactDigest {
-        ArtifactDigest { algorithm, value }
+impl RunPublicationHandoff {
+    pub fn new(
+        export_name: String,
+        state: State,
+        publication_id: Option<String>,
+        failure: Option<models::RunPublicationHandoffFailure>,
+    ) -> RunPublicationHandoff {
+        RunPublicationHandoff {
+            export_name,
+            state,
+            publication_id,
+            failure: failure.map(Box::new),
+        }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Algorithm {
-    #[serde(rename = "sha256")]
-    ArtifactDigestAlgorithmSha256,
+pub enum State {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "started")]
+    Started,
+    #[serde(rename = "skipped")]
+    Skipped,
+    #[serde(rename = "failed")]
+    Failed,
 }
 
-impl Default for Algorithm {
-    fn default() -> Algorithm {
-        Self::ArtifactDigestAlgorithmSha256
+impl Default for State {
+    fn default() -> State {
+        Self::Pending
     }
 }

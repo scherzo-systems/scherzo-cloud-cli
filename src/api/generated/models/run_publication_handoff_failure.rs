@@ -17,7 +17,7 @@ use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PublicationFailure {
+pub struct RunPublicationHandoffFailure {
     #[serde(rename = "phase")]
     pub phase: Phase,
     #[serde(rename = "code")]
@@ -26,9 +26,9 @@ pub struct PublicationFailure {
     pub retryable: bool,
 }
 
-impl PublicationFailure {
-    pub fn new(phase: Phase, code: Code, retryable: bool) -> PublicationFailure {
-        PublicationFailure {
+impl RunPublicationHandoffFailure {
+    pub fn new(phase: Phase, code: Code, retryable: bool) -> RunPublicationHandoffFailure {
+        RunPublicationHandoffFailure {
             phase,
             code,
             retryable,
@@ -41,10 +41,6 @@ pub enum Phase {
     Artifact,
     #[serde(rename = "preflight")]
     Preflight,
-    #[serde(rename = "branch")]
-    Branch,
-    #[serde(rename = "pull_request")]
-    PullRequest,
 }
 
 impl Default for Phase {
@@ -54,38 +50,24 @@ impl Default for Phase {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Code {
+    #[serde(rename = "artifact_unavailable")]
+    ArtifactUnavailable,
     #[serde(rename = "artifact_expired")]
     ArtifactExpired,
     #[serde(rename = "artifact_invalid")]
     ArtifactInvalid,
-    #[serde(rename = "artifact_not_applicable")]
-    ArtifactNotApplicable,
-    #[serde(rename = "workflow_file_change_unsupported")]
-    WorkflowFileChangeUnsupported,
-    #[serde(rename = "base_branch_unavailable")]
-    BaseBranchUnavailable,
-    #[serde(rename = "base_branch_incompatible")]
-    BaseBranchIncompatible,
+    #[serde(rename = "export_not_publishable")]
+    ExportNotPublishable,
     #[serde(rename = "actor_authority_lost")]
     ActorAuthorityLost,
     #[serde(rename = "project_repository_changed")]
     ProjectRepositoryChanged,
-    #[serde(rename = "provider_permission_unavailable")]
-    ProviderPermissionUnavailable,
-    #[serde(rename = "target_branch_conflict")]
-    TargetBranchConflict,
-    #[serde(rename = "pull_request_conflict")]
-    PullRequestConflict,
-    #[serde(rename = "provider_rejected")]
-    ProviderRejected,
-    #[serde(rename = "provider_unavailable")]
-    ProviderUnavailable,
     #[serde(rename = "internal_publication_failure")]
     InternalPublicationFailure,
 }
 
 impl Default for Code {
     fn default() -> Code {
-        Self::ArtifactExpired
+        Self::ArtifactUnavailable
     }
 }

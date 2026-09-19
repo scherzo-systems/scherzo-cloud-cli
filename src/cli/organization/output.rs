@@ -452,6 +452,7 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
     match kind {
         OrganizationAuditSubjectKind::Organization => "organization",
         OrganizationAuditSubjectKind::ArtifactSet => "artifact_set",
+        OrganizationAuditSubjectKind::Run => "run",
         OrganizationAuditSubjectKind::Publication => "publication",
         OrganizationAuditSubjectKind::RunInputSet => "run_input_set",
         OrganizationAuditSubjectKind::Membership => "membership",

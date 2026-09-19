@@ -127,6 +127,7 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
             "issueId": "issue-private-context-sentinel",
             "source": "linear"
         },
+        "publication": null,
         "createdAt": "2026-08-10T12:00:00Z",
         "updatedAt": "2026-08-10T12:05:00Z"
     })

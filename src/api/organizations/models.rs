@@ -169,6 +169,7 @@ pub(crate) struct OrganizationAuditSubject {
 pub(crate) enum OrganizationAuditSubjectKind {
     Organization,
     ArtifactSet,
+    Run,
     Publication,
     RunInputSet,
     Membership,
@@ -933,6 +934,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
         let (kind, prefix) = match value.kind {
             Kind::Organization => (OrganizationAuditSubjectKind::Organization, "org_"),
             Kind::ArtifactSet => (OrganizationAuditSubjectKind::ArtifactSet, "ats_"),
+            Kind::Run => (OrganizationAuditSubjectKind::Run, "run_"),
             Kind::Publication => (OrganizationAuditSubjectKind::Publication, "pub_"),
             Kind::RunInputSet => (OrganizationAuditSubjectKind::RunInputSet, "ris_"),
             Kind::Membership => (OrganizationAuditSubjectKind::Membership, "mem_"),
@@ -983,6 +985,7 @@ impl From<models::OrganizationAuditChange> for OrganizationAuditChange {
             Field::CapabilityExpiresAt => "capability_expires_at",
             Field::ProjectId => "project_id",
             Field::ExportName => "export_name",
+            Field::PublicationId => "publication_id",
             Field::InputCount => "input_count",
             Field::AttachmentCount => "attachment_count",
             Field::AggregateSizeBytes => "aggregate_size_bytes",

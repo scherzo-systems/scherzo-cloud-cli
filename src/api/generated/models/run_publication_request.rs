@@ -17,31 +17,13 @@ use crate::api::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CreateProjectRequest {
-    #[serde(rename = "name")]
-    pub name: String,
-    #[serde(rename = "repository")]
-    pub repository: Box<models::ProjectRepositorySelection>,
-    #[serde(rename = "runnerPoolId", skip_serializing_if = "Option::is_none")]
-    pub runner_pool_id: Option<String>,
-    /// An optional active human delegator used only for service-action audit attribution.
-    #[serde(
-        rename = "delegatorPrincipalId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub delegator_principal_id: Option<String>,
+pub struct RunPublicationRequest {
+    #[serde(rename = "exportName")]
+    pub export_name: String,
 }
 
-impl CreateProjectRequest {
-    pub fn new(
-        name: String,
-        repository: models::ProjectRepositorySelection,
-    ) -> CreateProjectRequest {
-        CreateProjectRequest {
-            name,
-            repository: Box::new(repository),
-            runner_pool_id: None,
-            delegator_principal_id: None,
-        }
+impl RunPublicationRequest {
+    pub fn new(export_name: String) -> RunPublicationRequest {
+        RunPublicationRequest { export_name }
     }
 }
