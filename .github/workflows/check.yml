@@ -52,7 +52,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rust_version=$(awk -F '"' '/^rust-version = / { print $2 }' Cargo.toml)
+          rust_version=$(awk -F '"' '
+            $0 == "[package]" { inside_package = 1; next }
+            /^\[/ { inside_package = 0 }
+            inside_package && /^rust-version = / { print $2; exit }
+          ' Cargo.toml)
           if [[ ! "$rust_version" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]]; then
             echo "Could not read a canonical rust-version from Cargo.toml: $rust_version" >&2
             exit 1
@@ -167,7 +171,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rust_version=$(awk -F '"' '/^rust-version = / { print $2 }' Cargo.toml)
+          rust_version=$(awk -F '"' '
+            $0 == "[package]" { inside_package = 1; next }
+            /^\[/ { inside_package = 0 }
+            inside_package && /^rust-version = / { print $2; exit }
+          ' Cargo.toml)
           if [[ ! "$rust_version" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]]; then
             echo "Could not read a canonical rust-version from Cargo.toml: $rust_version" >&2
             exit 1
