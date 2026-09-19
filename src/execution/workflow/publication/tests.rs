@@ -382,21 +382,35 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
 #[test]
 fn publishes_streams_within_live_tui_run_budget() {
     const STEP_COUNT: usize = 12;
-    const STREAM_BYTES: usize = 4 * 1024 * 1024;
+    const INJECTED_STREAM_BYTES: usize = 1_024;
+
+    let production_stream_bytes = super::super::maximum_retained_bytes_per_stream(STEP_COUNT);
+    assert_eq!(
+        production_stream_bytes,
+        super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+    );
+    assert!(
+        u64::try_from(STEP_COUNT).unwrap() * production_stream_bytes
+            <= super::super::RUN_LOG_BYTE_BUDGET
+    );
 
     let fixture = PublicationFixture::new();
-    let retained = Arc::<[u8]>::from(vec![b'x'; STREAM_BYTES]);
+    let retained = Arc::<[u8]>::from(vec![b'x'; INJECTED_STREAM_BYTES]);
     let empty = Arc::<[u8]>::from([]);
+    let diagnostic = |retained| {
+        StepDiagnostic::from_streams(
+            CapturedDiagnosticStream::from_parts(retained, 0, true),
+            CapturedDiagnosticStream::from_parts(Arc::clone(&empty), 0, true),
+        )
+    };
     let mut run = run_fixture(&fixture);
+    run.maximum_retained_bytes_per_stream = u64::try_from(INJECTED_STREAM_BYTES).unwrap();
     run.exports.clear();
     run.export_sources.clear();
     run.steps = (0..STEP_COUNT)
         .map(|index| {
             let mut step = succeeded_step(&format!("emit{index}"), BTreeMap::new());
-            step.command_output = Some(StepDiagnostic::from_streams(
-                CapturedDiagnosticStream::from_parts(Arc::clone(&retained), 0, true),
-                CapturedDiagnosticStream::from_parts(Arc::clone(&empty), 0, true),
-            ));
+            step.command_output = Some(diagnostic(Arc::clone(&retained)));
             step
         })
         .collect();
@@ -406,7 +420,22 @@ fn publishes_streams_within_live_tui_run_budget() {
         &fixture.artifacts,
         &run,
     )
-    .expect("all streams retained within the live TUI run budget must be publishable");
+    .expect("all streams retained at the admitted limit must be publishable");
+
+    let oversized = Arc::<[u8]>::from(vec![b'x'; INJECTED_STREAM_BYTES + 1]);
+    run.steps[0].command_output = Some(diagnostic(oversized));
+    let failure = publish_workflow_result(
+        &fixture.destination("tui-over-limit-stream"),
+        &fixture.artifacts,
+        &run,
+    )
+    .unwrap_err();
+    assert_eq!(failure.phase(), LocalPublicationPhase::Serialization);
+    assert_eq!(
+        failure.kind(),
+        LocalPublicationFailureKind::InvalidRunResult
+    );
+    assert_eq!(failure.invariant(), Some(RunResultInvariant::StepMetadata));
 }
 
 #[test]

@@ -521,10 +521,17 @@ async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
 
 #[tokio::test]
 async fn derived_capacity_retains_past_the_old_limit_then_evicts_the_oldest_suffix() {
+    const INJECTED_RECORD_CAPACITY: usize = 18;
+
     let (_temporary, workflow) = resolved_workflow();
     let base = crate::timing::monotonic_now();
     let clock = ControlledClock::new(point(base, 0));
-    let view = model(&workflow, clock);
+    let capacity = StepLogCapacity::new(
+        INJECTED_RECORD_CAPACITY + 1,
+        INJECTED_RECORD_CAPACITY * MAX_NORMALIZED_CHILD_RECORD_BYTES,
+    )
+    .unwrap();
+    let view = model_with_capacity(&workflow, clock, capacity);
 
     view.observe(output(
         "consume",
@@ -558,29 +565,52 @@ async fn derived_capacity_retains_past_the_old_limit_then_evicts_the_oldest_suff
         step(&snapshot, "consume").log.clone()
     };
 
-    for index in 17..257 {
-        view.observe(output(
-            "prepare",
-            CommandOutputSource::StandardOutput,
-            sequence,
-            maximum_record(index),
-        ))
-        .await;
-        sequence = sequence.next();
+    view.observe(output(
+        "prepare",
+        CommandOutputSource::StandardOutput,
+        sequence,
+        maximum_record(17),
+    ))
+    .await;
+    sequence = sequence.next();
+
+    {
+        let snapshot = view.snapshot();
+        let prepare = &step(&snapshot, "prepare").log;
+        assert_eq!(prepare.observed_records, 18);
+        assert_eq!(prepare.retained_records, 18);
+        assert_eq!(
+            prepare.retained_bytes,
+            u64::try_from(INJECTED_RECORD_CAPACITY * MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap()
+        );
+        assert_eq!(prepare.discarded_records, 0);
+        assert!(prepare.records[0].payload.starts_with("record-000"));
+        assert!(prepare.records[17].payload.starts_with("record-017"));
     }
+
+    view.observe(output(
+        "prepare",
+        CommandOutputSource::StandardOutput,
+        sequence,
+        maximum_record(18),
+    ))
+    .await;
 
     let snapshot = view.snapshot();
     let prepare = &step(&snapshot, "prepare").log;
-    assert_eq!(prepare.observed_records, 257);
-    assert_eq!(prepare.retained_records, 256);
-    assert_eq!(prepare.retained_bytes, 4 * 1024 * 1024);
+    assert_eq!(prepare.observed_records, 19);
+    assert_eq!(prepare.retained_records, 18);
+    assert_eq!(
+        prepare.retained_bytes,
+        u64::try_from(INJECTED_RECORD_CAPACITY * MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap()
+    );
     assert_eq!(prepare.discarded_records, 1);
     assert_eq!(
         prepare.discarded_bytes,
         u64::try_from(MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap()
     );
     assert!(prepare.records[0].payload.starts_with("record-001"));
-    assert!(prepare.records[255].payload.starts_with("record-256"));
+    assert!(prepare.records[17].payload.starts_with("record-018"));
     assert_eq!(&step(&snapshot, "consume").log, &consume_before);
 }
 
