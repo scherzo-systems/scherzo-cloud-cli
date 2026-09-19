@@ -9,11 +9,10 @@ use clap::Args;
 use serde::Serialize;
 // jscpd:ignore-end
 
-use crate::execution::workflow::portable_artifact::{
+use crate::execution::{
     ArtifactDiagnostic, ArtifactValidationSummary, PortableArtifactValidation,
-    PortableArtifactValidationFailure, validate_portable_artifact_set,
+    PortableArtifactValidationFailure, validate_portable_artifact_set, visible_text,
 };
-use crate::execution::workflow::presentation::visible_text;
 use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "Validate a portable workflow artifact directory";

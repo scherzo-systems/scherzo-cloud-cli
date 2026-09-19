@@ -5,19 +5,12 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::execution::workflow::archived_attempt::{
-    load_local_archived_attempt, reconcile_current_result_publication,
+use crate::execution::{
+    ColorChoice, FailureDetail, LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot,
+    LocalStatusError, LocalStatusResult, NodeDetail, PresentationConfig, RequestedPresentationMode,
+    RetryIneligibilityReason, TerminalCapabilities, WorkflowResultV1, load_local_archived_attempt,
+    read_local_run_status, reconcile_current_result_publication, styled_terminal_text as styled,
 };
-use crate::execution::workflow::evidence::{FailureDetail, NodeDetail};
-use crate::execution::workflow::local_run::{
-    LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot, LocalStatusError,
-    LocalStatusResult, RetryIneligibilityReason, read_local_run_status,
-};
-use crate::execution::workflow::presentation::{
-    ColorChoice, PresentationConfig, RequestedPresentationMode, TerminalCapabilities,
-    styled_terminal_text as styled,
-};
-use crate::execution::workflow::publication::WorkflowResultV1;
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Show local workflow run status";

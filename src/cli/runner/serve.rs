@@ -3,15 +3,11 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Args;
 
-use crate::execution::claude_code::{
-    ClaudeCodeInstallationFailure, ValidatedClaudeCodeInstallation,
-    discover_and_validate_claude_code_installation,
-};
-use crate::execution::codex::{
-    CodexInstallationFailure, ValidatedCodexInstallation, discover_and_validate_codex_installation,
-};
-use crate::execution::pi::{
-    PiInstallationFailure, ValidatedPiInstallation, discover_and_validate_pi_installation,
+use crate::execution::{
+    ClaudeCodeInstallationFailure, CodexInstallationFailure, PiInstallationFailure,
+    ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
+    discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
+    discover_and_validate_pi_installation,
 };
 use crate::exit_code::ExitCode;
 use crate::runner::service::Config;
@@ -46,7 +42,7 @@ impl Command {
             claude_code_installation,
             codex_installation,
         );
-        match crate::runner::service::run(config) {
+        match crate::runner::service::run(config, crate::build_info::VERSION) {
             Ok(()) => Ok(ExitCode::Success),
             Err(error) => {
                 let exit_code = service_exit_code(&error);
@@ -115,7 +111,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::execution::claude_code::ClaudeCodeIncompatibility;
+    use crate::execution::ClaudeCodeIncompatibility;
     use crate::runner::credential::test_credential;
     use crate::runner::service::ConfigFixture;
 

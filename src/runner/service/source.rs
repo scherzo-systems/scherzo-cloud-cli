@@ -18,10 +18,9 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 use zeroize::Zeroize as _;
 
-use crate::execution::workflow::admission::EnvironmentSnapshot;
-use crate::execution::workflow::artifact::CaptureCancellation;
-use crate::execution::workflow::git_capture::CloudGitCaptureProjection;
-use crate::execution::workflow::resolution::{self, ResolvedWorkflow};
+use crate::execution::{
+    CaptureCancellation, CloudGitCaptureProjection, EnvironmentSnapshot, ResolvedWorkflow, resolve,
+};
 use crate::process::ManagedProcessGroup;
 use crate::runner::credential::Credential;
 use crate::runner::service::config::RepositoryUrlPolicy;
@@ -831,7 +830,7 @@ pub(super) fn resolve_checkout(
     cancellation: &CaptureCancellation,
 ) -> Result<MaterializedSource, MaterializationFailure> {
     ensure_current(cancellation)?;
-    let workflow = resolution::resolve(
+    let workflow = resolve(
         &checkout.source_root,
         Path::new(&checkout.request.workflow_path),
     )
@@ -1751,20 +1750,13 @@ mod tests {
     use nix::unistd::mkfifo;
 
     use super::*;
-    use crate::execution::workflow::admission::{
-        CancellationPolicy, CancellationSource, ExecutionContext, ResolvedInputs,
-        admit_runner_workflow, default_execution_policy_limits,
+    use crate::execution::{
+        ArtifactStaging, CancellationPolicy, CancellationSource, CapturedDiagnosticStream,
+        CapturedValue, CloudCarrierBody, ExecutionContext, ExportValue, FailurePolicy,
+        ResolvedInputs, RunOutcome, StepDiagnostic, StepState, WorkflowNodeRole, WorkflowRunResult,
+        WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
+        admit_runner_workflow, default_execution_policy_limits, prepare_cloud_workflow_result,
     };
-    use crate::execution::workflow::artifact::ArtifactStaging;
-    use crate::execution::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
-    use crate::execution::workflow::document::FailurePolicy;
-    use crate::execution::workflow::publication::{
-        CloudCarrierBody, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
-        WorkflowRunTiming, WorkflowStepTiming, prepare_cloud_workflow_result,
-    };
-    use crate::execution::workflow::runtime::{ExportValue, RunOutcome, StepState};
-    use crate::execution::workflow::validated::WorkflowNodeRole;
-    use crate::execution::workflow::value::CapturedValue;
     use crate::runner::credential::test_credential;
     use crate::runner::telemetry::test_recorder;
 
@@ -2444,7 +2436,7 @@ mod tests {
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap();
-        let digest = resolution::resolve(&repository, Path::new("workflows/workflow.yaml"))
+        let digest = resolve(&repository, Path::new("workflows/workflow.yaml"))
             .unwrap()
             .content_digest
             .value;
@@ -2904,12 +2896,11 @@ mod tests {
                 CloudCarrierBody::Bytes(bytes) => fs::write(destination, bytes).unwrap(),
             }
         }
-        let validation =
-            crate::execution::workflow::portable_artifact::validate_portable_artifact_set(
-                portable.path(),
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+        let validation = crate::execution::validate_portable_artifact_set(
+            portable.path(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(validation.is_valid());
         assert_eq!(
             broker.calls.lock().unwrap().as_slice(),

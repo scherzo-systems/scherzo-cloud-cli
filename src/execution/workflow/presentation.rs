@@ -13,6 +13,7 @@ use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::watch;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::super::ExecutionOutcome;
 use super::admission::{AdmissionFailure, CancellationReason};
 use super::document::FailurePolicy;
 use super::evidence::{BlockedDetail, FailureDetail, Prerequisite, PrimaryIssueDetail};
@@ -288,7 +289,7 @@ pub(crate) enum WorkflowRunPresentationResult {
         human_diagnostic: Option<String>,
     },
     Published {
-        exit_status: u16,
+        outcome: ExecutionOutcome,
         result_directory: String,
     },
     PublicationFailed(LocalPublicationError),
@@ -405,7 +406,7 @@ where
             schema_version: 1,
             command: self.command,
             outcome: "rejected",
-            exit_status: crate::exit_code::ExitCode::GeneralFailure.as_u8(),
+            exit_status: 1,
             phase,
             run_directory: retry_run_directory.as_deref(),
             workflow: workflow_path.map(|path| RejectedWorkflowV1 { path }),
@@ -444,7 +445,7 @@ where
             schema_version: 1,
             command: RETRY_COMMAND,
             outcome: "rejected",
-            exit_status: crate::exit_code::ExitCode::GeneralFailure.as_u8(),
+            exit_status: 1,
             phase: "retry",
             run_directory,
             attempt_number: rejection.attempt_number(),
@@ -1664,7 +1665,7 @@ where
                     return WorkflowRunPresentationResult::Failed(failure);
                 }
                 WorkflowRunPresentationResult::Published {
-                    exit_status: terminal.exit_status(),
+                    outcome: terminal.execution_outcome(),
                     result_directory: terminal.result_directory().to_owned(),
                 }
             }

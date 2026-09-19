@@ -31,7 +31,7 @@ pub(crate) use config::Config;
 #[cfg(test)]
 pub(crate) use test_support::ConfigFixture;
 
-use crate::execution::workflow::cancellation::MAXIMUM_CANCELLATION_GRACE;
+use crate::execution::MAXIMUM_CANCELLATION_GRACE;
 use crate::runner::control_protocol::{ConnectionFailure, ControlError};
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use assignment::{AssignmentDependencies, AssignmentManager};
@@ -330,19 +330,19 @@ pub(crate) fn run_workflow_git_helper() -> bool {
     workflow_git::run_internal_helper()
 }
 
-pub(crate) fn run(config: Config) -> Result<(), ServiceError> {
+pub(crate) fn run(config: Config, service_version: &str) -> Result<(), ServiceError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| ServiceError::BuildRuntime)?;
-    runtime.block_on(run_until_cancelled(config))
+    runtime.block_on(run_until_cancelled(config, service_version))
 }
 
-async fn run_until_cancelled(config: Config) -> Result<(), ServiceError> {
+async fn run_until_cancelled(config: Config, service_version: &str) -> Result<(), ServiceError> {
     let frame_source: Arc<dyn FrameSource> = Arc::new(SystemFrameSource);
     let sleeper: Arc<dyn Sleeper> = Arc::new(TokioSleeper);
     let boot_id = frame_source.public_id("rbt_");
-    let recorder = Recorder::stderr(&boot_id);
+    let recorder = Recorder::stderr(&boot_id, service_version);
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
     run_connection_loop(
@@ -529,7 +529,7 @@ async fn run_connection_loop_with_work_root(
         &boot_id,
         opening_message_id.clone(),
         opening_sequence,
-        crate::build_info::VERSION,
+        recorder.service_version(),
     )
     .map_err(ServiceError::Connection)?;
     let mut attempt = 1_u64;
@@ -862,7 +862,7 @@ async fn run_connection_loop_with_work_root(
                 &boot_id,
                 opening_message_id.clone(),
                 opening_sequence,
-                crate::build_info::VERSION,
+                recorder.service_version(),
             )
             .map_err(ServiceError::Connection)?;
         }
@@ -1194,7 +1194,7 @@ impl ReloadDependencies {
             &self.boot_id,
             opening_message_id.clone(),
             opening_sequence,
-            crate::build_info::VERSION,
+            self.recorder.service_version(),
         )
         .map_err(|error| candidate_control_error(&connection_event, error))?;
         let candidate = connection::authenticate_candidate(
@@ -1336,7 +1336,7 @@ fn connection_event(recorder: &Recorder, config: &Config, boot_id: &str, attempt
         KeyValue::new(telemetry::attribute::RUNNER_BOOT_ID, boot_id.to_owned()),
         KeyValue::new(
             telemetry::attribute::RUNNER_VERSION,
-            crate::build_info::VERSION,
+            recorder.service_version().to_owned(),
         ),
         KeyValue::new(
             telemetry::attribute::CONNECTION_ATTEMPT,
@@ -1500,7 +1500,7 @@ mod tests {
         Sleeper, TokioSleeper, record_startup_retention, run_connection_loop_with_work_root,
         run_until_cancelled_with_dependencies,
     };
-    use crate::execution::workflow::resolution;
+    use crate::execution::resolve;
     use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
     use crate::runner::credential::test_credential;
     use crate::runner::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
@@ -2615,7 +2615,7 @@ mod tests {
 
     fn accepted_assignment_offer(source: &Path) -> Message {
         let commit_oid = fixture_git(source, &["rev-parse", "HEAD"]);
-        let workflow = resolution::resolve(source, Path::new("workflow.yaml"))
+        let workflow = resolve(source, Path::new("workflow.yaml"))
             .expect("resolve accepted assignment workflow");
         let requirements = workflow.capacity.requirements;
         let digest = &workflow.capacity.source_closure_digest;
@@ -3028,7 +3028,7 @@ mod tests {
             assert_eq!(first_hello["sentAt"], "2026-07-23T00:00:00Z");
             assert_eq!(
                 first_hello["payload"]["runnerVersion"],
-                crate::build_info::VERSION
+                crate::runner::telemetry::TEST_SERVICE_VERSION
             );
             let first_sequence = first_hello["sequence"]
                 .as_u64()
@@ -3074,7 +3074,7 @@ mod tests {
             assert_eq!(second_hello["sentAt"], "2026-07-23T00:00:00Z");
             assert_eq!(
                 second_hello["payload"]["runnerVersion"],
-                crate::build_info::VERSION
+                crate::runner::telemetry::TEST_SERVICE_VERSION
             );
         });
 
@@ -3087,10 +3087,10 @@ mod tests {
         let (backoff_delay, release_sleep) = backoff_request(&mut sleep_requests).await;
         let records = capture.records();
         assert!(records.iter().all(|record| {
-            record["service.version"] == crate::build_info::VERSION
+            record["service.version"] == crate::runner::telemetry::TEST_SERVICE_VERSION
                 && record
                     .get("scherzo.runner.version")
-                    .is_none_or(|version| version == crate::build_info::VERSION)
+                    .is_none_or(|version| version == crate::runner::telemetry::TEST_SERVICE_VERSION)
         }));
         let events = capture.events();
         let connection_events: Vec<_> = events
@@ -3100,7 +3100,10 @@ mod tests {
         assert_eq!(connection_events.len(), 1);
         let event = connection_events[0];
         assert_eq!(event["scherzo.connection.failure_kind"], "retryable");
-        assert_eq!(event["scherzo.runner.version"], crate::build_info::VERSION);
+        assert_eq!(
+            event["scherzo.runner.version"],
+            crate::runner::telemetry::TEST_SERVICE_VERSION
+        );
         assert_eq!(event["error.type"], "read_gateway_frame");
         assert_eq!(event["scherzo.outcome"], "disconnected");
         assert_eq!(

@@ -1,8 +1,9 @@
 //! Cargo-workspace and source-boundary architecture tests.
 //!
-//! Slice 1 has four unpublished leaf packages at their final roots. These tests
-//! keep Cargo's package graph, the residual root-module graph, generated-source
-//! privacy, and external-crate ownership aligned with `ARCHITECTURE.md`.
+//! Slice 2A retains execution in the root package behind its final facade. These
+//! tests keep Cargo's package graph, the residual root-module graph, execution
+//! and process seams, generated-source privacy, and external-crate ownership
+//! aligned with `ARCHITECTURE.md`.
 
 #![allow(
     clippy::disallowed_macros,
@@ -220,15 +221,12 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             ],
         ),
         ("error", &["exit_code"]),
-        ("execution", &["build_info", "exit_code", "process"]),
-        ("exit_code", &[]),
+        ("execution", &["process"]),
+        ("exit_code", &["execution"]),
         ("human_auth", &[]),
         ("idempotency", &[]),
         ("process", &[]),
-        (
-            "runner",
-            &["build_info", "execution", "idempotency", "process"],
-        ),
+        ("runner", &["execution", "idempotency", "process"]),
         ("service_auth", &[]),
         ("test_support", &[]),
     ];
@@ -312,6 +310,455 @@ fn residual_module_dependencies_match_architecture() {
         "architecture boundary violations:\n{}",
         violations.join("\n")
     );
+}
+
+const EXECUTION_IMPLEMENTATION_MODULES: [&str; 6] = [
+    "claude_code",
+    "codex",
+    "harness_installation",
+    "owned_tree",
+    "pi",
+    "workflow",
+];
+
+const DIRECT_PROCESS_CONSUMERS: [&str; 10] = [
+    "src/execution/claude_code.rs",
+    "src/execution/claude_code/tests.rs",
+    "src/execution/codex.rs",
+    "src/execution/harness_installation.rs",
+    "src/execution/pi.rs",
+    "src/execution/pi/tests.rs",
+    "src/execution/workflow/child_guard.rs",
+    "src/execution/workflow/git_capture.rs",
+    "src/runner/doctor/git.rs",
+    "src/runner/service/source.rs",
+];
+
+#[test]
+fn execution_facade_and_direct_process_exception_match_slice_two_a() {
+    let root = cli_root();
+    let facade = read_source(&root.join("src/execution/mod.rs"));
+    let mut violations = execution_facade_violations("src/execution/mod.rs", &facade);
+
+    for source in rust_sources(&root.join("src")) {
+        let relative = source.strip_prefix(&root).unwrap();
+        if relative.starts_with("src/execution") {
+            continue;
+        }
+        let relative_text = relative.to_string_lossy().replace('\\', "/");
+        let text = read_source(&source);
+        violations.extend(execution_consumer_violations(&relative_text, &text));
+    }
+
+    for source in rust_sources(&root.join("src")) {
+        let relative = source.strip_prefix(&root).unwrap();
+        let relative_text = relative.to_string_lossy().replace('\\', "/");
+        let text = read_source(&source);
+        if !DIRECT_PROCESS_CONSUMERS.contains(&relative_text.as_str()) {
+            for line_number in root_process_references(&relative_text, &text) {
+                violations.push(format!(
+                    "{relative_text}:{line_number} directly accesses root process outside the Slice 2A inventory"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "execution facade violations:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn execution_boundary_policy_accepts_only_the_slice_two_a_seams() {
+    assert!(
+        execution_facade_violations(
+            "src/execution/mod.rs",
+            "mod workflow;\npub(crate) use workflow::ResolvedWorkflow;\n",
+        )
+        .is_empty()
+    );
+    assert!(
+        execution_consumer_violations(
+            "src/cli/workflow.rs",
+            "use crate::execution::ResolvedWorkflow;",
+        )
+        .is_empty()
+    );
+    for exposed_module in [
+        "pub mod workflow;\n",
+        "pub(crate) mod workflow;\n",
+        "pub(super) mod workflow;\n",
+        "pub(in crate) mod workflow;\n",
+    ] {
+        assert!(
+            !execution_facade_violations("src/execution/mod.rs", exposed_module).is_empty(),
+            "accepted exposed execution module: {exposed_module}"
+        );
+    }
+    for deep_import in [
+        "use crate::execution::workflow::ResolvedWorkflow;",
+        "use crate::execution::{workflow::ResolvedWorkflow};",
+        "use crate::execution::{\n    workflow::ResolvedWorkflow,\n};",
+        "use crate::{execution::workflow::ResolvedWorkflow};",
+        "use crate::{execution::{workflow::ResolvedWorkflow}};",
+    ] {
+        assert!(
+            !execution_consumer_violations("src/cli/workflow.rs", deep_import).is_empty(),
+            "accepted deep execution import: {deep_import}"
+        );
+    }
+    for process_forwarding in [
+        "mod workflow;\npub(crate) use crate::process::CommandRunner;\n",
+        "mod workflow;\npub(crate) use crate::{process::CommandRunner};\n",
+        "mod workflow;\npub(crate) use super::{process::CommandRunner};\n",
+    ] {
+        assert!(
+            !execution_facade_violations("src/execution/mod.rs", process_forwarding).is_empty(),
+            "accepted process forwarding: {process_forwarding}"
+        );
+    }
+    for allowed_process_import in [
+        "use crate::process::CommandRunner;",
+        "use crate::{process::CommandRunner};",
+        "use super::super::super::{process::CommandRunner};",
+    ] {
+        assert!(
+            execution_consumer_violations("src/runner/doctor/git.rs", allowed_process_import)
+                .is_empty(),
+            "rejected inventoried process consumer: {allowed_process_import}"
+        );
+    }
+    for unlisted_process_import in [
+        "use crate::process::CommandRunner;",
+        "use crate::{process::CommandRunner};",
+        "use crate::{\n    process::CommandRunner,\n};",
+        "use super::super::super::{process::CommandRunner};",
+    ] {
+        assert!(
+            !execution_consumer_violations(
+                "src/runner/service/execution.rs",
+                unlisted_process_import,
+            )
+            .is_empty(),
+            "accepted unlisted process consumer: {unlisted_process_import}"
+        );
+    }
+
+    let top_modules = ["cli", "process"].into_iter().map(str::to_owned).collect();
+    let module_path = &["cli".to_owned(), "workflow".to_owned()];
+    assert_eq!(
+        referenced_targets(
+            "use crate::{\n    process::CommandRunner,\n};",
+            module_path,
+            &top_modules,
+        ),
+        vec![(2, "process".to_owned())],
+        "residual dependency scan missed a grouped crate path"
+    );
+    assert_eq!(
+        referenced_targets(
+            "use super::super::{\n    process::CommandRunner,\n};",
+            module_path,
+            &top_modules,
+        ),
+        vec![(2, "process".to_owned())],
+        "residual dependency scan missed a grouped escaping super path"
+    );
+}
+
+#[test]
+fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
+    let root = cli_root();
+    let mut violations = Vec::new();
+    for owner in ["src/execution", "src/runner"] {
+        for source in rust_sources(&root.join(owner)) {
+            let relative = source.strip_prefix(&root).unwrap();
+            let text = read_source(&source);
+            for forbidden in [
+                "crate::build_info",
+                "crate::exit_code",
+                "SCHERZO_CLOUD_VERSION",
+                "SCHERZO_CLOUD_BUILD_IDENTITY",
+                "CARGO_PKG_VERSION",
+            ] {
+                if text.contains(forbidden) {
+                    violations.push(format!(
+                        "{} reads root identity or exit policy through `{forbidden}`",
+                        relative.display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "root policy leaked into execution or runner:\n{}",
+        violations.join("\n")
+    );
+}
+
+fn execution_facade_violations(path: &str, source: &str) -> Vec<String> {
+    let mut violations = exposed_module_declarations(source)
+        .into_iter()
+        .map(|line_number| {
+            format!("{path}:{line_number} exposes an execution implementation module")
+        })
+        .collect::<Vec<_>>();
+    for line_number in root_process_references(path, source) {
+        violations.push(format!(
+            "{path}:{line_number} forwards root process through execution"
+        ));
+    }
+    violations
+}
+
+fn execution_consumer_violations(path: &str, source: &str) -> Vec<String> {
+    let mut violations = private_execution_module_references(source)
+        .into_iter()
+        .map(|(line_number, module)| {
+            format!("{path}:{line_number} names private execution module `{module}`")
+        })
+        .collect::<Vec<_>>();
+    if !DIRECT_PROCESS_CONSUMERS.contains(&path) {
+        for line_number in root_process_references(path, source) {
+            violations.push(format!(
+                "{path}:{line_number} directly accesses root process outside the Slice 2A inventory"
+            ));
+        }
+    }
+    violations
+}
+
+#[derive(Clone, Copy)]
+struct SourceToken<'a> {
+    text: &'a str,
+    line_number: usize,
+}
+
+fn source_tokens(source: &str) -> Vec<SourceToken<'_>> {
+    let mut tokens = Vec::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = strip_line_comment(raw_line);
+        let bytes = line.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if is_ident_byte(bytes[cursor]) {
+                let start = cursor;
+                cursor += 1;
+                while cursor < bytes.len() && is_ident_byte(bytes[cursor]) {
+                    cursor += 1;
+                }
+                tokens.push(SourceToken {
+                    text: &line[start..cursor],
+                    line_number: index + 1,
+                });
+            } else if bytes[cursor] == b':'
+                && bytes.get(cursor + 1).is_some_and(|byte| *byte == b':')
+            {
+                tokens.push(SourceToken {
+                    text: "::",
+                    line_number: index + 1,
+                });
+                cursor += 2;
+            } else {
+                if matches!(bytes[cursor], b'{' | b'}' | b'(' | b')' | b',') {
+                    tokens.push(SourceToken {
+                        text: &line[cursor..cursor + 1],
+                        line_number: index + 1,
+                    });
+                }
+                cursor += 1;
+            }
+        }
+    }
+    tokens
+}
+
+fn rooted_module_references<'a>(source: &'a str, root: &str) -> Vec<(usize, &'a str)> {
+    let tokens = source_tokens(source);
+    let mut references = Vec::new();
+    for index in 0..tokens.len() {
+        if tokens[index].text == root
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| token.text == "::")
+        {
+            references.extend(module_references_at(&tokens, index + 2));
+        }
+    }
+    references
+}
+
+fn escaping_super_module_references(source: &str, module_depth: usize) -> Vec<(usize, &str)> {
+    let tokens = source_tokens(source);
+    let mut references = Vec::new();
+    for index in 0..tokens.len() {
+        if tokens[index].text != "super"
+            || index
+                .checked_sub(1)
+                .and_then(|previous| tokens.get(previous))
+                .is_some_and(|token| token.text == "::")
+        {
+            continue;
+        }
+        let mut supers = 0_usize;
+        let mut cursor = index;
+        while tokens
+            .get(cursor)
+            .is_some_and(|token| token.text == "super")
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.text == "::")
+        {
+            supers += 1;
+            cursor += 2;
+        }
+        if supers >= module_depth {
+            references.extend(module_references_at(&tokens, cursor));
+        }
+    }
+    references
+}
+
+fn module_references_at<'a>(tokens: &[SourceToken<'a>], index: usize) -> Vec<(usize, &'a str)> {
+    module_token_indexes_at(tokens, index)
+        .into_iter()
+        .map(|index| (tokens[index].line_number, tokens[index].text))
+        .collect()
+}
+
+fn module_token_indexes_at(tokens: &[SourceToken<'_>], index: usize) -> Vec<usize> {
+    let Some(next) = tokens.get(index) else {
+        return Vec::new();
+    };
+    if next.text != "{" {
+        return if is_source_identifier(next.text) && next.text != "self" {
+            vec![index]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let mut indexes = Vec::new();
+    let mut depth = 1_usize;
+    let mut entry_start = true;
+    let mut cursor = index + 1;
+    while let Some(token) = tokens.get(cursor) {
+        if depth == 1 && entry_start && is_source_identifier(token.text) {
+            if token.text != "self" {
+                indexes.push(cursor);
+            }
+            entry_start = false;
+        }
+        match token.text {
+            "{" => depth += 1,
+            "}" => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            "," if depth == 1 => entry_start = true,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    indexes
+}
+
+fn is_source_identifier(token: &str) -> bool {
+    token
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| is_ident_byte(*byte))
+}
+
+fn root_process_references(path: &str, source: &str) -> Vec<usize> {
+    let mut references = rooted_module_references(source, "crate");
+    if let Ok(relative) = Path::new(path).strip_prefix("src") {
+        references.extend(escaping_super_module_references(
+            source,
+            module_path_of(relative).len(),
+        ));
+    }
+    let mut line_numbers = references
+        .into_iter()
+        .filter_map(|(line_number, module)| (module == "process").then_some(line_number))
+        .collect::<Vec<_>>();
+    line_numbers.sort_unstable();
+    line_numbers.dedup();
+    line_numbers
+}
+
+fn exposed_module_declarations(source: &str) -> Vec<usize> {
+    let tokens = source_tokens(source);
+    let mut declarations = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.text != "pub" {
+            continue;
+        }
+        let mut cursor = index + 1;
+        if tokens.get(cursor).is_some_and(|token| token.text == "(") {
+            let mut depth = 1_usize;
+            cursor += 1;
+            while let Some(token) = tokens.get(cursor) {
+                match token.text {
+                    "(" => depth += 1,
+                    ")" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            cursor += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                cursor += 1;
+            }
+        }
+        if tokens.get(cursor).is_some_and(|token| token.text == "mod") {
+            declarations.push(token.line_number);
+        }
+    }
+    declarations
+}
+
+fn private_execution_module_references(source: &str) -> Vec<(usize, &'static str)> {
+    let tokens = source_tokens(source);
+    let mut references = Vec::new();
+    for index in 0..tokens.len() {
+        if tokens[index].text != "crate"
+            || tokens.get(index + 1).is_none_or(|token| token.text != "::")
+        {
+            continue;
+        }
+        for execution_index in module_token_indexes_at(&tokens, index + 2)
+            .into_iter()
+            .filter(|index| tokens[*index].text == "execution")
+        {
+            if tokens
+                .get(execution_index + 1)
+                .is_none_or(|token| token.text != "::")
+            {
+                continue;
+            }
+            for (line_number, name) in module_references_at(&tokens, execution_index + 2) {
+                if let Some(module) = execution_implementation_module(name) {
+                    references.push((line_number, module));
+                }
+            }
+        }
+    }
+    references
+}
+
+fn execution_implementation_module(name: &str) -> Option<&'static str> {
+    EXECUTION_IMPLEMENTATION_MODULES
+        .iter()
+        .copied()
+        .find(|module| *module == name)
 }
 
 /// External crates and the package-owned source prefixes that may use them.
@@ -464,18 +911,12 @@ fn referenced_targets(
     module_path: &[String],
     top_modules: &BTreeSet<String>,
 ) -> Vec<(usize, String)> {
-    let mut targets = Vec::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line = strip_line_comment(raw_line);
-        let line_number = index + 1;
-        for target in crate_path_targets(line) {
-            targets.push((line_number, target));
-        }
-        for target in escaping_super_targets(line, module_path.len(), top_modules) {
-            targets.push((line_number, target));
-        }
-    }
-    targets
+    rooted_module_references(text, "crate")
+        .into_iter()
+        .chain(escaping_super_module_references(text, module_path.len()))
+        .filter(|(_, module)| top_modules.contains(*module))
+        .map(|(line_number, module)| (line_number, module.to_owned()))
+        .collect()
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -493,90 +934,6 @@ fn strip_line_comment(line: &str) -> &str {
 
 fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn crate_path_targets(line: &str) -> Vec<String> {
-    const MARKER: &str = "crate::";
-    let bytes = line.as_bytes();
-    let mut targets = Vec::new();
-    let mut search_from = 0;
-    while let Some(found) = line[search_from..].find(MARKER) {
-        let start = search_from + found;
-        search_from = start + MARKER.len();
-        if start > 0 {
-            let before = bytes[start - 1];
-            if is_ident_byte(before) || before == b':' {
-                continue;
-            }
-        }
-        let mut segments = Vec::new();
-        let mut cursor = start + MARKER.len();
-        while segments.len() < 2 {
-            let segment_start = cursor;
-            while cursor < bytes.len() && is_ident_byte(bytes[cursor]) {
-                cursor += 1;
-            }
-            if cursor == segment_start {
-                break;
-            }
-            segments.push(&line[segment_start..cursor]);
-            if line[cursor..].starts_with("::") {
-                cursor += 2;
-            } else {
-                break;
-            }
-        }
-        if let Some(first) = segments.first()
-            && first
-                .chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_lowercase())
-        {
-            targets.push(segments.join("::"));
-        }
-    }
-    targets
-}
-
-fn escaping_super_targets(
-    line: &str,
-    module_depth: usize,
-    top_modules: &BTreeSet<String>,
-) -> Vec<String> {
-    const MARKER: &str = "super::";
-    let bytes = line.as_bytes();
-    let mut targets = Vec::new();
-    let mut search_from = 0;
-    while let Some(found) = line[search_from..].find(MARKER) {
-        let start = search_from + found;
-        if start > 0 {
-            let before = bytes[start - 1];
-            if is_ident_byte(before) || before == b':' {
-                search_from = start + MARKER.len();
-                continue;
-            }
-        }
-        let mut supers = 0;
-        let mut cursor = start;
-        while line[cursor..].starts_with(MARKER) {
-            supers += 1;
-            cursor += MARKER.len();
-        }
-        search_from = cursor;
-        if supers < module_depth {
-            continue;
-        }
-        let segment_start = cursor;
-        let mut segment_end = cursor;
-        while segment_end < bytes.len() && is_ident_byte(bytes[segment_end]) {
-            segment_end += 1;
-        }
-        let ident = &line[segment_start..segment_end];
-        if top_modules.contains(ident) {
-            targets.push(ident.to_string());
-        }
-    }
-    targets
 }
 
 fn is_path_prefix(target: &str, prefix: &str) -> bool {

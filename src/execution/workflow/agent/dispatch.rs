@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use super::{
     AgentAdapter, AgentFailureCause, AgentObservationSink, AgentStartCallback,
@@ -74,6 +75,7 @@ pub(crate) fn production_agent_dispatcher<Clock, Observer>(
     maximum_diagnostic_stream_bytes: NonZeroU64,
     clock: Clock,
     observer: Observer,
+    client_version: &str,
 ) -> io::Result<ProductionAgentDispatcher<Clock, Observer>>
 where
     Clock: Clone,
@@ -96,6 +98,7 @@ where
         maximum_diagnostic_stream_bytes,
         clock,
         observer,
+        Arc::from(client_version),
     )?;
     Ok(ClosedAgentDispatcher::new(pi, claude_code, codex))
 }

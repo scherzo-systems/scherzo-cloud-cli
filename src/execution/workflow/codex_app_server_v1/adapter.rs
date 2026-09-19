@@ -57,6 +57,7 @@ pub(crate) struct CodexAppServerV1Adapter<Clock, Observer, Worker = ProcessResul
     clock: Clock,
     observer: Observer,
     validation_worker: Worker,
+    client_version: Arc<str>,
     #[cfg(test)]
     synthetic_model_provider: Option<Arc<str>>,
 }
@@ -70,6 +71,7 @@ impl<Clock, Observer> CodexAppServerV1Adapter<Clock, Observer, ProcessResultVali
         maximum_diagnostic_stream_bytes: NonZeroU64,
         clock: Clock,
         observer: Observer,
+        client_version: Arc<str>,
     ) -> io::Result<Self> {
         Ok(Self {
             diagnostics,
@@ -77,6 +79,7 @@ impl<Clock, Observer> CodexAppServerV1Adapter<Clock, Observer, ProcessResultVali
             clock,
             observer,
             validation_worker: ProcessResultValidationWorker::for_current_executable()?,
+            client_version,
             #[cfg(test)]
             synthetic_model_provider: None,
         })
@@ -95,6 +98,7 @@ impl<Clock, Observer, Worker> CodexAppServerV1Adapter<Clock, Observer, Worker> {
         clock: Clock,
         observer: Observer,
         validation_worker: Worker,
+        client_version: Arc<str>,
         synthetic_model_provider: Option<Arc<str>>,
     ) -> Self {
         Self {
@@ -103,6 +107,7 @@ impl<Clock, Observer, Worker> CodexAppServerV1Adapter<Clock, Observer, Worker> {
             clock,
             observer,
             validation_worker,
+            client_version,
             synthetic_model_provider,
         }
     }
@@ -136,6 +141,7 @@ where
             clock: self.clock.clone(),
             observer: self.observer.clone(),
             validation_worker: self.validation_worker.clone(),
+            client_version: Arc::clone(&self.client_version),
             #[cfg(test)]
             synthetic_model_provider: self.synthetic_model_provider.clone(),
         }
@@ -262,6 +268,7 @@ where
             expected_cwd,
             codex_home,
             sqlite_home,
+            Arc::clone(&self.client_version),
             Arc::from(invocation.adapter().version()),
             Arc::from(configuration.model.as_str()),
             Arc::from(configuration.effort.as_str()),

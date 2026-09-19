@@ -5,18 +5,11 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use crate::execution::workflow::archived_attempt::{
-    ArchivedAttemptLoadError, load_local_archived_attempt,
-};
-use crate::execution::workflow::archived_presentation::{
-    ArchivedViewOutput, ineligibility_code, operational_error_code,
-};
-use crate::execution::workflow::presentation::{
-    PresentationConfig, PresentationFailure, PresentationMode, TerminalCapabilities,
-};
-use crate::execution::workflow::presentation_feed::normalize_terminal_scalar;
-use crate::execution::workflow::terminal_host::archived::{
-    ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
+use crate::execution::{
+    ArchivedAttemptLoadError, ArchivedTerminalHostExit, ArchivedViewOutput,
+    ArchivedWorkflowTerminalHost, PresentationConfig, PresentationFailure, PresentationMode,
+    TerminalCapabilities, ineligibility_code, load_local_archived_attempt,
+    normalize_terminal_scalar, operational_error_code,
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
 
@@ -178,7 +171,7 @@ async fn write_noninteractive(
     tokio::select! {
         biased;
         result = &mut job => match result {
-            Ok(Ok(exit)) => Ok(exit),
+            Ok(Ok(outcome)) => Ok(outcome.into()),
             Ok(Err(error)) => Err(anyhow::Error::new(error).into()),
             Err(error) => Err(anyhow::Error::new(error)
                 .context("produce workflow view output")

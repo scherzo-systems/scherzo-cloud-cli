@@ -20,7 +20,7 @@ use rustix::process::{wait, waitpgid};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
-use crate::exit_code::ExitCode;
+use super::super::ExecutionOutcome;
 
 use super::cancellation::{CancellationFlag, MAXIMUM_CANCELLATION_GRACE};
 #[cfg(any(target_vendor = "apple", test))]
@@ -547,7 +547,7 @@ pub(crate) fn internal_worker_requested() -> bool {
     )
 }
 
-pub(crate) fn run_internal_worker() -> ExitCode {
+pub(crate) fn run_internal_worker() -> ExecutionOutcome {
     let mode = std::env::var(INTERNAL_WORKER_ENVIRONMENT);
     let result = match mode.as_deref() {
         Ok(GUARD_WORKER) => run_guard_worker(),
@@ -555,12 +555,12 @@ pub(crate) fn run_internal_worker() -> ExitCode {
         _ => Err(()),
     };
     if result.is_ok() {
-        ExitCode::Success
+        ExecutionOutcome::Succeeded
     } else {
         if let (Ok(mode), Ok(root)) = (mode, internal_root()) {
             let _ = write_atomic(&root.join(WORKER_FAILURE_FILE), mode.as_bytes());
         }
-        ExitCode::GeneralFailure
+        ExecutionOutcome::Failed
     }
 }
 

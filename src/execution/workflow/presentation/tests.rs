@@ -1036,7 +1036,10 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
         .await;
     assert!(matches!(
         plain.finish(&run, PublicationPresentation::Published(&plain_terminal)),
-        WorkflowRunPresentationResult::Published { exit_status: 0, .. }
+        WorkflowRunPresentationResult::Published {
+            outcome: ExecutionOutcome::Succeeded,
+            ..
+        }
     ));
 
     let json_stdout = SharedWriter::default();
@@ -1066,7 +1069,10 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
     .await;
     assert!(matches!(
         json.finish(&run, PublicationPresentation::Published(&json_terminal)),
-        WorkflowRunPresentationResult::Published { exit_status: 0, .. }
+        WorkflowRunPresentationResult::Published {
+            outcome: ExecutionOutcome::Succeeded,
+            ..
+        }
     ));
 
     let plain_view = plain_stdout.text();
@@ -1122,7 +1128,10 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
             &run,
             PublicationPresentation::Published(&cleanup_terminal),
         ),
-        WorkflowRunPresentationResult::Published { exit_status: 0, .. }
+        WorkflowRunPresentationResult::Published {
+            outcome: ExecutionOutcome::Succeeded,
+            ..
+        }
     ));
     assert!(cleanup_stdout.text().is_empty());
     assert!(
@@ -1162,7 +1171,10 @@ fn tui_handoff_uses_the_standard_summary_without_reopening_live_output() {
 
     assert!(matches!(
         presented,
-        WorkflowRunPresentationResult::Published { exit_status: 0, .. }
+        WorkflowRunPresentationResult::Published {
+            outcome: ExecutionOutcome::Succeeded,
+            ..
+        }
     ));
     let summary = stdout.text();
     assert!(summary.starts_with("\n── summary ─"));
@@ -1281,7 +1293,7 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
             PublicationPresentation::Published(&cancelled_terminal),
         ),
         WorkflowRunPresentationResult::Published {
-            exit_status: 143,
+            outcome: ExecutionOutcome::Terminated,
             ..
         }
     ));

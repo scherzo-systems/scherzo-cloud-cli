@@ -18,7 +18,9 @@ use rustix::fs::{
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitTeardownReport};
-use crate::execution::owned_tree::{self, RemovalError};
+use crate::execution::{
+    RemovalError, open_directory_at, open_regular_file_at, remove_open_tree_at,
+};
 
 const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
 const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
@@ -215,7 +217,7 @@ impl TreeRemover for SystemTreeRemover {
         }
         let link = tree.link().ok_or_else(safety_removal_error)?;
         let directory = link.directory.as_ref().ok_or_else(safety_removal_error)?;
-        owned_tree::remove_open_tree_at(
+        remove_open_tree_at(
             link.parent.as_ref(),
             link.identity.as_ref(),
             directory.as_ref(),
@@ -861,9 +863,8 @@ impl DirectoryLink {
             AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|_| ())?;
-        let directory = Arc::new(
-            owned_tree::open_directory_at(parent.as_ref(), identity.as_ref()).map_err(|_| ())?,
-        );
+        let directory =
+            Arc::new(open_directory_at(parent.as_ref(), identity.as_ref()).map_err(|_| ())?);
         let opened = fstat(directory.as_ref()).map_err(|_| ())?;
         let named = statat(
             parent.as_ref(),
@@ -1695,8 +1696,7 @@ fn read_private_record_at(
     name: &str,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, ()> {
-    let (descriptor, metadata) =
-        owned_tree::open_regular_file_at(directory, name).map_err(|_| ())?;
+    let (descriptor, metadata) = open_regular_file_at(directory, name).map_err(|_| ())?;
     if !safe_private_file_stat(&metadata) {
         return Err(());
     }
@@ -2771,11 +2771,11 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let environment = crate::execution::workflow::admission::EnvironmentSnapshot::new([(
+        let environment = crate::execution::EnvironmentSnapshot::new([(
             "PATH",
             std::env::var_os("PATH").unwrap(),
         )]);
-        let cancellation = crate::execution::workflow::artifact::CaptureCancellation::default();
+        let cancellation = crate::execution::CaptureCancellation::default();
         let authority = super::super::workflow_git::WorkflowGitAuthority::install(
             super::super::workflow_git::WorkflowGitInstall {
                 broker: super::super::source::test_support::unavailable_source_broker(),

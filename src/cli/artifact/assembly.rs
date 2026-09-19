@@ -11,9 +11,7 @@ use scherzo_cloud_api::{
 };
 use scherzo_cloud_support::valid_typed_id;
 
-use crate::execution::workflow::portable_artifact::{
-    PortableArtifactValidationFailure, validate_portable_artifact_set,
-};
+use crate::execution::{PortableArtifactValidationFailure, validate_portable_artifact_set};
 
 const INVENTORY_PAGE_LIMIT: u16 = 200;
 const CAPABILITY_BATCH_SIZE: usize = 100;
@@ -712,7 +710,7 @@ mod tests {
             },
             "commandOutputPolicy": {
                 "encoding": "base64",
-                "maximumRetainedBytesPerStream": crate::execution::workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM
+                "maximumRetainedBytesPerStream": crate::execution::MAXIMUM_RETAINED_BYTES_PER_STREAM
             },
             "outcome": "succeeded",
             "forceAbort": null,

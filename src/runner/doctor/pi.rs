@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::{
     CheckDescriptor, DoctorCheck, Outcome, capability_failure_details, compatible_harness_outcome,
 };
-use crate::execution::pi::{
+use crate::execution::{
     PI_JSON_V1_QUALIFICATION_VERSION, PI_JSON_V1_SUPPORTED_RANGE, PiCompatibilityProfile,
     PiIncompatibility, PiInstallationFailure, PiProbe, discover_and_validate_pi_installation,
 };

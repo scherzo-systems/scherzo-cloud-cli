@@ -2,12 +2,10 @@ use std::io::{self, Write};
 
 use clap::Args;
 
-use crate::execution::workflow::admission::{CancellationSource, admit_local_workflow};
-use crate::execution::workflow::archived_attempt::reconcile_current_result_publication;
-use crate::execution::workflow::local_run::{
-    LocalRetryBeginError, LocalRetryOpen, acquire_local_retry,
+use crate::execution::{
+    CancellationSource, LocalRetryBeginError, LocalRetryOpen, WorkflowRunOutput,
+    acquire_local_retry, admit_local_workflow, reconcile_current_result_publication,
 };
-use crate::execution::workflow::presentation::WorkflowRunOutput;
 
 pub(super) const ABOUT: &str = "Retry a local workflow run";
 pub(super) const AFTER_HELP: &str = "Retry eligibility:
@@ -133,8 +131,8 @@ impl Command {
 }
 
 fn render_retry_rejection(
-    config: crate::execution::workflow::presentation::PresentationConfig,
-    rejection: &crate::execution::workflow::local_run::LocalRetryRejection,
+    config: crate::execution::PresentationConfig,
+    rejection: &crate::execution::LocalRetryRejection,
 ) -> super::super::CommandResult {
     let output = WorkflowRunOutput::new(config, io::stdout(), io::stderr())
         .for_retry(rejection.run_directory());

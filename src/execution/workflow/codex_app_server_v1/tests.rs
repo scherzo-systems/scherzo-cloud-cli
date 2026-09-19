@@ -8,6 +8,7 @@ use super::*;
 const THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
 const CODEX_HOME: &str = "/synthetic/codex-home";
 const SQLITE_HOME: &str = "/synthetic/sqlite-home";
+const CLIENT_VERSION: &str = "0.0.0-test";
 
 fn parser(
     value_kind: AgentValueKind,
@@ -32,6 +33,7 @@ fn parser_with_system_prompt(
         Arc::from("/synthetic/project"),
         Arc::from(CODEX_HOME),
         Arc::from(SQLITE_HOME),
+        Arc::from(CLIENT_VERSION),
         Arc::from("0.147.0"),
         Arc::from("scherzo-loopback"),
         Arc::from("high"),
@@ -309,6 +311,7 @@ fn admitted_text_attachment_fits_the_initial_native_turn() {
         Arc::from("/synthetic/project"),
         Arc::from(CODEX_HOME),
         Arc::from(SQLITE_HOME),
+        Arc::from(CLIENT_VERSION),
         Arc::from("0.147.0"),
         Arc::from("scherzo-loopback"),
         Arc::from("high"),

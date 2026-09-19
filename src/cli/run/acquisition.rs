@@ -532,7 +532,7 @@ fn input_name(value: Option<&OsString>) -> Result<&str, InputAcquisitionFailure>
 }
 
 fn validate_name(name: &str) -> Result<(), InputAcquisitionFailure> {
-    if crate::execution::workflow::is_input_name(name) {
+    if crate::execution::is_input_name(name) {
         Ok(())
     } else {
         Err(InputAcquisitionFailure::InvalidName)
@@ -541,7 +541,7 @@ fn validate_name(name: &str) -> Result<(), InputAcquisitionFailure> {
 
 fn media_type(value: Option<&OsString>) -> Result<String, InputAcquisitionFailure> {
     let value = string_argument(value)?;
-    if crate::execution::workflow::is_valid_media_type(value) {
+    if crate::execution::is_valid_media_type(value) {
         Ok(value.to_owned())
     } else {
         Err(InputAcquisitionFailure::InvalidMediaType)

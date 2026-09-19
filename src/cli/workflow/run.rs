@@ -16,60 +16,33 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::unix::AsyncFd;
 
-use crate::execution::AgentHarnessInstallationFailure;
-use crate::execution::claude_code::discover_and_validate_claude_code_installation;
-use crate::execution::codex::discover_and_validate_codex_installation;
-use crate::execution::pi::discover_and_validate_pi_installation;
-use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 #[cfg(test)]
-use crate::execution::workflow::admission::admit_workflow;
-use crate::execution::workflow::admission::{
-    AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource,
-    EnvironmentSnapshot, ExecutionContext, ResolvedAttachment, ResolvedFile, ResolvedInput,
-    ResolvedInputs, ResolvedJsonInput, admit_local_workflow, default_execution_policy_limits,
-};
-use crate::execution::workflow::agent::WorkflowRunId;
-use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
-use crate::execution::workflow::agent_input::AgentInputStaging;
-use crate::execution::workflow::artifact::ArtifactStaging;
-use crate::execution::workflow::coordinator::CoordinationError;
-use crate::execution::workflow::coordinator::CoordinatorClock;
-use crate::execution::workflow::diagnostic::StepDiagnosticLog;
-use crate::execution::workflow::execution::{WorkflowExecutionResult, execute_workflow};
-use crate::execution::workflow::input::InputStaging;
-use crate::execution::workflow::invocation_accounting::InvocationAccountingLog;
-use crate::execution::workflow::local_run::{
-    DurableDeadline, InitialLocalRun, LocalAttemptOwner, LocalAttemptOwnershipReleased,
-    PublicationFailurePhaseV1,
-};
-use crate::execution::workflow::observation::{ExecutionObservation, ExecutionObserver};
-use crate::execution::workflow::presentation::{
-    ColorChoice, PresentationConfig, PresentationFailure, PresentationFailureOperation,
-    PresentationMode, PublicationPresentation, RequestedPresentationMode, SystemObservationClock,
-    TerminalCapabilities, WorkflowRunOutput, WorkflowRunPresentation,
-    WorkflowRunPresentationResult,
-};
-use crate::execution::workflow::presentation_feed::DisplayDeadline;
-use crate::execution::workflow::publication::{
-    LocalPublicationError, LocalPublicationPhase, RecoveryInvocationDiagnosticV1,
-    RecoveryInvocationStateV1, RecoveryInvocationV1, WorkflowRunCancellation,
-    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunResult,
-    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
-    WorkflowStepTiming, command_output_v1, prepare_attempt_result_destination,
-    publish_prepared_workflow_result, step_recovery_summary_v1, summary_disposition_matches,
-};
-use crate::execution::workflow::resolution::{ResolvedWorkflow, resolve_workflow_file};
-use crate::execution::workflow::run_timing::{
-    ObservationClock, RunTimingObservation, RunTimingSnapshot,
-};
-use crate::execution::workflow::run_view_model::{
-    WorkflowRunCleanupResult, WorkflowRunPublicationResult, WorkflowRunViewModel,
-};
-use crate::execution::workflow::runtime::RunOutcome;
-use crate::execution::workflow::step_runtime::AgentExecution;
-use crate::execution::workflow::terminal_host::{TerminalHostExit, WorkflowTerminalHost};
-use crate::execution::workflow::validated::{
-    ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, WorkflowNodeRole,
+use crate::execution::admit_workflow;
+use crate::execution::{
+    ActionId, AdmittedWorkflow, AgentExecution, AgentHarnessInstallationFailure, AgentInputStaging,
+    ArtifactStaging, CancellationPolicy, CancellationReason, CancellationSource, ColorChoice,
+    CoordinationError, CoordinatorClock, DisplayDeadline, DurableDeadline,
+    DurableInvocationStateV1, DurableInvocationV1, EnvironmentSnapshot, ExecutionContext,
+    ExecutionObservation, ExecutionObserver, FailurePolicy, InitialLocalRun, InputStaging,
+    InvocationAccountingLog, LocalAttemptOwner, LocalAttemptOwnershipReleased,
+    LocalPublicationError, LocalPublicationPhase, MAXIMUM_PARALLEL_STEPS, ObservationClock,
+    PresentationConfig, PresentationFailure, PresentationFailureOperation, PresentationMode,
+    PublicationFailurePhaseV1, PublicationPresentation, RecoveryDiagnosticKindV1,
+    RecoveryInvocationDiagnosticV1, RecoveryInvocationStateV1, RecoveryInvocationV1,
+    RequestedPresentationMode, ResolvedAttachment, ResolvedFile, ResolvedInput, ResolvedInputs,
+    ResolvedJsonInput, ResolvedWorkflow, RunOutcome, RunTimingObservation, RunTimingSnapshot,
+    StepDiagnosticLog, SystemObservationClock, TerminalCapabilities, TerminalHostExit,
+    TransitionSequence, ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep,
+    WorkflowExecutionResult, WorkflowNodeRole, WorkflowRunCancellation, WorkflowRunCleanupResult,
+    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunOutput,
+    WorkflowRunPresentation, WorkflowRunPresentationResult, WorkflowRunPublicationResult,
+    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1,
+    WorkflowRunTiming, WorkflowRunViewModel, WorkflowStepTiming, WorkflowTerminalHost,
+    admit_local_workflow, command_output_v1, default_execution_policy_limits,
+    discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
+    discover_and_validate_pi_installation, execute_workflow, prepare_attempt_result_destination,
+    production_agent_dispatcher, publish_prepared_workflow_result, resolve_workflow_file,
+    step_recovery_summary_v1, summary_disposition_matches,
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
 
@@ -492,6 +465,7 @@ pub(super) async fn execute_owned_attempt(
                 maximum_log_bytes,
                 SystemExecutionClock,
                 observer.clone(),
+                crate::build_info::VERSION,
             ) else {
                 signal_task.abort();
                 settle_before_execution_failure(&owned_run);
@@ -688,9 +662,7 @@ pub(super) fn rejection_exit(result: WorkflowRunPresentationResult) -> super::su
 
 fn presentation_exit_code(result: WorkflowRunPresentationResult) -> super::super::CommandResult {
     match result {
-        WorkflowRunPresentationResult::Published { exit_status, .. } => {
-            Ok(ExitCode::from_u16(exit_status).unwrap_or(ExitCode::GeneralFailure))
-        }
+        WorkflowRunPresentationResult::Published { outcome, .. } => Ok(outcome.into()),
         WorkflowRunPresentationResult::Rejected {
             human_diagnostic: Some(diagnostic),
         } => Err(anyhow!(diagnostic).into()),
@@ -960,7 +932,7 @@ fn input_argument<'a>(value: Option<&'a OsString>, description: &str) -> anyhow:
 }
 
 fn validate_input_name(name: &str) -> anyhow::Result<()> {
-    if !crate::execution::workflow::is_input_name(name) {
+    if !crate::execution::is_input_name(name) {
         return Err(anyhow!("invalid Workflow V1 input name"));
     }
     Ok(())
@@ -1697,13 +1669,13 @@ fn publication_failure_phase(phase: LocalPublicationPhase) -> PublicationFailure
 
 struct LocalRunEvidence<'a> {
     diagnostics: &'a StepDiagnosticLog,
-    durable_invocations: &'a [crate::execution::workflow::local_run::DurableInvocationV1],
+    durable_invocations: &'a [DurableInvocationV1],
     timing: RunTimingSnapshot,
 }
 
 fn build_run_result(
     workflow: &ResolvedWorkflow,
-    admitted: &crate::execution::workflow::admission::AdmittedWorkflow,
+    admitted: &AdmittedWorkflow,
     execution: WorkflowExecutionResult<ExecutionInstant>,
     evidence: LocalRunEvidence<'_>,
     run_timing: WorkflowRunTiming,
@@ -1751,10 +1723,10 @@ fn build_run_result(
             }
         };
         let (kind, failure_policy) = match workflow.definition.steps.get(id) {
-            Some(crate::execution::workflow::validated::ValidatedStep::Command(command)) => {
+            Some(ValidatedStep::Command(command)) => {
                 (WorkflowRunStepKind::Command, command.common.failure_policy)
             }
-            Some(crate::execution::workflow::validated::ValidatedStep::Agent(agent)) => {
+            Some(ValidatedStep::Agent(agent)) => {
                 (WorkflowRunStepKind::Agent, agent.common.failure_policy)
             }
             None => return Err(invalid_terminal_result_error()),
@@ -1888,7 +1860,7 @@ fn build_run_result(
 
 fn project_recovery_invocations(
     step_id: &str,
-    durable: &[crate::execution::workflow::local_run::DurableInvocationV1],
+    durable: &[DurableInvocationV1],
     diagnostics: &StepDiagnosticLog,
 ) -> anyhow::Result<Vec<RecoveryInvocationV1>> {
     let mut projected = Vec::new();
@@ -1907,10 +1879,8 @@ fn project_recovery_invocations(
         let duration = (finished - started).whole_milliseconds();
         let duration_milliseconds =
             u64::try_from(duration).map_err(|_| invalid_terminal_result_error())?;
-        let action = crate::execution::workflow::runtime::ActionId {
-            transition_sequence: crate::execution::workflow::runtime::TransitionSequence(
-                invocation.invocation_id,
-            ),
+        let action = ActionId {
+            transition_sequence: TransitionSequence(invocation.invocation_id),
         };
         let retained = diagnostics.get_invocation(step_id, action);
         let command_output = retained
@@ -1927,14 +1897,10 @@ fn project_recovery_invocations(
                 .as_ref()
                 .ok_or_else(invalid_terminal_result_error)?;
             let stream = match diagnostic.kind {
-                crate::execution::workflow::publication::RecoveryDiagnosticKindV1::CommandStdout
-                | crate::execution::workflow::publication::RecoveryDiagnosticKindV1::AgentHarnessStdout => {
-                    output.stdout.clone()
-                }
-                crate::execution::workflow::publication::RecoveryDiagnosticKindV1::CommandStderr
-                | crate::execution::workflow::publication::RecoveryDiagnosticKindV1::AgentHarnessStderr => {
-                    output.stderr.clone()
-                }
+                RecoveryDiagnosticKindV1::CommandStdout
+                | RecoveryDiagnosticKindV1::AgentHarnessStdout => output.stdout.clone(),
+                RecoveryDiagnosticKindV1::CommandStderr
+                | RecoveryDiagnosticKindV1::AgentHarnessStderr => output.stderr.clone(),
             };
             if stream.retained_bytes != diagnostic.retained_bytes
                 || stream.discarded_bytes != diagnostic.discarded_bytes
@@ -1955,13 +1921,9 @@ fn project_recovery_invocations(
             target_execution: invocation.target_execution,
             recovery_round: invocation.recovery_round,
             state: match invocation.state {
-                crate::execution::workflow::local_run::DurableInvocationStateV1::Settled => {
-                    RecoveryInvocationStateV1::Settled
-                }
-                crate::execution::workflow::local_run::DurableInvocationStateV1::Cancelled => {
-                    RecoveryInvocationStateV1::Cancelled
-                }
-                crate::execution::workflow::local_run::DurableInvocationStateV1::Active => {
+                DurableInvocationStateV1::Settled => RecoveryInvocationStateV1::Settled,
+                DurableInvocationStateV1::Cancelled => RecoveryInvocationStateV1::Cancelled,
+                DurableInvocationStateV1::Active => {
                     return Err(invalid_terminal_result_error());
                 }
             },
@@ -1983,26 +1945,18 @@ fn project_recovery_invocations(
 fn finalizer_kind_and_policy(
     workflow: &ResolvedWorkflow,
     id: &str,
-) -> Option<(
-    WorkflowRunStepKind,
-    crate::execution::workflow::document::FailurePolicy,
-)> {
+) -> Option<(WorkflowRunStepKind, FailurePolicy)> {
     let finalizer = workflow.definition.finalizers.get(id)?;
     let (kind, policy) = match &finalizer.body {
-        crate::execution::workflow::validated::ValidatedStep::Command(command) => {
+        ValidatedStep::Command(command) => {
             (WorkflowRunStepKind::Command, command.common.failure_policy)
         }
-        crate::execution::workflow::validated::ValidatedStep::Agent(agent) => {
-            (WorkflowRunStepKind::Agent, agent.common.failure_policy)
-        }
+        ValidatedStep::Agent(agent) => (WorkflowRunStepKind::Agent, agent.common.failure_policy),
     };
     Some((kind, policy))
 }
 
-fn finalizer_failure_policy(
-    workflow: &ResolvedWorkflow,
-    id: &str,
-) -> Option<crate::execution::workflow::document::FailurePolicy> {
+fn finalizer_failure_policy(workflow: &ResolvedWorkflow, id: &str) -> Option<FailurePolicy> {
     finalizer_kind_and_policy(workflow, id).map(|(_, policy)| policy)
 }
 
@@ -2041,11 +1995,9 @@ mod tests {
     use time::format_description::well_known::Rfc3339;
 
     use super::*;
-    use crate::execution::workflow::observation::TransitionObservation;
-    use crate::execution::workflow::resolution::resolve;
-    use crate::execution::workflow::run_timing::ObservationTime;
-    use crate::execution::workflow::runtime::{
-        SchedulingGate, StepStateKind, TransitionEvent, TransitionSequence, WorkflowState,
+    use crate::execution::{
+        ObservationTime, SchedulingGate, StepStateKind, TransitionEvent, TransitionObservation,
+        TransitionSequence, WorkflowState, resolve,
     };
 
     #[derive(Clone)]
@@ -2764,8 +2716,8 @@ mod tests {
             event: TransitionEvent::Step {
                 sequence: TransitionSequence::default(),
                 step: "step".to_owned(),
-                role: crate::execution::workflow::validated::WorkflowNodeRole::Step,
-                failure_policy: crate::execution::workflow::document::FailurePolicy::Required,
+                role: WorkflowNodeRole::Step,
+                failure_policy: FailurePolicy::Required,
                 from,
                 to,
             },

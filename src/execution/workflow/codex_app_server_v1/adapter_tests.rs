@@ -744,6 +744,7 @@ fn start_fixture_with_clock_and_synthetic_model_provider<Clock: CoordinatorClock
         clock,
         NoopExecutionObserver,
         InlineValidationWorker,
+        Arc::from("0.0.0-test"),
         synthetic_model_provider,
     );
     let (started, start) = agent_start_channel();

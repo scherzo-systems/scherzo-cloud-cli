@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::{CheckDescriptor, DoctorCheck, Outcome, compatible_harness_outcome};
-use crate::execution::codex::{
+use crate::execution::{
     CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CODEX_APP_SERVER_V1_SUPPORTED_RANGE,
     CodexCompatibilityProfile, CodexIncompatibility, CodexInstallationFailure, CodexProbe,
     discover_and_validate_codex_installation,

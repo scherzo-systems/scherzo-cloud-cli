@@ -5,11 +5,9 @@ use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 
-use crate::execution::workflow::rejection::{
-    RejectionDiagnostic as Diagnostic, human_resolution_remedy,
-};
-use crate::execution::workflow::resolution::{
-    ResolutionFailure, ResolvedWorkflow, resolve_workflow_file,
+use crate::execution::{
+    RejectionDiagnostic as Diagnostic, ResolutionFailure, ResolvedWorkflow,
+    human_resolution_remedy, resolve_workflow_file,
 };
 use crate::exit_code::ExitCode;
 
@@ -106,15 +104,13 @@ fn human_required_inputs(workflow: &ResolvedWorkflow) -> String {
         .join(", ")
 }
 
-fn input_kind(kind: crate::execution::workflow::validated::WorkflowValueType) -> &'static str {
+fn input_kind(kind: crate::execution::WorkflowValueType) -> &'static str {
     match kind {
-        crate::execution::workflow::validated::WorkflowValueType::Text => "text",
-        crate::execution::workflow::validated::WorkflowValueType::AttachmentCollection => {
-            "attachments"
-        }
-        crate::execution::workflow::validated::WorkflowValueType::Json => "json",
-        crate::execution::workflow::validated::WorkflowValueType::File => "file",
-        crate::execution::workflow::validated::WorkflowValueType::GitBranch => "git_branch",
+        crate::execution::WorkflowValueType::Text => "text",
+        crate::execution::WorkflowValueType::AttachmentCollection => "attachments",
+        crate::execution::WorkflowValueType::Json => "json",
+        crate::execution::WorkflowValueType::File => "file",
+        crate::execution::WorkflowValueType::GitBranch => "git_branch",
     }
 }
 

@@ -33,7 +33,6 @@ const TURN_INTERRUPT_REQUEST_ID: RequestId = RequestId(5);
 const CORRECTION_TURN_START_REQUEST_ID: RequestId = RequestId(6);
 const MAXIMUM_CORRECTION_TURNS: u8 = 1;
 const CLIENT_NAME: &str = "scherzo-cloud";
-const CLIENT_VERSION: &str = crate::build_info::VERSION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CodexAppServerV1ProtocolLimits {
@@ -413,6 +412,7 @@ impl CodexAppServerV1Parser {
         expected_cwd: Arc<str>,
         codex_home: Arc<str>,
         sqlite_home: Arc<str>,
+        client_version: Arc<str>,
         codex_version: Arc<str>,
         model: Arc<str>,
         effort: Arc<str>,
@@ -482,7 +482,7 @@ impl CodexAppServerV1Parser {
             json!({
                 "clientInfo": {
                     "name": CLIENT_NAME,
-                    "version": CLIENT_VERSION,
+                    "version": client_version.as_ref(),
                 }
             }),
         )?;

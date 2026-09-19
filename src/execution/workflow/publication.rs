@@ -23,6 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use super::super::ExecutionOutcome;
 use super::admission::CancellationReason;
 use super::agent::{AgentFailure, AgentFailureCause};
 use super::agent_input::AgentInputStartFailure;
@@ -334,6 +335,8 @@ pub(crate) struct WorkflowRunTerminalResultV1 {
     command: &'static str,
     outcome: WorkflowOutcomeV1,
     exit_status: u16,
+    #[serde(skip)]
+    execution_outcome: ExecutionOutcome,
     run_directory: String,
     attempt_number: u64,
     result_directory: String,
@@ -343,6 +346,10 @@ pub(crate) struct WorkflowRunTerminalResultV1 {
 impl WorkflowRunTerminalResultV1 {
     pub(crate) fn exit_status(&self) -> u16 {
         self.exit_status
+    }
+
+    pub(crate) fn execution_outcome(&self) -> ExecutionOutcome {
+        self.execution_outcome
     }
 
     pub(crate) fn result_directory(&self) -> &str {
@@ -1664,11 +1671,13 @@ fn publish_prepared_with_observer(
     drop(staging);
 
     let outcome = result.outcome;
+    let execution_outcome = execution_outcome(run, outcome);
     let terminal = WorkflowRunTerminalResultV1 {
         schema_version: 1,
         command: COMMAND,
         outcome,
-        exit_status: exit_status(run, outcome),
+        exit_status: exit_status(execution_outcome),
+        execution_outcome,
         run_directory: retained_path(&run.run_directory)?,
         attempt_number: run.attempt_number,
         result_directory: target.normalized.clone(),
@@ -2849,9 +2858,7 @@ fn export_unavailable_reason(reason: ExportUnavailableReason) -> ExportUnavailab
     }
 }
 
-fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
-    use crate::exit_code::{ExitCode, OutcomeClass};
-
+fn execution_outcome(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> ExecutionOutcome {
     if run.force_abort.is_some()
         || run
             .steps
@@ -2888,18 +2895,18 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
                     })
         })
     {
-        return ExitCode::GeneralFailure.as_u16();
+        return ExecutionOutcome::Failed;
     }
     match outcome {
-        WorkflowOutcomeV1::Succeeded => ExitCode::Success.as_u16(),
-        WorkflowOutcomeV1::Failed => ExitCode::GeneralFailure.as_u16(),
+        WorkflowOutcomeV1::Succeeded => ExecutionOutcome::Succeeded,
+        WorkflowOutcomeV1::Failed => ExecutionOutcome::Failed,
         WorkflowOutcomeV1::Cancelled => match &run.outcome {
             RunOutcome::Cancelled {
                 reason: CancellationReason::UserRequest,
-            } => OutcomeClass::Interrupted.exit_code().as_u16(),
+            } => ExecutionOutcome::Interrupted,
             RunOutcome::Cancelled {
                 reason: CancellationReason::TerminationRequest,
-            } => OutcomeClass::Terminated.exit_code().as_u16(),
+            } => ExecutionOutcome::Terminated,
             RunOutcome::Cancelled {
                 reason:
                     CancellationReason::CallerOutputFailure
@@ -2908,8 +2915,17 @@ fn exit_status(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> u16 {
                     | CancellationReason::ForceAbort,
             }
             | RunOutcome::Succeeded
-            | RunOutcome::Failed { .. } => ExitCode::GeneralFailure.as_u16(),
+            | RunOutcome::Failed { .. } => ExecutionOutcome::Failed,
         },
+    }
+}
+
+const fn exit_status(outcome: ExecutionOutcome) -> u16 {
+    match outcome {
+        ExecutionOutcome::Succeeded => 0,
+        ExecutionOutcome::Failed => 1,
+        ExecutionOutcome::Interrupted => 130,
+        ExecutionOutcome::Terminated => 143,
     }
 }
 

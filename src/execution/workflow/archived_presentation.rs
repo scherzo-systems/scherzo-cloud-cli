@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use super::super::ExecutionOutcome;
 use super::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
     ArchivedAttemptOperationalErrorCode, ArchivedAttemptState, ArchivedAttemptTrigger,
@@ -16,7 +17,6 @@ use super::presentation::{human_duration, styled_terminal_text as styled};
 use super::presentation_feed::{WorkflowPresentationStep, normalize_terminal_scalar};
 use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
 use super::validated::WorkflowNodeRole;
-use crate::exit_code::ExitCode;
 
 const COMMAND: &str = "scherzo-cloud workflow view";
 const STYLE_PRIMARY: &str = "38;2;205;214;244";
@@ -58,14 +58,17 @@ impl std::fmt::Display for ArchivedViewOutputFailure {
 impl std::error::Error for ArchivedViewOutputFailure {}
 
 impl ArchivedViewOutput {
-    pub(crate) fn write_stdout(self) -> Result<ExitCode, ArchivedViewOutputFailure> {
+    pub(crate) fn write_stdout(self) -> Result<ExecutionOutcome, ArchivedViewOutputFailure> {
         let (bytes, exit) = match self {
             Self::Plain { attempt, color } => (
                 render_plain(&attempt, color)?.into_bytes(),
-                ExitCode::Success,
+                ExecutionOutcome::Succeeded,
             ),
-            Self::JsonSuccess(loaded) => (serialize_json_success(&loaded)?, ExitCode::Success),
-            Self::JsonError(error) => (serialize_json_error(&error)?, ExitCode::GeneralFailure),
+            Self::JsonSuccess(loaded) => (
+                serialize_json_success(&loaded)?,
+                ExecutionOutcome::Succeeded,
+            ),
+            Self::JsonError(error) => (serialize_json_error(&error)?, ExecutionOutcome::Failed),
         };
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
@@ -422,7 +425,7 @@ fn serialize_json_success(
         schema_version: 1,
         command: COMMAND,
         outcome: "view",
-        exit_status: ExitCode::Success.as_u8(),
+        exit_status: 0,
         run_directory,
         current_attempt_number: attempt.current_attempt_number,
         attempt_number: attempt.attempt_number,
@@ -459,7 +462,7 @@ fn serialize_json_error(
         schema_version: 1,
         command: COMMAND,
         outcome: "error",
-        exit_status: ExitCode::GeneralFailure.as_u8(),
+        exit_status: 1,
         run_directory,
         attempt_number,
         error: WorkflowViewErrorDetail { code, message },

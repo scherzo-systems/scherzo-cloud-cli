@@ -134,7 +134,8 @@ queue, request, batching, and shutdown work. Export failures report only bounded
 diagnostics and cannot feed back into runner state.
 
 The SDK resource is built from an empty resource and adds only the fixed runner service
-name, package version, and generated boot ID, so default and environment resource
+name, root-resolved version injected at Runner Serve startup, and generated boot ID, so
+default and environment resource
 detectors cannot expand the reviewed contract. Connection spans inject only W3C Trace
 Context into their WebSocket upgrade. Gateway sessions can use the runner connection as
 a remote parent; baggage is excluded, and effect acknowledgement spans remain
@@ -370,9 +371,29 @@ exactly four unpublished library members at their final roots:
 The binary depends on support, API, and runner-protocol in production and on test-support
 for tests. Commands, execution, runner service, human authentication, service
 credential files, process abstractions, build identity, and exit policy remain rooted in
-`src/`. There is no compatibility module or re-export at any moved path. This preserves
-one executable, `CARGO_BIN_EXE_scherzo-cloud`, and the existing archive shape while Cargo
-can compile and test the four leaves independently.
+`src/`. Slice 2A does not move execution or process into a package, add compatibility
+aliases, or begin the Slice 2B package cutover. It preserves one executable,
+`CARGO_BIN_EXE_scherzo-cloud`, and the existing archive shape while Cargo can compile and
+test the four leaves independently.
+
+The retained root-owned seams have this closed ownership matrix:
+
+| Concern | Owner | Permitted consumption |
+| --- | --- | --- |
+| Execution implementation | Private modules beneath `src/execution/` | Non-execution code uses only the flat crate-private inventory re-exported by `src/execution/mod.rs`; implementation modules are not public. |
+| Process implementation | `src/process.rs` | Execution may use it directly. The only non-execution consumers are `src/runner/doctor/git.rs` and `src/runner/service/source.rs`; process is not forwarded through the execution facade. |
+| Build identity | `src/build_info.rs` and the crate root | Root CLI dispatch injects the resolved version into local agent dispatch and Runner Serve. Execution and runner code do not read build environment or root build policy. |
+| Exit policy | `src/exit_code.rs` and the crate root | Execution returns the closed `ExecutionOutcome` domain value. Root command dispatch maps that value to the unchanged process exit statuses. |
+
+The direct process inventory within execution is limited to
+`claude_code.rs`, `claude_code/tests.rs`, `codex.rs`,
+`harness_installation.rs`, `pi.rs`, `pi/tests.rs`,
+`workflow/child_guard.rs`, and `workflow/git_capture.rs`. This exception is deliberately
+narrow: Slice 2A keeps the existing process owner and call sites in place rather than
+creating a forwarding API that would become accidental package surface. The Rust
+unused-import lint keeps facade entries tied to real consumers, and architecture tests
+reject deep execution imports, public implementation modules, unlisted direct process
+consumers, and process forwarding.
 
 `tests/architecture.rs` enforces the exact member and internal-edge inventories, each
 member's inherited lint policy, the residual root-module graph, private generated API,

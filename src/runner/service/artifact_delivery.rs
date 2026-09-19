@@ -17,8 +17,7 @@ use super::assignment::{
     ArtifactRequest, ArtifactRequestKind, AssignmentObservation, ObservationOutbox, OutboxFailure,
 };
 use super::backoff::Backoff;
-use crate::execution::workflow::artifact::{ArtifactStaging, StagedCarrier};
-use crate::execution::workflow::publication::{CloudCarrierBody, CloudResultCarrier};
+use crate::execution::{ArtifactStaging, CloudCarrierBody, CloudResultCarrier, StagedCarrier};
 use scherzo_cloud_runner_protocol::{
     ArtifactConfirmationOutcome, ArtifactConfirmationResponse, ArtifactRegistrationOutcome,
     ArtifactRegistrationResponse, ArtifactResultConfirmationOutcome,

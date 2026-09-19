@@ -6,7 +6,7 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
-use crate::execution::workflow::presentation::visible_text;
+use crate::execution::visible_text;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 #[cfg(test)]

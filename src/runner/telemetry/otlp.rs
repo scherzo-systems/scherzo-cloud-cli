@@ -844,7 +844,10 @@ mod tests {
     }
 
     fn resource() -> Resource {
-        runner_resource(crate::build_info::VERSION, "rbt_fixture")
+        runner_resource(
+            crate::runner::telemetry::TEST_SERVICE_VERSION,
+            "rbt_fixture",
+        )
     }
 
     fn recorder_with_exporter(
@@ -863,7 +866,7 @@ mod tests {
         Arc::new(Recorder::new(
             provider,
             writer,
-            crate::build_info::VERSION,
+            crate::runner::telemetry::TEST_SERVICE_VERSION,
             "rbt_fixture",
         ))
     }
@@ -959,7 +962,7 @@ mod tests {
                 ),
                 (
                     "service.version".to_owned(),
-                    serde_json::json!(crate::build_info::VERSION)
+                    serde_json::json!(crate::runner::telemetry::TEST_SERVICE_VERSION)
                 ),
                 (
                     "service.instance.id".to_owned(),

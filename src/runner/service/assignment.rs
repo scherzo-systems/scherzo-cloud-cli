@@ -23,18 +23,15 @@ use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, RetentionReason,
     WorkRootLease, WorkspaceDisposition,
 };
-use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
-use crate::execution::workflow::admission::{
+use crate::execution::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
-    CancellationSource, EnvironmentSnapshot, ExecutionContext, OrdinaryCancellationRequestResult,
-    ResolvedInputs, SourceRevisionProvenance, WorkflowCapacityBudget, admit_runner_workflow,
-    default_execution_policy_limits,
+    CancellationReason, CancellationSource, CaptureCancellation, CloudGitCaptureProjection,
+    EnvironmentSnapshot, ExecutionContext, MAXIMUM_CANCELLATION_GRACE, MAXIMUM_PARALLEL_STEPS,
+    MINIMUM_CANCELLATION_GRACE, OrdinaryCancellationRequestResult, RUNNER_TERMINAL_FRAME_BYTES,
+    ResolvedInputs, ResolvedWorkflow, SourceRevisionProvenance, ValidatedClaudeCodeInstallation,
+    ValidatedCodexInstallation, ValidatedPiInstallation, WorkflowCapacityBudget,
+    admit_runner_workflow, default_execution_policy_limits,
 };
-use crate::execution::workflow::artifact::CaptureCancellation;
-use crate::execution::workflow::cancellation::{
-    MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE,
-};
-use crate::execution::workflow::capacity::RUNNER_TERMINAL_FRAME_BYTES;
 use crate::runner::control_protocol::AssignmentCounts;
 use crate::runner::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 use scherzo_cloud_runner_protocol::{
@@ -1141,6 +1138,7 @@ pub(super) struct AcceptedAssignment {
     pub(super) root: AssignmentRoot,
     pub(super) admitted: AdmittedWorkflow,
     pub(super) transition_budget: usize,
+    pub(super) execution_version: Arc<str>,
     pub(super) process_guards: AssignmentProcessGuards,
     pub(super) guard_processes: bool,
     pub(super) workflow_git: WorkflowGitAuthority,
@@ -1421,11 +1419,11 @@ impl PreparationAuthority<'_> {
 
 #[derive(Clone)]
 struct AdmissionRuntime {
-    pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
-    claude_code_installation:
-        Option<crate::execution::claude_code::ValidatedClaudeCodeInstallation>,
-    codex_installation: Option<crate::execution::codex::ValidatedCodexInstallation>,
+    pi_installation: Option<ValidatedPiInstallation>,
+    claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<ValidatedCodexInstallation>,
     environment: EnvironmentSnapshot,
+    execution_version: Arc<str>,
     outbox: ObservationOutbox,
     guard_processes: bool,
     recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
@@ -1460,9 +1458,9 @@ impl AdmissionRuntime {
         &self,
         offer: &AssignmentOffer,
         root: AssignmentRoot,
-        workflow: crate::execution::workflow::resolution::ResolvedWorkflow,
+        workflow: ResolvedWorkflow,
         inputs: ResolvedInputs,
-        git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
+        git_capture: Option<CloudGitCaptureProjection>,
         authority: PreparationAuthority<'_>,
     ) -> Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>> {
         let prepared = (|| {
@@ -1505,6 +1503,7 @@ impl AdmissionRuntime {
             root,
             admitted,
             transition_budget,
+            execution_version: Arc::clone(&self.execution_version),
             process_guards: AssignmentProcessGuards::new(),
             guard_processes: self.guard_processes,
             workflow_git,
@@ -1518,6 +1517,7 @@ pub(super) struct AssignmentDependencies {
     sleeper: Arc<dyn Sleeper>,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
+    execution_version: Arc<str>,
     recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
     guard_processes: bool,
 }
@@ -1528,6 +1528,7 @@ impl AssignmentDependencies {
         sleeper: Arc<dyn Sleeper>,
         source_broker: Option<Arc<dyn SourceCredentialBroker>>,
         input_broker: Option<Arc<dyn RunInputBroker>>,
+        execution_version: Arc<str>,
         recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
         guard_processes: bool,
     ) -> Self {
@@ -1538,6 +1539,7 @@ impl AssignmentDependencies {
             sleeper,
             source_broker,
             input_broker,
+            execution_version,
             recorder,
             guard_processes,
         }
@@ -1567,6 +1569,7 @@ impl AssignmentDependencies {
             sleeper,
             source_broker,
             input_broker,
+            Arc::from(recorder.service_version()),
             Some(recorder),
             true,
         )
@@ -1592,11 +1595,11 @@ pub(super) struct AssignmentManager {
     work_root: Arc<WorkRootLease>,
     root_preparer: Arc<dyn AssignmentRootPreparer>,
     root_preparation_worker: AssignmentRootPreparationWorker,
-    pi_installation: Option<crate::execution::pi::ValidatedPiInstallation>,
-    claude_code_installation:
-        Option<crate::execution::claude_code::ValidatedClaudeCodeInstallation>,
-    codex_installation: Option<crate::execution::codex::ValidatedCodexInstallation>,
+    pi_installation: Option<ValidatedPiInstallation>,
+    claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<ValidatedCodexInstallation>,
     environment: EnvironmentSnapshot,
+    execution_version: Arc<str>,
     lease_clock: LeaseClock,
     sleeper: Arc<dyn Sleeper>,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
@@ -1633,6 +1636,7 @@ impl AssignmentManager {
             sleeper,
             source_broker,
             input_broker,
+            execution_version,
             recorder,
             guard_processes,
         } = dependencies;
@@ -1654,6 +1658,7 @@ impl AssignmentManager {
             claude_code_installation: config.claude_code_installation().cloned(),
             codex_installation: config.codex_installation().cloned(),
             environment: EnvironmentSnapshot::new(std::env::vars_os()),
+            execution_version,
             lease_clock,
             sleeper,
             source_broker,
@@ -2309,9 +2314,9 @@ impl AssignmentManager {
                             }
                         }
                         CancellationMode::Graceful => {
-                            let application = running.cancellation.request_ordinary_cancellation(
-                                crate::execution::workflow::admission::CancellationReason::UserRequest,
-                            );
+                            let application = running
+                                .cancellation
+                                .request_ordinary_cancellation(CancellationReason::UserRequest);
                             if awaiting_start_authority {
                                 CancellationApplicationDisposition::PreExecutionStopped
                             } else if application
@@ -3091,9 +3096,9 @@ impl AssignmentManager {
                     .infrastructure_interruption
                     .send_replace(Some(InfrastructureInterruption::RunnerShutdown));
                 disable_workflow_git_off_thread(&running.workflow_git);
-                running.cancellation.request_cancellation(
-                    crate::execution::workflow::admission::CancellationReason::RunnerShutdown,
-                );
+                running
+                    .cancellation
+                    .request_cancellation(CancellationReason::RunnerShutdown);
                 self.slot = Some(LocalSlot::Running(running));
             }
             LocalSlot::Finishing(finishing) => {
@@ -3951,6 +3956,7 @@ impl AssignmentManager {
             claude_code_installation: self.claude_code_installation.clone(),
             codex_installation: self.codex_installation.clone(),
             environment: self.environment.clone(),
+            execution_version: Arc::clone(&self.execution_version),
             outbox: self.outbox.clone(),
             guard_processes: self.guard_processes,
             recorder: self.recorder.clone(),
@@ -4047,6 +4053,7 @@ pub(super) mod test_support {
             sleeper,
             source_broker.or(default_source_broker),
             input_broker,
+            Arc::from(crate::runner::telemetry::TEST_SERVICE_VERSION),
             recorder,
             guard_processes,
         );
@@ -4364,7 +4371,7 @@ pub(super) mod test_support {
     // jscpd:ignore-start -- Test offers and production result metadata use distinct protocol projections.
     pub(in crate::runner::service) fn align_fixture_capacity(
         execution_spec: &mut ExecutionSpecV1RunnerProjection,
-        workflow: &crate::execution::workflow::resolution::ResolvedWorkflow,
+        workflow: &ResolvedWorkflow,
     ) {
         let digest = &workflow.capacity.source_closure_digest;
         let requirements = workflow.capacity.requirements;
@@ -4401,7 +4408,7 @@ pub(super) mod test_support {
 
 fn validate_carried_capacity(
     execution_spec: &ExecutionSpecV1RunnerProjection,
-    workflow: &crate::execution::workflow::resolution::ResolvedWorkflow,
+    workflow: &ResolvedWorkflow,
 ) -> Result<(), AssignmentDecline> {
     let carried = &execution_spec.capacity;
     let resolved = workflow.capacity.requirements;
@@ -4445,13 +4452,11 @@ fn capacity_binding_invalid() -> AssignmentDecline {
 fn build_execution_context(
     execution_spec: &ExecutionSpecV1RunnerProjection,
     root: &Path,
-    git_capture: Option<crate::execution::workflow::git_capture::CloudGitCaptureProjection>,
+    git_capture: Option<CloudGitCaptureProjection>,
     environment: &EnvironmentSnapshot,
-    pi_installation: Option<&crate::execution::pi::ValidatedPiInstallation>,
-    claude_code_installation: Option<
-        &crate::execution::claude_code::ValidatedClaudeCodeInstallation,
-    >,
-    codex_installation: Option<&crate::execution::codex::ValidatedCodexInstallation>,
+    pi_installation: Option<&ValidatedPiInstallation>,
+    claude_code_installation: Option<&ValidatedClaudeCodeInstallation>,
+    codex_installation: Option<&ValidatedCodexInstallation>,
 ) -> Result<ExecutionContext, AssignmentDecline> {
     let maximum_parallel_steps =
         usize::try_from(execution_spec.execution_limits.maximum_parallel_steps)
@@ -4499,9 +4504,9 @@ fn revoke_authority(running: &mut RunningAssignment) {
     running.authority_updates.send_modify(|authority| {
         authority.revoked = true;
     });
-    running.cancellation.request_cancellation(
-        crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired,
-    );
+    running
+        .cancellation
+        .request_cancellation(CancellationReason::ExecutionLeaseExpired);
 }
 
 fn disable_workflow_git_off_thread(workflow_git: &WorkflowGitAuthority) {
@@ -4885,12 +4890,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::execution::claude_code::ValidatedClaudeCodeInstallation;
-    use crate::execution::codex::{
-        CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedCodexInstallation,
+    use crate::execution::{
+        CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedClaudeCodeInstallation,
+        ValidatedCodexInstallation, ValidatedPiInstallation, resolve,
     };
-    use crate::execution::pi::ValidatedPiInstallation;
-    use crate::execution::workflow::resolution;
     use crate::runner::credential::test_credential;
     use crate::runner::service::assignment::test_support::{
         active_step_count, align_fixture_capacity,
@@ -5392,7 +5395,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             .workflow_path = "workflow.yaml".to_owned();
         offered.execution_spec.workflow_definition_source.commit_oid = commit_oid.clone();
         offered.execution_spec.primary_workspace_source.commit_oid = commit_oid;
-        if let Ok(workflow) = resolution::resolve(&source, Path::new("workflow.yaml")) {
+        if let Ok(workflow) = resolve(&source, Path::new("workflow.yaml")) {
             align_fixture_capacity(&mut offered.execution_spec, &workflow);
         }
     }
@@ -5667,6 +5670,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             Arc::new(crate::runner::service::TokioSleeper),
             Some(fixture_source_broker(source)),
             None,
+            Arc::from(crate::runner::telemetry::TEST_SERVICE_VERSION),
             None,
             false,
         );
@@ -7513,7 +7517,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             &manager.slot,
             Some(LocalSlot::Running(running))
                 if running.cancellation.cancellation_reason()
-                    == Some(crate::execution::workflow::admission::CancellationReason::UserRequest)
+                    == Some(CancellationReason::UserRequest)
         ));
         let force = cancel_for(&offered, CancellationMode::Force, "bn");
         manager.handle_cancel(force.clone()).unwrap();
@@ -8099,7 +8103,7 @@ steps:
             &manager.slot,
             Some(LocalSlot::Running(running))
                 if running.cancellation.cancellation_reason()
-                    == Some(crate::execution::workflow::admission::CancellationReason::RunnerShutdown)
+                    == Some(CancellationReason::RunnerShutdown)
         ));
         let (authority_active, authority) = match &manager.slot {
             Some(LocalSlot::Running(running)) => (
@@ -8550,7 +8554,7 @@ steps:
             Some(LocalSlot::Running(running))
                 if running.current_grant.sequence == 1
                     && running.cancellation.cancellation_reason()
-                        == Some(crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired)
+                        == Some(CancellationReason::ExecutionLeaseExpired)
                     && running.authority_updates.borrow().revoked
         ));
         fs::write(boundary_release, b"complete").unwrap();
@@ -9120,7 +9124,7 @@ steps:
             &manager.slot,
             Some(LocalSlot::Running(running))
                 if running.cancellation.cancellation_reason()
-                    == Some(crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired)
+                    == Some(CancellationReason::ExecutionLeaseExpired)
         ));
     }
 
@@ -9300,7 +9304,7 @@ steps:
         );
         assert_eq!(
             running.cancellation.cancellation_reason(),
-            Some(crate::execution::workflow::admission::CancellationReason::ExecutionLeaseExpired)
+            Some(CancellationReason::ExecutionLeaseExpired)
         );
         assert!(running.authority_updates.borrow().revoked);
     }

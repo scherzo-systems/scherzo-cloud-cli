@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-use crate::exit_code::ExitCode;
+use super::super::ExecutionOutcome;
 
 use super::admission::{CancellationReason, CancellationSource, MAXIMUM_AGENT_RESULT_BYTES};
 use super::agent::PositiveDuration;
@@ -481,10 +481,10 @@ pub(crate) fn internal_worker_requested() -> bool {
     std::env::var(INTERNAL_WORKER_ENVIRONMENT).as_deref() == Ok(INTERNAL_WORKER_VERSION)
 }
 
-pub(crate) fn run_internal_worker() -> ExitCode {
+pub(crate) fn run_internal_worker() -> ExecutionOutcome {
     match run_internal_worker_io(&mut io::stdin().lock(), &mut io::stdout().lock()) {
-        Ok(()) => ExitCode::Success,
-        Err(()) => ExitCode::GeneralFailure,
+        Ok(()) => ExecutionOutcome::Succeeded,
+        Err(()) => ExecutionOutcome::Failed,
     }
 }
 

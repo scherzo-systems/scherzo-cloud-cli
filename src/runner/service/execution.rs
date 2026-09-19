@@ -27,41 +27,30 @@ use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
 };
 use super::workspace::{RetentionReason, WorkspaceDisposition};
-use crate::execution::workflow::admission::CancellationReason;
-use crate::execution::workflow::agent::WorkflowRunId;
-use crate::execution::workflow::agent::dispatch::production_agent_dispatcher;
-use crate::execution::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
-use crate::execution::workflow::agent_input::AgentInputStaging;
-use crate::execution::workflow::artifact::ArtifactStaging;
-use crate::execution::workflow::coordinator::CoordinatorClock;
-use crate::execution::workflow::diagnostic::StepDiagnosticLog;
-use crate::execution::workflow::evidence::PrimaryIssue;
-use crate::execution::workflow::execution::{NoopCommitPort, execute_workflow};
-use crate::execution::workflow::input::InputStaging;
-use crate::execution::workflow::invocation_accounting::InvocationAccountingLog;
-use crate::execution::workflow::observation::{
-    ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
+use crate::execution::{
+    ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
+    AgentInputStaging, ArtifactStaging, AuthenticatedProcessGroup, CancellationReason,
+    CancellationSource, CloudCarrierBody, CloudExecutionCapacityV1, CoordinatorClock, DigestV1,
+    DurableProcessGuardStore, ExecutionObservation, ExecutionObserver, FailurePolicy,
+    FinalizationGate, FinalizationSummary, FinalizerResult, ForceAbortEvidence, InputStaging,
+    InvocationAccountingLog, NoopCommitPort, ObservedStepTransition, PreparedCloudWorkflowResult,
+    PrimaryIssue, ProcessGuardRegistry, ProcessIdentityInspector, ProcessIdentityObservation,
+    RecoveryDecisionKind, RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
+    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
+    RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnosticLog,
+    StepFailureCause, StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector,
+    TransitionEvent, TransitionObservation, ValidatedStep, WorkflowExecutionResult,
+    WorkflowNodeRole, WorkflowRunCancellation, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult, WorkflowRunStep,
+    WorkflowRunStepKind, WorkflowRunTiming, WorkflowState, WorkflowStepTiming, command_output_v1,
+    execute_workflow, prepare_cloud_workflow_result, production_agent_dispatcher,
+    step_recovery_summary_v1, summary_disposition_matches, terminate_authenticated_process_group,
 };
-use crate::execution::workflow::process_group::{
-    AuthenticatedProcessGroup, DurableProcessGuardStore, ProcessGuardRegistry,
-    ProcessIdentityInspector, ProcessIdentityObservation, SystemProcessIdentityInspector,
-    terminate_authenticated_process_group,
+#[cfg(test)]
+use crate::execution::{
+    BlockedDetail, FinalizationTrigger, Prerequisite, RecoveryRoundNumber, TargetExecutionNumber,
+    TransitionSequence, spawn_isolated_command_launch,
 };
-use crate::execution::workflow::publication::{
-    CloudCarrierBody, CloudExecutionCapacityV1, DigestV1, PreparedCloudWorkflowResult,
-    RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1,
-    RecoveryInvocationStateV1, RecoveryInvocationUsageV1, RecoveryInvocationV1,
-    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
-    command_output_v1, prepare_cloud_workflow_result, step_recovery_summary_v1,
-    summary_disposition_matches,
-};
-use crate::execution::workflow::runtime::{
-    ActionId, ActiveStepInvocation, FinalizationGate, FinalizationSummary, FinalizerResult,
-    RunOutcome, SchedulingGate, StepState, StepStateKind, TransitionEvent, WorkflowState,
-};
-use crate::execution::workflow::step_runtime::{AgentExecution, StepFailureCause};
-use crate::execution::workflow::validated::WorkflowNodeRole;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuardLifecycle {
@@ -741,6 +730,7 @@ impl ExecutionJob {
                 maximum_log_bytes,
                 RunnerExecutionClock,
                 observer.clone(),
+                &self.accepted.execution_version,
             ) else {
                 return self.abort_retained(
                     assignment_id,
@@ -1075,9 +1065,7 @@ impl ExecutionJob {
     fn runner_result(
         &self,
         diagnostics: &StepDiagnosticLog,
-        execution: crate::execution::workflow::execution::WorkflowExecutionResult<
-            RunnerExecutionInstant,
-        >,
+        execution: WorkflowExecutionResult<RunnerExecutionInstant>,
         observer: &RunnerExecutionObserver,
         started_at: RunnerExecutionInstant,
         finished_at: RunnerExecutionInstant,
@@ -1210,7 +1198,7 @@ impl ExecutionJob {
         assignment_id: &str,
         attempt_id: &str,
         artifacts: &ArtifactStaging,
-        prepared: crate::execution::workflow::publication::PreparedCloudWorkflowResult,
+        prepared: PreparedCloudWorkflowResult,
     ) -> Result<ArtifactDeliveryOutcome, LeaseClockError> {
         for carrier in prepared.carriers {
             let delivery = ArtifactDeliverySpec::cloud_carrier(
@@ -1312,7 +1300,7 @@ impl ExecutionJob {
 
     async fn wait_for_start_authority(
         &mut self,
-        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        cancellation: &CancellationSource,
         post_stop_fence: &PostStopFence,
         assignment_id: &str,
         attempt_id: &str,
@@ -1378,7 +1366,7 @@ impl ExecutionJob {
 
     async fn ensure_execution_authority(
         &self,
-        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        cancellation: &CancellationSource,
         post_stop_fence: &PostStopFence,
         assignment_id: &str,
         attempt_id: &str,
@@ -1394,7 +1382,7 @@ impl ExecutionJob {
 
     async fn fail_before_execution(
         &self,
-        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        cancellation: &CancellationSource,
         post_stop_fence: &PostStopFence,
         assignment_id: &str,
         attempt_id: &str,
@@ -1499,9 +1487,7 @@ fn cancellation_before_start_completion(reason: CancellationReason) -> Execution
     }
 }
 
-pub(super) fn cloud_execution_capacity(
-    admitted: &crate::execution::workflow::admission::AdmittedWorkflow,
-) -> CloudExecutionCapacityV1 {
+pub(super) fn cloud_execution_capacity(admitted: &AdmittedWorkflow) -> CloudExecutionCapacityV1 {
     let capacity = admitted.capacity();
     let requirements = capacity.resolved.requirements;
     let digest = &capacity.resolved.source_closure_digest;
@@ -1569,19 +1555,12 @@ fn internal_delivery_failure(phase: &str) -> ArtifactDeliveryOutcome {
     })
 }
 
-fn workflow_step_kind_policy(
-    step: &crate::execution::workflow::validated::ValidatedStep,
-) -> (
-    WorkflowRunStepKind,
-    crate::execution::workflow::document::FailurePolicy,
-) {
+fn workflow_step_kind_policy(step: &ValidatedStep) -> (WorkflowRunStepKind, FailurePolicy) {
     match step {
-        crate::execution::workflow::validated::ValidatedStep::Command(command) => {
+        ValidatedStep::Command(command) => {
             (WorkflowRunStepKind::Command, command.common.failure_policy)
         }
-        crate::execution::workflow::validated::ValidatedStep::Agent(agent) => {
-            (WorkflowRunStepKind::Agent, agent.common.failure_policy)
-        }
+        ValidatedStep::Agent(agent) => (WorkflowRunStepKind::Agent, agent.common.failure_policy),
     }
 }
 
@@ -1608,7 +1587,7 @@ fn artifact_delivery_result(delivery: &ArtifactDeliveryOutcome) -> Value {
 
 #[derive(Clone, Copy)]
 struct LeaseFailureContext<'a> {
-    cancellation: &'a crate::execution::workflow::admission::CancellationSource,
+    cancellation: &'a CancellationSource,
     post_stop_fence: &'a PostStopFence,
     process_guards: &'a AssignmentProcessGuards,
 }
@@ -1631,7 +1610,7 @@ enum LeaseExecution<Output> {
 )]
 async fn run_under_lease<F, Output>(
     execution: F,
-    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    cancellation: &CancellationSource,
     lease_clock: &LeaseClock,
     mut authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
     mut infrastructure_updates: tokio::sync::watch::Receiver<Option<InfrastructureInterruption>>,
@@ -1888,7 +1867,7 @@ fn complete_ready_execution<Output>(
 
 async fn finish_after_lease_loss<F, Output>(
     execution: &mut std::pin::Pin<&mut F>,
-    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    cancellation: &CancellationSource,
     lease_clock: &LeaseClock,
     authority: &LeaseAuthority,
     post_stop_fence: &PostStopFence,
@@ -1992,7 +1971,7 @@ where
 }
 
 fn fail_lease_clock<Output>(
-    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    cancellation: &CancellationSource,
     post_stop_fence: &PostStopFence,
     process_guards: &AssignmentProcessGuards,
 ) -> LeaseExecution<Output> {
@@ -2003,7 +1982,7 @@ fn fail_lease_clock<Output>(
 }
 
 fn begin_forced_containment(
-    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    cancellation: &CancellationSource,
     post_stop_fence: &PostStopFence,
     process_guards: &AssignmentProcessGuards,
 ) {
@@ -2106,7 +2085,7 @@ struct RunnerExecutionObserver {
     transition_budget: usize,
     outbox: ObservationOutbox,
     post_stop_fence: PostStopFence,
-    cancellation: crate::execution::workflow::admission::CancellationSource,
+    cancellation: CancellationSource,
     invocation_evidence: RunnerInvocationEvidence,
     state: Arc<Mutex<ObserverState>>,
 }
@@ -2122,7 +2101,7 @@ struct ObserverState {
     last_sequence: u64,
     terminal_sequence: Option<u64>,
     terminal_state: Option<WorkflowState>,
-    force_abort: Option<crate::execution::workflow::runtime::ForceAbortEvidence>,
+    force_abort: Option<ForceAbortEvidence>,
     cancellation: Option<(CancellationReason, RunnerExecutionInstant)>,
     step_timings: BTreeMap<String, RunnerStepTiming>,
     active_invocations: BTreeMap<String, RunnerActiveInvocation>,
@@ -2150,7 +2129,7 @@ impl RunnerExecutionObserver {
         transition_budget: usize,
         outbox: ObservationOutbox,
         post_stop_fence: PostStopFence,
-        cancellation: crate::execution::workflow::admission::CancellationSource,
+        cancellation: CancellationSource,
         invocation_evidence: RunnerInvocationEvidence,
     ) -> Self {
         Self {
@@ -2188,7 +2167,7 @@ impl RunnerExecutionObserver {
         self.lock().terminal_state.clone()
     }
 
-    fn force_abort(&self) -> Option<crate::execution::workflow::runtime::ForceAbortEvidence> {
+    fn force_abort(&self) -> Option<ForceAbortEvidence> {
         self.lock().force_abort
     }
 
@@ -2497,7 +2476,7 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 }
             }
             if let TransitionEvent::ForceAbortAccepted { reason, phase, .. } = &transition.event {
-                state.force_abort = Some(crate::execution::workflow::runtime::ForceAbortEvidence {
+                state.force_abort = Some(ForceAbortEvidence {
                     reason: *reason,
                     phase: *phase,
                 });
@@ -2585,10 +2564,7 @@ fn is_lease_loss_terminal_transition(
 }
 
 fn terminal_recovery_summaries(
-    recoveries: &BTreeMap<
-        String,
-        Option<crate::execution::workflow::runtime::StepRecoveryState<StepFailureCause>>,
-    >,
+    recoveries: &BTreeMap<String, Option<StepRecoveryState<StepFailureCause>>>,
 ) -> Option<Value> {
     let summaries = recoveries
         .iter()
@@ -2608,7 +2584,7 @@ fn terminal_outcome(
     primary_issue: Option<Value>,
     reason: Option<&str>,
     finalization: Option<Value>,
-    force_abort: Option<crate::execution::workflow::runtime::ForceAbortEvidence>,
+    force_abort: Option<ForceAbortEvidence>,
     recovery_summaries: Option<Value>,
 ) -> Value {
     let mut object = serde_json::Map::from_iter([
@@ -2747,7 +2723,7 @@ fn distributed_invocation_evidence(invocation: &RecoveryInvocationV1) -> Option<
 fn workflow_event(
     transition: &TransitionObservation<RunnerExecutionInstant>,
     invocation_evidence: Option<&RecoveryInvocationV1>,
-    force_abort: Option<crate::execution::workflow::runtime::ForceAbortEvidence>,
+    force_abort: Option<ForceAbortEvidence>,
 ) -> Value {
     let mut event = match &transition.event {
         TransitionEvent::Step {
@@ -2803,8 +2779,8 @@ fn workflow_event(
                             progress.insert(
                                 "handlerKind".to_owned(),
                                 json!(match kind {
-                                    crate::execution::workflow::runtime::RecoveryHandlerKind::Command => "cmd",
-                                    crate::execution::workflow::runtime::RecoveryHandlerKind::Agent => "agent",
+                                    RecoveryHandlerKind::Command => "cmd",
+                                    RecoveryHandlerKind::Agent => "agent",
                                 }),
                             );
                         }
@@ -2812,8 +2788,8 @@ fn workflow_event(
                             progress.insert(
                                 "handlerState".to_owned(),
                                 json!(match handler_state {
-                                    crate::execution::workflow::runtime::RecoveryHandlerActivity::Starting => "starting",
-                                    crate::execution::workflow::runtime::RecoveryHandlerActivity::Running => "running",
+                                    RecoveryHandlerActivity::Starting => "starting",
+                                    RecoveryHandlerActivity::Running => "running",
                                 }),
                             );
                         }
@@ -2821,8 +2797,8 @@ fn workflow_event(
                             progress.insert(
                                 "decision".to_owned(),
                                 json!(match decision {
-                                    crate::execution::workflow::runtime::RecoveryDecisionKind::Recheck => "recheck",
-                                    crate::execution::workflow::runtime::RecoveryDecisionKind::GaveUp => "gave_up",
+                                    RecoveryDecisionKind::Recheck => "recheck",
+                                    RecoveryDecisionKind::GaveUp => "gave_up",
                                 }),
                             );
                         }
@@ -3122,7 +3098,7 @@ pub(super) mod test_support {
     pub(in crate::runner::service) struct LiveLeaseExecution {
         completion: tokio::sync::oneshot::Sender<&'static str>,
         task: tokio::task::JoinHandle<LeaseExecution<&'static str>>,
-        cancellation: crate::execution::workflow::admission::CancellationSource,
+        cancellation: CancellationSource,
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
         invocations: Arc<AtomicUsize>,
@@ -3165,7 +3141,7 @@ pub(super) mod test_support {
         lease_clock: LeaseClock,
         authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
         causal_lease: CausalLease,
-        cancellation: crate::execution::workflow::admission::CancellationSource,
+        cancellation: CancellationSource,
         assignment_id: String,
         attempt_id: String,
     ) -> LiveLeaseExecution {
@@ -3221,7 +3197,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::execution::workflow::validated::WorkflowNodeRole;
     use crate::runner::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
     use crate::runner::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
     use scherzo_cloud_runner_protocol::{
@@ -3247,7 +3222,7 @@ mod tests {
         result: tokio::sync::oneshot::Sender<&'static str>,
         task: tokio::task::JoinHandle<LeaseExecution<&'static str>>,
         waits: tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
-        cancellation: crate::execution::workflow::admission::CancellationSource,
+        cancellation: CancellationSource,
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
         _authority: tokio::sync::watch::Sender<LeaseAuthority>,
@@ -3257,7 +3232,7 @@ mod tests {
 
     struct SupervisedExecution<Output> {
         task: tokio::task::JoinHandle<LeaseExecution<Output>>,
-        cancellation: crate::execution::workflow::admission::CancellationSource,
+        cancellation: CancellationSource,
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
         authority: tokio::sync::watch::Sender<LeaseAuthority>,
@@ -3292,7 +3267,7 @@ mod tests {
         Execution: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
     {
-        let cancellation = crate::execution::workflow::admission::CancellationSource::new();
+        let cancellation = CancellationSource::new();
         let observed_cancellation = cancellation.clone();
         let outbox = ObservationOutbox::new();
         let observed_outbox = outbox.clone();
@@ -3367,7 +3342,7 @@ mod tests {
     }
 
     fn assert_forced_containment(
-        cancellation: &crate::execution::workflow::admission::CancellationSource,
+        cancellation: &CancellationSource,
         fence: &PostStopFence,
         guards: &AssignmentProcessGuards,
     ) {
@@ -3416,7 +3391,7 @@ mod tests {
         let (launch_started, started) = tokio::sync::oneshot::channel();
         let (release_launch, released) = std::sync::mpsc::channel();
         let execution = async move {
-            crate::execution::workflow::step_runtime::spawn_isolated_command_launch(move || {
+            spawn_isolated_command_launch(move || {
                 let _ = launch_started.send(());
                 let _ = released.recv();
                 "launch-completed"
@@ -3773,24 +3748,23 @@ mod tests {
             4,
             outbox.clone(),
             PostStopFence::with_workflow_git(None),
-            crate::execution::workflow::admission::CancellationSource::new(),
+            CancellationSource::new(),
             RunnerInvocationEvidence::default(),
         );
         let target = ActionId {
-            transition_sequence: crate::execution::workflow::runtime::TransitionSequence(1),
+            transition_sequence: TransitionSequence(1),
         };
         let handler = ActionId {
-            transition_sequence: crate::execution::workflow::runtime::TransitionSequence(2),
+            transition_sequence: TransitionSequence(2),
         };
         observer
             .observe(ExecutionObservation::Transition(Box::new(
                 TransitionObservation {
                     event: TransitionEvent::Step {
-                        sequence: crate::execution::workflow::runtime::TransitionSequence(1),
+                        sequence: TransitionSequence(1),
                         step: "verify".to_owned(),
                         role: WorkflowNodeRole::Step,
-                        failure_policy:
-                            crate::execution::workflow::document::FailurePolicy::Required,
+                        failure_policy: FailurePolicy::Required,
                         from: StepStateKind::Pending,
                         to: StepStateKind::Starting,
                     },
@@ -3802,33 +3776,27 @@ mod tests {
             .observe(ExecutionObservation::Transition(Box::new(
                 TransitionObservation {
                     event: TransitionEvent::Step {
-                        sequence: crate::execution::workflow::runtime::TransitionSequence(2),
+                        sequence: TransitionSequence(2),
                         step: "verify".to_owned(),
                         role: WorkflowNodeRole::Step,
-                        failure_policy:
-                            crate::execution::workflow::document::FailurePolicy::Required,
+                        failure_policy: FailurePolicy::Required,
                         from: StepStateKind::Running,
                         to: StepStateKind::Recovering,
                     },
                     step: Some(ObservedStepTransition::Recovery {
                         active: ActiveStepInvocation::RecoveryHandler {
-                            round:
-                                crate::execution::workflow::runtime::RecoveryRoundNumber::fixture(1),
+                            round: RecoveryRoundNumber::fixture(1),
                         },
                         active_invocation_id: handler,
                         settled_invocation: Some((
                             target,
                             ActiveStepInvocation::Target {
-                                execution_number: crate::execution::workflow::runtime::TargetExecutionNumber::fixture(1),
+                                execution_number: TargetExecutionNumber::fixture(1),
                             },
                         )),
                         configured_rounds: 1,
-                        handler_kind: Some(
-                            crate::execution::workflow::runtime::RecoveryHandlerKind::Command,
-                        ),
-                        handler_state: Some(
-                            crate::execution::workflow::runtime::RecoveryHandlerActivity::Starting,
-                        ),
+                        handler_kind: Some(RecoveryHandlerKind::Command),
+                        handler_state: Some(RecoveryHandlerActivity::Starting),
                         decision: None,
                     }),
                 },
@@ -3862,7 +3830,7 @@ mod tests {
             2,
             outbox.clone(),
             fence.clone(),
-            crate::execution::workflow::admission::CancellationSource::new(),
+            CancellationSource::new(),
             RunnerInvocationEvidence::default(),
         );
         fence.fence();
@@ -3903,7 +3871,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_stop_fence_rearms_lease_loss_at_finalization_boundary() {
-        let cancellation = crate::execution::workflow::admission::CancellationSource::new();
+        let cancellation = CancellationSource::new();
         assert!(cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired));
         assert!(cancellation.fixture_begin_finalization_arm());
 
@@ -3930,8 +3898,7 @@ mod tests {
                             },
                         },
                         to: Box::new(WorkflowState::Finalizing {
-                            trigger:
-                                crate::execution::workflow::document::FinalizationTrigger::Cancelled,
+                            trigger: FinalizationTrigger::Cancelled,
                             gate: FinalizationGate::Open,
                             primary_issue: None,
                         }),
@@ -3972,18 +3939,15 @@ mod tests {
     fn advisory_step_transition_preserves_policy_and_raw_disposition() {
         let transition = TransitionObservation::<RunnerExecutionInstant> {
             event: TransitionEvent::Step {
-                sequence: crate::execution::workflow::runtime::TransitionSequence::default(),
+                sequence: TransitionSequence::default(),
                 step: "lint".to_owned(),
                 role: WorkflowNodeRole::Step,
-                failure_policy: crate::execution::workflow::document::FailurePolicy::Advisory,
+                failure_policy: FailurePolicy::Advisory,
                 from: StepStateKind::Pending,
                 to: StepStateKind::Blocked,
             },
             step: Some(ObservedStepTransition::Blocked {
-                detail: crate::execution::workflow::evidence::BlockedDetail::new([
-                    crate::execution::workflow::evidence::Prerequisite::control("analyze").unwrap(),
-                ])
-                .unwrap(),
+                detail: BlockedDetail::new([Prerequisite::control("analyze").unwrap()]).unwrap(),
             }),
         };
 

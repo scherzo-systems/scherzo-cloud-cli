@@ -22,7 +22,7 @@ use super::source::{
 use super::test_support::{
     ConfigFixture, DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
 };
-use crate::execution::workflow::artifact::CaptureCancellation;
+use crate::execution::CaptureCancellation;
 use crate::runner::credential::test_credential;
 use crate::runner::telemetry::test_recorder;
 

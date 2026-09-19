@@ -46,22 +46,15 @@ impl ExitCode {
     pub(crate) const fn as_u8(self) -> u8 {
         self as u8
     }
+}
 
-    pub(crate) const fn as_u16(self) -> u16 {
-        self as u16
-    }
-
-    pub(crate) const fn from_u16(code: u16) -> Option<Self> {
-        match code {
-            0 => Some(Self::Success),
-            1 => Some(Self::GeneralFailure),
-            2 => Some(Self::UsageError),
-            3 => Some(Self::AuthenticationRequired),
-            4 => Some(Self::Unavailable),
-            5 => Some(Self::RunnerRecoveryRequired),
-            130 => Some(Self::Interrupted),
-            143 => Some(Self::Terminated),
-            _ => None,
+impl From<crate::execution::ExecutionOutcome> for ExitCode {
+    fn from(outcome: crate::execution::ExecutionOutcome) -> Self {
+        match outcome {
+            crate::execution::ExecutionOutcome::Succeeded => Self::Success,
+            crate::execution::ExecutionOutcome::Failed => Self::GeneralFailure,
+            crate::execution::ExecutionOutcome::Interrupted => Self::Interrupted,
+            crate::execution::ExecutionOutcome::Terminated => Self::Terminated,
         }
     }
 }
@@ -81,6 +74,7 @@ impl Termination for ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{ExitCode, OutcomeClass};
+    use crate::execution::ExecutionOutcome;
 
     #[test]
     fn outcome_classes_map_to_registered_exit_codes() {
@@ -101,6 +95,20 @@ mod tests {
 
         for (outcome, expected) in cases {
             assert_eq!(outcome.exit_code(), expected);
+        }
+    }
+
+    #[test]
+    fn execution_outcomes_map_to_registered_exit_codes() {
+        let cases = [
+            (ExecutionOutcome::Succeeded, ExitCode::Success),
+            (ExecutionOutcome::Failed, ExitCode::GeneralFailure),
+            (ExecutionOutcome::Interrupted, ExitCode::Interrupted),
+            (ExecutionOutcome::Terminated, ExitCode::Terminated),
+        ];
+
+        for (outcome, expected) in cases {
+            assert_eq!(ExitCode::from(outcome), expected);
         }
     }
 }

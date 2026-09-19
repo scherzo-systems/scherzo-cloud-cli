@@ -283,8 +283,7 @@ impl fmt::Debug for Recorder {
 }
 
 impl Recorder {
-    pub(crate) fn stderr(service_instance_id: &str) -> Arc<Self> {
-        let service_version = crate::build_info::VERSION;
+    pub(crate) fn stderr(service_instance_id: &str, service_version: &str) -> Arc<Self> {
         let dropped_count = Arc::new(AtomicU64::new(0));
         let queued_writer = Arc::new(QueuedWriter::stderr(Arc::clone(&dropped_count)));
         let writer: Arc<dyn EventWriter> = queued_writer.clone();
@@ -304,6 +303,10 @@ impl Recorder {
             service_instance_id,
             dropped_count,
         ))
+    }
+
+    pub(crate) fn service_version(&self) -> &str {
+        &self.service_version
     }
 
     #[cfg(test)]
@@ -635,6 +638,9 @@ impl opentelemetry_sdk::trace::SpanExporter for TestCapture {
 }
 
 #[cfg(test)]
+pub(crate) const TEST_SERVICE_VERSION: &str = "0.0.0-test";
+
+#[cfg(test)]
 pub(crate) fn test_recorder(service_instance_id: &str) -> (Arc<Recorder>, TestCapture) {
     let capture = TestCapture::default();
     let provider = SdkTracerProvider::builder()
@@ -643,7 +649,7 @@ pub(crate) fn test_recorder(service_instance_id: &str) -> (Arc<Recorder>, TestCa
     let recorder = Recorder::new(
         provider,
         Arc::new(capture.clone()),
-        crate::build_info::VERSION,
+        TEST_SERVICE_VERSION,
         service_instance_id,
     );
     (Arc::new(recorder), capture)

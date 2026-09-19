@@ -26,11 +26,11 @@ use std::env;
 use crate::exit_code::ExitCode;
 
 fn main() -> ExitCode {
-    if execution::workflow::child_guard::internal_worker_requested() {
-        return execution::workflow::child_guard::run_internal_worker();
+    if execution::child_guard_worker_requested() {
+        return execution::run_child_guard_worker().into();
     }
-    if execution::workflow::result_validation::internal_worker_requested() {
-        return execution::workflow::result_validation::run_internal_worker();
+    if execution::result_validation_worker_requested() {
+        return execution::run_result_validation_worker().into();
     }
     if runner::service::workflow_git_helper_requested() {
         return if runner::service::run_workflow_git_helper() {
