@@ -1,6 +1,10 @@
 [test-groups]
 # Keep process-heavy integration tests from exhausting host process capacity.
-external-process = { max-threads = 2 }
+# Measured 2026-09-19 at 0569e4b7315aa128d39725682016fa968faa443e:
+# aarch64-apple-darwin median wall time was 77.324s at cap 2 and 49.861s at cap 4;
+# x86_64-unknown-linux-gnu was 144.579s at cap 2 and 145.593s at cap 4.
+# Cap 8 was rejected after higher-cap-only failures on macOS.
+external-process = { max-threads = 4 }
 
 [profile.default]
 # Report ordinary tests as slow after 30 seconds and terminate them after 60.
