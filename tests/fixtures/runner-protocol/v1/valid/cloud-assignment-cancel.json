@@ -1,0 +1,16 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abm",
+  "sentAt": "2026-09-15T18:00:01Z",
+  "type": "assignment_cancel",
+  "payloadVersion": 1,
+  "payload": {
+    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abm",
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abj",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "requestId": "cmd_01k0z6r1w8f4jy2m7q9v3x5abm",
+    "mode": "graceful"
+  }
+}

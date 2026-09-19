@@ -855,6 +855,11 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
         reason: CancellationReason,
         deadline: Deadline,
     },
+    OrdinaryCancellationOperationRequested {
+        operation: CancellationOperationId,
+        reason: CancellationReason,
+        deadline: Deadline,
+    },
     ForceAbortRequested {
         operation: CancellationOperationId,
         deadline: Deadline,
@@ -1374,6 +1379,17 @@ where
                 Some(operation),
             );
         }
+        Occurrence::OrdinaryCancellationOperationRequested {
+            operation,
+            reason,
+            deadline,
+        } => {
+            return apply_ordinary_only_cancellation(
+                reduction,
+                CancellationRequest { reason, deadline },
+                operation,
+            );
+        }
         Occurrence::ForceAbortRequested {
             operation,
             deadline,
@@ -1407,6 +1423,28 @@ where
         }
     }
     true
+}
+
+fn apply_ordinary_only_cancellation<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    cancellation: CancellationRequest<Deadline>,
+    operation: CancellationOperationId,
+) -> bool
+where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    if cancellation.reason == CancellationReason::ForceAbort
+        || stale_operation(&reduction.state, operation)
+    {
+        return false;
+    }
+    if !matches!(&reduction.state.workflow, WorkflowState::Executing { .. }) {
+        reduction.state.last_cancellation_operation = Some(operation);
+        return matches!(&reduction.state.workflow, WorkflowState::Finalizing { .. });
+    }
+    apply_ordinary_cancellation(reduction, cancellation, Some(operation))
 }
 
 fn stale_operation<Cause, Output, Deadline>(

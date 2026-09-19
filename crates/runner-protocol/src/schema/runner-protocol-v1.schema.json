@@ -23,6 +23,9 @@
       "$ref": "#/$defs/RunnerAssignmentRejected"
     },
     {
+      "$ref": "#/$defs/RunnerAssignmentCancellationApplied"
+    },
+    {
       "$ref": "#/$defs/RunnerAssignmentInterrupted"
     },
     {
@@ -83,6 +86,9 @@
       "$ref": "#/$defs/CloudAssignmentStart"
     },
     {
+      "$ref": "#/$defs/CloudAssignmentCancel"
+    },
+    {
       "$ref": "#/$defs/CloudExecutionStartAuthorized"
     },
     {
@@ -116,6 +122,26 @@
     "effectId": {
       "type": "string",
       "pattern": "^eff_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "cancellationRequestId": {
+      "type": "string",
+      "pattern": "^cmd_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "CancellationMode": {
+      "enum": [
+        "graceful",
+        "force"
+      ]
+    },
+    "CancellationApplicationDisposition": {
+      "enum": [
+        "pre_execution_stopped",
+        "ordinary_cancelling",
+        "finalizers_preserved",
+        "force_cancelling",
+        "execution_terminal",
+        "superseded"
+      ]
     },
     "assignmentId": {
       "type": "string",
@@ -780,6 +806,57 @@
       ],
       "unevaluatedProperties": false
     },
+    "RunnerAssignmentCancellationApplied": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RunnerEnvelope"
+        },
+        {
+          "properties": {
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "requestId": {
+                  "$ref": "#/$defs/cancellationRequestId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "mode": {
+                  "$ref": "#/$defs/CancellationMode"
+                },
+                "effectiveMode": {
+                  "$ref": "#/$defs/CancellationMode"
+                },
+                "disposition": {
+                  "$ref": "#/$defs/CancellationApplicationDisposition"
+                }
+              },
+              "required": [
+                "effectId",
+                "requestId",
+                "assignmentId",
+                "attemptId",
+                "mode",
+                "effectiveMode",
+                "disposition"
+              ]
+            },
+            "type": {
+              "const": "assignment_cancellation_applied"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
     "RunnerAssignmentInterrupted": {
       "allOf": [
         {
@@ -804,7 +881,9 @@
                 "reason": {
                   "enum": [
                     "graceful_shutdown",
-                    "execution_lease_expired"
+                    "execution_lease_expired",
+                    "user_request",
+                    "force_abort"
                   ]
                 }
               },
@@ -1078,6 +1157,53 @@
                 "attemptId",
                 "executionSpecId",
                 "lease"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudAssignmentCancel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/CloudEnvelope"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "assignment_cancel"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": {
+                  "$ref": "#/$defs/effectId"
+                },
+                "assignmentId": {
+                  "$ref": "#/$defs/assignmentId"
+                },
+                "runId": {
+                  "$ref": "#/$defs/runId"
+                },
+                "attemptId": {
+                  "$ref": "#/$defs/attemptId"
+                },
+                "requestId": {
+                  "$ref": "#/$defs/cancellationRequestId"
+                },
+                "mode": {
+                  "$ref": "#/$defs/CancellationMode"
+                }
+              },
+              "required": [
+                "effectId",
+                "assignmentId",
+                "runId",
+                "attemptId",
+                "requestId",
+                "mode"
               ]
             }
           }
@@ -3548,6 +3674,9 @@
             "primaryIssue",
             "forceAbort"
           ]
+        },
+        {
+          "$ref": "#/$defs/UserCancelledOutcome"
         }
       ]
     },
@@ -4020,6 +4149,9 @@
             "finalization": {
               "$ref": "#/$defs/FinalizationSummary"
             },
+            "recoverySummaries": {
+              "$ref": "#/$defs/RecoverySummaries"
+            },
             "reason": {
               "$ref": "#/$defs/RuntimeCancellationReason"
             }
@@ -4032,6 +4164,23 @@
         }
       ]
     },
+    "UserCancelledOutcome": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/WorkflowCancelledOutcome"
+        },
+        {
+          "properties": {
+            "reason": {
+              "enum": [
+                "user_request",
+                "force_abort"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "RunnerShutdownCancelledOutcome": {
       "allOf": [
         {
@@ -4040,7 +4189,11 @@
         {
           "properties": {
             "reason": {
-              "const": "runner_shutdown"
+              "enum": [
+                "runner_shutdown",
+                "user_request",
+                "force_abort"
+              ]
             }
           }
         }
@@ -4054,7 +4207,12 @@
         {
           "properties": {
             "reason": {
-              "const": "execution_lease_expired"
+              "enum": [
+                "execution_lease_expired",
+                "runner_shutdown",
+                "user_request",
+                "force_abort"
+              ]
             }
           }
         }

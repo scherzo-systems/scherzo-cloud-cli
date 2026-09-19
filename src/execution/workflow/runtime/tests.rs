@@ -3241,6 +3241,66 @@ fn trace_fresh_finalization_cancellation_does_not_replay_ordinary_cancellation()
 }
 
 #[test]
+fn ordinary_only_cancellation_preserves_open_finalization() {
+    let definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Succeeded],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let mut state = initialize_test(definition).state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: action_id(1),
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: action_id(1),
+            provisional: String::new(),
+        },
+    );
+    let release = boundary.actions[0].id;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "release".into(),
+            action: release,
+        },
+    );
+
+    let preserved = reduce_and_advance(
+        &mut state,
+        Occurrence::OrdinaryCancellationOperationRequested {
+            operation: CancellationOperationId::fixture(2),
+            reason: CancellationReason::UserRequest,
+            deadline: deadline(20),
+        },
+    );
+
+    assert!(preserved.actions.is_empty());
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Finalizing {
+            trigger: FinalizationTrigger::Succeeded,
+            gate: FinalizationGate::Open,
+            primary_issue: None,
+        }
+    );
+    assert_eq!(state.finalization.as_ref().unwrap().cancellation, None);
+    assert_eq!(state.steps["release"].state, StepState::Running);
+}
+
+#[test]
 fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_outputs() {
     let definition = finalizer_definition(
         &[("producer", FailurePolicy::Required, &[], &[], &["resource"])],

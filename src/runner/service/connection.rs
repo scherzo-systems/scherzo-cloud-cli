@@ -19,9 +19,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 
 use crate::runner::service::artifact_delivery::ArtifactCloudResponse;
 use crate::runner::service::assignment::{
-    ArtifactRequestKind, AssignmentManager, AssignmentManagerFailure, AssignmentOffer,
-    AssignmentPrepare, AssignmentRenewal, AssignmentStart, AssignmentStartAuthorization,
-    PendingAssignmentObservation, RetainedObservationFrame, WelcomePolicyFailure,
+    ArtifactRequestKind, AssignmentCancel, AssignmentManager, AssignmentManagerFailure,
+    AssignmentOffer, AssignmentPrepare, AssignmentRelease, AssignmentRenewal, AssignmentStart,
+    AssignmentStartAuthorization, PendingAssignmentObservation, RetainedObservationFrame,
+    WelcomePolicyFailure,
 };
 use crate::runner::service::config::Config;
 use crate::runner::service::control::LiveStatus;
@@ -194,6 +195,17 @@ impl<'a> ProtocolLog<'a> {
             } => (
                 envelope,
                 "assignment_rejected",
+                Some(effect_id),
+                Some(assignment_id),
+            ),
+            RunnerFrame::AssignmentCancellationApplied {
+                envelope,
+                effect_id,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "assignment_cancellation_applied",
                 Some(effect_id),
                 Some(assignment_id),
             ),
@@ -423,6 +435,21 @@ impl<'a> ProtocolLog<'a> {
                     run_id,
                     lease.sequence,
                 ),
+            ),
+            CloudFrame::AssignmentCancel {
+                envelope,
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            } => (
+                envelope,
+                "assignment_cancel",
+                vec![
+                    KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                    KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                ],
             ),
             CloudFrame::ExecutionStartAuthorized {
                 envelope,
@@ -1427,6 +1454,31 @@ impl BufferedEffect {
                     AssignmentManagerEffect::Start(start),
                 )
             }
+            CloudFrame::AssignmentCancel {
+                effect_id,
+                assignment_id,
+                run_id,
+                attempt_id,
+                request_id,
+                mode,
+                ..
+            } => {
+                let cancel = AssignmentCancel {
+                    effect_id: effect_id.clone(),
+                    assignment_id: assignment_id.clone(),
+                    run_id: run_id.clone(),
+                    attempt_id,
+                    request_id,
+                    mode,
+                };
+                (
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    None,
+                    AssignmentManagerEffect::Cancel(cancel),
+                )
+            }
             CloudFrame::ExecutionStartAuthorized {
                 effect_id,
                 assignment_id,
@@ -1480,16 +1532,17 @@ impl BufferedEffect {
                 reason,
                 ..
             } => (
-                effect_id,
+                effect_id.clone(),
                 assignment_id.clone(),
                 run_id.clone(),
                 None,
-                AssignmentManagerEffect::Release {
+                AssignmentManagerEffect::Release(AssignmentRelease {
+                    effect_id,
                     assignment_id,
                     run_id,
                     attempt_id,
                     reason,
-                },
+                }),
             ),
             _ => {
                 return Err(ConnectionError::terminal(
@@ -1578,14 +1631,10 @@ enum AssignmentManagerEffect {
     Offer(Box<AssignmentOffer>),
     Prepare(AssignmentPrepare),
     Start(AssignmentStart),
+    Cancel(AssignmentCancel),
     StartAuthorized(AssignmentStartAuthorization),
     Renewal(AssignmentRenewal),
-    Release {
-        assignment_id: String,
-        run_id: String,
-        attempt_id: String,
-        reason: String,
-    },
+    Release(AssignmentRelease),
 }
 
 fn apply_assignment_manager_effect(
@@ -1603,6 +1652,7 @@ fn apply_assignment_manager_effect(
                 manager.handle_prepare(prepare).map(|_| None)
             }
             AssignmentManagerEffect::Start(start) => manager.handle_start(start),
+            AssignmentManagerEffect::Cancel(cancel) => manager.handle_cancel(cancel).map(|()| None),
             AssignmentManagerEffect::StartAuthorized(authorization) => manager
                 .handle_start_authorized(authorization)
                 .map(|()| None),
@@ -1626,14 +1676,9 @@ fn apply_assignment_manager_effect(
                     }
                 }
             }
-            AssignmentManagerEffect::Release {
-                assignment_id,
-                run_id,
-                attempt_id,
-                reason,
-            } => manager
-                .handle_release(&assignment_id, &run_id, &attempt_id, &reason)
-                .map(|_| None),
+            AssignmentManagerEffect::Release(release) => {
+                manager.handle_release(release).map(|_| None)
+            }
         }
     };
     match manager_result {
@@ -2334,6 +2379,7 @@ where
             effect @ CloudFrame::AssignmentOffer { .. }
             | effect @ CloudFrame::AssignmentPrepare { .. }
             | effect @ CloudFrame::AssignmentStart { .. }
+            | effect @ CloudFrame::AssignmentCancel { .. }
             | effect @ CloudFrame::ExecutionStartAuthorized { .. }
             | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
@@ -2984,6 +3030,16 @@ mod tests {
         Message::Text(frame.to_string().into())
     }
 
+    fn assignment_cancel() -> Message {
+        Message::Text(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-cancel.json"
+            ))
+            .into(),
+        )
+    }
+
     fn assignment_release() -> Message {
         Message::Text(
             json!({
@@ -3557,6 +3613,55 @@ mod tests {
         assert_eq!(event["scherzo.lease.request_age_ms"], 29_000);
         assert_eq!(event["scherzo.lease.cancellation_headroom_ms"], 1_000);
         assert!(event["scherzo.lease.decision_delay_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_cancellation_emits_only_a_transport_receipt() {
+        let context = EstablishedTestContext::new();
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            assert!(matches!(outbound.recv().await, Some(Message::Text(_))));
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            inbound.send(assignment_cancel());
+
+            let receipt = with_watchdog(outbound.recv())
+                .await
+                .expect("cancellation receipt timed out")
+                .expect("cancellation receipt missing");
+            let Message::Text(receipt) = receipt else {
+                panic!("cancellation receipt was not text");
+            };
+            let receipt: serde_json::Value =
+                serde_json::from_str(&receipt).expect("decode cancellation receipt");
+            assert_eq!(receipt["type"], "effect_acknowledged");
+            assert_eq!(
+                receipt["payload"]["effectId"],
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abm"
+            );
+            assert_eq!(receipt["sequence"], 2);
+            inbound.send(observation_acknowledgement(
+                receipt["messageId"].as_str().expect("receipt message ID"),
+                2,
+            ));
+            inbound.send(Message::Ping(b"cancellation-applied".to_vec().into()));
+            assert!(matches!(
+                with_watchdog(outbound.recv()).await,
+                Ok(Some(Message::Pong(payload))) if payload.as_ref() == b"cancellation-applied"
+            ));
+            assert!(outbound.try_recv().is_err());
+            inbound.send(Message::Close(None));
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("cancellation receipt transcript timed out");
+        let progress = result.expect("cancellation receipt transcript failed");
+        assert_eq!(progress.effects_received, 1);
+        assert_eq!(progress.effect_acknowledgements_confirmed, 1);
+        assert_eq!(next_sequence, 3);
     }
 
     #[tokio::test]

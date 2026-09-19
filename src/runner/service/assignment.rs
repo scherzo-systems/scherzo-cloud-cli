@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,9 @@ use super::artifact_delivery::{
     ArtifactCloudResponse, ArtifactDeliveryBroker, ArtifactDeliveryProtocolFailure,
 };
 use super::config::Config;
-use super::execution::{AssignmentProcessGuards, ExecutionAuthority, ExecutionJob};
+use super::execution::{
+    AssignmentProcessGuards, ExecutionAuthority, ExecutionJob, InfrastructureInterruption,
+};
 use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::run_inputs::{HttpRunInputBroker, PreparationDeadline, RunInputBroker, RunInputFailure};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
@@ -24,8 +26,8 @@ use super::workspace::{
 use crate::execution::workflow::MAXIMUM_PARALLEL_STEPS;
 use crate::execution::workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
-    CancellationSource, EnvironmentSnapshot, ExecutionContext, ResolvedInputs,
-    SourceRevisionProvenance, WorkflowCapacityBudget, admit_runner_workflow,
+    CancellationSource, EnvironmentSnapshot, ExecutionContext, OrdinaryCancellationRequestResult,
+    ResolvedInputs, SourceRevisionProvenance, WorkflowCapacityBudget, admit_runner_workflow,
     default_execution_policy_limits,
 };
 use crate::execution::workflow::artifact::CaptureCancellation;
@@ -36,12 +38,12 @@ use crate::execution::workflow::capacity::RUNNER_TERMINAL_FRAME_BYTES;
 use crate::runner::control_protocol::AssignmentCounts;
 use crate::runner::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 use scherzo_cloud_runner_protocol::{
-    AssignmentDecline, ExecutionLeaseGrant, ExecutionLeasePolicy, ExecutionSpecInvalidReason,
-    ExecutionSpecV1RunnerProjection, MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES,
-    MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES,
-    PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope, RunnerFrame, RunnerUnableReason,
-    WorkflowDefinitionSourceV1RunnerProjection, encode_runner_frame,
-    is_condition_evidence_workflow_event,
+    AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ExecutionLeaseGrant,
+    ExecutionLeasePolicy, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection,
+    MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES, MAXIMUM_ORDINARY_FRAME_BYTES,
+    MAXIMUM_TERMINAL_FRAME_BYTES, PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope,
+    RunnerFrame, RunnerUnableReason, WorkflowDefinitionSourceV1RunnerProjection,
+    encode_runner_frame, is_condition_evidence_workflow_event,
 };
 
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
@@ -233,6 +235,44 @@ pub(super) struct AssignmentStart {
     pub(super) attempt_id: String,
     pub(super) execution_spec_id: String,
     pub(super) lease: ExecutionLeaseGrant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AssignmentCancel {
+    pub(super) effect_id: String,
+    pub(super) assignment_id: String,
+    pub(super) run_id: String,
+    pub(super) attempt_id: String,
+    pub(super) request_id: String,
+    pub(super) mode: CancellationMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AssignmentRelease {
+    pub(super) effect_id: String,
+    pub(super) assignment_id: String,
+    pub(super) run_id: String,
+    pub(super) attempt_id: String,
+    pub(super) reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AssignmentCancellationApplication {
+    effect_id: String,
+    request_id: String,
+    assignment_id: String,
+    attempt_id: String,
+    mode: CancellationMode,
+    effective_mode: CancellationMode,
+    disposition: CancellationApplicationDisposition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedCancellation {
+    command: AssignmentCancel,
+    application: Option<AssignmentCancellationApplication>,
+    observation_id: Option<u64>,
+    ready: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -607,6 +647,7 @@ pub(super) enum AssignmentObservation {
         phase: String,
     },
     Decision(AssignmentDecision),
+    CancellationApplied(AssignmentCancellationApplication),
     LeaseRenewalRequested {
         assignment_id: String,
         attempt_id: String,
@@ -629,6 +670,7 @@ impl AssignmentObservation {
             Self::Preparing { assignment_id, .. }
             | Self::PreparationProgress { assignment_id, .. } => assignment_id,
             Self::Decision(decision) => decision.assignment_id(),
+            Self::CancellationApplied(application) => &application.assignment_id,
             Self::LeaseRenewalRequested { assignment_id, .. }
             | Self::Execution { assignment_id, .. } => assignment_id,
             Self::Artifact { request, .. } => request.assignment_id(),
@@ -668,6 +710,16 @@ impl AssignmentObservation {
                 phase: phase.clone(),
             },
             Self::Decision(decision) => decision.runner_frame(envelope),
+            Self::CancellationApplied(application) => RunnerFrame::AssignmentCancellationApplied {
+                envelope,
+                effect_id: application.effect_id.clone(),
+                request_id: application.request_id.clone(),
+                assignment_id: application.assignment_id.clone(),
+                attempt_id: application.attempt_id.clone(),
+                mode: application.mode,
+                effective_mode: application.effective_mode,
+                disposition: application.disposition,
+            },
             Self::LeaseRenewalRequested {
                 assignment_id,
                 attempt_id,
@@ -1209,7 +1261,9 @@ struct RunningAssignment {
     causal_lease: CausalLease,
     authority_updates: tokio::sync::watch::Sender<LeaseAuthority>,
     start_authority: tokio::sync::watch::Sender<bool>,
+    infrastructure_interruption: tokio::sync::watch::Sender<Option<InfrastructureInterruption>>,
     workflow_git: WorkflowGitAuthority,
+    engine_terminal: Arc<AtomicBool>,
     workspace_release: Option<CleanupResult>,
 }
 
@@ -1292,6 +1346,7 @@ struct FinishingAssignment {
 enum ReleaseAfter {
     Idle,
     Reporting(Box<AssignmentIdentity>),
+    PreExecutionCancellation(Box<AssignmentIdentity>),
 }
 
 struct ReleasingAssignment {
@@ -1551,6 +1606,8 @@ pub(super) struct AssignmentManager {
     slot: Option<LocalSlot>,
     reporting: Option<AssignmentIdentity>,
     decisions: VecDeque<RetainedDecision>,
+    cancellations: VecDeque<RetainedCancellation>,
+    releases: VecDeque<AssignmentRelease>,
     outbox: ObservationOutbox,
     artifact_delivery: ArtifactDeliveryBroker,
     events: mpsc::UnboundedReceiver<ManagerEvent>,
@@ -1606,6 +1663,8 @@ impl AssignmentManager {
             slot: None,
             reporting: None,
             decisions: VecDeque::new(),
+            cancellations: VecDeque::new(),
+            releases: VecDeque::new(),
             outbox,
             artifact_delivery,
             events,
@@ -1647,6 +1706,9 @@ impl AssignmentManager {
         &mut self,
         offer: AssignmentOffer,
     ) -> Result<(), AssignmentManagerFailure> {
+        if self.cancellation_uses_effect_id(&offer.effect_id) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
         if let Some(LocalSlot::Preparing(preparing)) = &self.slot {
             if preparing.offer.assignment_id == offer.assignment_id {
                 return if same_assignment(&preparing.offer, &offer) {
@@ -1685,6 +1747,17 @@ impl AssignmentManager {
             if deferred.effect_id == offer.effect_id {
                 return Err(AssignmentManagerFailure::ConflictingOffer);
             }
+        }
+        if let Some(cancelled) = self.cancellations.iter().find(|retained| {
+            retained.application.is_some() && retained.command.assignment_id == offer.assignment_id
+        }) {
+            return if cancelled.command.run_id == offer.run_id
+                && cancelled.command.attempt_id == offer.attempt_id
+            {
+                Ok(())
+            } else {
+                Err(AssignmentManagerFailure::ConflictingOffer)
+            };
         }
 
         if self.cleanup_failed {
@@ -1770,6 +1843,9 @@ impl AssignmentManager {
         prepare: AssignmentPrepare,
     ) -> Result<(), AssignmentManagerFailure> {
         self.drain_events();
+        if self.cancellation_uses_effect_id(&prepare.effect_id) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
         let Some(LocalSlot::Preparing(mut preparing)) = self.slot.take() else {
             return Ok(());
         };
@@ -2022,11 +2098,357 @@ impl AssignmentManager {
         Ok(())
     }
 
+    fn cancellation_uses_effect_id(&self, effect_id: &str) -> bool {
+        self.cancellations
+            .iter()
+            .any(|retained| retained.command.effect_id == effect_id)
+    }
+
+    fn release_uses_effect_id(&self, effect_id: &str) -> bool {
+        self.releases
+            .iter()
+            .any(|release| release.effect_id == effect_id)
+    }
+
+    fn retain_release(&mut self, release: AssignmentRelease) {
+        if self.releases.len() == MAXIMUM_RETAINED_DECISIONS {
+            self.releases.pop_front();
+        }
+        self.releases.push_back(release);
+    }
+
+    pub(super) fn handle_cancel(
+        &mut self,
+        cancel: AssignmentCancel,
+    ) -> Result<(), AssignmentManagerFailure> {
+        self.drain_events();
+
+        if let Some(index) = self
+            .cancellations
+            .iter()
+            .position(|retained| retained.command.request_id == cancel.request_id)
+        {
+            if self.cancellations[index].command != cancel {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            }
+            if self.cancellations[index].ready
+                && self.cancellations[index].observation_id.is_none()
+                && self.cancellations[index].application.is_some()
+            {
+                self.emit_cancellation_application(index)?;
+            }
+            return Ok(());
+        }
+        if self.cancellation_uses_effect_id(&cancel.effect_id)
+            || self.release_uses_effect_id(&cancel.effect_id)
+            || self.decisions.iter().any(|decision| {
+                decision.offer.effect_id == cancel.effect_id
+                    || match &decision.response {
+                        AssignmentDecision::Accepted { effect_id, .. }
+                        | AssignmentDecision::Rejected { effect_id, .. } => {
+                            effect_id == &cancel.effect_id
+                        }
+                    }
+                    || decision
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.effect_id == cancel.effect_id)
+                    || decision
+                        .start_authorization
+                        .as_ref()
+                        .is_some_and(|authorization| authorization.effect_id == cancel.effect_id)
+                    || decision.renewals.contains_key(&cancel.effect_id)
+                    || decision.rejected_renewals.contains_key(&cancel.effect_id)
+            })
+            || matches!(&self.slot,
+                Some(LocalSlot::Preparing(preparing))
+                    if preparing.offer.effect_id == cancel.effect_id
+                        || preparing.prepare_effect_id.as_ref() == Some(&cancel.effect_id))
+            || self
+                .deferred_successor
+                .as_ref()
+                .is_some_and(|offer| offer.effect_id == cancel.effect_id)
+        {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        if self.cancellations.iter().any(|retained| {
+            retained.command.assignment_id == cancel.assignment_id
+                && (retained.command.run_id != cancel.run_id
+                    || retained.command.attempt_id != cancel.attempt_id)
+        }) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        if let Some(LocalSlot::Preparing(preparing)) = &self.slot
+            && preparing.offer.assignment_id == cancel.assignment_id
+        {
+            if preparing.offer.run_id != cancel.run_id
+                || preparing.offer.attempt_id != cancel.attempt_id
+            {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            }
+            let effective_mode = self.effective_cancellation_mode(&cancel);
+            let application = cancellation_application(
+                &cancel,
+                effective_mode,
+                cancellation_disposition(cancel.mode, effective_mode, false),
+            );
+            self.retain_cancellation(cancel, Some(application), false)?;
+            let Some(LocalSlot::Preparing(preparing)) = &mut self.slot else {
+                return Err(AssignmentManagerFailure::ConflictingOffer);
+            };
+            preparing.cancellation.cancel();
+            if let Some(event) = preparing.preparation_event.take() {
+                event.finish(TelemetryOutcome::Cancelled);
+            }
+            if preparing.root.is_some() && preparing.prepare_effect_id.is_none() {
+                let Some(LocalSlot::Preparing(mut preparing)) = self.slot.take() else {
+                    return Err(AssignmentManagerFailure::ConflictingOffer);
+                };
+                let Some(root) = preparing.root.take() else {
+                    self.slot = Some(LocalSlot::Preparing(preparing));
+                    return Err(AssignmentManagerFailure::ConflictingOffer);
+                };
+                let identity = AssignmentIdentity::from_offer(&preparing.offer);
+                self.begin_assignment_finalization(
+                    identity.assignment_id.clone(),
+                    root,
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Cancelled),
+                    ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
+                );
+            }
+            return Ok(());
+        }
+
+        let matching_decision = self.matching_decision_index(
+            &cancel.assignment_id,
+            &cancel.run_id,
+            &cancel.attempt_id,
+        )?;
+        if let Some(LocalSlot::Releasing(releasing)) = &self.slot
+            && releasing.assignment_id == cancel.assignment_id
+            && let ReleaseAfter::PreExecutionCancellation(identity) = &releasing.after
+            && (identity.run_id != cancel.run_id || identity.attempt_id != cancel.attempt_id)
+        {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        let accepted_target = matching_decision.is_some_and(|index| {
+            matches!(
+                self.decisions[index].response,
+                AssignmentDecision::Accepted { .. }
+            )
+        });
+        let exact_slot = match &self.slot {
+            Some(LocalSlot::Accepted(accepted)) => {
+                accepted.identity.assignment_id == cancel.assignment_id
+            }
+            Some(LocalSlot::Running(running)) => {
+                running.identity.assignment_id == cancel.assignment_id
+            }
+            Some(LocalSlot::Finishing(finishing)) => {
+                finishing.identity.assignment_id == cancel.assignment_id
+            }
+            Some(LocalSlot::Releasing(releasing)) => {
+                releasing.assignment_id == cancel.assignment_id
+                    && (accepted_target
+                        || matches!(&releasing.after, ReleaseAfter::PreExecutionCancellation(_)))
+            }
+            Some(LocalSlot::Preparing(_)) | None => false,
+        };
+        if !exact_slot {
+            if accepted_target {
+                let effective_mode = self.effective_cancellation_mode(&cancel);
+                let application = cancellation_application(
+                    &cancel,
+                    effective_mode,
+                    cancellation_disposition(cancel.mode, effective_mode, true),
+                );
+                let index = self.retain_cancellation(cancel, Some(application), true)?;
+                self.emit_cancellation_application(index)?;
+            } else {
+                self.retain_cancellation(cancel, None, true)?;
+            }
+            return Ok(());
+        }
+
+        let effective_mode = self.effective_cancellation_mode(&cancel);
+        let superseded =
+            cancel.mode == CancellationMode::Graceful && effective_mode == CancellationMode::Force;
+        self.make_cancellation_room()?;
+        match self.slot.take() {
+            Some(LocalSlot::Accepted(accepted)) => {
+                let identity = accepted.identity.clone();
+                let application = cancellation_application(
+                    &cancel,
+                    effective_mode,
+                    cancellation_disposition(cancel.mode, effective_mode, false),
+                );
+                self.retain_cancellation(cancel, Some(application), false)?;
+                self.begin_assignment_finalization(
+                    identity.assignment_id.clone(),
+                    accepted.root,
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Cancelled),
+                    ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
+                );
+            }
+            Some(LocalSlot::Running(running)) => {
+                let awaiting_start_authority = !*running.start_authority.borrow();
+                let disposition = if superseded {
+                    CancellationApplicationDisposition::Superseded
+                } else if running.engine_terminal.load(Ordering::Acquire) {
+                    CancellationApplicationDisposition::ExecutionTerminal
+                } else {
+                    match cancel.mode {
+                        CancellationMode::Force => {
+                            running.cancellation.request_force_abort();
+                            if awaiting_start_authority {
+                                CancellationApplicationDisposition::PreExecutionStopped
+                            } else {
+                                CancellationApplicationDisposition::ForceCancelling
+                            }
+                        }
+                        CancellationMode::Graceful => {
+                            let application = running.cancellation.request_ordinary_cancellation(
+                                crate::execution::workflow::admission::CancellationReason::UserRequest,
+                            );
+                            if awaiting_start_authority {
+                                CancellationApplicationDisposition::PreExecutionStopped
+                            } else if application
+                                == OrdinaryCancellationRequestResult::FinalizersPreserved
+                            {
+                                CancellationApplicationDisposition::FinalizersPreserved
+                            } else {
+                                CancellationApplicationDisposition::OrdinaryCancelling
+                            }
+                        }
+                    }
+                };
+                let application = cancellation_application(&cancel, effective_mode, disposition);
+                let ready =
+                    running.engine_terminal.load(Ordering::Acquire) || !awaiting_start_authority;
+                let index = self.retain_cancellation(cancel, Some(application), ready)?;
+                self.slot = Some(LocalSlot::Running(running));
+                if self.cancellations[index].ready {
+                    self.emit_cancellation_application(index)?;
+                }
+            }
+            Some(LocalSlot::Finishing(finishing)) => {
+                let application = cancellation_application(
+                    &cancel,
+                    effective_mode,
+                    cancellation_disposition(cancel.mode, effective_mode, true),
+                );
+                let index = self.retain_cancellation(cancel, Some(application), true)?;
+                self.slot = Some(LocalSlot::Finishing(finishing));
+                self.emit_cancellation_application(index)?;
+            }
+            Some(LocalSlot::Releasing(releasing)) => {
+                let pre_execution =
+                    matches!(&releasing.after, ReleaseAfter::PreExecutionCancellation(_));
+                let application = cancellation_application(
+                    &cancel,
+                    effective_mode,
+                    cancellation_disposition(cancel.mode, effective_mode, !pre_execution),
+                );
+                let index = self.retain_cancellation(cancel, Some(application), !pre_execution)?;
+                self.slot = Some(LocalSlot::Releasing(releasing));
+                if self.cancellations[index].ready {
+                    self.emit_cancellation_application(index)?;
+                }
+            }
+            slot => {
+                self.slot = slot;
+                self.retain_cancellation(cancel, None, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn effective_cancellation_mode(&self, cancel: &AssignmentCancel) -> CancellationMode {
+        if cancel.mode == CancellationMode::Force
+            || self.cancellations.iter().any(|retained| {
+                retained.command.assignment_id == cancel.assignment_id
+                    && retained.application.as_ref().is_some_and(|application| {
+                        application.effective_mode == CancellationMode::Force
+                    })
+            })
+        {
+            CancellationMode::Force
+        } else {
+            CancellationMode::Graceful
+        }
+    }
+
+    fn make_cancellation_room(&mut self) -> Result<(), AssignmentManagerFailure> {
+        if self.cancellations.len() < MAXIMUM_RETAINED_DECISIONS {
+            return Ok(());
+        }
+        let active_assignment_id = match &self.slot {
+            Some(LocalSlot::Preparing(preparing)) => Some(preparing.offer.assignment_id.as_str()),
+            Some(LocalSlot::Accepted(accepted)) => Some(accepted.identity.assignment_id.as_str()),
+            Some(LocalSlot::Running(running)) => Some(running.identity.assignment_id.as_str()),
+            Some(LocalSlot::Finishing(finishing)) => {
+                Some(finishing.identity.assignment_id.as_str())
+            }
+            Some(LocalSlot::Releasing(releasing)) => Some(releasing.assignment_id.as_str()),
+            None => self
+                .reporting
+                .as_ref()
+                .map(|identity| identity.assignment_id.as_str()),
+        };
+        let Some(index) = self.cancellations.iter().position(|retained| {
+            retained.observation_id.is_none()
+                && retained.ready
+                && active_assignment_id != Some(retained.command.assignment_id.as_str())
+        }) else {
+            return Err(AssignmentManagerFailure::DecisionCapacity);
+        };
+        self.cancellations.remove(index);
+        Ok(())
+    }
+
+    fn retain_cancellation(
+        &mut self,
+        command: AssignmentCancel,
+        application: Option<AssignmentCancellationApplication>,
+        ready: bool,
+    ) -> Result<usize, AssignmentManagerFailure> {
+        self.make_cancellation_room()?;
+        self.cancellations.push_back(RetainedCancellation {
+            command,
+            application,
+            observation_id: None,
+            ready,
+        });
+        Ok(self.cancellations.len() - 1)
+    }
+
+    fn emit_cancellation_application(
+        &mut self,
+        index: usize,
+    ) -> Result<(), AssignmentManagerFailure> {
+        let application = self.cancellations[index]
+            .application
+            .clone()
+            .ok_or(AssignmentManagerFailure::ConflictingOffer)?;
+        let observation_id = self
+            .outbox
+            .enqueue(AssignmentObservation::CancellationApplied(application))
+            .map_err(|_| AssignmentManagerFailure::DecisionCapacity)?;
+        self.cancellations[index].observation_id = Some(observation_id);
+        self.cancellations[index].ready = true;
+        Ok(())
+    }
+
     pub(super) fn handle_start(
         &mut self,
         start: AssignmentStart,
     ) -> Result<Option<ExecutionJob>, AssignmentManagerFailure> {
         self.drain_events();
+        if self.cancellation_uses_effect_id(&start.effect_id) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
         if self.decisions.iter().any(|decision| {
             decision
                 .start
@@ -2120,7 +2542,10 @@ impl AssignmentManager {
             .clone();
         let (authority_updates, authority_receiver) = tokio::sync::watch::channel(authority);
         let (start_authority, start_authority_receiver) = tokio::sync::watch::channel(false);
+        let (infrastructure_interruption, infrastructure_interruption_receiver) =
+            tokio::sync::watch::channel(None);
         let workflow_git = accepted.workflow_git.clone();
+        let engine_terminal = Arc::new(AtomicBool::new(false));
         self.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
             cancellation,
@@ -2129,7 +2554,9 @@ impl AssignmentManager {
             causal_lease: causal_lease.clone(),
             authority_updates,
             start_authority,
+            infrastructure_interruption,
             workflow_git,
+            engine_terminal: Arc::clone(&engine_terminal),
             workspace_release: None,
         })));
         Ok(Some(ExecutionJob::new(
@@ -2137,11 +2564,13 @@ impl AssignmentManager {
             self.outbox.clone(),
             self.artifact_delivery.clone(),
             self.event_sender.clone(),
+            engine_terminal,
             ExecutionAuthority {
                 lease_clock: self.lease_clock.clone(),
                 causal_lease,
                 updates: authority_receiver,
                 start_authority: start_authority_receiver,
+                infrastructure_interruption: infrastructure_interruption_receiver,
             },
         )))
     }
@@ -2171,6 +2600,9 @@ impl AssignmentManager {
         authorization: AssignmentStartAuthorization,
     ) -> Result<(), AssignmentManagerFailure> {
         self.drain_events();
+        if self.cancellation_uses_effect_id(&authorization.effect_id) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
         if self.decisions.iter().any(|decision| {
             decision.offer.effect_id == authorization.effect_id
                 || decision
@@ -2213,6 +2645,7 @@ impl AssignmentManager {
             && running.identity.assignment_id == authorization.assignment_id
             && running.identity.run_id == authorization.run_id
             && running.identity.attempt_id == authorization.attempt_id
+            && !self.has_pending_pre_execution_cancellation(&authorization.assignment_id)
         {
             running.start_authority.send_replace(true);
         }
@@ -2224,6 +2657,9 @@ impl AssignmentManager {
         renewal: AssignmentRenewal,
     ) -> Result<RenewalDecision, AssignmentManagerFailure> {
         self.drain_events();
+        if self.cancellation_uses_effect_id(&renewal.effect_id) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
         if self.decisions.iter().any(|decision| {
             decision.offer.effect_id == renewal.effect_id
                 || decision
@@ -2319,9 +2755,8 @@ impl AssignmentManager {
             cancellation_headroom_ms,
             request_age_ms,
         };
-        let cancellation_started = authority.revoked
-            || running.cancellation.is_cancelled()
-            || cancellation_order != std::cmp::Ordering::Less;
+        let cancellation_started =
+            authority.revoked || cancellation_order != std::cmp::Ordering::Less;
         if cancellation_started {
             let Some(LocalSlot::Running(running)) = &mut self.slot else {
                 return Ok(timed(RenewalDisposition::NotRunning));
@@ -2381,19 +2816,73 @@ impl AssignmentManager {
 
     pub(super) fn handle_release(
         &mut self,
-        assignment_id: &str,
-        run_id: &str,
-        attempt_id: &str,
-        reason: &str,
+        release: AssignmentRelease,
     ) -> Result<(), AssignmentManagerFailure> {
         self.drain_events();
+        if self.cancellation_uses_effect_id(&release.effect_id) {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        if let Some(known) = self
+            .releases
+            .iter()
+            .find(|known| known.effect_id == release.effect_id)
+        {
+            return if known == &release {
+                Ok(())
+            } else {
+                Err(AssignmentManagerFailure::ConflictingOffer)
+            };
+        }
         let retained_conflict = self.decisions.iter().any(|decision| {
-            decision.offer.assignment_id == assignment_id
-                && (decision.offer.run_id != run_id || decision.offer.attempt_id != attempt_id)
+            decision.offer.assignment_id == release.assignment_id
+                && (decision.offer.run_id != release.run_id
+                    || decision.offer.attempt_id != release.attempt_id)
         });
         if retained_conflict {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
+        let slot_conflict = match &self.slot {
+            Some(LocalSlot::Preparing(preparing))
+                if preparing.offer.assignment_id == release.assignment_id =>
+            {
+                preparing.offer.run_id != release.run_id
+                    || preparing.offer.attempt_id != release.attempt_id
+            }
+            Some(LocalSlot::Accepted(accepted))
+                if accepted.identity.assignment_id == release.assignment_id =>
+            {
+                accepted.identity.run_id != release.run_id
+                    || accepted.identity.attempt_id != release.attempt_id
+            }
+            Some(LocalSlot::Running(running))
+                if running.identity.assignment_id == release.assignment_id =>
+            {
+                running.identity.run_id != release.run_id
+                    || running.identity.attempt_id != release.attempt_id
+            }
+            Some(LocalSlot::Finishing(finishing))
+                if finishing.identity.assignment_id == release.assignment_id =>
+            {
+                finishing.identity.run_id != release.run_id
+                    || finishing.identity.attempt_id != release.attempt_id
+            }
+            Some(
+                LocalSlot::Preparing(_)
+                | LocalSlot::Accepted(_)
+                | LocalSlot::Running(_)
+                | LocalSlot::Finishing(_)
+                | LocalSlot::Releasing(_),
+            )
+            | None => false,
+        };
+        if slot_conflict {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        self.retain_release(release.clone());
+        let assignment_id = release.assignment_id.as_str();
+        let run_id = release.run_id.as_str();
+        let attempt_id = release.attempt_id.as_str();
+        let reason = release.reason.as_str();
         if let Some(LocalSlot::Preparing(preparing)) = &self.slot
             && preparing.offer.assignment_id == assignment_id
         {
@@ -2469,6 +2958,14 @@ impl AssignmentManager {
         let Some(observation) = self.outbox.acknowledge(id) else {
             return;
         };
+        if let AssignmentObservation::CancellationApplied(application) = &observation
+            && let Some(retained) = self.cancellations.iter_mut().find(|retained| {
+                retained.command.request_id == application.request_id
+                    && retained.observation_id == Some(id)
+            })
+        {
+            retained.observation_id = None;
+        }
         if let AssignmentObservation::Decision(decision) = &observation
             && let Some(retained) = self
                 .decisions
@@ -2545,6 +3042,14 @@ impl AssignmentManager {
                 decision.response_observation_id = None;
             }
         }
+        for cancellation in &mut self.cancellations {
+            if cancellation
+                .observation_id
+                .is_some_and(|id| removed.contains(&id))
+            {
+                cancellation.observation_id = None;
+            }
+        }
     }
 
     pub(super) fn begin_shutdown(&mut self) -> Result<(), AssignmentManagerFailure> {
@@ -2582,6 +3087,9 @@ impl AssignmentManager {
                 self.finish_before_execution(identity, root, "graceful_shutdown")?;
             }
             LocalSlot::Running(running) => {
+                running
+                    .infrastructure_interruption
+                    .send_replace(Some(InfrastructureInterruption::RunnerShutdown));
                 disable_workflow_git_off_thread(&running.workflow_git);
                 running.cancellation.request_cancellation(
                     crate::execution::workflow::admission::CancellationReason::RunnerShutdown,
@@ -2707,12 +3215,15 @@ impl AssignmentManager {
             self.slot = Some(LocalSlot::Releasing(releasing));
             return;
         }
-        match releasing.after {
-            ReleaseAfter::Idle => {}
-            ReleaseAfter::Reporting(identity) => self.reporting = Some(*identity),
-        }
         match result {
             CleanupResult::Released | CleanupResult::Retained => {
+                match releasing.after {
+                    ReleaseAfter::Idle => {}
+                    ReleaseAfter::Reporting(identity) => self.reporting = Some(*identity),
+                    ReleaseAfter::PreExecutionCancellation(identity) => {
+                        self.complete_pre_execution_cancellation(*identity);
+                    }
+                }
                 if let Some(successor) = self.deferred_successor.take()
                     && let Err(failure) = self.handle_offer_after_drain(successor)
                 {
@@ -2732,6 +3243,62 @@ impl AssignmentManager {
         self.outbox.wake();
     }
 
+    fn complete_pre_execution_cancellation(&mut self, identity: AssignmentIdentity) {
+        let pending: Vec<_> = self
+            .cancellations
+            .iter()
+            .enumerate()
+            .filter(|(_, retained)| {
+                retained.command.assignment_id == identity.assignment_id
+                    && retained.application.is_some()
+                    && !retained.ready
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in pending {
+            self.cancellations[index].ready = true;
+            if self.emit_cancellation_application(index).is_err() {
+                self.cleanup_failed = true;
+                self.retire_assignment_observations(&identity.assignment_id);
+                return;
+            }
+        }
+        let reason = if self.cancellations.iter().any(|retained| {
+            retained.command.assignment_id == identity.assignment_id
+                && retained.application.as_ref().is_some_and(|application| {
+                    application.effective_mode == CancellationMode::Force
+                })
+        }) {
+            "force_abort"
+        } else {
+            "user_request"
+        };
+        if self
+            .enqueue_assignment_interruption(&identity, reason)
+            .is_err()
+        {
+            self.cleanup_failed = true;
+            self.retire_assignment_observations(&identity.assignment_id);
+            return;
+        }
+        self.reporting = Some(identity);
+        self.outbox.wake();
+    }
+
+    fn enqueue_assignment_interruption(
+        &self,
+        identity: &AssignmentIdentity,
+        reason: &str,
+    ) -> Result<u64, OutboxFailure> {
+        self.outbox.enqueue(AssignmentObservation::Execution {
+            assignment_id: identity.assignment_id.clone(),
+            attempt_id: identity.attempt_id.clone(),
+            report: ExecutionReport::AssignmentInterrupted {
+                reason: reason.to_owned(),
+            },
+        })
+    }
+
     fn finish_before_execution(
         &mut self,
         identity: AssignmentIdentity,
@@ -2739,14 +3306,7 @@ impl AssignmentManager {
         reason: &str,
     ) -> Result<(), AssignmentManagerFailure> {
         let final_observation_id = self
-            .outbox
-            .enqueue(AssignmentObservation::Execution {
-                assignment_id: identity.assignment_id.clone(),
-                attempt_id: identity.attempt_id.clone(),
-                report: ExecutionReport::AssignmentInterrupted {
-                    reason: reason.to_owned(),
-                },
-            })
+            .enqueue_assignment_interruption(&identity, reason)
             .map_err(|_| AssignmentManagerFailure::DecisionCapacity)?;
         let workspace_disposition = WorkspaceDisposition::Retain(match reason {
             "graceful_shutdown" => RetentionReason::Cancelled,
@@ -2855,12 +3415,23 @@ impl AssignmentManager {
                     preparing.root_preparation = None;
                     match root {
                         Ok(root) if preparing.cancellation.is_cancelled() => {
-                            self.begin_assignment_cleanup(
-                                assignment_id,
-                                root,
-                                ProcessQuiescence::Proven,
-                                ReleaseAfter::Idle,
-                            );
+                            let identity = AssignmentIdentity::from_offer(&preparing.offer);
+                            if self.has_pending_pre_execution_cancellation(&assignment_id) {
+                                self.begin_assignment_finalization(
+                                    assignment_id,
+                                    root,
+                                    ProcessQuiescence::Proven,
+                                    WorkspaceDisposition::Retain(RetentionReason::Cancelled),
+                                    ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
+                                );
+                            } else {
+                                self.begin_assignment_cleanup(
+                                    assignment_id,
+                                    root,
+                                    ProcessQuiescence::Proven,
+                                    ReleaseAfter::Idle,
+                                );
+                            }
                         }
                         Ok(root) => {
                             let preparation = AssignmentObservation::Preparing {
@@ -2885,7 +3456,9 @@ impl AssignmentManager {
                             }
                         }
                         Err(error) => {
-                            if error == AssignmentRootCreationError::CleanupFailed {
+                            let cleanup_failed =
+                                error == AssignmentRootCreationError::CleanupFailed;
+                            if cleanup_failed {
                                 self.cleanup_failed = true;
                             }
                             if !preparing.cancellation.is_cancelled() {
@@ -2895,6 +3468,12 @@ impl AssignmentManager {
                                     self.lease_clock_failed |=
                                         failure == AssignmentManagerFailure::LeaseClock;
                                 }
+                            } else if !cleanup_failed
+                                && self.has_pending_pre_execution_cancellation(&assignment_id)
+                            {
+                                self.complete_pre_execution_cancellation(
+                                    AssignmentIdentity::from_offer(&preparing.offer),
+                                );
                             }
                             self.outbox.wake();
                         }
@@ -2921,12 +3500,23 @@ impl AssignmentManager {
                             Ok(accepted) => accepted.root,
                             Err(failure) => failure.0,
                         };
-                        self.begin_assignment_cleanup(
-                            offer.assignment_id.clone(),
-                            root,
-                            ProcessQuiescence::Proven,
-                            ReleaseAfter::Idle,
-                        );
+                        let identity = AssignmentIdentity::from_offer(&offer);
+                        if self.has_pending_pre_execution_cancellation(&offer.assignment_id) {
+                            self.begin_assignment_finalization(
+                                offer.assignment_id.clone(),
+                                root,
+                                ProcessQuiescence::Proven,
+                                WorkspaceDisposition::Retain(RetentionReason::Cancelled),
+                                ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
+                            );
+                        } else {
+                            self.begin_assignment_cleanup(
+                                offer.assignment_id.clone(),
+                                root,
+                                ProcessQuiescence::Proven,
+                                ReleaseAfter::Idle,
+                            );
+                        }
                         continue;
                     }
                     if let Some(event) = preparing.preparation_event.take() {
@@ -3015,6 +3605,9 @@ impl AssignmentManager {
                     let identity = running.identity;
                     let retained_root = retained_root.map(|root| *root);
                     if quiescence == ProcessQuiescence::Failed {
+                        // Unproven process containment permanently fences this boot from
+                        // admitting another assignment, even after its roots are retained.
+                        self.cleanup_failed = true;
                         let after = if final_observation_id.is_some() {
                             ReleaseAfter::Reporting(Box::new(identity))
                         } else {
@@ -3035,6 +3628,22 @@ impl AssignmentManager {
                         continue;
                     }
                     let Some(final_observation_id) = final_observation_id else {
+                        if !lease_clock_failed
+                            && self.has_pending_pre_execution_cancellation(&assignment_id)
+                        {
+                            if let Some(root) = retained_root {
+                                self.begin_assignment_finalization(
+                                    assignment_id,
+                                    root,
+                                    quiescence,
+                                    workspace_disposition,
+                                    ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
+                                );
+                            } else {
+                                self.complete_pre_execution_cancellation(identity);
+                            }
+                            continue;
+                        }
                         self.lease_clock_failed |= lease_clock_failed;
                         self.finish_without_reporting(
                             assignment_id,
@@ -3178,6 +3787,14 @@ impl AssignmentManager {
         }
     }
 
+    fn has_pending_pre_execution_cancellation(&self, assignment_id: &str) -> bool {
+        self.cancellations.iter().any(|retained| {
+            retained.command.assignment_id == assignment_id
+                && retained.application.is_some()
+                && !retained.ready
+        })
+    }
+
     fn clamp_to_shutdown_cleanup_deadline(
         &self,
         deadline: LeaseInstant,
@@ -3251,6 +3868,15 @@ impl AssignmentManager {
                     .is_some_and(|id| !self.outbox.contains(id))
             {
                 decision.response_observation_id = None;
+            }
+        }
+        for cancellation in &mut self.cancellations {
+            if cancellation.command.assignment_id == assignment_id
+                && cancellation
+                    .observation_id
+                    .is_some_and(|id| !self.outbox.contains(id))
+            {
+                cancellation.observation_id = None;
             }
         }
     }
@@ -3589,6 +4215,8 @@ pub(super) mod test_support {
         let cancellation = CancellationSource::new();
         let (authority_updates, authority) = tokio::sync::watch::channel(initial_authority);
         let (start_authority, _start_authority) = tokio::sync::watch::channel(true);
+        let (infrastructure_interruption, _infrastructure_interruption) =
+            tokio::sync::watch::channel(None);
         let broker = manager
             .source_broker
             .clone()
@@ -3606,7 +4234,9 @@ pub(super) mod test_support {
             causal_lease: causal_lease.clone(),
             authority_updates,
             start_authority,
+            infrastructure_interruption,
             workflow_git,
+            engine_terminal: Arc::new(AtomicBool::new(false)),
             workspace_release: None,
         })));
         RenewalTimingFixture {
@@ -4184,6 +4814,36 @@ fn environment_unavailable() -> AssignmentDecline {
     AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable)
 }
 
+fn cancellation_application(
+    cancel: &AssignmentCancel,
+    effective_mode: CancellationMode,
+    disposition: CancellationApplicationDisposition,
+) -> AssignmentCancellationApplication {
+    AssignmentCancellationApplication {
+        effect_id: cancel.effect_id.clone(),
+        request_id: cancel.request_id.clone(),
+        assignment_id: cancel.assignment_id.clone(),
+        attempt_id: cancel.attempt_id.clone(),
+        mode: cancel.mode,
+        effective_mode,
+        disposition,
+    }
+}
+
+fn cancellation_disposition(
+    requested_mode: CancellationMode,
+    effective_mode: CancellationMode,
+    terminal: bool,
+) -> CancellationApplicationDisposition {
+    if requested_mode == CancellationMode::Graceful && effective_mode == CancellationMode::Force {
+        CancellationApplicationDisposition::Superseded
+    } else if terminal {
+        CancellationApplicationDisposition::ExecutionTerminal
+    } else {
+        CancellationApplicationDisposition::PreExecutionStopped
+    }
+}
+
 fn rejected(offer: &AssignmentOffer, decline: AssignmentDecline) -> AssignmentDecision {
     AssignmentDecision::Rejected {
         effect_id: offer.effect_id.clone(),
@@ -4217,7 +4877,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use rustix::process::Pid;
     use serde_json::json;
@@ -4439,6 +5099,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     enum GatedRootPreparationOutcome {
         Create(Arc<WorkRootLease>),
         Unavailable,
+        CleanupFailed,
     }
 
     struct GatedAssignmentRootPreparer {
@@ -4469,6 +5130,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                     ),
                 GatedRootPreparationOutcome::Unavailable => {
                     Err(AssignmentRootCreationError::Unavailable)
+                }
+                GatedRootPreparationOutcome::CleanupFailed => {
+                    Err(AssignmentRootCreationError::CleanupFailed)
                 }
             }
         }
@@ -4835,12 +5499,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     fn release_current(manager: &mut AssignmentManager, offered: &AssignmentOffer, reason: &str) {
         manager
-            .handle_release(
-                &offered.assignment_id,
-                &offered.run_id,
-                &offered.attempt_id,
-                reason,
-            )
+            .handle_release(release_for(offered, "br", reason))
             .unwrap();
     }
 
@@ -4888,6 +5547,28 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             commit_oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             materialization_contract: "git_full_clone_v1".to_owned(),
         }
+    }
+
+    fn assert_offer_rejected_without_cleanup(
+        manager: &mut AssignmentManager,
+        offered: AssignmentOffer,
+        expected: AssignmentDecline,
+    ) {
+        let assignment_id = offered.assignment_id.clone();
+        manager.handle_offer(offered).unwrap();
+        assert!(
+            manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .iter()
+                .any(|pending| matches!(
+                    &pending.observation,
+                    AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                        assignment_id: rejected_assignment_id,
+                        decline,
+                        ..
+                    }) if rejected_assignment_id == &assignment_id && decline == &expected
+                ))
+        );
     }
 
     async fn assert_offer_declined(
@@ -5249,6 +5930,154 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         }
     }
 
+    fn cancel_for(
+        offered: &AssignmentOffer,
+        mode: CancellationMode,
+        suffix: &str,
+    ) -> AssignmentCancel {
+        AssignmentCancel {
+            effect_id: format!("eff_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
+            assignment_id: offered.assignment_id.clone(),
+            run_id: offered.run_id.clone(),
+            attempt_id: offered.attempt_id.clone(),
+            request_id: format!("cmd_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
+            mode,
+        }
+    }
+
+    fn release_for(offered: &AssignmentOffer, suffix: &str, reason: &str) -> AssignmentRelease {
+        AssignmentRelease {
+            effect_id: format!("eff_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
+            assignment_id: offered.assignment_id.clone(),
+            run_id: offered.run_id.clone(),
+            attempt_id: offered.attempt_id.clone(),
+            reason: reason.to_owned(),
+        }
+    }
+
+    fn cancellation_applications(
+        manager: &mut AssignmentManager,
+    ) -> Vec<(u64, AssignmentCancellationApplication)> {
+        manager
+            .pending_observations(&BTreeSet::new(), 100)
+            .into_iter()
+            .filter_map(|pending| match pending.observation {
+                AssignmentObservation::CancellationApplied(application) => {
+                    Some((pending.id, application))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pre_execution_cancellation_application(
+        manager: &mut AssignmentManager,
+        request_id: &str,
+    ) -> (u64, AssignmentCancellationApplication) {
+        let pending = manager.pending_observations(&BTreeSet::new(), 100);
+        let (application_id, application) = pending
+            .iter()
+            .find_map(|pending| match &pending.observation {
+                AssignmentObservation::CancellationApplied(application) => {
+                    Some((pending.id, application.clone()))
+                }
+                _ => None,
+            })
+            .expect("cancellation application");
+        assert_eq!(application.request_id, request_id);
+        assert_eq!(
+            application.disposition,
+            CancellationApplicationDisposition::PreExecutionStopped
+        );
+        let terminal = pending
+            .iter()
+            .find(|pending| pending.observation.is_terminal())
+            .expect("pre-execution cancellation terminal");
+        assert!(application_id < terminal.id);
+        assert!(matches!(
+            &terminal.observation,
+            AssignmentObservation::Execution {
+                report: ExecutionReport::AssignmentInterrupted { reason },
+                ..
+            } if reason == "user_request"
+        ));
+        (application_id, application)
+    }
+
+    fn assert_no_terminal_observation(manager: &mut AssignmentManager) {
+        assert!(
+            !manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .iter()
+                .any(|pending| pending.observation.is_terminal())
+        );
+    }
+
+    fn gate_assignment_root_preparation_with_outcome(
+        manager: &mut AssignmentManager,
+        outcome: GatedRootPreparationOutcome,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started, root_preparation_started) = tokio::sync::mpsc::unbounded_channel();
+        let (release_root_preparation, released) = std::sync::mpsc::channel();
+        manager.root_preparer = Arc::new(GatedAssignmentRootPreparer {
+            started,
+            release: Mutex::new(released),
+            outcome,
+        });
+        (root_preparation_started, release_root_preparation)
+    }
+
+    fn gate_assignment_root_preparation(
+        manager: &mut AssignmentManager,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        gate_assignment_root_preparation_with_outcome(
+            manager,
+            GatedRootPreparationOutcome::Create(Arc::clone(&manager.work_root)),
+        )
+    }
+
+    fn gated_root_preparation_fixture() -> (
+        tempfile::TempDir,
+        AssignmentManager,
+        AssignmentOffer,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        let (root_preparation_started, release_root_preparation) =
+            gate_assignment_root_preparation(&mut manager);
+        (
+            temporary,
+            manager,
+            offered,
+            root_preparation_started,
+            release_root_preparation,
+        )
+    }
+
+    async fn cancel_while_root_preparation_is_blocked(
+        manager: &mut AssignmentManager,
+        offered: &AssignmentOffer,
+        root_preparation_started: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) -> AssignmentCancel {
+        manager.handle_offer(offered.clone()).unwrap();
+        root_preparation_started
+            .recv()
+            .await
+            .expect("assignment root preparation did not start");
+        let cancel = cancel_for(offered, CancellationMode::Graceful, "bm");
+        manager.handle_cancel(cancel.clone()).unwrap();
+        cancel
+    }
+
     fn start_authorization_for(offered: &AssignmentOffer) -> AssignmentStartAuthorization {
         AssignmentStartAuthorization {
             effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
@@ -5323,6 +6152,24 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     fn spawn_execution(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
         execution_job(manager, offered).spawn();
+    }
+
+    async fn cancellable_running_fixture() -> (
+        tempfile::TempDir,
+        AssignmentManager,
+        AssignmentOffer,
+        CancellationSource,
+    ) {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let _job = execution_job(&mut manager, &offered);
+        let cancellation = match &manager.slot {
+            Some(LocalSlot::Running(running)) => running.cancellation.clone(),
+            _ => panic!("assignment must be running"),
+        };
+        (temporary, manager, offered, cancellation)
     }
 
     fn request_next_renewal(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
@@ -5564,6 +6411,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                         AssignmentObservation::Preparing { .. }
                         | AssignmentObservation::PreparationProgress { .. }
                         | AssignmentObservation::Decision(_)
+                        | AssignmentObservation::CancellationApplied(_)
                         | AssignmentObservation::LeaseRenewalRequested { .. }
                         | AssignmentObservation::Artifact { .. } => None,
                     })
@@ -6269,17 +7117,14 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     #[tokio::test]
     async fn release_during_root_preparation_retains_the_late_root() {
-        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let (_temporary, mut manager) = manager_fixture(workflow);
-        let offered = offer("bg");
+        let (
+            _temporary,
+            mut manager,
+            offered,
+            mut root_preparation_started,
+            release_root_preparation,
+        ) = gated_root_preparation_fixture();
         let root_path = manager.work_root.boot_path().join(&offered.assignment_id);
-        let (started, mut root_preparation_started) = tokio::sync::mpsc::unbounded_channel();
-        let (release_root_preparation, released) = std::sync::mpsc::channel();
-        manager.root_preparer = Arc::new(GatedAssignmentRootPreparer {
-            started,
-            release: Mutex::new(released),
-            outcome: GatedRootPreparationOutcome::Create(Arc::clone(&manager.work_root)),
-        });
 
         manager.handle_offer(offered.clone()).unwrap();
         root_preparation_started
@@ -6457,6 +7302,441 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             assert_eq!(request.duration, Duration::from_millis(expected));
             request.release.send(()).unwrap();
         }
+    }
+
+    #[test]
+    fn cancellation_effect_identity_fences_every_later_effect_kind() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        let cancel = cancel_for(&offered, CancellationMode::Graceful, "bm");
+        manager.handle_cancel(cancel.clone()).unwrap();
+
+        let mut conflicting_offer = offered.clone();
+        conflicting_offer.effect_id = cancel.effect_id.clone();
+        assert_eq!(
+            manager.handle_offer(conflicting_offer),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        let mut conflicting_prepare = prepare_for(&manager, &offered);
+        conflicting_prepare.effect_id = cancel.effect_id.clone();
+        assert_eq!(
+            manager.handle_prepare(conflicting_prepare),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        let mut conflicting_start = start_for(&offered);
+        conflicting_start.effect_id = cancel.effect_id.clone();
+        assert!(matches!(
+            manager.handle_start(conflicting_start),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        ));
+
+        let mut conflicting_authorization = start_authorization_for(&offered);
+        conflicting_authorization.effect_id = cancel.effect_id.clone();
+        assert_eq!(
+            manager.handle_start_authorized(conflicting_authorization),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        let mut conflicting_renewal = renewal_for(&offered);
+        conflicting_renewal.effect_id = cancel.effect_id.clone();
+        assert!(matches!(
+            manager.handle_renewal(conflicting_renewal),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        ));
+
+        assert_eq!(
+            manager.handle_release(AssignmentRelease {
+                effect_id: cancel.effect_id.clone(),
+                assignment_id: offered.assignment_id.clone(),
+                run_id: offered.run_id.clone(),
+                attempt_id: offered.attempt_id.clone(),
+                reason: "execution_lease_expired".to_owned(),
+            }),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+    }
+
+    #[test]
+    fn retained_release_fences_replay_payload_and_later_cancellation() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        let release = release_for(&offered, "br", "execution_lease_expired");
+        manager.handle_release(release.clone()).unwrap();
+        manager.handle_release(release.clone()).unwrap();
+
+        let mut changed_release = release.clone();
+        changed_release.reason = "stale_or_invalid_acceptance".to_owned();
+        assert_eq!(
+            manager.handle_release(changed_release),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        let mut cancel = cancel_for(&offered, CancellationMode::Force, "bs");
+        cancel.effect_id = release.effect_id;
+        assert_eq!(
+            manager.handle_cancel(cancel),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+    }
+
+    #[tokio::test]
+    async fn root_cleanup_failure_suppresses_pre_execution_cancellation_evidence() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        let (mut root_preparation_started, release_root_preparation) =
+            gate_assignment_root_preparation_with_outcome(
+                &mut manager,
+                GatedRootPreparationOutcome::CleanupFailed,
+            );
+
+        let cancel = cancel_while_root_preparation_is_blocked(
+            &mut manager,
+            &offered,
+            &mut root_preparation_started,
+        )
+        .await;
+        release_root_preparation
+            .send(())
+            .expect("release assignment root preparation");
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager.drain_events();
+            manager.cleanup_failed
+        }))
+        .await
+        .expect("assignment root cleanup failure was not observed");
+
+        assert!(manager.slot.is_none());
+        assert!(manager.reporting.is_none());
+        assert!(cancellation_applications(&mut manager).is_empty());
+        assert_no_terminal_observation(&mut manager);
+        let retained = manager
+            .cancellations
+            .iter()
+            .find(|retained| retained.command.request_id == cancel.request_id)
+            .expect("retained cancellation command");
+        assert!(!retained.ready);
+        assert!(retained.observation_id.is_none());
+
+        assert_offer_rejected_without_cleanup(&mut manager, offer("bh"), environment_unavailable());
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_start_waits_for_preparation_containment_and_replays() {
+        let (
+            _temporary,
+            mut manager,
+            offered,
+            mut root_preparation_started,
+            release_root_preparation,
+        ) = gated_root_preparation_fixture();
+
+        let cancel = cancel_while_root_preparation_is_blocked(
+            &mut manager,
+            &offered,
+            &mut root_preparation_started,
+        )
+        .await;
+        assert!(manager.handle_start(start_for(&offered)).unwrap().is_none());
+        assert!(cancellation_applications(&mut manager).is_empty());
+        assert_no_terminal_observation(&mut manager);
+
+        release_root_preparation
+            .send(())
+            .expect("release assignment root preparation");
+        let contained = with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager.drain_events();
+            manager.slot.is_none() && manager.reporting.is_some()
+        }))
+        .await;
+        if contained.is_err() {
+            let slot = match &manager.slot {
+                Some(LocalSlot::Preparing(_)) => "preparing",
+                Some(LocalSlot::Accepted(_)) => "accepted",
+                Some(LocalSlot::Running(_)) => "running",
+                Some(LocalSlot::Finishing(_)) => "finishing",
+                Some(LocalSlot::Releasing(_)) => "releasing",
+                None => "idle",
+            };
+            panic!(
+                "cancelled preparation did not prove containment: slot={slot}, reporting={}, cleanup_failed={}, cancellations={:?}",
+                manager.reporting.is_some(),
+                manager.cleanup_failed,
+                manager.cancellations
+            );
+        }
+
+        let (application_id, application) =
+            pre_execution_cancellation_application(&mut manager, &cancel.request_id);
+        assert_eq!(application.effective_mode, CancellationMode::Graceful);
+
+        let mut changed_identity = cancel_for(&offered, CancellationMode::Graceful, "br");
+        changed_identity.run_id = "run_01k0z6r1w8f4jy2m7q9v3x5abz".to_owned();
+        assert_eq!(
+            manager.handle_cancel(changed_identity),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+
+        manager.mark_observation_encoded(application_id);
+        manager.finish_transport();
+        let replay = cancellation_applications(&mut manager);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].0, application_id);
+        assert_eq!(replay[0].1, application);
+
+        manager.handle_cancel(cancel.clone()).unwrap();
+        assert_eq!(cancellation_applications(&mut manager).len(), 1);
+        manager.acknowledge_observation(application_id);
+        manager.handle_cancel(cancel).unwrap();
+        assert_eq!(cancellation_applications(&mut manager).len(), 1);
+
+        manager.handle_offer(offered.clone()).unwrap();
+        assert!(manager.handle_start(start_for(&offered)).unwrap().is_none());
+        assert!(manager.slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn running_cancellation_is_sticky_and_exactly_fenced() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let _job = execution_job(&mut manager, &offered);
+
+        let graceful = cancel_for(&offered, CancellationMode::Graceful, "bm");
+        manager.handle_cancel(graceful.clone()).unwrap();
+        assert!(matches!(
+            &manager.slot,
+            Some(LocalSlot::Running(running))
+                if running.cancellation.cancellation_reason()
+                    == Some(crate::execution::workflow::admission::CancellationReason::UserRequest)
+        ));
+        let force = cancel_for(&offered, CancellationMode::Force, "bn");
+        manager.handle_cancel(force.clone()).unwrap();
+        let superseded = cancel_for(&offered, CancellationMode::Graceful, "bp");
+        manager.handle_cancel(superseded).unwrap();
+
+        let applications = cancellation_applications(&mut manager);
+        assert!(applications.iter().any(|(_, application)| {
+            application.request_id == graceful.request_id
+                && application.effective_mode == CancellationMode::Graceful
+                && application.disposition == CancellationApplicationDisposition::OrdinaryCancelling
+        }));
+        let force_application = applications
+            .iter()
+            .find(|(_, application)| application.request_id == force.request_id)
+            .expect("force cancellation application");
+        assert_eq!(force_application.1.effective_mode, CancellationMode::Force);
+        assert_eq!(
+            force_application.1.disposition,
+            CancellationApplicationDisposition::ForceCancelling
+        );
+        assert!(applications.iter().any(|(_, application)| {
+            application.effective_mode == CancellationMode::Force
+                && application.disposition == CancellationApplicationDisposition::Superseded
+        }));
+
+        manager.acknowledge_observation(force_application.0);
+        manager.handle_cancel(force.clone()).unwrap();
+        assert_eq!(
+            cancellation_applications(&mut manager)
+                .iter()
+                .filter(|(_, application)| application.request_id == force.request_id)
+                .count(),
+            1
+        );
+
+        let mut changed = force.clone();
+        changed.mode = CancellationMode::Graceful;
+        assert_eq!(
+            manager.handle_cancel(changed),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+        let mut stale = cancel_for(&offered, CancellationMode::Graceful, "bq");
+        stale.attempt_id = "atm_01k0z6r1w8f4jy2m7q9v3x5abz".to_owned();
+        assert_eq!(
+            manager.handle_cancel(stale),
+            Err(AssignmentManagerFailure::ConflictingOffer)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_result_delivery_reports_execution_terminal() {
+        let (_temporary, mut manager, offered, cancellation) = cancellable_running_fixture().await;
+        let engine_terminal = match &manager.slot {
+            Some(LocalSlot::Running(running)) => Arc::clone(&running.engine_terminal),
+            _ => panic!("assignment must be running"),
+        };
+        engine_terminal.store(true, Ordering::Release);
+
+        let cancel = cancel_for(&offered, CancellationMode::Force, "bm");
+        manager.handle_cancel(cancel.clone()).unwrap();
+
+        assert_eq!(cancellation.cancellation_reason(), None);
+        assert!(
+            cancellation_applications(&mut manager)
+                .iter()
+                .any(|(_, application)| {
+                    application.request_id == cancel.request_id
+                        && application.disposition
+                            == CancellationApplicationDisposition::ExecutionTerminal
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_graceful_cancellation_preserves_open_finalizers() {
+        let (_temporary, mut manager, offered, cancellation) = cancellable_running_fixture().await;
+        assert!(cancellation.fixture_begin_finalization_arm());
+        assert!(cancellation.fixture_complete_finalization_arm());
+
+        let cancel = cancel_for(&offered, CancellationMode::Graceful, "bm");
+        manager.handle_cancel(cancel.clone()).unwrap();
+
+        assert_eq!(cancellation.cancellation_reason(), None);
+        assert!(!cancellation.finalization_cancellation_requested());
+        assert!(
+            cancellation_applications(&mut manager)
+                .iter()
+                .any(|(_, application)| {
+                    application.request_id == cancel.request_id
+                        && application.disposition
+                            == CancellationApplicationDisposition::FinalizersPreserved
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn causally_requested_renewal_survives_user_cancellation() {
+        for (mode, suffix) in [
+            (CancellationMode::Graceful, "bm"),
+            (CancellationMode::Force, "bn"),
+        ] {
+            let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+            let (_temporary, mut manager) = manager_fixture(workflow);
+            let (lease_clock, control, _waits) = controlled_lease_clock();
+            manager.lease_clock = lease_clock;
+            let offered = offer("bg");
+            offer_then_prepare(&mut manager, &offered).await;
+            let job = execution_job(&mut manager, &offered);
+            control.advance(Duration::from_secs(1));
+            request_next_renewal(&mut manager, &offered);
+
+            manager
+                .handle_cancel(cancel_for(&offered, mode, suffix))
+                .unwrap();
+            let decision = manager
+                .handle_renewal(renewal_for(&offered))
+                .unwrap_or_else(|failure| panic!("{mode:?} renewal failed: {failure:?}"));
+
+            assert_eq!(decision.disposition, RenewalDisposition::Applied);
+            assert_eq!(job.authority_updates.borrow().sequence, 2);
+            assert!(!job.authority_updates.borrow().revoked);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_cancellation_completion_waits_for_process_quiescence() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let job = execution_job(&mut manager, &offered);
+        manager
+            .handle_cancel(cancel_for(&offered, CancellationMode::Graceful, "bm"))
+            .unwrap();
+        job.spawn();
+
+        let reports = wait_for_terminal(&mut manager).await;
+        assert!(reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Finished { outcome, .. }
+                if outcome["outcome"] == "cancelled" && outcome["reason"] == "user_request"
+        )));
+    }
+
+    #[tokio::test]
+    async fn runner_shutdown_remains_an_interruption_after_user_cancellation() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        spawn_execution(&mut manager, &offered);
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .iter()
+                .any(|pending| {
+                    matches!(
+                        &pending.observation,
+                        AssignmentObservation::Execution {
+                            report: ExecutionReport::Transition { workflow_event, .. },
+                            ..
+                        } if workflow_event["eventType"] == "step_state_changed"
+                            && workflow_event["stepId"] == "check"
+                            && workflow_event["to"] == "running"
+                    )
+                })
+        }))
+        .await
+        .expect("workflow did not enter ordinary execution");
+
+        manager
+            .handle_cancel(cancel_for(&offered, CancellationMode::Graceful, "bm"))
+            .unwrap();
+        manager.begin_shutdown().unwrap();
+
+        let reports = wait_for_terminal(&mut manager).await;
+        assert!(reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Interrupted {
+                reason,
+                terminal_outcome,
+                ..
+            } if reason == "graceful_shutdown"
+                && terminal_outcome["outcome"] == "cancelled"
+                && terminal_outcome["reason"] == "user_request"
+        )));
+    }
+
+    #[tokio::test]
+    async fn failed_containment_suppresses_cancellation_completion_and_slot_reuse() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let job = execution_job(&mut manager, &offered);
+        job.use_quiescence_fixture(Arc::new(AtomicBool::new(false)));
+        manager
+            .handle_cancel(cancel_for(&offered, CancellationMode::Graceful, "bm"))
+            .unwrap();
+        job.spawn();
+
+        with_watchdog(async {
+            let notification = manager.notification();
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                manager.drain_events();
+                let pending = manager.pending_observations(&BTreeSet::new(), 100);
+                fail_pending_artifact_registrations(&mut manager, &pending);
+                if manager.cleanup_failed && manager.slot.is_none() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("failed containment did not fence assignment admission");
+        assert!(manager.reporting.is_none());
+        assert_no_terminal_observation(&mut manager);
+
+        assert_offer_rejected_without_cleanup(&mut manager, offer("bh"), environment_unavailable());
+        assert!(manager.slot.is_none());
     }
 
     #[tokio::test]
@@ -6729,12 +8009,7 @@ steps:
         assert_eq!(manager.pending_observations(&BTreeSet::new(), 10).len(), 1);
 
         manager
-            .handle_release(
-                &offered.assignment_id,
-                &offered.run_id,
-                &offered.attempt_id,
-                "stale_or_invalid_acceptance",
-            )
+            .handle_release(release_for(&offered, "br", "stale_or_invalid_acceptance"))
             .unwrap();
         settle_cleanup(&mut manager).await;
 
@@ -6998,6 +8273,39 @@ steps:
         manager.begin_shutdown().unwrap();
         wait_for_execution_finalization(&mut manager).await;
         assert!(!workflow_git.is_active());
+        assert_no_executed_workflow_reports(&mut manager);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_start_authorization_reports_pre_execution_stop() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager) = manager_fixture(workflow);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        start_execution_waiting_for_authority(&mut manager, &offered).await;
+
+        let cancel = cancel_for(&offered, CancellationMode::Graceful, "bm");
+        manager.handle_cancel(cancel.clone()).unwrap();
+        assert!(cancellation_applications(&mut manager).is_empty());
+        assert_no_terminal_observation(&mut manager);
+        assert!(matches!(manager.slot, Some(LocalSlot::Running(_))));
+
+        manager
+            .handle_start_authorized(start_authorization_for(&offered))
+            .unwrap();
+        assert!(matches!(
+            &manager.slot,
+            Some(LocalSlot::Running(running)) if !*running.start_authority.borrow()
+        ));
+
+        with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+            manager.drain_events();
+            manager.slot.is_none() && manager.reporting.is_some()
+        }))
+        .await
+        .expect("pre-execution cancellation did not finish containment");
+
+        pre_execution_cancellation_application(&mut manager, &cancel.request_id);
         assert_no_executed_workflow_reports(&mut manager);
     }
 
@@ -7804,12 +9112,7 @@ steps:
         let job = execution_job(&mut manager, &offered);
 
         manager
-            .handle_release(
-                &offered.assignment_id,
-                &offered.run_id,
-                &offered.attempt_id,
-                "execution_lease_expired",
-            )
+            .handle_release(release_for(&offered, "br", "execution_lease_expired"))
             .unwrap();
 
         assert!(job.authority_updates.borrow().revoked);

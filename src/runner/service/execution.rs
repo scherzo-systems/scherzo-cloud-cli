@@ -240,8 +240,24 @@ impl PostStopFence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InfrastructureInterruption {
+    RunnerShutdown,
+    ExecutionLeaseExpired,
+}
+
+impl InfrastructureInterruption {
+    const fn report_reason(self) -> &'static str {
+        match self {
+            Self::RunnerShutdown => "graceful_shutdown",
+            Self::ExecutionLeaseExpired => "execution_lease_expired",
+        }
+    }
+}
+
 struct ExecutionCompletion {
     final_observation_id: Option<u64>,
+    deferred_containment_report: Option<ExecutionReport>,
     final_delivery_deadline: Option<LeaseInstant>,
     lease_clock_failed: bool,
     workspace_disposition: WorkspaceDisposition,
@@ -251,6 +267,7 @@ impl ExecutionCompletion {
     fn retained(final_observation_id: Option<u64>, reason: RetentionReason) -> Self {
         Self {
             final_observation_id,
+            deferred_containment_report: None,
             final_delivery_deadline: None,
             lease_clock_failed: false,
             workspace_disposition: WorkspaceDisposition::Retain(reason),
@@ -272,6 +289,20 @@ impl ExecutionCompletion {
     ) -> Self {
         Self {
             final_observation_id,
+            deferred_containment_report: None,
+            final_delivery_deadline: None,
+            lease_clock_failed: false,
+            workspace_disposition,
+        }
+    }
+
+    fn containment_gated(
+        report: ExecutionReport,
+        workspace_disposition: WorkspaceDisposition,
+    ) -> Self {
+        Self {
+            final_observation_id: None,
+            deferred_containment_report: Some(report),
             final_delivery_deadline: None,
             lease_clock_failed: false,
             workspace_disposition,
@@ -285,6 +316,7 @@ impl ExecutionCompletion {
     fn lease_clock_failed(final_observation_id: Option<u64>) -> Self {
         Self {
             final_observation_id,
+            deferred_containment_report: None,
             final_delivery_deadline: None,
             lease_clock_failed: true,
             workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::OutcomeUnknown),
@@ -297,6 +329,8 @@ pub(super) struct ExecutionAuthority {
     pub(super) causal_lease: CausalLease,
     pub(super) updates: tokio::sync::watch::Receiver<LeaseAuthority>,
     pub(super) start_authority: tokio::sync::watch::Receiver<bool>,
+    pub(super) infrastructure_interruption:
+        tokio::sync::watch::Receiver<Option<InfrastructureInterruption>>,
 }
 
 trait PreservableStaging {
@@ -363,15 +397,29 @@ impl<T: PreservableStaging> Drop for PreserveOnDrop<T> {
     }
 }
 
+async fn mark_engine_terminal<Output>(
+    execution: impl Future<Output = Output>,
+    engine_terminal: Arc<AtomicBool>,
+) -> Output {
+    execution
+        .map(move |output| {
+            engine_terminal.store(true, Ordering::Release);
+            output
+        })
+        .await
+}
+
 pub(super) struct ExecutionJob {
     accepted: AcceptedAssignment,
     outbox: ObservationOutbox,
     artifact_delivery: ArtifactDeliveryBroker,
     manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
+    engine_terminal: Arc<AtomicBool>,
     lease_clock: LeaseClock,
     causal_lease: CausalLease,
     pub(super) authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
     start_authority: tokio::sync::watch::Receiver<bool>,
+    infrastructure_interruption: tokio::sync::watch::Receiver<Option<InfrastructureInterruption>>,
     workspace_release_reported: AtomicBool,
 }
 
@@ -381,6 +429,7 @@ impl ExecutionJob {
         outbox: ObservationOutbox,
         artifact_delivery: ArtifactDeliveryBroker,
         manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
+        engine_terminal: Arc<AtomicBool>,
         authority: ExecutionAuthority,
     ) -> Self {
         Self {
@@ -388,12 +437,21 @@ impl ExecutionJob {
             outbox,
             artifact_delivery,
             manager_events,
+            engine_terminal,
             lease_clock: authority.lease_clock,
             causal_lease: authority.causal_lease,
             authority_updates: authority.updates,
             start_authority: authority.start_authority,
+            infrastructure_interruption: authority.infrastructure_interruption,
             workspace_release_reported: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn use_quiescence_fixture(&self, quiescent: Arc<std::sync::atomic::AtomicBool>) {
+        self.accepted
+            .process_guards
+            .use_quiescence_fixture(quiescent);
     }
 
     pub(super) fn spawn(self) {
@@ -454,17 +512,22 @@ impl ExecutionJob {
         ) {
             self.accepted.process_guards.begin_forced_containment();
         }
+        let quiescence = if self.accepted.process_guards.is_quiescent() {
+            super::workspace::ProcessQuiescence::Proven
+        } else {
+            super::workspace::ProcessQuiescence::Failed
+        };
+        if quiescence == super::workspace::ProcessQuiescence::Proven
+            && let Some(report) = completion.deferred_containment_report.take()
+        {
+            completion.final_observation_id = self.enqueue(&assignment_id, &attempt_id, report);
+        }
         if completion.final_observation_id.is_some() && !completion.lease_clock_failed {
             match self.terminal_report_deadline() {
                 Ok(deadline) => completion.final_delivery_deadline = Some(deadline),
                 Err(_) => completion.lease_clock_failed = true,
             }
         }
-        let quiescence = if self.accepted.process_guards.is_quiescent() {
-            super::workspace::ProcessQuiescence::Proven
-        } else {
-            super::workspace::ProcessQuiescence::Failed
-        };
         let _ = self
             .release_workspace(quiescence, completion.workspace_disposition)
             .await;
@@ -696,28 +759,32 @@ impl ExecutionJob {
             // Enabled and disabled execution carry distinct static dispatcher types;
             // keeping each engine call explicit avoids a dynamic adapter boundary.
             // jscpd:ignore-start
-            let result = run_under_lease(
-                execute_workflow(
-                    self.accepted.admitted.clone(),
-                    &artifacts,
-                    &inputs,
-                    &diagnostics,
-                    agents,
-                    RunnerExecutionClock,
-                    NoopCommitPort,
-                    observer.clone(),
-                    process_guard_registry,
+            let result = mark_engine_terminal(
+                run_under_lease(
+                    execute_workflow(
+                        self.accepted.admitted.clone(),
+                        &artifacts,
+                        &inputs,
+                        &diagnostics,
+                        agents,
+                        RunnerExecutionClock,
+                        NoopCommitPort,
+                        observer.clone(),
+                        process_guard_registry,
+                    ),
+                    &cancellation,
+                    &self.lease_clock,
+                    self.authority_updates.clone(),
+                    self.infrastructure_interruption.clone(),
+                    Some((initial_authority.sequence, initial_wait)),
+                    &self.causal_lease,
+                    &self.outbox,
+                    assignment_id,
+                    attempt_id,
+                    &post_stop_fence,
+                    &self.accepted.process_guards,
                 ),
-                &cancellation,
-                &self.lease_clock,
-                self.authority_updates.clone(),
-                Some((initial_authority.sequence, initial_wait)),
-                &self.causal_lease,
-                &self.outbox,
-                assignment_id,
-                attempt_id,
-                &post_stop_fence,
-                &self.accepted.process_guards,
+                Arc::clone(&self.engine_terminal),
             )
             .await;
             // jscpd:ignore-end
@@ -725,28 +792,32 @@ impl ExecutionJob {
         } else {
             // See the enabled branch: the no-agent dispatcher is intentionally a different type.
             // jscpd:ignore-start
-            let result = run_under_lease(
-                execute_workflow(
-                    self.accepted.admitted.clone(),
-                    &artifacts,
-                    &inputs,
-                    &diagnostics,
-                    AgentExecution::disabled(),
-                    RunnerExecutionClock,
-                    NoopCommitPort,
-                    observer.clone(),
-                    process_guard_registry,
+            let result = mark_engine_terminal(
+                run_under_lease(
+                    execute_workflow(
+                        self.accepted.admitted.clone(),
+                        &artifacts,
+                        &inputs,
+                        &diagnostics,
+                        AgentExecution::disabled(),
+                        RunnerExecutionClock,
+                        NoopCommitPort,
+                        observer.clone(),
+                        process_guard_registry,
+                    ),
+                    &cancellation,
+                    &self.lease_clock,
+                    self.authority_updates.clone(),
+                    self.infrastructure_interruption.clone(),
+                    Some((initial_authority.sequence, initial_wait)),
+                    &self.causal_lease,
+                    &self.outbox,
+                    assignment_id,
+                    attempt_id,
+                    &post_stop_fence,
+                    &self.accepted.process_guards,
                 ),
-                &cancellation,
-                &self.lease_clock,
-                self.authority_updates.clone(),
-                Some((initial_authority.sequence, initial_wait)),
-                &self.causal_lease,
-                &self.outbox,
-                assignment_id,
-                attempt_id,
-                &post_stop_fence,
-                &self.accepted.process_guards,
+                Arc::clone(&self.engine_terminal),
             )
             .await;
             // jscpd:ignore-end
@@ -754,14 +825,16 @@ impl ExecutionJob {
         };
         self.accepted.workflow_git.disable();
 
-        let (result, final_delivery_budget) = match execution {
+        let (result, final_delivery_budget, infrastructure_interruption) = match execution {
             LeaseExecution::Completed {
                 output: Ok(result),
                 final_delivery_budget,
-            } => (result, final_delivery_budget),
+                infrastructure_interruption,
+            } => (result, final_delivery_budget, infrastructure_interruption),
             LeaseExecution::Completed {
                 output: Err(_),
                 final_delivery_budget,
+                ..
             } => {
                 return self
                     .abort_unless_fenced(
@@ -873,6 +946,17 @@ impl ExecutionJob {
         if delivery == ArtifactDeliveryOutcome::AuthorityLost {
             return ExecutionCompletion::without_report();
         }
+        let infrastructure_interruption = infrastructure_interruption.or(match &result.outcome {
+            RunOutcome::Cancelled {
+                reason: CancellationReason::RunnerShutdown,
+            } => Some(InfrastructureInterruption::RunnerShutdown),
+            RunOutcome::Cancelled {
+                reason: CancellationReason::ExecutionLeaseExpired,
+            } => Some(InfrastructureInterruption::ExecutionLeaseExpired),
+            RunOutcome::Succeeded | RunOutcome::Failed { .. } | RunOutcome::Cancelled { .. } => {
+                None
+            }
+        });
         let workspace_disposition = match (&result.outcome, &delivery) {
             (RunOutcome::Succeeded, ArtifactDeliveryOutcome::Prepared { .. }) => {
                 WorkspaceDisposition::Remove
@@ -881,15 +965,15 @@ impl ExecutionJob {
                 WorkspaceDisposition::Retain(RetentionReason::ArtifactDeliveryFailed)
             }
             (RunOutcome::Failed { .. }, _) => WorkspaceDisposition::Retain(RetentionReason::Failed),
+            (RunOutcome::Cancelled { .. }, _) if infrastructure_interruption.is_some() => {
+                WorkspaceDisposition::Retain(RetentionReason::Interrupted)
+            }
             (
                 RunOutcome::Cancelled {
-                    reason: CancellationReason::ExecutionLeaseExpired,
-                },
-                _,
-            ) => WorkspaceDisposition::Retain(RetentionReason::Interrupted),
-            (
-                RunOutcome::Cancelled {
-                    reason: CancellationReason::RunnerShutdown,
+                    reason:
+                        CancellationReason::RunnerShutdown
+                        | CancellationReason::UserRequest
+                        | CancellationReason::ForceAbort,
                 },
                 _,
             ) => WorkspaceDisposition::Retain(RetentionReason::Cancelled),
@@ -929,47 +1013,56 @@ impl ExecutionJob {
                 ),
                 artifact_delivery,
             },
-            RunOutcome::Cancelled {
-                reason: CancellationReason::ExecutionLeaseExpired,
-            } => ExecutionReport::Interrupted {
-                final_execution_event_sequence: last_sequence,
-                reason: "execution_lease_expired".to_owned(),
-                terminal_outcome: terminal_outcome(
-                    "cancelled",
-                    None,
-                    Some("execution_lease_expired"),
-                    finalization,
-                    result.force_abort,
-                    None,
-                ),
-                artifact_delivery,
-            },
-            RunOutcome::Cancelled {
-                reason: CancellationReason::RunnerShutdown,
-            } => ExecutionReport::Interrupted {
-                final_execution_event_sequence: last_sequence,
-                reason: "graceful_shutdown".to_owned(),
-                terminal_outcome: terminal_outcome(
-                    "cancelled",
-                    None,
-                    Some("runner_shutdown"),
-                    finalization,
-                    result.force_abort,
-                    None,
-                ),
-                artifact_delivery,
-            },
-            RunOutcome::Cancelled { .. } => {
-                return self
-                    .abort_unless_fenced(
-                        &post_stop_fence,
-                        assignment_id,
-                        attempt_id,
-                        last_sequence,
-                        "runner_internal_failure",
-                        final_delivery_budget,
-                    )
-                    .await;
+            RunOutcome::Cancelled { reason } => {
+                let report = if let Some(interruption) = infrastructure_interruption {
+                    ExecutionReport::Interrupted {
+                        final_execution_event_sequence: last_sequence,
+                        reason: interruption.report_reason().to_owned(),
+                        terminal_outcome: terminal_outcome(
+                            "cancelled",
+                            None,
+                            Some(reason.as_str()),
+                            finalization,
+                            result.force_abort,
+                            recovery_summaries,
+                        ),
+                        artifact_delivery,
+                    }
+                } else if matches!(
+                    reason,
+                    CancellationReason::UserRequest | CancellationReason::ForceAbort
+                ) {
+                    ExecutionReport::Finished {
+                        final_execution_event_sequence: last_sequence,
+                        outcome: terminal_outcome(
+                            "cancelled",
+                            None,
+                            Some(reason.as_str()),
+                            finalization,
+                            result.force_abort,
+                            recovery_summaries,
+                        ),
+                        artifact_delivery,
+                    }
+                } else {
+                    return self
+                        .abort_unless_fenced(
+                            &post_stop_fence,
+                            assignment_id,
+                            attempt_id,
+                            last_sequence,
+                            "runner_internal_failure",
+                            final_delivery_budget,
+                        )
+                        .await;
+                };
+                if matches!(
+                    reason,
+                    CancellationReason::UserRequest | CancellationReason::ForceAbort
+                ) {
+                    return ExecutionCompletion::containment_gated(report, workspace_disposition);
+                }
+                report
             }
         };
         ExecutionCompletion::with_budget(
@@ -1235,8 +1328,8 @@ impl ExecutionJob {
                     )
                     .await;
             }
-            if cancellation.cancellation_reason().is_some() {
-                return Err(ExecutionCompletion::without_report());
+            if let Some(reason) = cancellation.cancellation_reason() {
+                return Err(cancellation_before_start_completion(reason));
             }
             self.ensure_execution_authority(
                 cancellation,
@@ -1248,8 +1341,8 @@ impl ExecutionJob {
             let cancellation_start = self.authority_updates.borrow().cancellation_start;
             tokio::select! {
                 biased;
-                _ = cancellation.wait_for_cancellation() => {
-                    return Err(ExecutionCompletion::without_report());
+                reason = cancellation.wait_for_cancellation() => {
+                    return Err(cancellation_before_start_completion(reason));
                 }
                 changed = self.start_authority.changed() => {
                     if changed.is_err() {
@@ -1394,6 +1487,18 @@ impl ExecutionJob {
     }
 }
 
+fn cancellation_before_start_completion(reason: CancellationReason) -> ExecutionCompletion {
+    match reason {
+        CancellationReason::UserRequest | CancellationReason::ForceAbort => {
+            ExecutionCompletion::retained(None, RetentionReason::Cancelled)
+        }
+        CancellationReason::TerminationRequest
+        | CancellationReason::CallerOutputFailure
+        | CancellationReason::RunnerShutdown
+        | CancellationReason::ExecutionLeaseExpired => ExecutionCompletion::without_report(),
+    }
+}
+
 pub(super) fn cloud_execution_capacity(
     admitted: &crate::execution::workflow::admission::AdmittedWorkflow,
 ) -> CloudExecutionCapacityV1 {
@@ -1512,6 +1617,7 @@ enum LeaseExecution<Output> {
     Completed {
         output: Output,
         final_delivery_budget: Option<Duration>,
+        infrastructure_interruption: Option<InfrastructureInterruption>,
     },
     ContainmentDeadline,
     LeaseClockFailed {
@@ -1528,6 +1634,7 @@ async fn run_under_lease<F, Output>(
     cancellation: &crate::execution::workflow::admission::CancellationSource,
     lease_clock: &LeaseClock,
     mut authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
+    mut infrastructure_updates: tokio::sync::watch::Receiver<Option<InfrastructureInterruption>>,
     mut initial_wait: Option<(u64, LeaseWait)>,
     causal_lease: &CausalLease,
     outbox: &ObservationOutbox,
@@ -1540,8 +1647,12 @@ where
     F: Future<Output = Output>,
 {
     tokio::pin!(execution);
+    let mut infrastructure_interruption = *infrastructure_updates.borrow_and_update();
     loop {
         let authority = authority_updates.borrow_and_update().clone();
+        if let Some(interruption) = *infrastructure_updates.borrow_and_update() {
+            infrastructure_interruption = Some(interruption);
+        }
         let failure = LeaseFailureContext {
             cancellation,
             post_stop_fence,
@@ -1652,14 +1763,20 @@ where
                             ).await;
                         }
                     }
+                    changed = infrastructure_updates.changed() => {
+                        if changed.is_ok()
+                            && let Some(interruption) = *infrastructure_updates.borrow_and_update()
+                        {
+                            infrastructure_interruption = Some(interruption);
+                        }
+                    }
                     result = &mut execution => {
                         return complete_ready_execution(
                             result,
-                            cancellation,
+                            failure,
                             lease_clock,
                             &authority,
-                            post_stop_fence,
-                            process_guards,
+                            infrastructure_interruption,
                             false,
                         );
                     }
@@ -1677,14 +1794,20 @@ where
                     ).await;
                 }
             }
+            changed = infrastructure_updates.changed() => {
+                if changed.is_ok()
+                    && let Some(interruption) = *infrastructure_updates.borrow_and_update()
+                {
+                    infrastructure_interruption = Some(interruption);
+                }
+            }
             result = &mut execution => {
                 return complete_ready_execution(
                     result,
-                    cancellation,
+                    failure,
                     lease_clock,
                     &authority,
-                    post_stop_fence,
-                    process_guards,
+                    infrastructure_interruption,
                     false,
                 );
             }
@@ -1694,13 +1817,17 @@ where
 
 fn complete_ready_execution<Output>(
     output: Output,
-    cancellation: &crate::execution::workflow::admission::CancellationSource,
+    failure: LeaseFailureContext<'_>,
     lease_clock: &LeaseClock,
     authority: &LeaseAuthority,
-    post_stop_fence: &PostStopFence,
-    process_guards: &AssignmentProcessGuards,
+    infrastructure_interruption: Option<InfrastructureInterruption>,
     lease_already_lost: bool,
 ) -> LeaseExecution<Output> {
+    let LeaseFailureContext {
+        cancellation,
+        post_stop_fence,
+        process_guards,
+    } = failure;
     let now = match lease_clock.now() {
         Ok(now) => now,
         Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
@@ -1711,6 +1838,7 @@ fn complete_ready_execution<Output>(
                 return LeaseExecution::Completed {
                     output,
                     final_delivery_budget: None,
+                    infrastructure_interruption,
                 };
             }
             Ok(_) => {}
@@ -1723,6 +1851,9 @@ fn complete_ready_execution<Output>(
             return LeaseExecution::Completed {
                 output,
                 final_delivery_budget: Some(authority.terminal_report_delivery_budget),
+                infrastructure_interruption: Some(
+                    InfrastructureInterruption::ExecutionLeaseExpired,
+                ),
             };
         }
         Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => {
@@ -1741,6 +1872,9 @@ fn complete_ready_execution<Output>(
             LeaseExecution::Completed {
                 output,
                 final_delivery_budget: Some(authority.terminal_report_delivery_budget),
+                infrastructure_interruption: Some(
+                    InfrastructureInterruption::ExecutionLeaseExpired,
+                ),
             }
         }
         Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
@@ -1789,11 +1923,10 @@ where
             output = execution.as_mut() => {
                 return complete_ready_execution(
                     output,
-                    cancellation,
+                    failure,
                     lease_clock,
                     authority,
-                    post_stop_fence,
-                    process_guards,
+                    Some(InfrastructureInterruption::ExecutionLeaseExpired),
                     true,
                 );
             }
@@ -1822,11 +1955,10 @@ where
         biased;
         output = execution.as_mut() => complete_ready_execution(
             output,
-            cancellation,
+            failure,
             lease_clock,
             authority,
-            post_stop_fence,
-            process_guards,
+            Some(InfrastructureInterruption::ExecutionLeaseExpired),
             true,
         ),
         wait = wait_for_lease_deadline(lease_clock, authority.force_stop_end) => {
@@ -2994,6 +3126,7 @@ pub(super) mod test_support {
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
         invocations: Arc<AtomicUsize>,
+        infrastructure_interruption: tokio::sync::watch::Sender<Option<InfrastructureInterruption>>,
     }
 
     impl LiveLeaseExecution {
@@ -3005,6 +3138,7 @@ pub(super) mod test_support {
                 fence,
                 guards,
                 invocations,
+                infrastructure_interruption,
             } = self;
             completion
                 .send("completed-after-renewal")
@@ -3023,6 +3157,7 @@ pub(super) mod test_support {
             assert_eq!(cancellation.cancellation_reason(), None);
             assert!(!fence.is_fenced());
             assert!(!guards.forced_containment_started());
+            drop(infrastructure_interruption);
         }
     }
 
@@ -3040,6 +3175,8 @@ pub(super) mod test_support {
         let observed_fence = fence.clone();
         let guards = AssignmentProcessGuards::new();
         let observed_guards = guards.clone();
+        let (infrastructure_interruption, infrastructure_updates) =
+            tokio::sync::watch::channel(None);
         let (completion, completed) = tokio::sync::oneshot::channel();
         let invocations = Arc::new(AtomicUsize::new(0));
         let observed_invocations = Arc::clone(&invocations);
@@ -3052,6 +3189,7 @@ pub(super) mod test_support {
                 &cancellation,
                 &lease_clock,
                 authority_updates,
+                infrastructure_updates,
                 None,
                 &causal_lease,
                 &outbox,
@@ -3069,6 +3207,7 @@ pub(super) mod test_support {
             fence: observed_fence,
             guards: observed_guards,
             invocations,
+            infrastructure_interruption,
         }
     }
 }
@@ -3112,6 +3251,8 @@ mod tests {
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
         _authority: tokio::sync::watch::Sender<LeaseAuthority>,
+        _infrastructure_interruption:
+            tokio::sync::watch::Sender<Option<InfrastructureInterruption>>,
     }
 
     struct SupervisedExecution<Output> {
@@ -3120,6 +3261,7 @@ mod tests {
         fence: PostStopFence,
         guards: AssignmentProcessGuards,
         authority: tokio::sync::watch::Sender<LeaseAuthority>,
+        infrastructure_interruption: tokio::sync::watch::Sender<Option<InfrastructureInterruption>>,
         outbox: ObservationOutbox,
     }
 
@@ -3159,12 +3301,16 @@ mod tests {
         let observed_guards = guards.clone();
         let causal_lease = CausalLease::new(authority.basis);
         let (authority_sender, authority_updates) = tokio::sync::watch::channel(authority);
+        let (infrastructure_interruption, infrastructure_updates) =
+            tokio::sync::watch::channel(None);
+        let observed_infrastructure_interruption = infrastructure_interruption.clone();
         let task = tokio::spawn(async move {
             run_under_lease(
                 execution,
                 &cancellation,
                 &lease_clock,
                 authority_updates,
+                infrastructure_updates,
                 None,
                 &causal_lease,
                 &outbox,
@@ -3181,6 +3327,7 @@ mod tests {
             fence: observed_fence,
             guards: observed_guards,
             authority: authority_sender,
+            infrastructure_interruption: observed_infrastructure_interruption,
             outbox: observed_outbox,
         }
     }
@@ -3200,6 +3347,7 @@ mod tests {
             fence: supervised.fence,
             guards: supervised.guards,
             _authority: supervised.authority,
+            _infrastructure_interruption: supervised.infrastructure_interruption,
         }
     }
 
@@ -3383,6 +3531,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_shutdown_is_retained_separately_from_sticky_user_cancellation() {
+        let (lease_clock, _control, _waits) = controlled_lease_clock();
+        let basis = lease_clock.now().unwrap();
+        let (result_sender, result) = tokio::sync::oneshot::channel();
+        let supervised = supervise_execution(lease_clock, lease_authority(basis), async {
+            result.await.expect("fixture result")
+        });
+        assert!(
+            supervised
+                .cancellation
+                .request_cancellation(CancellationReason::UserRequest)
+        );
+        supervised
+            .infrastructure_interruption
+            .send_replace(Some(InfrastructureInterruption::RunnerShutdown));
+        result_sender.send("user-stopped").unwrap();
+
+        assert!(matches!(
+            with_watchdog(supervised.task)
+                .await
+                .expect("shutdown supervision timed out")
+                .expect("shutdown supervision task failed"),
+            LeaseExecution::Completed {
+                output: "user-stopped",
+                infrastructure_interruption: Some(InfrastructureInterruption::RunnerShutdown),
+                ..
+            }
+        ));
+        assert_eq!(
+            supervised.cancellation.cancellation_reason(),
+            Some(CancellationReason::UserRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_loss_is_retained_separately_from_sticky_user_cancellation() {
+        let mut fixture = supervised_lease_fixture();
+        assert!(
+            fixture
+                .cancellation
+                .request_cancellation(CancellationReason::UserRequest)
+        );
+        lease_wait_request(&mut fixture.waits, Duration::from_secs(2))
+            .await
+            .release();
+        lease_wait_request(&mut fixture.waits, Duration::from_secs(2))
+            .await
+            .release();
+        let _force_stop = lease_wait_request(&mut fixture.waits, Duration::from_secs(1)).await;
+        fixture.result.send("user-stopped").unwrap();
+
+        assert!(matches!(
+            with_watchdog(fixture.task)
+                .await
+                .expect("lease-loss supervision timed out")
+                .expect("lease-loss supervision task failed"),
+            LeaseExecution::Completed {
+                output: "user-stopped",
+                infrastructure_interruption: Some(
+                    InfrastructureInterruption::ExecutionLeaseExpired
+                ),
+                ..
+            }
+        ));
+        assert_eq!(
+            fixture.cancellation.cancellation_reason(),
+            Some(CancellationReason::UserRequest)
+        );
+    }
+
+    #[tokio::test]
     async fn lease_timer_failure_contains_without_accepting_ready_progress() {
         let (lease_clock, authority) = unavailable_timer_fixture();
         let (result_sender, result) = tokio::sync::oneshot::channel();
@@ -3454,6 +3673,8 @@ mod tests {
             LeaseExecution::Completed {
                 output: "late-success",
                 final_delivery_budget: Some(duration),
+                infrastructure_interruption:
+                    Some(InfrastructureInterruption::ExecutionLeaseExpired),
             } if duration == Duration::from_secs(7)
         ));
     }

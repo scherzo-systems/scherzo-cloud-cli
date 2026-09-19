@@ -197,6 +197,7 @@ where
         #[cfg(test)]
         Occurrence::CancellationRequested { deadline, .. } => match *deadline {},
         Occurrence::CancellationOperationRequested { deadline, .. }
+        | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
         | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
     }
     let digest = context.finish();
@@ -453,6 +454,11 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 operation: _,
                 deadline,
                 ..
+            }
+            | Occurrence::OrdinaryCancellationOperationRequested {
+                operation: _,
+                deadline,
+                ..
             } => match deadline {},
             Occurrence::ForceAbortRequested {
                 operation: _,
@@ -531,6 +537,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
             #[cfg(test)]
             Occurrence::CancellationRequested { deadline, .. } => match *deadline {},
             Occurrence::CancellationOperationRequested { deadline, .. }
+            | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
             | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
         };
         DriverOccurrenceIdentity {
@@ -980,15 +987,16 @@ where
         let mut cancellation = cancellation_source.subscribe_operations();
         let grace = self.admitted.execution().cancellation().grace();
         let initial_cancellation = match cancellation.next_operation() {
-            Some(CancellationOperation::Graceful { id, reason }) => {
-                Some(runtime::InitialCancellation::Graceful {
-                    request: CancellationRequest {
-                        reason,
-                        deadline: self.clock.now() + grace,
-                    },
-                    operation: Some(id),
-                })
-            }
+            Some(
+                CancellationOperation::Graceful { id, reason }
+                | CancellationOperation::OrdinaryOnly { id, reason },
+            ) => Some(runtime::InitialCancellation::Graceful {
+                request: CancellationRequest {
+                    reason,
+                    deadline: self.clock.now() + grace,
+                },
+                operation: Some(id),
+            }),
             Some(CancellationOperation::ForceAbort { id }) => {
                 Some(runtime::InitialCancellation::ForceAbort {
                     operation: id,
@@ -1043,6 +1051,13 @@ where
                                     deadline: self.clock.now() + grace,
                                 }
                             }
+                            CancellationOperation::OrdinaryOnly { id, reason } => {
+                                Occurrence::OrdinaryCancellationOperationRequested {
+                                    operation: id,
+                                    reason,
+                                    deadline: self.clock.now() + grace,
+                                }
+                            }
                             CancellationOperation::ForceAbort { id } => {
                                 Occurrence::ForceAbortRequested {
                                     operation: id,
@@ -1063,6 +1078,13 @@ where
                             let occurrence = match operation {
                                 CancellationOperation::Graceful { id, reason } => {
                                     Occurrence::CancellationOperationRequested {
+                                        operation: id,
+                                        reason,
+                                        deadline: self.clock.now() + grace,
+                                    }
+                                }
+                                CancellationOperation::OrdinaryOnly { id, reason } => {
+                                    Occurrence::OrdinaryCancellationOperationRequested {
                                         operation: id,
                                         reason,
                                         deadline: self.clock.now() + grace,

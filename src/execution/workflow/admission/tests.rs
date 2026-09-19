@@ -317,6 +317,26 @@ fn cancellation_source_rearms_graceful_cancellation_and_authorizes_one_force_abo
         Some(CancellationReason::ForceAbort)
     );
 
+    let cloud_graceful = CancellationSource::new();
+    assert_eq!(
+        cloud_graceful.request_ordinary_cancellation(CancellationReason::UserRequest),
+        OrdinaryCancellationRequestResult::Applied
+    );
+    assert_eq!(
+        cloud_graceful.subscribe_operations().next_operation(),
+        Some(CancellationOperation::OrdinaryOnly {
+            id: CancellationOperationId::fixture(1),
+            reason: CancellationReason::UserRequest,
+        })
+    );
+    assert!(cloud_graceful.begin_finalization_arm());
+    assert!(cloud_graceful.complete_finalization_arm());
+    assert_eq!(
+        cloud_graceful.request_ordinary_cancellation(CancellationReason::UserRequest),
+        OrdinaryCancellationRequestResult::FinalizersPreserved
+    );
+    assert_eq!(cloud_graceful.cancellation_reason(), None);
+
     let aborted = CancellationSource::new();
     assert!(aborted.request_cancellation(CancellationReason::UserRequest));
     let mut aborted_operations = aborted.subscribe_operations();

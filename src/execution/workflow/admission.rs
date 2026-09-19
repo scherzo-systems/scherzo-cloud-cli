@@ -98,9 +98,20 @@ pub(crate) enum CancellationOperation {
         id: CancellationOperationId,
         reason: CancellationReason,
     },
+    OrdinaryOnly {
+        id: CancellationOperationId,
+        reason: CancellationReason,
+    },
     ForceAbort {
         id: CancellationOperationId,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OrdinaryCancellationRequestResult {
+    Applied,
+    AlreadyRequested,
+    FinalizersPreserved,
 }
 
 #[derive(Debug)]
@@ -194,6 +205,34 @@ impl CancellationSource {
             self.operation_version.send_replace(version);
         }
         true
+    }
+
+    pub(crate) fn request_ordinary_cancellation(
+        &self,
+        reason: CancellationReason,
+    ) -> OrdinaryCancellationRequestResult {
+        if reason == CancellationReason::ForceAbort {
+            return OrdinaryCancellationRequestResult::AlreadyRequested;
+        }
+        let version = {
+            let mut state = lock_cancellation_operations(&self.operations);
+            if state.finalization_arming || state.finalization_armed {
+                return OrdinaryCancellationRequestResult::FinalizersPreserved;
+            }
+            if state.phase_reason.is_some() || state.force_abort_requested {
+                return OrdinaryCancellationRequestResult::AlreadyRequested;
+            }
+            let id = CancellationOperationId(state.next_id);
+            state.next_id = state.next_id.saturating_add(1);
+            state.phase_reason = Some(reason);
+            state
+                .operations
+                .push(CancellationOperation::OrdinaryOnly { id, reason });
+            u64::try_from(state.operations.len()).unwrap_or(u64::MAX)
+        };
+        self.reason.send_replace(Some(reason));
+        self.operation_version.send_replace(version);
+        OrdinaryCancellationRequestResult::Applied
     }
 
     pub(crate) fn request_force_abort(&self) -> bool {

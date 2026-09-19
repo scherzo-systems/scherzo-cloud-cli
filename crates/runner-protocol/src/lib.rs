@@ -71,6 +71,16 @@ pub enum RunnerFrame {
         assignment_id: String,
         decline: AssignmentDecline,
     },
+    AssignmentCancellationApplied {
+        envelope: RunnerEnvelope,
+        effect_id: String,
+        request_id: String,
+        assignment_id: String,
+        attempt_id: String,
+        mode: CancellationMode,
+        effective_mode: CancellationMode,
+        disposition: CancellationApplicationDisposition,
+    },
     AssignmentInterrupted {
         envelope: RunnerEnvelope,
         assignment_id: String,
@@ -322,6 +332,44 @@ pub struct ExecutionLeaseGrant {
     pub sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancellationMode {
+    Graceful,
+    Force,
+}
+
+impl CancellationMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Force => "force",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancellationApplicationDisposition {
+    PreExecutionStopped,
+    OrdinaryCancelling,
+    FinalizersPreserved,
+    ForceCancelling,
+    ExecutionTerminal,
+    Superseded,
+}
+
+impl CancellationApplicationDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreExecutionStopped => "pre_execution_stopped",
+            Self::OrdinaryCancelling => "ordinary_cancelling",
+            Self::FinalizersPreserved => "finalizers_preserved",
+            Self::ForceCancelling => "force_cancelling",
+            Self::ExecutionTerminal => "execution_terminal",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CloudEnvelope {
     pub message_id: String,
@@ -496,6 +544,15 @@ pub enum CloudFrame {
         attempt_id: String,
         execution_spec_id: String,
         lease: ExecutionLeaseGrant,
+    },
+    AssignmentCancel {
+        envelope: CloudEnvelope,
+        effect_id: String,
+        assignment_id: String,
+        run_id: String,
+        attempt_id: String,
+        request_id: String,
+        mode: CancellationMode,
     },
     ExecutionStartAuthorized {
         envelope: CloudEnvelope,
@@ -683,6 +740,28 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
                 }),
             )
         }
+        RunnerFrame::AssignmentCancellationApplied {
+            envelope,
+            effect_id,
+            request_id,
+            assignment_id,
+            attempt_id,
+            mode,
+            effective_mode,
+            disposition,
+        } => runner_frame_value(
+            envelope,
+            "assignment_cancellation_applied",
+            json!({
+                "effectId": effect_id,
+                "requestId": request_id,
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "mode": mode.as_str(),
+                "effectiveMode": effective_mode.as_str(),
+                "disposition": disposition.as_str(),
+            }),
+        ),
         RunnerFrame::AssignmentInterrupted {
             envelope,
             assignment_id,
@@ -980,6 +1059,14 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 &frame.direction,
                 frame.sent_at,
             )
+        }
+        generated::RunnerProtocolVersion1::RunnerAssignmentCancellationApplied(frame) => {
+            validate_cancellation_application(
+                cancellation_mode(frame.payload.mode),
+                cancellation_mode(frame.payload.effective_mode),
+                cancellation_application_disposition(frame.payload.disposition),
+            )?;
+            validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerAssignmentInterrupted(frame) => {
             validated_runner_frame!(frame)
@@ -1287,6 +1374,18 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 },
             }))
         }
+        generated::RunnerProtocolVersion1::CloudAssignmentCancel(frame) => {
+            let envelope = validated_cloud_envelope!(frame)?;
+            Ok(cloud(CloudFrame::AssignmentCancel {
+                envelope,
+                effect_id: frame.payload.effect_id.to_string(),
+                assignment_id: frame.payload.assignment_id.to_string(),
+                run_id: frame.payload.run_id.to_string(),
+                attempt_id: frame.payload.attempt_id.to_string(),
+                request_id: frame.payload.request_id.to_string(),
+                mode: cancellation_mode(frame.payload.mode),
+            }))
+        }
         generated::RunnerProtocolVersion1::CloudExecutionStartAuthorized(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
             Ok(cloud(CloudFrame::ExecutionStartAuthorized {
@@ -1322,6 +1421,69 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 reason: frame.payload.reason.to_string(),
             }))
         }
+    }
+}
+
+fn cancellation_mode(value: generated::CancellationMode) -> CancellationMode {
+    match value {
+        generated::CancellationMode::Graceful => CancellationMode::Graceful,
+        generated::CancellationMode::Force => CancellationMode::Force,
+    }
+}
+
+fn cancellation_application_disposition(
+    value: generated::CancellationApplicationDisposition,
+) -> CancellationApplicationDisposition {
+    match value {
+        generated::CancellationApplicationDisposition::PreExecutionStopped => {
+            CancellationApplicationDisposition::PreExecutionStopped
+        }
+        generated::CancellationApplicationDisposition::OrdinaryCancelling => {
+            CancellationApplicationDisposition::OrdinaryCancelling
+        }
+        generated::CancellationApplicationDisposition::FinalizersPreserved => {
+            CancellationApplicationDisposition::FinalizersPreserved
+        }
+        generated::CancellationApplicationDisposition::ForceCancelling => {
+            CancellationApplicationDisposition::ForceCancelling
+        }
+        generated::CancellationApplicationDisposition::ExecutionTerminal => {
+            CancellationApplicationDisposition::ExecutionTerminal
+        }
+        generated::CancellationApplicationDisposition::Superseded => {
+            CancellationApplicationDisposition::Superseded
+        }
+    }
+}
+
+fn validate_cancellation_application(
+    mode: CancellationMode,
+    effective_mode: CancellationMode,
+    disposition: CancellationApplicationDisposition,
+) -> Result<(), DecodeError> {
+    let valid = match (mode, effective_mode) {
+        (CancellationMode::Force, CancellationMode::Graceful) => false,
+        (CancellationMode::Graceful, CancellationMode::Force) => {
+            disposition == CancellationApplicationDisposition::Superseded
+        }
+        (CancellationMode::Force, CancellationMode::Force) => matches!(
+            disposition,
+            CancellationApplicationDisposition::PreExecutionStopped
+                | CancellationApplicationDisposition::ForceCancelling
+                | CancellationApplicationDisposition::ExecutionTerminal
+        ),
+        (CancellationMode::Graceful, CancellationMode::Graceful) => matches!(
+            disposition,
+            CancellationApplicationDisposition::PreExecutionStopped
+                | CancellationApplicationDisposition::OrdinaryCancelling
+                | CancellationApplicationDisposition::FinalizersPreserved
+                | CancellationApplicationDisposition::ExecutionTerminal
+        ),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DecodeError::InvalidFrame("cancellation application"))
     }
 }
 
@@ -1617,6 +1779,15 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         }
         "assignment_accepted" => &["effectId", "assignmentId", "offeredExecutionSpecId"],
         "assignment_rejected" => &["effectId", "assignmentId", "decline"],
+        "assignment_cancellation_applied" => &[
+            "effectId",
+            "requestId",
+            "assignmentId",
+            "attemptId",
+            "mode",
+            "effectiveMode",
+            "disposition",
+        ],
         "assignment_interrupted" => &["assignmentId", "attemptId", "reason"],
         "execution_lease_renewal_requested" => {
             &["assignmentId", "attemptId", "currentLeaseSequence"]
@@ -1696,6 +1867,14 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "attemptId",
             "executionSpecId",
             "lease",
+        ],
+        "assignment_cancel" => &[
+            "effectId",
+            "assignmentId",
+            "runId",
+            "attemptId",
+            "requestId",
+            "mode",
         ],
         "execution_start_authorized" => &["effectId", "assignmentId", "runId", "attemptId"],
         "assignment_lease_renewed" => &["effectId", "assignmentId", "runId", "attemptId", "lease"],
@@ -1819,11 +1998,19 @@ mod tests {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-assignment-cancellation-applied.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-assignment-interrupted.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-start.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-cancel.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1860,6 +2047,10 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-recovery.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-user-cancelled.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2002,6 +2193,22 @@ mod tests {
                 .and_then(|frame| decode_frame(fixture).ok().map(|_| frame));
             assert!(result.is_none(), "invalid fixture {index} was accepted");
         }
+    }
+
+    #[test]
+    fn cancellation_application_rejects_inconsistent_modes() {
+        let fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-assignment-cancellation-applied.json"
+        ));
+        let mut frame: Value = serde_json::from_slice(fixture).unwrap();
+        frame["payload"]["mode"] = json!("force");
+        frame["payload"]["effectiveMode"] = json!("graceful");
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        assert!(matches!(
+            decode_frame(&encoded),
+            Err(DecodeError::InvalidFrame("cancellation application"))
+        ));
     }
 
     #[test]
