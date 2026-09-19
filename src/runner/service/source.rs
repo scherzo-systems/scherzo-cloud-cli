@@ -359,7 +359,12 @@ impl HttpSourceCredentialBroker {
             };
             let status = response.status();
             let retry_after = match response.headers().get(RETRY_AFTER) {
-                Some(value) if status == StatusCode::SERVICE_UNAVAILABLE => {
+                Some(value)
+                    if matches!(
+                        status,
+                        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
+                    ) =>
+                {
                     let seconds = value
                         .to_str()
                         .ok()
@@ -3433,8 +3438,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn broker_honors_provider_retry_delay_before_retrying() {
+    #[derive(Clone, Copy)]
+    enum BrokerRetryOperation {
+        Issue,
+        CommitAvailability,
+    }
+
+    fn assert_broker_honors_retry_delay(status: &str, operation: BrokerRetryOperation) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let endpoint = Url::parse(&format!("ws://{address}/v1/runner/connect")).unwrap();
@@ -3445,36 +3455,61 @@ mod tests {
             started: retry_started,
             release: Mutex::new(retry_release),
         });
-        let worker = std::thread::spawn(move || {
-            broker.issue(
-                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
-                &CaptureCancellation::default(),
-            )
+        let worker = std::thread::spawn(move || match operation {
+            BrokerRetryOperation::Issue => broker
+                .issue(
+                    "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    &CaptureCancellation::default(),
+                )
+                .map(|credential| assert_eq!(credential.token.0, b"provider-token")),
+            BrokerRetryOperation::CommitAvailability => {
+                let availability = broker.commit_availability(
+                    "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    &CaptureCancellation::default(),
+                )?;
+                assert_eq!(availability, CommitAvailability::CommitAvailable);
+                Ok(())
+            }
         });
 
         let (mut first, _) = listener.accept().unwrap();
         let first_request = read_source_broker_request(&mut first);
-        write_source_broker_response(
-            &mut first,
-            "503 Service Unavailable",
-            "Retry-After: 37\r\n",
-            "",
-        );
+        write_source_broker_response(&mut first, status, "Retry-After: 37\r\n", "");
         assert_eq!(retry_observed.recv().unwrap(), Duration::from_secs(37));
         release_retry.send(()).unwrap();
 
         let (mut second, _) = listener.accept().unwrap();
         let second_request = read_source_broker_request(&mut second);
-        write_source_broker_response(
-            &mut second,
-            "200 OK",
-            "",
-            r#"{"schemaVersion":1,"repositoryUrl":"https://github.example/acme/private.git","token":"provider-token","expiresAt":"2099-08-20T13:00:00Z"}"#,
-        );
+        let body = match operation {
+            BrokerRetryOperation::Issue => {
+                r#"{"schemaVersion":1,"repositoryUrl":"https://github.example/acme/private.git","token":"provider-token","expiresAt":"2099-08-20T13:00:00Z"}"#
+            }
+            BrokerRetryOperation::CommitAvailability => {
+                r#"{"schemaVersion":1,"availability":"commit_available"}"#
+            }
+        };
+        write_source_broker_response(&mut second, "200 OK", "", body);
 
-        let credential = worker.join().unwrap().unwrap();
-        assert_eq!(credential.token.0, b"provider-token");
+        worker.join().unwrap().unwrap();
         assert_eq!(first_request, second_request);
+    }
+
+    #[test]
+    fn broker_honors_provider_retry_delay_before_retrying() {
+        assert_broker_honors_retry_delay("503 Service Unavailable", BrokerRetryOperation::Issue);
+    }
+
+    #[test]
+    fn broker_retries_rate_limited_issuance_after_the_advertised_delay() {
+        assert_broker_honors_retry_delay("429 Too Many Requests", BrokerRetryOperation::Issue);
+    }
+
+    #[test]
+    fn broker_retries_rate_limited_commit_verification_after_the_advertised_delay() {
+        assert_broker_honors_retry_delay(
+            "429 Too Many Requests",
+            BrokerRetryOperation::CommitAvailability,
+        );
     }
 
     #[test]
