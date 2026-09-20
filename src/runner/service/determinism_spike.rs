@@ -412,7 +412,14 @@ async fn run_assignment_scenario() -> Vec<String> {
     );
     let events = transcript.snapshot();
     assert_assignment_acknowledgement_order(&events);
+    // Assignment preparation runs independently from the connection loop. Its
+    // notification can become ready immediately before or after the liveness
+    // timer is first polled, so timer-request ordering is not a protocol
+    // guarantee. Timeout-specific scenarios below retain those events.
     events
+        .into_iter()
+        .filter(|event| !event.starts_with("sleep.requested:"))
+        .collect()
 }
 
 async fn run_timeout_boundary_scenarios() -> Vec<String> {
