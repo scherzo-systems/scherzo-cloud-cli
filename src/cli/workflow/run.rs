@@ -131,37 +131,66 @@ impl Command {
                 return Err(failure);
             }
         };
+        let source_root = self.source.source_root.clone();
+        let workflow_file = self.source.workflow_file.clone();
         let workflow =
-            match resolve_workflow_file(&self.source.source_root, &self.source.workflow_file) {
+            match blocking_operation(move || resolve_workflow_file(&source_root, &workflow_file))
+                .await
+            {
                 Ok(workflow) => workflow,
-                Err(failure) => {
+                Err(BlockingOperationError::Operation(failure)) => {
                     signal_task.abort();
                     return rejection_output(presentation_config, |output| {
                         output.render_resolution_rejection(&failure)
                     });
                 }
+                Err(BlockingOperationError::WorkerUnavailable) => {
+                    signal_task.abort();
+                    return diagnose("resolve local workflow definition");
+                }
             };
-        let context = match execution_context_for_workflow(
-            &workflow,
-            self.execution.execution_root,
-            self.max_parallel,
-            cancellation.clone(),
-        ) {
+        let workflow_for_context = workflow.clone();
+        let execution_root = self.execution.execution_root;
+        let maximum_parallel_steps = self.max_parallel;
+        let context_cancellation = cancellation.clone();
+        let context = match blocking_operation(move || {
+            execution_context_for_workflow(
+                &workflow_for_context,
+                execution_root,
+                maximum_parallel_steps,
+                context_cancellation,
+            )
+        })
+        .await
+        {
             Ok(context) => context,
-            Err(failure) => {
+            Err(BlockingOperationError::Operation(failure)) => {
                 signal_task.abort();
                 return rejection_output(presentation_config, |output| {
                     output.render_agent_harness_installation_rejection(&workflow, &failure)
                 });
             }
+            Err(BlockingOperationError::WorkerUnavailable) => {
+                signal_task.abort();
+                return diagnose("prepare local workflow execution context");
+            }
         };
-        let admitted = match admit_local_workflow(workflow.clone(), inputs, context) {
+        let workflow_for_admission = workflow.clone();
+        let admitted = match blocking_operation(move || {
+            admit_local_workflow(workflow_for_admission, inputs, context)
+        })
+        .await
+        {
             Ok(admitted) => admitted,
-            Err(failure) => {
+            Err(BlockingOperationError::Operation(failure)) => {
                 signal_task.abort();
                 return rejection_output(presentation_config, |output| {
                     output.render_admission_rejection(&workflow, &failure)
                 });
+            }
+            Err(BlockingOperationError::WorkerUnavailable) => {
+                signal_task.abort();
+                return diagnose("admit local workflow");
             }
         };
 
@@ -173,9 +202,15 @@ impl Command {
                 "prepare local workflow paths: an authoritative path is not valid UTF-8",
             );
         }
-        let owned_run = match InitialLocalRun::create(&self.run_dir, &admitted)
-            .map_err(anyhow::Error::new)
-            .with_context(|| format!("create workflow run {}", self.run_dir.display()))
+        let run_directory = self.run_dir.clone();
+        let admitted_for_creation = admitted.clone();
+        let owned_run = match tokio::task::spawn_blocking(move || {
+            InitialLocalRun::create(&run_directory, &admitted_for_creation)
+        })
+        .await
+        .map_err(anyhow::Error::new)
+        .and_then(|result| result.map_err(anyhow::Error::new))
+        .with_context(|| format!("create workflow run {}", self.run_dir.display()))
         {
             Ok(run) => run,
             Err(error) => {
@@ -221,6 +256,26 @@ impl Command {
             .input_plan()
             .is_ok_and(|plan| plan.standard_input_reserved);
         presentation_config_with(&self.presentation, standard_input_reserved, capabilities)
+    }
+}
+
+pub(super) enum BlockingOperationError<Error> {
+    Operation(Error),
+    WorkerUnavailable,
+}
+
+pub(super) async fn blocking_operation<Value, Error, Operation>(
+    operation: Operation,
+) -> Result<Value, BlockingOperationError<Error>>
+where
+    Value: Send + 'static,
+    Error: Send + 'static,
+    Operation: FnOnce() -> Result<Value, Error> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(BlockingOperationError::Operation(error)),
+        Err(_) => Err(BlockingOperationError::WorkerUnavailable),
     }
 }
 
@@ -297,7 +352,7 @@ pub(super) async fn execute_owned_attempt(
         Some(path) => path.to_owned(),
         None => {
             signal_task.abort();
-            settle_before_execution_failure(&owned_run);
+            settle_before_execution_failure(&owned_run).await;
             return diagnose(
                 "prepare local workflow paths: an authoritative path is not valid UTF-8",
             );
@@ -312,7 +367,7 @@ pub(super) async fn execute_owned_attempt(
         Ok(destination) => destination,
         Err(error) => {
             signal_task.abort();
-            settle_before_execution_failure(&owned_run);
+            settle_before_execution_failure(&owned_run).await;
             return diagnose(error);
         }
     };
@@ -320,7 +375,7 @@ pub(super) async fn execute_owned_attempt(
         Ok(staging) => staging,
         Err(_) => {
             signal_task.abort();
-            settle_before_execution_failure(&owned_run);
+            settle_before_execution_failure(&owned_run).await;
             return diagnose("prepare private local workflow staging");
         }
     };
@@ -332,7 +387,7 @@ pub(super) async fn execute_owned_attempt(
         Ok(artifacts) => artifacts,
         Err(error) => {
             signal_task.abort();
-            settle_before_execution_failure(&owned_run);
+            settle_before_execution_failure(&owned_run).await;
             return diagnose(error);
         }
     };
@@ -344,7 +399,7 @@ pub(super) async fn execute_owned_attempt(
         Ok(inputs) => inputs,
         Err(error) => {
             signal_task.abort();
-            settle_before_execution_failure(&owned_run);
+            settle_before_execution_failure(&owned_run).await;
             let cleanup_failed = artifacts.release().is_err();
             record_private_cleanup_failure(&owned_run, cleanup_failed);
             return diagnose(error);
@@ -357,7 +412,7 @@ pub(super) async fn execute_owned_attempt(
             Ok(staging) => Some(staging),
             Err(error) => {
                 signal_task.abort();
-                settle_before_execution_failure(&owned_run);
+                settle_before_execution_failure(&owned_run).await;
                 let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
                 record_private_cleanup_failure(&owned_run, cleanup_failed);
                 return diagnose(format_args!("prepare private local agent staging: {error}"));
@@ -422,7 +477,7 @@ pub(super) async fn execute_owned_attempt(
         Ok(prepared) => prepared,
         Err(failure) => {
             signal_task.abort();
-            settle_before_execution_failure(&owned_run);
+            settle_before_execution_failure(&owned_run).await;
             let cleanup_failed =
                 release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
             record_private_cleanup_failure(&owned_run, cleanup_failed);
@@ -432,7 +487,7 @@ pub(super) async fn execute_owned_attempt(
 
     if let Err(failure) = host.activate_execution() {
         signal_task.abort();
-        settle_before_execution_failure(&owned_run);
+        settle_before_execution_failure(&owned_run).await;
         let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
         record_private_cleanup_failure(&owned_run, cleanup_failed);
         host.stop_terminal().await;
@@ -444,7 +499,7 @@ pub(super) async fn execute_owned_attempt(
             Ok(sessions) => Some(sessions),
             Err(_) => {
                 signal_task.abort();
-                settle_before_execution_failure(&owned_run);
+                settle_before_execution_failure(&owned_run).await;
                 let cleanup_failed =
                     release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
                 record_private_cleanup_failure(&owned_run, cleanup_failed);
@@ -468,7 +523,7 @@ pub(super) async fn execute_owned_attempt(
                 crate::build_info::VERSION,
             ) else {
                 signal_task.abort();
-                settle_before_execution_failure(&owned_run);
+                settle_before_execution_failure(&owned_run).await;
                 let cleanup_failed =
                     release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
                 record_private_cleanup_failure(&owned_run, cleanup_failed);
@@ -486,7 +541,7 @@ pub(super) async fn execute_owned_attempt(
         (None, None) => AgentExecution::Disabled,
         (Some(_), None) | (None, Some(_)) => {
             signal_task.abort();
-            settle_before_execution_failure(&owned_run);
+            settle_before_execution_failure(&owned_run).await;
             let cleanup_failed =
                 release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
             record_private_cleanup_failure(&owned_run, cleanup_failed);
@@ -501,7 +556,7 @@ pub(super) async fn execute_owned_attempt(
         &diagnostics,
         agents,
         SystemExecutionClock,
-        owned_run.commit_port(diagnostics.clone(), accounting),
+        owned_run.commit_port(diagnostics.clone(), accounting, artifacts.clone()),
         observer.clone(),
         owned_run.process_guard_registry(),
     )
@@ -512,7 +567,7 @@ pub(super) async fn execute_owned_attempt(
         Ok(execution) => execution,
         Err(error) => {
             if error == CoordinationError::CommitFailed {
-                let _ = owned_run.record_state_persistence_failure();
+                let _ = owned_run.record_state_persistence_failure_async().await;
             }
             let cleanup_failed =
                 release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
@@ -571,34 +626,58 @@ pub(super) async fn execute_owned_attempt(
     }
 
     host.begin_publication();
-    let mut publication = publish_prepared_workflow_result(&destination, &artifacts, &run);
-    if leaf == ExecutionLeaf::Retry
-        && let Ok(terminal) = &mut publication
-    {
-        terminal.mark_retry();
-    }
-    let state_publication = match &publication {
-        Ok(_) => owned_run.record_result_published(),
-        Err(error) => owned_run.record_result_publication_failed(
-            publication_failure_phase(error.phase()),
-            error.invariant(),
-        ),
-    };
+    let publication_run = run.clone();
+    let publication_artifacts = artifacts.clone();
+    let (owned_run, publication, state_publication) = complete_blocking_phase(
+        blocking_operation(move || {
+            let mut publication = publish_prepared_workflow_result(
+                &destination,
+                &publication_artifacts,
+                &publication_run,
+            );
+            if leaf == ExecutionLeaf::Retry
+                && let Ok(terminal) = &mut publication
+            {
+                terminal.mark_retry();
+            }
+            let state_publication = match &publication {
+                Ok(_) => owned_run.record_result_published(),
+                Err(error) => owned_run.record_result_publication_failed(
+                    publication_failure_phase(error.phase()),
+                    error.invariant(),
+                ),
+            };
+            Ok::<_, std::convert::Infallible>((owned_run, publication, state_publication))
+        })
+        .await,
+        &mut host,
+        "publish terminal local workflow result",
+    )
+    .await?;
     host.complete_publication(&publication);
     host.begin_cleanup();
-    let execution_staging_failed =
-        release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-    let private_staging_failed = private_staging.release().is_err();
-    let cleanup_failed = execution_staging_failed || private_staging_failed;
-    let cleanup_state = if cleanup_failed {
-        owned_run.record_private_cleanup_failure()
-    } else {
-        Ok(())
-    };
+    let (cleanup_failed, cleanup_state, released_ownership) = complete_blocking_phase(
+        blocking_operation(move || {
+            let execution_staging_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            let private_staging_failed = private_staging.release().is_err();
+            let cleanup_failed = execution_staging_failed || private_staging_failed;
+            let cleanup_state = if cleanup_failed {
+                owned_run.record_private_cleanup_failure()
+            } else {
+                Ok(())
+            };
+            let released_ownership = owned_run.release();
+            Ok::<_, std::convert::Infallible>((cleanup_failed, cleanup_state, released_ownership))
+        })
+        .await,
+        &mut host,
+        "release private local workflow staging",
+    )
+    .await?;
     host.complete_cleanup(cleanup_failed);
     let state_commit_failed = state_publication.is_err() || cleanup_state.is_err();
 
-    let released_ownership = owned_run.release();
     host.mark_adapter_lifecycle_completed(released_ownership);
     host.finish(
         &workflow,
@@ -608,6 +687,21 @@ pub(super) async fn execute_owned_attempt(
         state_commit_failed,
     )
     .await
+}
+
+async fn complete_blocking_phase<Value>(
+    completion: Result<Value, BlockingOperationError<std::convert::Infallible>>,
+    host: &mut ActiveRunHost,
+    failure_context: &str,
+) -> Result<Value, super::super::CommandFailure> {
+    match completion {
+        Ok(value) => Ok(value),
+        Err(BlockingOperationError::Operation(never)) => match never {},
+        Err(BlockingOperationError::WorkerUnavailable) => {
+            host.stop_terminal().await;
+            Err(anyhow!(failure_context.to_owned()).into())
+        }
+    }
 }
 
 fn release_execution_staging(
@@ -1645,8 +1739,8 @@ fn observed_run_timing(timing: &RunTimingSnapshot) -> Option<WorkflowRunTiming> 
     })
 }
 
-fn settle_before_execution_failure(run: &InitialLocalRun) {
-    let _ = run.record_executor_fault_before_execution();
+async fn settle_before_execution_failure(run: &InitialLocalRun) {
+    let _ = run.record_executor_fault_before_execution_async().await;
 }
 
 fn record_private_cleanup_failure(run: &InitialLocalRun, cleanup_failed: bool) {

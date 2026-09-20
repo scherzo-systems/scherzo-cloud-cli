@@ -32,7 +32,11 @@ struct AdmittedFixture {
 
 impl AdmittedFixture {
     fn new() -> Self {
-        Self::from_source_with_inputs(
+        Self::new_with_environment(EnvironmentSnapshot::default())
+    }
+
+    fn new_with_environment(environment: EnvironmentSnapshot) -> Self {
+        Self::from_source_with_inputs_and_environment(
             "schemaVersion: 1\ninputs:\n  request: {kind: text}\n  settings: {kind: json}\n  evidence: {kind: attachments}\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n",
             ResolvedInputs::new(BTreeMap::from([
                 (
@@ -57,6 +61,7 @@ impl AdmittedFixture {
                 ),
             ])),
             1024,
+            environment,
         )
     }
 
@@ -72,6 +77,20 @@ impl AdmittedFixture {
         source: &str,
         inputs: ResolvedInputs,
         maximum_step_log_bytes: u64,
+    ) -> Self {
+        Self::from_source_with_inputs_and_environment(
+            source,
+            inputs,
+            maximum_step_log_bytes,
+            EnvironmentSnapshot::default(),
+        )
+    }
+
+    fn from_source_with_inputs_and_environment(
+        source: &str,
+        inputs: ResolvedInputs,
+        maximum_step_log_bytes: u64,
+        environment: EnvironmentSnapshot,
     ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
@@ -93,7 +112,7 @@ impl AdmittedFixture {
                     InputLimits::new(16, 1024, 4096, 4096),
                     maximum_step_log_bytes,
                 ),
-                EnvironmentSnapshot::default(),
+                environment,
                 CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
             ),
         )
@@ -734,6 +753,13 @@ fn atomic_state_replace_rejects_a_concurrent_authoritative_change() {
     );
 }
 
+fn fixture_settlement_snapshot() -> WorkspaceSnapshotV1 {
+    capture_settlement_snapshot(
+        Path::new("/fixture-workspace-is-unavailable"),
+        WorkspaceSnapshotSettlementV1::Engine,
+    )
+}
+
 fn settle_as_workflow_failed(run: &InitialLocalRun) {
     run.state
         .update(|state| {
@@ -741,6 +767,7 @@ fn settle_as_workflow_failed(run: &InitialLocalRun) {
             let settled = attempt.created_at.clone();
             attempt.started_at = Some(settled.clone());
             attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
             attempt.state = AttemptStateV1::WorkflowFailed;
             attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
             attempt.progress.steps[0].detail =
@@ -773,12 +800,266 @@ fn settle_as_workflow_failed(run: &InitialLocalRun) {
 }
 
 #[test]
+fn schema_one_documents_without_continuation_foundation_fields_remain_readable() {
+    let fixture = AdmittedFixture::new();
+    let run =
+        InitialLocalRun::create(&fixture.run_path("schema-one-old"), &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+
+    let mut run_document: serde_json::Value =
+        serde_json::from_slice(&read_regular_file(run.root_handle(), RUN_FILE).unwrap()).unwrap();
+    run_document.as_object_mut().unwrap().remove("gitBaseline");
+    assert!(decode_run(&json_bytes(run_document)).is_ok());
+
+    let mut state_document: serde_json::Value =
+        serde_json::from_slice(&read_regular_file(run.root_handle(), STATE_FILE).unwrap()).unwrap();
+    let attempt = state_document["attempts"][0].as_object_mut().unwrap();
+    attempt.remove("definition");
+    attempt.remove("settlementSnapshot");
+    for step in attempt["progress"]["steps"].as_array_mut().unwrap() {
+        step.as_object_mut().unwrap().remove("outputs");
+    }
+    assert!(decode_state(&json_bytes(state_document)).is_ok());
+}
+
+#[test]
+fn archived_attempt_loads_schema_one_state_without_retained_output_foundation() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("schema-one-old-archive");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    publish_result_fixture(&fixture, &run);
+
+    let mut state: Value =
+        serde_json::from_slice(&read_regular_file(run.root_handle(), STATE_FILE).unwrap()).unwrap();
+    let attempt = state["attempts"][0].as_object_mut().unwrap();
+    attempt.remove("definition");
+    attempt.remove("settlementSnapshot");
+    for step in attempt["progress"]["steps"].as_array_mut().unwrap() {
+        step.as_object_mut().unwrap().remove("outputs");
+    }
+    fs::write(run_path.join(STATE_FILE), json_bytes(state)).unwrap();
+
+    let archived = load_local_archived_attempt(&run_path, None).unwrap();
+    assert_eq!(archived.attempt_number, 1);
+    assert_eq!(archived.state, ArchivedAttemptState::WorkflowFailed);
+}
+
+#[test]
+fn run_retains_original_git_baseline_for_descendant_retries() {
+    let fixture = AdmittedFixture::new_with_environment(EnvironmentSnapshot::new([(
+        "PATH",
+        std::env::var_os("PATH").unwrap(),
+    )]));
+    let git = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(&fixture.execution_root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(&["init", "--quiet"]);
+    git(&["config", "user.name", "Baseline Fixture"]);
+    git(&["config", "user.email", "baseline@example.invalid"]);
+    fs::write(fixture.execution_root.join("tracked"), b"original\n").unwrap();
+    git(&["add", "tracked"]);
+    git(&["commit", "--quiet", "-m", "original"]);
+    let original = String::from_utf8(git(&["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    let run_path = fixture.run_path("git-baseline");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    let retained = read_run(run.root_handle()).unwrap();
+    assert_eq!(
+        retained.git_baseline,
+        Some(GitBaselineV1::Available {
+            object_format: "sha1".to_owned(),
+            commit_oid: original.clone(),
+        })
+    );
+    settle_as_workflow_failed(&run);
+    drop(run);
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed attempt should be retryable");
+    };
+    let baseline = pending.git_baseline().unwrap().clone();
+
+    fs::write(fixture.execution_root.join("tracked"), b"descendant\n").unwrap();
+    git(&["add", "tracked"]);
+    git(&["commit", "--quiet", "-m", "descendant"]);
+    let capture = GitCaptureContext::admit_local_with_baseline(
+        fixture.admitted.execution(),
+        &baseline,
+        &super::super::artifact::CaptureCancellation::default(),
+    )
+    .unwrap();
+    assert_eq!(capture.baseline().commit_oid(), original);
+
+    git(&["checkout", "--quiet", "--orphan", "rewritten"]);
+    fs::write(fixture.execution_root.join("tracked"), b"rewritten\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "rewritten"]);
+    assert_eq!(
+        GitCaptureContext::admit_local_with_baseline(
+            fixture.admitted.execution(),
+            &baseline,
+            &super::super::artifact::CaptureCancellation::default(),
+        )
+        .unwrap_err(),
+        GitWorkspaceAdmissionFailure::BaselineUnavailable
+    );
+    let missing = LocalGitBaseline::new(GitObjectFormat::Sha1, Arc::from("0".repeat(40))).unwrap();
+    assert_eq!(
+        GitCaptureContext::admit_local_with_baseline(
+            fixture.admitted.execution(),
+            &missing,
+            &super::super::artifact::CaptureCancellation::default(),
+        )
+        .unwrap_err(),
+        GitWorkspaceAdmissionFailure::BaselineUnavailable
+    );
+}
+
+#[test]
+fn retained_output_carriers_are_verified_and_orphans_are_removed() {
+    let fixture = AdmittedFixture::new();
+    let run =
+        InitialLocalRun::create(&fixture.run_path("retained-output"), &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+    let private = run.create_private_staging().unwrap();
+    let artifacts = ArtifactStaging::create_bound(
+        fixture.admitted.execution(),
+        private.path(),
+        private.root_handle(),
+    )
+    .unwrap();
+    let attempts = open_directory_at(run.root_handle(), ATTEMPTS_DIRECTORY).unwrap();
+    let attempt = open_directory_at(&attempts, "000001").unwrap();
+    let values = create_or_open_directory(&attempt, VALUES_DIRECTORY).unwrap();
+    let steps = create_or_open_directory(&values, "steps").unwrap();
+    let first = create_or_open_directory(&steps, "first").unwrap();
+    let retained = retain_output_value(
+        &artifacts,
+        &first,
+        AttemptNodeRoleV1::Step,
+        "first",
+        "message",
+        &crate::execution::workflow::value::CapturedValue::text(Arc::from("evidence\n")),
+    )
+    .unwrap();
+    sync_directory(&first).unwrap();
+    sync_directory(&steps).unwrap();
+    sync_directory(&values).unwrap();
+    sync_directory(&attempt).unwrap();
+    run.state
+        .update(|state| {
+            state.attempts[0].progress.steps[0].outputs = Some(vec![retained.clone()]);
+            Ok(())
+        })
+        .unwrap();
+    let state = read_state(run.root_handle()).unwrap();
+    verify_retained_output_evidence(run.root_handle(), &state, 1).unwrap();
+
+    let carrier = retained.carrier().unwrap();
+    let carrier_path = run
+        .run_directory()
+        .join("attempts/000001")
+        .join(&carrier.relative_path);
+    let orphan = carrier_path.parent().unwrap().join("orphan");
+    fs::write(&orphan, b"not committed").unwrap();
+    cleanup_unreferenced_retained_values(run.root_handle(), &state, 1).unwrap();
+    assert!(!orphan.exists());
+    assert!(carrier_path.is_file());
+
+    let mut permissions = fs::metadata(&carrier_path).unwrap().permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&carrier_path, permissions).unwrap();
+    fs::write(&carrier_path, b"tampered\n").unwrap();
+    assert!(verify_retained_output_evidence(run.root_handle(), &state, 1).is_err());
+}
+
+#[test]
+fn retained_output_verification_rejects_a_fifo_without_waiting_for_a_writer() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message:\n        kind: text\n        from: path\n        path: message.txt\n",
+    );
+    let run =
+        InitialLocalRun::create(&fixture.run_path("retained-fifo"), &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+    retain_text_output_for_step(&run, "first", "message", b"evidence\n");
+    let state = read_state(run.root_handle()).unwrap();
+    let carrier = run
+        .run_directory()
+        .join("attempts/000001/values/steps/first/message");
+    fs::remove_file(&carrier).unwrap();
+    nix::unistd::mkfifo(
+        &carrier,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+
+    assert_eq!(
+        verify_retained_output_evidence(run.root_handle(), &state, 1),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+}
+
+#[test]
+fn retry_rejects_incomplete_succeeded_outputs_before_orphan_cleanup() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message:\n        kind: text\n        from: path\n        path: message.txt\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command: {argv: [\"false\"]}\n",
+    );
+    let run_path = fixture.run_path("retry-incomplete-output-set");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    run.state
+        .update(|state| {
+            let steps = &mut current_attempt_mut(state)?.progress.steps;
+            let failed_detail = steps[0].detail.take();
+            steps[0].state = AttemptStepStateV1::Succeeded;
+            steps[0].outputs = Some(Vec::new());
+            steps[1].state = AttemptStepStateV1::Failed;
+            steps[1].detail = failed_detail;
+            Ok(())
+        })
+        .unwrap();
+    let carrier = run_path.join("attempts/000001/values/steps/first/message");
+    fs::create_dir_all(carrier.parent().unwrap()).unwrap();
+    fs::write(&carrier, b"producer evidence\n").unwrap();
+    drop(run);
+
+    assert!(matches!(
+        acquire_local_retry(&run_path),
+        Err(LocalRunDirectoryError::StateInvalid)
+    ));
+    assert_eq!(fs::read(carrier).unwrap(), b"producer evidence\n");
+    assert!(!run_path.join("attempts/000002").exists());
+}
+
+#[test]
 fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
     let fixture = AdmittedFixture::new();
     let run_path = fixture.run_path("retry-fresh");
     let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
     settle_as_workflow_failed(&initial);
-    let predecessor = read_state(initial.root_handle()).unwrap().attempts[0].clone();
+    let documents = read_state(initial.root_handle()).unwrap();
+    let predecessor = documents.attempts[0].clone();
+    assert_eq!(
+        predecessor.definition.as_ref().unwrap().locator,
+        AttemptDefinitionLocatorV1::Run
+    );
+    assert_eq!(
+        predecessor.settlement_snapshot.as_ref().unwrap().settled_by,
+        Some(WorkspaceSnapshotSettlementV1::Engine)
+    );
     drop(initial);
 
     let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
@@ -812,6 +1093,10 @@ fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
     let attempt = &state.attempts[1];
     assert_eq!(attempt.trigger, AttemptTriggerV1::ExplicitRetry);
     assert_eq!(attempt.prior_attempt_number, Some(1));
+    assert_eq!(
+        attempt.definition.as_ref().unwrap().locator,
+        AttemptDefinitionLocatorV1::Run
+    );
     assert_eq!(attempt.state, AttemptStateV1::Created);
     assert_eq!(attempt.progress.accepted_occurrence_ordinal, 0);
     assert_eq!(attempt.progress.last_transition_sequence, 0);
@@ -826,6 +1111,81 @@ fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
     );
     assert!(run_path.join("attempts/000002").is_dir());
     assert!(!run_path.join("attempts/000002/result").exists());
+}
+
+#[test]
+fn attempt_definition_locator_resolves_attempt_retention_without_run_fallback() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("attempt-definition");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&initial);
+    drop(initial);
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("failed attempt should be retryable");
+    };
+    let retry = pending.begin(&fixture.admitted).unwrap_or_else(|_| {
+        panic!("retry should commit");
+    });
+    settle_as_workflow_failed(&retry);
+
+    let attempts = open_directory_at(retry.root_handle(), ATTEMPTS_DIRECTORY).unwrap();
+    let attempt = open_directory_at(&attempts, "000002").unwrap();
+    mkdir(&attempt, WORKFLOW_DIRECTORY).unwrap();
+    let workflow = open_directory_at(&attempt, WORKFLOW_DIRECTORY).unwrap();
+    mkdir(&workflow, WORKFLOW_FILES_DIRECTORY).unwrap();
+    let files = open_directory_at(&workflow, WORKFLOW_FILES_DIRECTORY).unwrap();
+    let manifest = retain_execution_specification(&files, &fixture.admitted).unwrap();
+    let manifest_bytes = encode_json(&manifest).unwrap();
+    write_new_immutable_file(&workflow, WORKFLOW_MANIFEST_FILE, &manifest_bytes).unwrap();
+    sync_directory(&files).unwrap();
+    sync_directory(&workflow).unwrap();
+    sync_directory(&attempt).unwrap();
+    retry
+        .state
+        .update(|state| {
+            let current = current_attempt_mut(state)?;
+            current.trigger = AttemptTriggerV1::Continuation;
+            current.definition = Some(AttemptDefinitionV1 {
+                digest: DigestV1 {
+                    algorithm: fixture
+                        .admitted
+                        .workflow()
+                        .content_digest
+                        .algorithm
+                        .as_str()
+                        .to_owned(),
+                    value: fixture.admitted.workflow().content_digest.value.clone(),
+                },
+                manifest_digest: DigestV1::sha256(&manifest_bytes),
+                locator: AttemptDefinitionLocatorV1::Attempt { attempt_number: 2 },
+            });
+            Ok(())
+        })
+        .unwrap();
+
+    let retained_run = read_run(retry.root_handle()).unwrap();
+    let retained_state = read_state(retry.root_handle()).unwrap();
+    validate_run_state_pair(&retained_run, &retained_state).unwrap();
+    let run_source = run_path.join("workflow/files/0001");
+    let mut permissions = fs::metadata(&run_source).unwrap().permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&run_source, permissions).unwrap();
+    fs::write(run_source, b"corrupted run-level closure\n").unwrap();
+
+    let mut budget = RetainedReadBudget::with_bytes(0).unwrap();
+    let (resolved, _, maximum_parallel_steps) = load_attempt_retained_execution_with_budget(
+        retry.root_handle(),
+        &retained_run,
+        &retained_state,
+        &retained_state.attempts[1],
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        resolved.content_digest,
+        fixture.admitted.workflow().content_digest
+    );
+    assert_eq!(maximum_parallel_steps, 2);
 }
 
 #[test]
@@ -850,6 +1210,7 @@ fn finalizer_retry_uses_fresh_identity_and_omits_prior_finalization_bytes() {
             let settled = attempt.created_at.clone();
             attempt.started_at = Some(settled.clone());
             attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
             attempt.state = AttemptStateV1::WorkflowFailed;
             attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
             attempt.progress.steps[0].detail =
@@ -873,6 +1234,7 @@ fn finalizer_retry_uses_fresh_identity_and_omits_prior_finalization_bytes() {
                         role: AttemptNodeRoleV1::Finalizer,
                         failure_policy: FailurePolicy::Required,
                         state: AttemptStepStateV1::Succeeded,
+                        outputs: Some(Vec::new()),
                         detail: None,
                     }],
                     issues: Vec::new(),
@@ -1109,6 +1471,7 @@ fn settle_as_succeeded(run: &LocalAttemptOwner) {
             let settled = attempt.created_at.clone();
             attempt.started_at = Some(settled.clone());
             attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
             attempt.state = AttemptStateV1::Succeeded;
             for step in &mut attempt.progress.steps {
                 step.state = AttemptStepStateV1::Succeeded;
@@ -1121,6 +1484,88 @@ fn settle_as_succeeded(run: &LocalAttemptOwner) {
         .unwrap();
 }
 
+fn retain_text_output_for_step(
+    run: &LocalAttemptOwner,
+    step_id: &str,
+    output_name: &str,
+    bytes: &[u8],
+) {
+    let state = read_state(run.root_handle()).unwrap();
+    let attempt_name = attempt_directory_name(state.current_attempt_number).unwrap();
+    let relative_path = retained_value_relative_path(AttemptNodeRoleV1::Step, step_id, output_name);
+    let path = run
+        .run_directory()
+        .join(ATTEMPTS_DIRECTORY)
+        .join(attempt_name)
+        .join(&relative_path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    let retained = RetainedOutputV1::Text {
+        name: output_name.to_owned(),
+        carrier: RetainedCarrierV1 {
+            relative_path,
+            media_type: "text/plain; charset=utf-8".to_owned(),
+            size_bytes: u64::try_from(bytes.len()).unwrap(),
+            digest: DigestV1::sha256(bytes),
+        },
+    };
+    run.state
+        .update(|state| {
+            let step = current_attempt_mut(state)?
+                .progress
+                .steps
+                .iter_mut()
+                .find(|step| step.id == step_id)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            step.outputs = Some(vec![retained.clone()]);
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn retain_file_outputs_for_step(
+    run: &LocalAttemptOwner,
+    step_id: &str,
+    outputs: &[(&str, &str, &[u8])],
+) {
+    let state = read_state(run.root_handle()).unwrap();
+    let attempt_number = state.current_attempt_number;
+    let attempt_name = attempt_directory_name(attempt_number).unwrap();
+    let mut retained = Vec::with_capacity(outputs.len());
+    for (name, media_type, bytes) in outputs {
+        let relative_path = retained_value_relative_path(AttemptNodeRoleV1::Step, step_id, name);
+        let path = run
+            .run_directory()
+            .join(ATTEMPTS_DIRECTORY)
+            .join(&attempt_name)
+            .join(&relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        retained.push(RetainedOutputV1::File {
+            name: (*name).to_owned(),
+            media_type: (*media_type).to_owned(),
+            carrier: RetainedCarrierV1 {
+                relative_path,
+                media_type: (*media_type).to_owned(),
+                size_bytes: u64::try_from(bytes.len()).unwrap(),
+                digest: DigestV1::sha256(bytes),
+            },
+        });
+    }
+    run.state
+        .update(|state| {
+            let step = current_attempt_mut(state)?
+                .progress
+                .steps
+                .iter_mut()
+                .find(|step| step.id == step_id)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            step.outputs = Some(retained.clone());
+            Ok(())
+        })
+        .unwrap();
+}
+
 fn settle_as_cancelled(run: &LocalAttemptOwner) {
     run.state
         .update(|state| {
@@ -1128,6 +1573,7 @@ fn settle_as_cancelled(run: &LocalAttemptOwner) {
             let settled = attempt.created_at.clone();
             attempt.started_at = Some(settled.clone());
             attempt.settled_at = Some(settled.clone());
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
             attempt.state = AttemptStateV1::Cancelled;
             attempt.cancellation = Some(AttemptCancellationV1 {
                 reason: CancellationReasonV1::UserRequest,
@@ -1163,6 +1609,7 @@ fn settle_as_force_cancelled_with_finalizer(
             let settled = attempt.created_at.clone();
             attempt.started_at = Some(settled.clone());
             attempt.settled_at = Some(settled.clone());
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
             attempt.state = AttemptStateV1::Cancelled;
             attempt.force_abort = Some(super::super::runtime::ForceAbortEvidence {
                 reason: CancellationReason::ForceAbort,
@@ -1198,6 +1645,7 @@ fn settle_as_force_cancelled_with_finalizer(
                         role: AttemptNodeRoleV1::Finalizer,
                         failure_policy: FailurePolicy::Required,
                         state: AttemptStepStateV1::Cancelled,
+                        outputs: Some(Vec::new()),
                         detail: Some(NodeDetail::Cancellation(
                             super::super::evidence::CancellationDetail::new(
                                 CancellationReason::ForceAbort,
@@ -1675,6 +2123,7 @@ fn archived_attempt_reports_each_nonpublished_disposition_without_fallback() {
             let attempt = current_attempt_mut(state)?;
             attempt.state = AttemptStateV1::Rejected;
             attempt.settled_at = Some(attempt.created_at.clone());
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
             attempt.rejection = Some(AttemptRejectionV1 {
                 code: RejectionCodeV1::ImmutableSpecificationUnusable,
             });
@@ -2035,6 +2484,7 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
     let run_path = fixture.run_path("large-result");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
     settle_as_succeeded(&run);
+    retain_file_outputs_for_step(&run, "produce", &[("payload", &media_type, b"x")]);
 
     let durable = read_state(run.root_handle()).unwrap();
     let attempt = durable.attempts.last().unwrap();
@@ -2137,6 +2587,75 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
 }
 
 #[test]
+fn archived_attempt_binds_retained_output_kind_and_export_metadata() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message:\n        kind: text\n        from: path\n        path: message.txt\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command: {argv: [\"true\"]}\nexports:\n  message:\n    ref: outputs.first.message\n",
+    );
+    let run_path = fixture.run_path("archive-output-binding");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+    let retained_bytes = b"\"evidence\"";
+    retain_text_output_for_step(&run, "first", "message", retained_bytes);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    let mut valid = result_value(&result_directory);
+    valid["exports"] = json!({
+        "message": {
+            "state": "available",
+            "kind": "text",
+            "mediaType": "text/plain; charset=utf-8",
+            "path": "exports/0001",
+            "sizeBytes": retained_bytes.len(),
+            "digest": {
+                "algorithm": "sha256",
+                "value": DigestV1::sha256(retained_bytes).value
+            }
+        }
+    });
+    fs::write(result_directory.join("exports/0001"), retained_bytes).unwrap();
+    overwrite_result(&result_directory, valid.clone());
+    load_local_archived_attempt(&run_path, None).unwrap();
+
+    let substituted = b"different";
+    let mut substituted_result = valid.clone();
+    substituted_result["exports"]["message"]["sizeBytes"] = substituted.len().into();
+    substituted_result["exports"]["message"]["digest"]["value"] =
+        DigestV1::sha256(substituted).value.into();
+    fs::write(result_directory.join("exports/0001"), substituted).unwrap();
+    overwrite_result(&result_directory, substituted_result);
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+    );
+
+    fs::write(result_directory.join("exports/0001"), retained_bytes).unwrap();
+    overwrite_result(&result_directory, valid);
+    run.state
+        .update(|state| {
+            let outputs = current_attempt_mut(state)?.progress.steps[0]
+                .outputs
+                .as_mut()
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            let carrier = match outputs.first() {
+                Some(RetainedOutputV1::Text { carrier, .. }) => carrier.clone(),
+                _ => return Err(LocalRunDirectoryError::StateInvalid),
+            };
+            outputs[0] = RetainedOutputV1::Json {
+                name: "message".to_owned(),
+                carrier: RetainedCarrierV1 {
+                    media_type: "application/json".to_owned(),
+                    ..carrier
+                },
+            };
+            Ok(())
+        })
+        .unwrap();
+    assert_archive_operational(
+        load_local_archived_attempt(&run_path, None).unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
+    );
+}
+
+#[test]
 fn archived_attempt_enforces_alias_source_identity() {
     let fixture = AdmittedFixture::from_source(
         "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      one:\n        kind: file\n        from: path\n        path: one.bin\n        mediaType: application/octet-stream\n      two:\n        kind: file\n        from: path\n        path: two.bin\n        mediaType: application/octet-stream\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\nexports:\n  a:\n    ref: outputs.first.one\n  b:\n    ref: outputs.first.one\n  c:\n    ref: outputs.first.two\n",
@@ -2144,6 +2663,14 @@ fn archived_attempt_enforces_alias_source_identity() {
     let run_path = fixture.run_path("archive-alias-identity");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
     settle_as_succeeded(&run);
+    retain_file_outputs_for_step(
+        &run,
+        "first",
+        &[
+            ("one", "application/octet-stream", b"x"),
+            ("two", "application/octet-stream", b"x"),
+        ],
+    );
     let result_directory = publish_result_fixture(&fixture, &run);
     let metadata = serde_json::json!({
         "state": "available",
@@ -2414,6 +2941,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
             let settled = attempt.created_at.clone();
             attempt.started_at = Some(settled.clone());
             attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
             attempt.state = AttemptStateV1::WorkflowFailed;
             attempt.progress.steps[0].state = AttemptStepStateV1::Failed;
             attempt.progress.steps[0].detail =

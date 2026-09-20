@@ -388,8 +388,9 @@ The retained root-owned seams have this closed ownership matrix:
 The direct process inventory within execution is limited to
 `claude_code.rs`, `claude_code/tests.rs`, `codex.rs`,
 `harness_installation.rs`, `pi.rs`, `pi/tests.rs`,
-`workflow/child_guard.rs`, and `workflow/git_capture.rs`. This exception is deliberately
-narrow: Slice 2A keeps the existing process owner and call sites in place rather than
+`workflow/child_guard.rs`, `workflow/git_capture.rs`, and
+`workflow/workspace_snapshot.rs`. This exception is deliberately narrow: Slice 2A keeps
+the process owner and call sites in place rather than
 creating a forwarding API that would become accidental package surface. The Rust
 unused-import lint keeps facade entries tied to real consumers, and architecture tests
 reject deep execution imports, public implementation modules, unlisted direct process

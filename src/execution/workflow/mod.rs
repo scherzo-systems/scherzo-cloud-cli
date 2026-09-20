@@ -57,6 +57,7 @@ mod test_support;
 pub(crate) mod validated;
 pub(crate) mod validation;
 pub(crate) mod value;
+mod workspace_snapshot;
 
 use std::fmt;
 use std::sync::OnceLock;

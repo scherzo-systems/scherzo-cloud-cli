@@ -1826,6 +1826,17 @@ exports:
         files,
         std::collections::BTreeSet::from(["0001".into(), "0003".into()])
     );
+    let archived = run(&[
+        "workflow".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ]);
+    assert!(
+        archived.status.success(),
+        "archived attempt did not resolve retained output evidence: {}",
+        String::from_utf8_lossy(&archived.stderr)
+    );
     let mut complete_set = result.clone();
     complete_set["exports"]["unavailable"] = serde_json::json!({
         "state": "unavailable",
@@ -1849,6 +1860,38 @@ exports:
 
     let carrier_path = artifact.join("exports/0001");
     let original = fs::read(&carrier_path).unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    let outputs = state["attempts"][0]["progress"]["steps"][0]["outputs"]
+        .as_array()
+        .unwrap();
+    let retained_change = outputs
+        .iter()
+        .find(|output| output["name"] == "changes")
+        .unwrap();
+    let retained_report = outputs
+        .iter()
+        .find(|output| output["name"] == "report")
+        .unwrap();
+    assert_eq!(retained_change["kind"], "git_branch");
+    assert_eq!(retained_report["kind"], "file");
+    let retained_change_path = destination
+        .join("attempts/000001")
+        .join(retained_change["carrier"]["relativePath"].as_str().unwrap());
+    let retained_report_path = destination
+        .join("attempts/000001")
+        .join(retained_report["carrier"]["relativePath"].as_str().unwrap());
+    assert_eq!(fs::read(&retained_change_path).unwrap(), original);
+    assert_eq!(fs::read(&retained_report_path).unwrap(), b"report");
+    assert_eq!(
+        fs::metadata(&retained_change_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o222,
+        0
+    );
+
     fs::set_permissions(&carrier_path, fs::Permissions::from_mode(0o600)).unwrap();
     let advertised_ref = b"refs/scherzo/head";
     let ref_offset = original
@@ -1859,6 +1902,11 @@ exports:
     wrong_profile[ref_offset..ref_offset + advertised_ref.len()]
         .copy_from_slice(b"refs/scherzo/heap");
     fs::write(&carrier_path, wrong_profile).unwrap();
+    assert_eq!(
+        fs::read(&retained_change_path).unwrap(),
+        original,
+        "published-result mutation must not alter retained attempt evidence"
+    );
     let invalid_profile = run(&[
         "artifact".to_owned(),
         "validate".to_owned(),
@@ -1933,6 +1981,12 @@ exports:
     assert_eq!(branch["kind"], "git_branch");
     assert_eq!(branch["baseOid"], branch["headOid"]);
     assert!(branch.get("carrier").is_none());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    let retained = &state["attempts"][0]["progress"]["steps"][0]["outputs"][0];
+    assert_eq!(retained["kind"], "git_branch");
+    assert_eq!(retained["baseOid"], retained["headOid"]);
+    assert!(retained.get("carrier").is_none());
     let artifact = attempt_result(&destination);
     assert_eq!(fs::read_dir(artifact.join("exports")).unwrap().count(), 0);
     let validation = run(&[
@@ -3471,6 +3525,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
             "createdAt",
+            "gitBaseline",
             "localRunId",
             "schemaVersion",
             "workflowDigest",

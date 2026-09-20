@@ -40,8 +40,20 @@ impl Command {
             Ok(task) => task,
             Err(error) => return Err(error.into()),
         };
-        reconcile_current_result_publication(&self.run.run_dir);
-        let pending = match acquire_local_retry(&self.run.run_dir) {
+        let run_directory = self.run.run_dir.clone();
+        let opened = match tokio::task::spawn_blocking(move || {
+            reconcile_current_result_publication(&run_directory);
+            acquire_local_retry(&run_directory)
+        })
+        .await
+        {
+            Ok(opened) => opened,
+            Err(_) => {
+                signal_task.abort();
+                return super::run::diagnose("inspect local workflow retry state");
+            }
+        };
+        let pending = match opened {
             Ok(LocalRetryOpen::Acquired(pending)) => *pending,
             Ok(LocalRetryOpen::Rejected(rejection)) => {
                 signal_task.abort();
@@ -56,14 +68,21 @@ impl Command {
             let (workflow, inputs, maximum_parallel_steps) = pending.execution_specification();
             (workflow.clone(), inputs.clone(), maximum_parallel_steps)
         };
-        let context = match super::run::execution_context_for_workflow(
-            &workflow,
-            self.execution.execution_root,
-            maximum_parallel_steps,
-            cancellation.clone(),
-        ) {
+        let workflow_for_context = workflow.clone();
+        let context_cancellation = cancellation.clone();
+        let execution_root = self.execution.execution_root;
+        let mut context = match super::run::blocking_operation(move || {
+            super::run::execution_context_for_workflow(
+                &workflow_for_context,
+                execution_root,
+                maximum_parallel_steps,
+                context_cancellation,
+            )
+        })
+        .await
+        {
             Ok(context) => context,
-            Err(failure) => {
+            Err(super::run::BlockingOperationError::Operation(failure)) => {
                 signal_task.abort();
                 let output =
                     WorkflowRunOutput::new(presentation_config, io::stdout(), io::stderr())
@@ -72,10 +91,22 @@ impl Command {
                     output.render_agent_harness_installation_rejection(&workflow, &failure),
                 );
             }
+            Err(super::run::BlockingOperationError::WorkerUnavailable) => {
+                signal_task.abort();
+                return super::run::diagnose("prepare local workflow retry context");
+            }
         };
-        let admitted = match admit_local_workflow(workflow.clone(), inputs, context) {
+        if workflow.requires_git_capture() {
+            context = context.with_local_git_baseline(pending.git_baseline().cloned());
+        }
+        let workflow_for_admission = workflow.clone();
+        let admitted = match super::run::blocking_operation(move || {
+            admit_local_workflow(workflow_for_admission, inputs, context)
+        })
+        .await
+        {
             Ok(admitted) => admitted,
-            Err(failure) => {
+            Err(super::run::BlockingOperationError::Operation(failure)) => {
                 signal_task.abort();
                 let output =
                     WorkflowRunOutput::new(presentation_config, io::stdout(), io::stderr())
@@ -83,6 +114,10 @@ impl Command {
                 return super::run::rejection_exit(
                     output.render_admission_rejection(&workflow, &failure),
                 );
+            }
+            Err(super::run::BlockingOperationError::WorkerUnavailable) => {
+                signal_task.abort();
+                return super::run::diagnose("admit local workflow retry");
             }
         };
         if workflow.source.source_root.to_str().is_none()
@@ -106,17 +141,23 @@ impl Command {
             return super::run::diagnose(format_args!("write workflow retry warning: {error}"));
         }
 
-        let owned_run = match pending.begin(&admitted) {
-            Ok(owned_run) => owned_run,
-            Err(LocalRetryBeginError::Rejected(rejection)) => {
-                signal_task.abort();
-                return render_retry_rejection(presentation_config, &rejection);
-            }
-            Err(LocalRetryBeginError::Operational(error)) => {
-                signal_task.abort();
-                return super::run::diagnose(error);
-            }
-        };
+        let admitted_for_begin = admitted.clone();
+        let owned_run =
+            match tokio::task::spawn_blocking(move || pending.begin(&admitted_for_begin)).await {
+                Ok(Ok(owned_run)) => owned_run,
+                Ok(Err(LocalRetryBeginError::Rejected(rejection))) => {
+                    signal_task.abort();
+                    return render_retry_rejection(presentation_config, &rejection);
+                }
+                Ok(Err(LocalRetryBeginError::Operational(error))) => {
+                    signal_task.abort();
+                    return super::run::diagnose(error);
+                }
+                Err(_) => {
+                    signal_task.abort();
+                    return super::run::diagnose("commit local workflow retry attempt");
+                }
+            };
         super::run::execute_owned_attempt(
             workflow,
             admitted,

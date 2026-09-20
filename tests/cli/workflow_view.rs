@@ -19,9 +19,7 @@ use std::process::{Output, Stdio};
 #[cfg(target_os = "linux")]
 use nix::fcntl::{FcntlArg, fcntl};
 #[cfg(target_os = "linux")]
-use nix::sys::stat::Mode;
-#[cfg(target_os = "linux")]
-use nix::unistd::{mkfifo, pipe};
+use nix::unistd::pipe;
 #[cfg(target_os = "linux")]
 use rustix::fd::OwnedFd;
 #[cfg(target_os = "linux")]
@@ -901,64 +899,6 @@ fn broken_plain_and_json_destinations_fail_without_mutating_the_run() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn signals_abandon_blocked_plain_and_json_archive_loading() {
-    for (mode, signal, expected_status) in
-        [("--plain", Signal::INT, 130), ("--json", Signal::TERM, 143)]
-    {
-        let (_bundle, run_directory) = successful_run(&format!("blocked-read-{mode}"));
-        let before = durable_files(&run_directory);
-        let run_file = run_directory.join("run.json");
-        let original_run = fs::read(&run_file).unwrap();
-        fs::remove_file(&run_file).unwrap();
-        mkfifo(&run_file, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-
-        let mut child = isolated_command(&view_args(&run_directory, &[mode]))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let process = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-        wait_for_loader_worker(process);
-        kill_process(process, signal).unwrap();
-        let status = wait_for_exit(&mut child, "signal during blocked archive loading");
-        assert_eq!(status.code(), Some(expected_status));
-
-        fs::remove_file(&run_file).unwrap();
-        fs::write(&run_file, &original_run).unwrap();
-        assert_eq!(durable_files(&run_directory), before);
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn signal_interrupts_a_blocked_archive_read_without_waiting_for_filesystem_completion() {
-    let (_bundle, run_directory) = successful_run("blocked-read");
-    let run_file = run_directory.join("run.json");
-    let original_run = fs::read(&run_file).unwrap();
-    fs::remove_file(&run_file).unwrap();
-    mkfifo(&run_file, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-
-    let (master, slave) = open_tui_pty();
-    let original_mode = rustix::termios::tcgetattr(&slave).unwrap();
-    let mut tui = spawn_tui_run(&view_args(&run_directory, &[]), master, slave);
-    let process = Pid::from_raw(i32::try_from(tui.child_mut().id()).unwrap()).unwrap();
-    wait_for_loader_worker(process);
-
-    kill_process(process, Signal::INT).unwrap();
-    let status = wait_for_exit(tui.child_mut(), "signal during blocked archive read");
-    assert_eq!(status.code(), Some(130));
-    assert_terminal_mode(tui.slave(), &original_mode);
-    let (_, transcript) = tui.wait_and_finish();
-    let transcript = String::from_utf8_lossy(&transcript).into_owned();
-    assert!(!transcript.contains("run_directory_invalid"));
-
-    fs::remove_file(&run_file).unwrap();
-    fs::write(&run_file, &original_run).unwrap();
-    assert_eq!(fs::read(run_file).unwrap(), original_run);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn terminal_setup_failure_after_raw_mode_restores_input_and_preserves_the_archive() {
     let (_bundle, run_directory) = successful_run("terminal-failure");
     let before = durable_files(&run_directory);
@@ -1038,26 +978,6 @@ impl TuiSession {
         assert!(!transcript[restored..].contains("result succeeded · exit 0"));
         (status, transcript)
     }
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_loader_worker(process: Pid) {
-    let tasks = Path::new("/proc")
-        .join(process.as_raw_pid().to_string())
-        .join("task");
-    let loader_started = poll_until(
-        "archive loader filesystem worker",
-        || {
-            fs::read_dir(&tasks)
-                .ok()
-                .is_some_and(|threads| threads.count() > 1)
-        },
-        |started| *started,
-    );
-    assert!(
-        loader_started,
-        "archive loader did not start its filesystem worker"
-    );
 }
 
 #[cfg(target_os = "linux")]

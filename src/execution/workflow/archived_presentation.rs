@@ -562,6 +562,7 @@ pub(crate) const fn archived_trigger(trigger: ArchivedAttemptTrigger) -> &'stati
     match trigger {
         ArchivedAttemptTrigger::Initial => "initial",
         ArchivedAttemptTrigger::ExplicitRetry => "explicit_retry",
+        ArchivedAttemptTrigger::Continuation => "continuation",
     }
 }
 

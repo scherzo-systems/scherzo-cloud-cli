@@ -21,7 +21,7 @@ use super::codex::CodexConfig;
 use super::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::git_capture::{
-    CloudGitCaptureProjection, GitCaptureContext, GitWorkspaceAdmissionFailure,
+    CloudGitCaptureProjection, GitCaptureContext, GitWorkspaceAdmissionFailure, LocalGitBaseline,
 };
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
@@ -907,6 +907,8 @@ pub(crate) fn default_execution_policy_limits(
 enum GitCaptureAdmission {
     None,
     Local,
+    LocalBaseline(LocalGitBaseline),
+    LocalBaselineUnavailable,
     Cloud(CloudGitCaptureProjection),
 }
 
@@ -1025,6 +1027,14 @@ impl ExecutionContext {
 
     pub(crate) fn with_local_git_capture(mut self) -> Self {
         self.git_capture = GitCaptureAdmission::Local;
+        self
+    }
+
+    pub(crate) fn with_local_git_baseline(mut self, baseline: Option<LocalGitBaseline>) -> Self {
+        self.git_capture = baseline.map_or(
+            GitCaptureAdmission::LocalBaselineUnavailable,
+            GitCaptureAdmission::LocalBaseline,
+        );
         self
     }
 
@@ -1723,6 +1733,19 @@ fn admit_workflow_for(
             }
             GitCaptureAdmission::Local => {
                 GitCaptureContext::admit_local(&execution, &CaptureCancellation::default())
+            }
+            GitCaptureAdmission::LocalBaseline(baseline) => {
+                GitCaptureContext::admit_local_with_baseline(
+                    &execution,
+                    baseline,
+                    &CaptureCancellation::default(),
+                )
+            }
+            GitCaptureAdmission::LocalBaselineUnavailable => {
+                return Err(AdmissionFailure::new(
+                    AdmissionFailureKind::GitBaselineUnavailable,
+                    AdmissionLocation::GitContext,
+                ));
             }
             GitCaptureAdmission::Cloud(projection) => {
                 GitCaptureContext::admit_cloud(&execution, projection)

@@ -42,6 +42,302 @@
         }
       }
     },
+    "GitBaseline": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "objectFormat",
+            "commitOid"
+          ],
+          "properties": {
+            "status": {
+              "const": "available"
+            },
+            "objectFormat": {
+              "const": "sha1"
+            },
+            "commitOid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason"
+          ],
+          "properties": {
+            "status": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "enum": [
+                "cancelled",
+                "execution_root_rebound",
+                "git_unavailable",
+                "git_timed_out",
+                "git_output_limit_exceeded",
+                "not_work_tree",
+                "execution_root_not_work_tree_root",
+                "unsupported_object_format",
+                "baseline_unavailable",
+                "initial_workspace_dirty"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "AttemptDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest",
+        "manifestDigest",
+        "locator"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "manifestDigest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "locator": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "run"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "attemptNumber"
+              ],
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "attempt",
+                    "prior_attempt"
+                  ]
+                },
+                "attemptNumber": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "SettlementSnapshot": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm",
+            "value",
+            "takenAt",
+            "settledBy"
+          ],
+          "properties": {
+            "algorithm": {
+              "const": "git_worktree_sha256_v1"
+            },
+            "value": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "takenAt": {
+              "$ref": "#/$defs/Timestamp"
+            },
+            "settledBy": {
+              "enum": [
+                "engine",
+                "abandonment_recovery"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm",
+            "unavailable",
+            "settledBy"
+          ],
+          "properties": {
+            "algorithm": {
+              "const": "git_worktree_sha256_v1"
+            },
+            "unavailable": {
+              "enum": [
+                "git_unavailable",
+                "git_output_limit_exceeded",
+                "not_work_tree",
+                "execution_root_not_work_tree_root",
+                "entry_limit_exceeded",
+                "content_limit_exceeded",
+                "gitlink",
+                "unsupported_entry",
+                "io_unavailable",
+                "mutation_around_read"
+              ]
+            },
+            "settledBy": {
+              "enum": [
+                "engine",
+                "abandonment_recovery"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "RetainedCarrier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relativePath",
+        "mediaType",
+        "sizeBytes",
+        "digest"
+      ],
+      "properties": {
+        "relativePath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mediaType": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 67108864
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      }
+    },
+    "RetainedOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name",
+            "carrier"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "text",
+                "json"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "carrier": {
+              "$ref": "#/$defs/RetainedCarrier"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name",
+            "mediaType",
+            "carrier"
+          ],
+          "properties": {
+            "kind": {
+              "const": "file"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mediaType": {
+              "type": "string",
+              "minLength": 1
+            },
+            "carrier": {
+              "$ref": "#/$defs/RetainedCarrier"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name",
+            "artifactVersion",
+            "objectFormat",
+            "baseOid",
+            "headOid",
+            "treeOid"
+          ],
+          "properties": {
+            "kind": {
+              "const": "git_branch"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "artifactVersion": {
+              "const": 1
+            },
+            "objectFormat": {
+              "const": "sha1"
+            },
+            "baseOid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "headOid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "treeOid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "carrier": {
+              "$ref": "#/$defs/RetainedCarrier"
+            }
+          }
+        }
+      ]
+    },
     "LocalRun": {
       "type": "object",
       "additionalProperties": false,
@@ -67,6 +363,9 @@
         },
         "workflowManifestDigest": {
           "$ref": "#/$defs/Digest"
+        },
+        "gitBaseline": {
+          "$ref": "#/$defs/GitBaseline"
         }
       }
     },
@@ -221,6 +520,13 @@
         },
         "recovery": {
           "$ref": "#/$defs/DurableRecovery"
+        },
+        "outputs": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/RetainedOutput"
+          }
         },
         "detail": {
           "oneOf": [
@@ -1122,6 +1428,13 @@
             "cancelled"
           ]
         },
+        "outputs": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/RetainedOutput"
+          }
+        },
         "detail": {
           "oneOf": [
             {
@@ -1734,8 +2047,12 @@
         "trigger": {
           "enum": [
             "initial",
-            "explicit_retry"
+            "explicit_retry",
+            "continuation"
           ]
+        },
+        "definition": {
+          "$ref": "#/$defs/AttemptDefinition"
         },
         "priorAttemptNumber": {
           "type": "integer",
@@ -1764,6 +2081,9 @@
         },
         "settledAt": {
           "$ref": "#/$defs/Timestamp"
+        },
+        "settlementSnapshot": {
+          "$ref": "#/$defs/SettlementSnapshot"
         },
         "owner": {
           "$ref": "#/$defs/AttemptOwner"

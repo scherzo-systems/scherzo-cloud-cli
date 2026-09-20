@@ -583,6 +583,10 @@ fn status_distinguishes_interrupted_abandoned_and_unproven_ownership() {
     let attempt = &mut state["attempts"][0];
     attempt["state"] = serde_json::json!("running");
     attempt.as_object_mut().unwrap().remove("settledAt");
+    attempt
+        .as_object_mut()
+        .unwrap()
+        .remove("settlementSnapshot");
     attempt.as_object_mut().unwrap().remove("interruption");
     attempt["result"] =
         serde_json::json!({"status": "not_published", "reason": "attempt_nonterminal"});
@@ -636,6 +640,10 @@ fn status_distinguishes_interrupted_abandoned_and_unproven_ownership() {
 fn signals_interrupt_blocked_status_output_without_a_valid_object() {
     let (_bundle, run_directory) = completed_run("signal");
     let mut state = read_state(&run_directory);
+    state["attempts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("definition");
     state["attempts"][0]["processGuards"] = serde_json::json!([]);
     state["attempts"][0]["progress"]["steps"] = serde_json::Value::Array(
         (0..20_000)

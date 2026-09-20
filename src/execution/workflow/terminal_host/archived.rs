@@ -569,6 +569,9 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
         crate::execution::workflow::archived_attempt::ArchivedAttemptTrigger::ExplicitRetry => {
             "explicit retry"
         }
+        crate::execution::workflow::archived_attempt::ArchivedAttemptTrigger::Continuation => {
+            "continuation"
+        }
     };
     let attempt_state = match attempt.state {
         crate::execution::workflow::archived_attempt::ArchivedAttemptState::Succeeded => {

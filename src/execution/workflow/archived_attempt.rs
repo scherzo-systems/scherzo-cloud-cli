@@ -26,8 +26,10 @@ use super::force_abort_evidence::{
 use super::local_run::{
     AttemptFinalizationV1, AttemptNodeRoleV1, AttemptResultV1, AttemptStateV1, AttemptStepStateV1,
     AttemptTriggerV1, LocalAttemptV1, LocalStatusError, LocalStatusErrorCode, RetainedReadBudget,
-    StableLocalRunSnapshot, attempt_result_relative_path, load_retained_execution_with_budget,
-    mark_validated_result_published, open_directory_at, read_stable_local_run_snapshot,
+    StableLocalRunSnapshot, attempt_result_relative_path,
+    load_attempt_retained_execution_with_budget, mark_validated_result_published,
+    open_directory_at, read_stable_local_run_snapshot, retained_output_matches_export,
+    validate_retained_outputs_against_definition, verify_retained_output_evidence,
 };
 use super::presentation_feed::WorkflowPresentationDefinition;
 use super::publication::{
@@ -95,6 +97,7 @@ pub(crate) enum ArchivedAttemptLoadError {
 pub(crate) enum ArchivedAttemptTrigger {
     Initial,
     ExplicitRetry,
+    Continuation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,14 +361,19 @@ fn load_local_archived_attempt_with(
         .map_err(|()| result_unavailable(&snapshot.run_directory))?;
     let mut retained_budget = RetainedReadBudget::with_bytes(snapshot.retained_json_bytes)
         .map_err(|_| result_invalid(&snapshot.run_directory))?;
-    let (workflow, _, maximum_parallel_steps) =
-        load_retained_execution_with_budget(&snapshot.root, &snapshot.run, &mut retained_budget)
-            .map_err(|_| {
-                ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
-                    code: ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
-                    run_directory: Some(snapshot.run_directory.clone()),
-                })
-            })?;
+    let (workflow, _, maximum_parallel_steps) = load_attempt_retained_execution_with_budget(
+        &snapshot.root,
+        &snapshot.run,
+        &snapshot.state,
+        &attempt,
+        &mut retained_budget,
+    )
+    .map_err(|_| retained_workflow_invalid(&snapshot.run_directory))?;
+    validate_retained_outputs_against_definition(&attempt, &workflow)
+        .and_then(|()| {
+            verify_retained_output_evidence(&snapshot.root, &snapshot.state, attempt.attempt_number)
+        })
+        .map_err(|_| retained_workflow_invalid(&snapshot.run_directory))?;
     let result_bytes = read_immutable_result(
         &result_root,
         observer,
@@ -406,6 +414,7 @@ fn load_local_archived_attempt_with(
         trigger: match attempt.trigger {
             AttemptTriggerV1::Initial => ArchivedAttemptTrigger::Initial,
             AttemptTriggerV1::ExplicitRetry => ArchivedAttemptTrigger::ExplicitRetry,
+            AttemptTriggerV1::Continuation => ArchivedAttemptTrigger::Continuation,
         },
         state: validated.state,
         created_at: parse_canonical_utc_timestamp(&attempt.created_at)
@@ -526,6 +535,13 @@ fn result_invalid(run_directory: &Path) -> ArchivedAttemptLoadError {
     })
 }
 
+fn retained_workflow_invalid(run_directory: &Path) -> ArchivedAttemptLoadError {
+    ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
+        code: ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
+        run_directory: Some(run_directory.to_owned()),
+    })
+}
+
 fn recovery_schema_unsupported(run_directory: &Path) -> ArchivedAttemptLoadError {
     ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
         code: ArchivedAttemptOperationalErrorCode::RecoverySchemaUnsupported,
@@ -637,8 +653,6 @@ fn validate_and_project_result(
         || Path::new(source_root) != workflow.source.source_root
         || result.workflow.digest.algorithm != SHA256_ALGORITHM
         || result.workflow.digest.value != workflow.content_digest.value
-        || result.workflow.digest.algorithm != snapshot.run.workflow_digest.algorithm
-        || result.workflow.digest.value != snapshot.run.workflow_digest.value
         || execution_root != attempt.execution_root
         || result.execution.maximum_parallel_steps != maximum_parallel_steps
         || result.command_output_policy.encoding != BASE64_ENCODING
@@ -738,7 +752,7 @@ fn validate_and_project_result(
     }) {
         return Err(());
     }
-    validate_exports(result, workflow, &steps)?;
+    validate_exports(result, workflow, attempt, &steps)?;
 
     Ok(ProjectedResult {
         state,
@@ -1546,6 +1560,7 @@ fn cancellation_reason(reason: CancellationReasonV1) -> Result<ArchivedCancellat
 fn validate_exports(
     result: &WorkflowResultV1,
     workflow: &super::resolution::ResolvedWorkflow,
+    attempt: &LocalAttemptV1,
     steps: &[ArchivedStep],
 ) -> Result<(), ()> {
     if !result.exports.keys().eq(workflow.definition.exports.keys()) {
@@ -1575,8 +1590,24 @@ fn validate_exports(
         }
         let source_step = steps
             .iter()
-            .find(|step| step.id == source.node.id)
+            .find(|step| step.id == source.node.id && step.role == source.node.role)
             .ok_or(())?;
+        let retained_role = match source.node.role {
+            WorkflowNodeRole::Step => AttemptNodeRoleV1::Step,
+            WorkflowNodeRole::Finalizer => AttemptNodeRoleV1::Finalizer,
+        };
+        if source_step.state == ArchivedStepState::Succeeded
+            && attempt.definition.is_some()
+            && !retained_output_matches_export(
+                attempt,
+                retained_role,
+                &source.node.id,
+                &source.output,
+                export,
+            )
+        {
+            return Err(());
+        }
         match export {
             ExportV1::Available {
                 kind,

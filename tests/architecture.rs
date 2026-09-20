@@ -321,7 +321,7 @@ const EXECUTION_IMPLEMENTATION_MODULES: [&str; 6] = [
     "workflow",
 ];
 
-const DIRECT_PROCESS_CONSUMERS: [&str; 10] = [
+const DIRECT_PROCESS_CONSUMERS: [&str; 11] = [
     "src/execution/claude_code.rs",
     "src/execution/claude_code/tests.rs",
     "src/execution/codex.rs",
@@ -330,6 +330,7 @@ const DIRECT_PROCESS_CONSUMERS: [&str; 10] = [
     "src/execution/pi/tests.rs",
     "src/execution/workflow/child_guard.rs",
     "src/execution/workflow/git_capture.rs",
+    "src/execution/workflow/workspace_snapshot.rs",
     "src/runner/doctor/git.rs",
     "src/runner/service/source.rs",
 ];

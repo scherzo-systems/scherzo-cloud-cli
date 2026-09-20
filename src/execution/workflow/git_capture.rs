@@ -151,6 +151,31 @@ impl CloudGitCaptureProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalGitBaseline {
+    object_format: GitObjectFormat,
+    commit_oid: Arc<str>,
+}
+
+impl LocalGitBaseline {
+    pub(crate) fn new(object_format: GitObjectFormat, commit_oid: Arc<str>) -> Option<Self> {
+        (object_format == GitObjectFormat::Sha1 && is_lowercase_hex(&commit_oid, 40)).then_some(
+            Self {
+                object_format,
+                commit_oid,
+            },
+        )
+    }
+
+    pub(crate) const fn object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+
+    pub(crate) fn commit_oid(&self) -> &str {
+        &self.commit_oid
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GitMetadataIdentity {
     path: PathBuf,
     device: u64,
@@ -215,6 +240,7 @@ impl GitCaptureContext {
             execution,
             &projection.admission_cancellation,
             Some(projection),
+            None,
             PathBuf::from("git"),
             GIT_COMMAND_TIMEOUT,
         )
@@ -230,8 +256,24 @@ impl GitCaptureContext {
             execution,
             cancellation,
             None,
+            None,
             git_program,
             command_timeout,
+        )
+    }
+
+    pub(crate) fn admit_local_with_baseline(
+        execution: &AdmittedExecutionContext,
+        baseline: &LocalGitBaseline,
+        cancellation: &CaptureCancellation,
+    ) -> Result<Self, GitWorkspaceAdmissionFailure> {
+        Self::admit_with_program_and_cloud(
+            execution,
+            cancellation,
+            None,
+            Some(baseline),
+            PathBuf::from("git"),
+            GIT_COMMAND_TIMEOUT,
         )
     }
 
@@ -239,6 +281,7 @@ impl GitCaptureContext {
         execution: &AdmittedExecutionContext,
         cancellation: &CaptureCancellation,
         cloud: Option<&CloudGitCaptureProjection>,
+        retained_baseline: Option<&LocalGitBaseline>,
         git_program: PathBuf,
         command_timeout: Duration,
     ) -> Result<Self, GitWorkspaceAdmissionFailure> {
@@ -328,8 +371,49 @@ impl GitCaptureContext {
                 None,
             )
             .map_err(admission_process_failure)?;
-        let baseline_oid =
+        let current_head =
             successful_oid(&baseline).ok_or(GitWorkspaceAdmissionFailure::BaselineUnavailable)?;
+        let baseline_oid = retained_baseline.map_or_else(
+            || Ok(Arc::clone(&current_head)),
+            |retained| {
+                if retained.object_format() != context.object_format {
+                    return Err(GitWorkspaceAdmissionFailure::UnsupportedObjectFormat);
+                }
+                let object = format!("{}^{{commit}}", retained.commit_oid());
+                let available = context
+                    .run_source(
+                        &["cat-file", "-e", &object],
+                        ProcessInput::None,
+                        MAXIMUM_SMALL_OUTPUT_BYTES,
+                        cancellation,
+                        true,
+                        None,
+                    )
+                    .map_err(admission_process_failure)?;
+                if !available.status.success() || available.stdout.truncated {
+                    return Err(GitWorkspaceAdmissionFailure::BaselineUnavailable);
+                }
+                let ancestry = context
+                    .run_source(
+                        &[
+                            "merge-base",
+                            "--is-ancestor",
+                            retained.commit_oid(),
+                            &current_head,
+                        ],
+                        ProcessInput::None,
+                        MAXIMUM_SMALL_OUTPUT_BYTES,
+                        cancellation,
+                        true,
+                        None,
+                    )
+                    .map_err(admission_process_failure)?;
+                if !ancestry.status.success() || ancestry.stdout.truncated {
+                    return Err(GitWorkspaceAdmissionFailure::BaselineUnavailable);
+                }
+                Ok(Arc::clone(&retained.commit_oid))
+            },
+        )?;
         let source_authority = context
             .read_source_authority(cancellation)
             .map_err(admission_process_failure)?;
@@ -371,6 +455,13 @@ impl GitCaptureContext {
         context.baseline_oid = baseline_oid;
         context.source_authority = source_authority;
         Ok(context)
+    }
+
+    pub(crate) fn baseline(&self) -> LocalGitBaseline {
+        LocalGitBaseline {
+            object_format: self.object_format,
+            commit_oid: Arc::clone(&self.baseline_oid),
+        }
     }
 
     #[cfg(test)]
