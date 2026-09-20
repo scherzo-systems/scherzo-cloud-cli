@@ -26,6 +26,8 @@ VERSION_RE = re.compile(
     r"^(?:(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|0\.0\.0-dev)$"
 )
 COMMAND_TIMEOUT_SECONDS = 10
+ENVIRONMENT_DIRECTORIES = ("home", "path", "tmp", "work")
+RUNTIME_CACHE_DIRECTORIES = (Path(".cache"), Path(".cache/rosetta"))
 
 
 class VerificationError(Exception):
@@ -133,9 +135,15 @@ def run(binary: Path, arguments: Sequence[str], environment_root: Path) -> bytes
 
 
 def require_empty_environment(environment_root: Path) -> None:
-    for relative in ("home", "path", "tmp", "work"):
+    for relative in ENVIRONMENT_DIRECTORIES:
         directory = environment_root / relative
-        if any(directory.iterdir()):
+        entries = {path.relative_to(directory) for path in directory.rglob("*")}
+        expected = set(RUNTIME_CACHE_DIRECTORIES) if relative == "home" else set()
+        expected_directories_changed = any(
+            (directory / path).is_symlink() or not (directory / path).is_dir()
+            for path in expected
+        )
+        if entries != expected or expected_directories_changed:
             fail(f"packaged authoring command changed isolated {relative} state")
 
 
@@ -192,8 +200,13 @@ def verify(
             fail("packaged executable mode differs")
 
         environment_root = temporary_root / "environment"
-        for relative in ("home", "path", "tmp", "work"):
+        for relative in ENVIRONMENT_DIRECTORIES:
             (environment_root / relative).mkdir(parents=True, exist_ok=True)
+        # Cross-architecture Linux builders may initialize Rosetta's empty cache
+        # directories before the command starts. Own that baseline explicitly and
+        # still reject any added file, link, or directory below the isolated roots.
+        for relative in RUNTIME_CACHE_DIRECTORIES:
+            (environment_root / "home" / relative).mkdir(parents=True, exist_ok=True)
 
         expected_version = f"scherzo-cloud {version}\n".encode("ascii")
         if run(binary, ["--version"], environment_root) != expected_version:

@@ -53,6 +53,7 @@ def write_binary(
         "misleading-help",
         "schema-drift",
         "source-dependent",
+        "state-write",
     ],
 ) -> None:
     schema = SCHEMA if mutation != "schema-drift" else '{"type":"string"}\n'
@@ -79,12 +80,23 @@ def write_binary(
         reference_output = repr(REFERENCE.encode())
         schema_output = repr(schema.encode())
 
+    state_write = ""
+    if mutation == "state-write":
+        state_write = """
+if arguments == ["workflow", "reference"]:
+    (Path(os.environ["HOME"]) / "unexpected-state").write_text(
+        "unexpected\\n", encoding="utf-8"
+    )
+"""
+
     path.write_text(
         f"""#!{sys.executable}
+import os
 import sys
 from pathlib import Path
 
 arguments = sys.argv[1:]
+{state_write}
 if arguments == ["--version"]:
     output = {f"scherzo-cloud {VERSION}\n".encode()!r}
 elif arguments == ["workflow", "--help"]:
@@ -197,6 +209,12 @@ def main() -> None:
         write_binary(binary, "schema-drift")
         schema_drift = archive(package_script, binary, root / "dist-schema-drift")
         expect_verification_failure(verifier, schema_drift, "mismatched embedded schema")
+
+        write_binary(binary, "state-write")
+        state_write = archive(package_script, binary, root / "dist-state-write")
+        expect_verification_failure(
+            verifier, state_write, "state-writing packaged authoring command"
+        )
 
     print("CLI release-package authoring checks passed.")
 
