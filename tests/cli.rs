@@ -489,6 +489,12 @@ impl ScriptedServer {
         self.server.next_request()
     }
 
+    fn wait_for_request(&mut self) -> String {
+        self.server
+            .wait_for_request()
+            .expect("fixture request sender should remain available")
+    }
+
     fn release_paused_response(&mut self) {
         self.server.release_response();
     }

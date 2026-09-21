@@ -300,7 +300,7 @@ fn account_deletion_preserves_a_concurrently_replaced_credential_pair() {
     }
     let child = command.spawn().unwrap();
 
-    let request = server.next_request();
+    let request = server.wait_for_request();
     assert!(request.starts_with("POST /api/v1/me/deletion HTTP/1.1\r\n"));
     let mut replacement: serde_json::Value =
         serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();

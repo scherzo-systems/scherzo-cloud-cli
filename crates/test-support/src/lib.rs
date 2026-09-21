@@ -134,6 +134,16 @@ impl ScriptedHttpServer {
         request
     }
 
+    /// Waits for the fixture's request readiness signal without a scheduler deadline.
+    ///
+    /// Use this at controlled external-process boundaries where the test runner's
+    /// per-test watchdog, rather than machine speed, should bound a missing request.
+    pub fn wait_for_request(&mut self) -> Result<String, mpsc::RecvError> {
+        let request = self.requests.recv()?;
+        self.remaining_requests -= 1;
+        Ok(request)
+    }
+
     #[allow(
         clippy::disallowed_macros,
         reason = "the single-request fixture asserts the cardinality promised by its method name"
