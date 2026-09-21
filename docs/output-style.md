@@ -165,3 +165,64 @@ Banned from human prose:
 - Contract-grade precision (snapshot semantics, eligibility rules, mode
   selection) goes in after-help sections, in full sentences — the model is
   `workflow run`'s "Interactive mode:" section.
+
+## Command grammar
+
+A **command group** is a command path that has subcommands. A **leaf** is a
+command path with no subcommands. An entity family's leaf set consists of the
+action leaves directly below its command group; a nested noun group starts a
+separate entity family.
+
+### Command names
+
+- **Noun number:** every command-group token is a singular noun. Compound group
+  names have a singular head noun (`input-set`, `runner-pool`,
+  `service-principal`). There are no plural exceptions. The number-neutral
+  names are exactly `auth` (an abbreviation) and `github` (a proper noun); add
+  any future number-neutral or irregular spelling here rather than inferring
+  it. In particular, the canonical singular group tokens are `identity`,
+  `input`, `invitation`, and `member`, never `identities`, `inputs`,
+  `invitations`, or `members`.
+- **Verb lexicon:** the final token of every leaf below a command group is one
+  of this closed set: `create`, `issue`, `list`, `show`, `update`, `rename`,
+  `set`, `remove`, `revoke`, `retire`, `validate`, `run`, `retry`, `view`,
+  `wait`, `download`, `upload`, `enroll`, `serve`, `doctor`, `status`. A new
+  leaf verb requires an amendment to this list; an existing command is not
+  precedent for adding one.
+- **Minting:** choose the creation verb from the immediate sibling leaf set. If
+  that set contains `revoke`, the creation leaf is `issue`; otherwise it is
+  `create`. This makes bearer secrets and capabilities, which can be
+  withdrawn, `issue`/`revoke` pairs.
+- **Rename or update:** use `rename` when the entity's complete set of mutable
+  attributes is exactly `{name}`. Use `update` when two or more entity
+  attributes are mutable. A family does not expose both verbs.
+- **Unbinding:** a leaf whose operation severs an existing binding is named
+  `remove`. `detach` and `disconnect` are not command verbs.
+
+### Groups and flags
+
+- **Family summaries:** use `Manage <domain>` if any descendant leaf mutates
+  remote state; otherwise use `Work with <domain>`. Do not use `Administer` or
+  `Discover`. `Work with local workflow definitions and runs` is the model for
+  a non-mutating family.
+- **Entity-identifier flags:** a long flag whose value is an entity identifier
+  is named `--<entity>-id`, and its value placeholder is the uppercase singular
+  entity name without `_ID`: for example, `--pool-id <POOL>` and
+  `--project-id <PROJECT>`. This applies to identifier-only flags, not
+  selectors that also accept a name or slug.
+- **Destructive confirmation:** the qualifying verb set is exactly `remove`,
+  `revoke`, and `retire`. Every leaf with one of those final verbs has a
+  required `--yes` flag, and no leaf with another final verb has `--yes`. These
+  are the verbs whose effects are irreversible for the principal or invalidate
+  live access.
+- **Common flag order:** whenever they co-occur, common flags appear in this
+  relative order: `--json`, then `--service-api-key-file`, then
+  `--allow-insecure-http`. Other arguments and flags do not affect this
+  relative-order check.
+- **Pagination:** every leaf that takes `--cursor` also takes `--limit` and
+  includes this exact after-help section (once per leaf):
+
+```
+Pagination:
+  This command returns one page. Pass --cursor <CURSOR> to continue.
+```
