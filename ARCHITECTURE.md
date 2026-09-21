@@ -261,10 +261,7 @@ into the Cloud runner protocol.
 
 The execution component is organized as an internal source boundary; there is no
 evidence that a separately published crate or process is necessary. All of its
-production code is developed within this public source boundary. The prior single-user
-Scherzo daemon is behavioral and design inspiration only: the Cloud runner does not
-import, embed, invoke, or communicate with it, and its APIs, storage, messages,
-configuration, and runtime layout are not compatibility targets.
+production code is developed within this public source boundary.
 
 ## Workflow execution model
 
