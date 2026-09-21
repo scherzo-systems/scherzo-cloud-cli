@@ -1,0 +1,1031 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use ring::digest::{Context, SHA256};
+use serde_json::Value;
+
+use super::capacity::{CapacityCalculationFailure, WorkflowCapacity, resolve_workflow_capacity};
+use super::result_validation::{JsonSchemaSupportFailure, RetainedJsonSchema};
+use super::schema_common::lowercase_hex;
+use super::validated::{
+    RequiredInputs, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNodeRole,
+};
+use super::validation::{ValidationFailureKind, ValidationLocation};
+use super::{DecodeFailureKind, decode, validation};
+use crate::workflow::document::Output;
+
+const CONTENT_CLOSURE_DOMAIN: &[u8] = b"scherzo.workflow.content-closure.v1\0";
+pub(crate) const MAX_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
+const SHA256_ALGORITHM: &str = "sha256";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolutionFailureKind {
+    SourceRootUnavailable,
+    SourceRootNotDirectory,
+    LexicalSourceEscape,
+    SourceUnavailable,
+    SymbolicLinkEscape,
+    SourceNotRegularFile,
+    InvalidCanonicalPath,
+    SourceChangedDuringResolution,
+    InvalidWorkflowDocument(DecodeFailureKind),
+    InvalidWorkflowDefinition(ValidationFailureKind),
+    InvalidTextEncoding,
+    InvalidInputSchemaEncoding,
+    InvalidInputSchemaJson,
+    InvalidInputSchemaDialect,
+    InvalidInputSchemaReference,
+    InvalidInputSchema,
+    InvalidResultSchemaEncoding,
+    InvalidResultSchemaJson,
+    InvalidResultSchemaDialect,
+    InvalidResultSchemaReference,
+    InvalidResultSchema,
+    DigestInputTooLarge,
+    CapacityArithmeticOverflow,
+    GeneralTransitionCapacityExceeded,
+    CloudTransitionCapacityExceeded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResolutionLocation {
+    SourceRoot,
+    Workflow,
+    Semantic(ValidationLocation),
+    SystemPrompt { step: String },
+    MessageText { step: String, index: usize },
+    MessageAttachment { step: String, index: usize },
+    InputSchema { input: String },
+    ResultSchema { step: String, output: String },
+    FinalizerSystemPrompt { finalizer: String },
+    FinalizerMessageText { finalizer: String, index: usize },
+    FinalizerMessageAttachment { finalizer: String, index: usize },
+    FinalizerResultSchema { finalizer: String, output: String },
+    RecoveryPrompt { step: String },
+    ContentDigest,
+    Capacity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionFailure {
+    kind: ResolutionFailureKind,
+    location: ResolutionLocation,
+    workflow_path: Option<String>,
+    source_path: Option<PathBuf>,
+}
+
+impl ResolutionFailure {
+    pub(crate) fn kind(&self) -> ResolutionFailureKind {
+        self.kind
+    }
+
+    pub(crate) fn location(&self) -> &ResolutionLocation {
+        &self.location
+    }
+
+    pub fn workflow_path(&self) -> Option<&str> {
+        self.workflow_path.as_deref()
+    }
+
+    pub(crate) fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    fn new(kind: ResolutionFailureKind, location: ResolutionLocation) -> Self {
+        Self {
+            kind,
+            location,
+            workflow_path: None,
+            source_path: None,
+        }
+    }
+
+    fn with_workflow_path(mut self, workflow_path: String) -> Self {
+        self.workflow_path = Some(workflow_path);
+        self
+    }
+
+    fn with_source_path(mut self, source_path: PathBuf) -> Self {
+        self.source_path = Some(source_path);
+        self
+    }
+}
+
+impl fmt::Display for ResolutionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "workflow resolution failure at {:?}: {:?}",
+            self.location, self.kind
+        )
+    }
+}
+
+impl std::error::Error for ResolutionFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentDigestAlgorithm {
+    Sha256,
+}
+
+impl ContentDigestAlgorithm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => SHA256_ALGORITHM,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowContentDigest {
+    pub algorithm: ContentDigestAlgorithm,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowSourceProvenance {
+    pub source_root: PathBuf,
+    pub workflow_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedWorkflow {
+    pub definition: ValidatedWorkflow,
+    pub(crate) source_closure: BTreeMap<String, Arc<[u8]>>,
+    json_schemas: BTreeMap<(String, String), RetainedJsonSchema>,
+    input_json_schemas: BTreeMap<String, RetainedJsonSchema>,
+    pub source: WorkflowSourceProvenance,
+    pub content_digest: WorkflowContentDigest,
+    pub capacity: WorkflowCapacity,
+}
+
+impl ResolvedWorkflow {
+    pub fn required_inputs(&self) -> &RequiredInputs {
+        &self.definition.required_inputs
+    }
+
+    pub fn source_bytes(&self, canonical_path: &str) -> Option<&[u8]> {
+        self.source_closure.get(canonical_path).map(AsRef::as_ref)
+    }
+
+    pub(crate) fn capacity_is_bound_to_source_closure(&self) -> bool {
+        digest_source_closure(&self.source_closure)
+            .is_ok_and(|digest| digest == self.content_digest && self.capacity.is_bound_to(&digest))
+    }
+
+    pub(crate) fn json_schema(&self, step: &str, output: &str) -> Option<&RetainedJsonSchema> {
+        self.json_schemas.get(&(step.to_owned(), output.to_owned()))
+    }
+
+    pub(crate) fn input_json_schema(&self, input: &str) -> Option<&RetainedJsonSchema> {
+        self.input_json_schemas.get(input)
+    }
+
+    pub fn requires_git_capture(&self) -> bool {
+        self.definition
+            .steps
+            .values()
+            .chain(
+                self.definition
+                    .finalizers
+                    .values()
+                    .map(|finalizer| &finalizer.body),
+            )
+            .any(|node| {
+                let outputs = match node {
+                    ValidatedStep::Command(node) => &node.common.outputs,
+                    ValidatedStep::Agent(node) => &node.common.outputs,
+                };
+                outputs
+                    .values()
+                    .any(|output| matches!(output.definition, Output::GitBranchWorkspace))
+            })
+    }
+}
+
+// Adapters provide an explicit source root and source-root-relative workflow path.
+pub fn resolve(
+    source_root: &Path,
+    selected_workflow: &Path,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    resolve_with_sources(SourceResolver::new(source_root)?, selected_workflow)
+}
+
+// Human CLI workflow files are ordinary host paths, independent of source-root spelling.
+pub fn resolve_workflow_file(
+    source_root: &Path,
+    workflow_file: &Path,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    let (source_root, workflow_file) = host_workflow_paths(source_root, workflow_file)?;
+    let sources = SourceResolver::new(&source_root)?;
+    let canonical_workflow = sources.canonical_workflow_file(&workflow_file)?;
+    resolve_with_sources(sources, &canonical_workflow)
+}
+
+fn host_workflow_paths(
+    source_root: &Path,
+    workflow_file: &Path,
+) -> Result<(PathBuf, PathBuf), ResolutionFailure> {
+    if source_root.is_absolute() && workflow_file.is_absolute() {
+        return Ok((source_root.to_owned(), workflow_file.to_owned()));
+    }
+    let initial_cwd = std::env::current_dir().map_err(|_| {
+        ResolutionFailure::new(
+            ResolutionFailureKind::SourceRootUnavailable,
+            ResolutionLocation::SourceRoot,
+        )
+    })?;
+    Ok((
+        host_path_from(&initial_cwd, source_root),
+        host_path_from(&initial_cwd, workflow_file),
+    ))
+}
+
+fn host_path_from(initial_cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        initial_cwd.join(path)
+    }
+}
+
+pub(crate) fn resolve_retained(
+    source_root: PathBuf,
+    workflow_path: &str,
+    source_closure: BTreeMap<String, Arc<[u8]>>,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    resolve_with_sources(
+        SourceResolver::from_retained(source_root, source_closure)?,
+        Path::new(workflow_path),
+    )
+}
+
+fn resolve_with_sources(
+    mut sources: SourceResolver,
+    selected_workflow: &Path,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    let selected_candidate = sources.path_from_root(selected_workflow);
+    let workflow_source = sources.load(&selected_candidate, ResolutionLocation::Workflow)?;
+    let workflow_path = workflow_source.canonical_path.clone();
+    resolve_loaded_workflow(sources, workflow_source)
+        .map_err(|failure| failure.with_workflow_path(workflow_path))
+}
+
+fn resolve_loaded_workflow(
+    mut sources: SourceResolver,
+    workflow_source: LoadedSource,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    let document = decode(&workflow_source.bytes).map_err(|failure| {
+        ResolutionFailure::new(
+            ResolutionFailureKind::InvalidWorkflowDocument(failure.kind()),
+            ResolutionLocation::Workflow,
+        )
+    })?;
+    let mut definition = validation::validate(document).map_err(|failure| {
+        ResolutionFailure::new(
+            ResolutionFailureKind::InvalidWorkflowDefinition(failure.kind()),
+            ResolutionLocation::Semantic(failure.location().clone()),
+        )
+    })?;
+
+    let Some(workflow_directory) = workflow_source.canonical_host_path.parent() else {
+        return Err(ResolutionFailure::new(
+            ResolutionFailureKind::InvalidCanonicalPath,
+            ResolutionLocation::Workflow,
+        ));
+    };
+    let resolved_schemas =
+        resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
+
+    let source_root = sources.canonical_root.clone();
+    let source_closure = sources.finish();
+    let content_digest = digest_source_closure(&source_closure)?;
+    let source_closure_bytes = source_closure
+        .values()
+        .try_fold(0_u64, |total, bytes| {
+            total.checked_add(u64::try_from(bytes.len()).ok()?)
+        })
+        .ok_or_else(|| source_closure_too_large(ResolutionLocation::Capacity))?;
+    let capacity =
+        resolve_workflow_capacity(&definition, content_digest.clone(), source_closure_bytes)
+            .map_err(|failure| {
+                let kind = match failure {
+                    CapacityCalculationFailure::ArithmeticOverflow => {
+                        ResolutionFailureKind::CapacityArithmeticOverflow
+                    }
+                    CapacityCalculationFailure::GeneralTransitionCapacityExceeded => {
+                        ResolutionFailureKind::GeneralTransitionCapacityExceeded
+                    }
+                    CapacityCalculationFailure::CloudTransitionCapacityExceeded => {
+                        ResolutionFailureKind::CloudTransitionCapacityExceeded
+                    }
+                    CapacityCalculationFailure::ConditionEvidenceCapacityExceeded => {
+                        ResolutionFailureKind::CloudTransitionCapacityExceeded
+                    }
+                };
+                ResolutionFailure::new(kind, ResolutionLocation::Capacity)
+            })?;
+    Ok(ResolvedWorkflow {
+        definition,
+        source_closure,
+        json_schemas: resolved_schemas.outputs,
+        input_json_schemas: resolved_schemas.inputs,
+        source: WorkflowSourceProvenance {
+            source_root,
+            workflow_path: workflow_source.canonical_path,
+        },
+        content_digest,
+        capacity,
+    })
+}
+
+struct LoadedSource {
+    canonical_host_path: PathBuf,
+    canonical_path: String,
+    bytes: Arc<[u8]>,
+}
+
+struct SourceResolver {
+    canonical_root: PathBuf,
+    supplied_root: PathBuf,
+    closure: BTreeMap<String, Arc<[u8]>>,
+    retained_bytes: u64,
+    retained_only: bool,
+}
+
+impl SourceResolver {
+    fn new(source_root: &Path) -> Result<Self, ResolutionFailure> {
+        let supplied_root = if source_root.is_absolute() {
+            source_root.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|_| {
+                    ResolutionFailure::new(
+                        ResolutionFailureKind::SourceRootUnavailable,
+                        ResolutionLocation::SourceRoot,
+                    )
+                })?
+                .join(source_root)
+        };
+        let canonical_root = fs::canonicalize(&supplied_root).map_err(|_| {
+            ResolutionFailure::new(
+                ResolutionFailureKind::SourceRootUnavailable,
+                ResolutionLocation::SourceRoot,
+            )
+        })?;
+        let metadata = fs::metadata(&canonical_root).map_err(|_| {
+            ResolutionFailure::new(
+                ResolutionFailureKind::SourceRootUnavailable,
+                ResolutionLocation::SourceRoot,
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::SourceRootNotDirectory,
+                ResolutionLocation::SourceRoot,
+            ));
+        }
+
+        Ok(Self {
+            canonical_root,
+            supplied_root,
+            closure: BTreeMap::new(),
+            retained_bytes: 0,
+            retained_only: false,
+        })
+    }
+
+    fn from_retained(
+        canonical_root: PathBuf,
+        closure: BTreeMap<String, Arc<[u8]>>,
+    ) -> Result<Self, ResolutionFailure> {
+        if !canonical_root.is_absolute()
+            || canonical_root.to_str().is_none()
+            || lexical_normalize(&canonical_root).as_deref() != Some(canonical_root.as_path())
+        {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::InvalidCanonicalPath,
+                ResolutionLocation::SourceRoot,
+            ));
+        }
+        let retained_bytes = closure.values().try_fold(0_u64, |total, bytes| {
+            total.checked_add(u64::try_from(bytes.len()).ok()?)
+        });
+        let Some(retained_bytes) =
+            retained_bytes.filter(|total| *total <= MAX_SOURCE_CLOSURE_BYTES)
+        else {
+            return Err(source_closure_too_large(ResolutionLocation::ContentDigest));
+        };
+        Ok(Self {
+            supplied_root: canonical_root.clone(),
+            canonical_root,
+            closure,
+            retained_bytes,
+            retained_only: true,
+        })
+    }
+
+    fn path_from_root(&self, path: &Path) -> PathBuf {
+        if !path.is_absolute() {
+            return self.canonical_root.join(path);
+        }
+        path.strip_prefix(&self.supplied_root)
+            .map(|relative| self.canonical_root.join(relative))
+            .unwrap_or_else(|_| path.to_owned())
+    }
+
+    fn canonical_workflow_file(&self, workflow_file: &Path) -> Result<PathBuf, ResolutionFailure> {
+        let location = ResolutionLocation::Workflow;
+        let supplied_workflow = workflow_file.to_owned();
+        let canonical_workflow = fs::canonicalize(&supplied_workflow).map_err(|_| {
+            ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(
+                    lexical_normalize(&supplied_workflow)
+                        .unwrap_or_else(|| supplied_workflow.clone()),
+                )
+        })?;
+        if canonical_workflow.starts_with(&self.canonical_root) {
+            return Ok(canonical_workflow);
+        }
+
+        let kind = if lexical_normalize(&supplied_workflow)
+            .is_some_and(|path| path.starts_with(&self.supplied_root))
+        {
+            ResolutionFailureKind::SymbolicLinkEscape
+        } else {
+            ResolutionFailureKind::LexicalSourceEscape
+        };
+        Err(ResolutionFailure::new(kind, location))
+    }
+
+    fn load(
+        &mut self,
+        candidate: &Path,
+        location: ResolutionLocation,
+    ) -> Result<LoadedSource, ResolutionFailure> {
+        if !lexically_within(&self.canonical_root, candidate) {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::LexicalSourceEscape,
+                location,
+            ));
+        }
+        if self.retained_only {
+            let canonical_host_path = lexical_normalize(candidate).ok_or_else(|| {
+                ResolutionFailure::new(
+                    ResolutionFailureKind::InvalidCanonicalPath,
+                    location.clone(),
+                )
+            })?;
+            let canonical_path =
+                canonical_relative_path(&self.canonical_root, &canonical_host_path).ok_or_else(
+                    || {
+                        ResolutionFailure::new(
+                            ResolutionFailureKind::InvalidCanonicalPath,
+                            location.clone(),
+                        )
+                    },
+                )?;
+            let bytes = self.closure.get(&canonical_path).cloned().ok_or_else(|| {
+                ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location)
+                    .with_source_path(canonical_host_path.clone())
+            })?;
+            return Ok(LoadedSource {
+                canonical_host_path,
+                canonical_path,
+                bytes,
+            });
+        }
+
+        let resolved_candidate =
+            lexical_normalize(candidate).unwrap_or_else(|| candidate.to_owned());
+        let canonical_host_path = fs::canonicalize(candidate).map_err(|_| {
+            ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(resolved_candidate)
+        })?;
+        if !canonical_host_path.starts_with(&self.canonical_root) {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::SymbolicLinkEscape,
+                location,
+            ));
+        }
+
+        let mut file = open_source_file(&canonical_host_path).map_err(|_| {
+            ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(canonical_host_path.clone())
+        })?;
+        let handle_metadata = file.metadata().map_err(|_| {
+            ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+                .with_source_path(canonical_host_path.clone())
+        })?;
+        if !handle_metadata.is_file() {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::SourceNotRegularFile,
+                location,
+            )
+            .with_source_path(canonical_host_path));
+        }
+
+        let rebound_path = fs::canonicalize(candidate).map_err(|_| {
+            ResolutionFailure::new(
+                ResolutionFailureKind::SourceChangedDuringResolution,
+                location.clone(),
+            )
+        })?;
+        if rebound_path != canonical_host_path
+            || !rebound_path.starts_with(&self.canonical_root)
+            || !path_identifies_file(&rebound_path, &handle_metadata).map_err(|_| {
+                ResolutionFailure::new(
+                    ResolutionFailureKind::SourceChangedDuringResolution,
+                    location.clone(),
+                )
+            })?
+        {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::SourceChangedDuringResolution,
+                location,
+            ));
+        }
+
+        let canonical_path = canonical_relative_path(&self.canonical_root, &canonical_host_path)
+            .ok_or_else(|| {
+                ResolutionFailure::new(
+                    ResolutionFailureKind::InvalidCanonicalPath,
+                    location.clone(),
+                )
+            })?;
+        if let Some(bytes) = self.closure.get(&canonical_path) {
+            return Ok(LoadedSource {
+                canonical_host_path,
+                canonical_path,
+                bytes: Arc::clone(bytes),
+            });
+        }
+
+        let remaining_bytes = MAX_SOURCE_CLOSURE_BYTES
+            .checked_sub(self.retained_bytes)
+            .ok_or_else(|| source_closure_too_large(location.clone()))?;
+        if handle_metadata.len() > remaining_bytes {
+            return Err(source_closure_too_large(location));
+        }
+
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(remaining_bytes + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| {
+                ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
+            })?;
+        let content_length =
+            u64::try_from(bytes.len()).map_err(|_| source_closure_too_large(location.clone()))?;
+        if content_length > remaining_bytes {
+            return Err(source_closure_too_large(location));
+        }
+        self.retained_bytes += content_length;
+        let bytes = Arc::<[u8]>::from(bytes);
+        self.closure
+            .insert(canonical_path.clone(), Arc::clone(&bytes));
+        Ok(LoadedSource {
+            canonical_host_path,
+            canonical_path,
+            bytes,
+        })
+    }
+
+    fn finish(self) -> BTreeMap<String, Arc<[u8]>> {
+        self.closure
+    }
+}
+
+struct ResolvedJsonSchemas {
+    inputs: BTreeMap<String, RetainedJsonSchema>,
+    outputs: BTreeMap<(String, String), RetainedJsonSchema>,
+}
+
+fn resolve_static_sources(
+    definition: &mut ValidatedWorkflow,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+) -> Result<ResolvedJsonSchemas, ResolutionFailure> {
+    let mut input_json_schemas = BTreeMap::new();
+    let mut json_schemas = BTreeMap::new();
+    let ValidatedWorkflow {
+        steps,
+        recoveries,
+        finalizers,
+        input_json_schema_paths,
+        ..
+    } = definition;
+    for (input, schema) in input_json_schema_paths {
+        let location = ResolutionLocation::InputSchema {
+            input: input.clone(),
+        };
+        let (canonical_path, retained) =
+            resolve_json_schema(schema, workflow_directory, sources, location)?;
+        *schema = canonical_path;
+        input_json_schemas.insert(input.clone(), retained);
+    }
+    for (node_name, step) in steps {
+        if let Some(super::validated::ValidatedStepRecovery {
+            handler: Some(super::validated::ValidatedRecoveryHandler::Agent { prompt, .. }),
+            ..
+        }) = recoveries.get_mut(node_name).and_then(Option::as_mut)
+        {
+            *prompt = resolve_text_source(
+                prompt,
+                workflow_directory,
+                sources,
+                ResolutionLocation::RecoveryPrompt {
+                    step: node_name.clone(),
+                },
+            )?;
+        }
+        resolve_node_static_sources(
+            node_name,
+            WorkflowNodeRole::Step,
+            step,
+            workflow_directory,
+            sources,
+            &mut json_schemas,
+        )?;
+    }
+    for (node_name, finalizer) in finalizers {
+        resolve_node_static_sources(
+            node_name,
+            WorkflowNodeRole::Finalizer,
+            &mut finalizer.body,
+            workflow_directory,
+            sources,
+            &mut json_schemas,
+        )?;
+    }
+    Ok(ResolvedJsonSchemas {
+        inputs: input_json_schemas,
+        outputs: json_schemas,
+    })
+}
+
+fn resolve_node_static_sources(
+    node_name: &str,
+    role: WorkflowNodeRole,
+    node: &mut ValidatedStep,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+    json_schemas: &mut BTreeMap<(String, String), RetainedJsonSchema>,
+) -> Result<(), ResolutionFailure> {
+    if let ValidatedStep::Agent(agent_node) = node {
+        let system_location = match role {
+            WorkflowNodeRole::Step => ResolutionLocation::SystemPrompt {
+                step: node_name.to_owned(),
+            },
+            WorkflowNodeRole::Finalizer => ResolutionLocation::FinalizerSystemPrompt {
+                finalizer: node_name.to_owned(),
+            },
+        };
+        agent_node.agent.system_prompt = resolve_text_source(
+            &agent_node.agent.system_prompt,
+            workflow_directory,
+            sources,
+            system_location,
+        )?;
+
+        resolve_message_files(
+            node_name,
+            role,
+            &mut agent_node.agent.message.text,
+            MessageFileKind::Text,
+            workflow_directory,
+            sources,
+        )?;
+        resolve_message_files(
+            node_name,
+            role,
+            &mut agent_node.agent.message.attachments,
+            MessageFileKind::Attachment,
+            workflow_directory,
+            sources,
+        )?;
+    }
+
+    let outputs = match node {
+        ValidatedStep::Command(node) => &mut node.common.outputs,
+        ValidatedStep::Agent(node) => &mut node.common.outputs,
+    };
+    for (output_name, output) in outputs {
+        let schema = match &mut output.definition {
+            Output::JsonPath { schema, .. } | Output::JsonAgentResult { schema } => schema,
+            Output::TextPath { .. }
+            | Output::TextAgentResponse
+            | Output::FilePath { .. }
+            | Output::GitBranchWorkspace => continue,
+        };
+        let location = match role {
+            WorkflowNodeRole::Step => ResolutionLocation::ResultSchema {
+                step: node_name.to_owned(),
+                output: output_name.clone(),
+            },
+            WorkflowNodeRole::Finalizer => ResolutionLocation::FinalizerResultSchema {
+                finalizer: node_name.to_owned(),
+                output: output_name.clone(),
+            },
+        };
+        let (canonical_path, retained) =
+            resolve_json_schema(schema, workflow_directory, sources, location)?;
+        *schema = canonical_path;
+        json_schemas.insert((node_name.to_owned(), output_name.clone()), retained);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum MessageFileKind {
+    Text,
+    Attachment,
+}
+
+fn resolve_message_files(
+    node_name: &str,
+    role: WorkflowNodeRole,
+    message_sources: &mut [ValidatedMessageSource],
+    kind: MessageFileKind,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+) -> Result<(), ResolutionFailure> {
+    for (index, source) in message_sources.iter_mut().enumerate() {
+        let ValidatedMessageSource::File { path } = source else {
+            continue;
+        };
+        let location = match (role, kind) {
+            (WorkflowNodeRole::Step, MessageFileKind::Text) => ResolutionLocation::MessageText {
+                step: node_name.to_owned(),
+                index,
+            },
+            (WorkflowNodeRole::Step, MessageFileKind::Attachment) => {
+                ResolutionLocation::MessageAttachment {
+                    step: node_name.to_owned(),
+                    index,
+                }
+            }
+            (WorkflowNodeRole::Finalizer, MessageFileKind::Text) => {
+                ResolutionLocation::FinalizerMessageText {
+                    finalizer: node_name.to_owned(),
+                    index,
+                }
+            }
+            (WorkflowNodeRole::Finalizer, MessageFileKind::Attachment) => {
+                ResolutionLocation::FinalizerMessageAttachment {
+                    finalizer: node_name.to_owned(),
+                    index,
+                }
+            }
+        };
+        *path = match kind {
+            MessageFileKind::Text => {
+                resolve_text_source(path, workflow_directory, sources, location)?
+            }
+            MessageFileKind::Attachment => {
+                resolve_binary_source(path, workflow_directory, sources, location)?
+            }
+        };
+    }
+    Ok(())
+}
+
+fn resolve_text_source(
+    source_path: &str,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+    location: ResolutionLocation,
+) -> Result<String, ResolutionFailure> {
+    load_utf8_static_source(
+        source_path,
+        workflow_directory,
+        sources,
+        &location,
+        ResolutionFailureKind::InvalidTextEncoding,
+    )
+    .map(|loaded| loaded.canonical_path)
+}
+
+fn resolve_binary_source(
+    source_path: &str,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+    location: ResolutionLocation,
+) -> Result<String, ResolutionFailure> {
+    load_static_source(source_path, workflow_directory, sources, location)
+        .map(|loaded| loaded.canonical_path)
+}
+
+fn resolve_json_schema(
+    source_path: &str,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+    location: ResolutionLocation,
+) -> Result<(String, RetainedJsonSchema), ResolutionFailure> {
+    let input_schema = matches!(location, ResolutionLocation::InputSchema { .. });
+    let encoding_failure = if input_schema {
+        ResolutionFailureKind::InvalidInputSchemaEncoding
+    } else {
+        ResolutionFailureKind::InvalidResultSchemaEncoding
+    };
+    let loaded = load_utf8_static_source(
+        source_path,
+        workflow_directory,
+        sources,
+        &location,
+        encoding_failure,
+    )?;
+    let schema = Arc::new(serde_json::from_slice::<Value>(&loaded.bytes).map_err(|_| {
+        ResolutionFailure::new(
+            if input_schema {
+                ResolutionFailureKind::InvalidInputSchemaJson
+            } else {
+                ResolutionFailureKind::InvalidResultSchemaJson
+            },
+            location.clone(),
+        )
+    })?);
+    let retained =
+        RetainedJsonSchema::compile(Arc::clone(&loaded.bytes), schema).map_err(|failure| {
+            let kind = match (input_schema, failure) {
+                (true, JsonSchemaSupportFailure::Dialect) => {
+                    ResolutionFailureKind::InvalidInputSchemaDialect
+                }
+                (true, JsonSchemaSupportFailure::Reference) => {
+                    ResolutionFailureKind::InvalidInputSchemaReference
+                }
+                (true, JsonSchemaSupportFailure::Schema) => {
+                    ResolutionFailureKind::InvalidInputSchema
+                }
+                (false, JsonSchemaSupportFailure::Dialect) => {
+                    ResolutionFailureKind::InvalidResultSchemaDialect
+                }
+                (false, JsonSchemaSupportFailure::Reference) => {
+                    ResolutionFailureKind::InvalidResultSchemaReference
+                }
+                (false, JsonSchemaSupportFailure::Schema) => {
+                    ResolutionFailureKind::InvalidResultSchema
+                }
+            };
+            ResolutionFailure::new(kind, location)
+        })?;
+    Ok((loaded.canonical_path, retained))
+}
+
+fn load_utf8_static_source(
+    source_path: &str,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+    location: &ResolutionLocation,
+    encoding_failure: ResolutionFailureKind,
+) -> Result<LoadedSource, ResolutionFailure> {
+    let loaded = load_static_source(source_path, workflow_directory, sources, location.clone())?;
+    std::str::from_utf8(&loaded.bytes)
+        .map_err(|_| ResolutionFailure::new(encoding_failure, location.clone()))?;
+    Ok(loaded)
+}
+
+fn load_static_source(
+    source_path: &str,
+    workflow_directory: &Path,
+    sources: &mut SourceResolver,
+    location: ResolutionLocation,
+) -> Result<LoadedSource, ResolutionFailure> {
+    sources.load(&workflow_directory.join(source_path), location)
+}
+
+fn lexically_within(root: &Path, candidate: &Path) -> bool {
+    lexical_normalize(candidate).is_some_and(|normalized| normalized.starts_with(root))
+}
+
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn canonical_relative_path(root: &Path, canonical_path: &Path) -> Option<String> {
+    let relative = canonical_path.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return None;
+        };
+        parts.push(part.to_str()?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+fn open_source_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(source_open_flags());
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "O_NOFOLLOW and O_NONBLOCK fit in the signed custom_flags value on Unix"
+)]
+fn source_open_flags() -> i32 {
+    (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32
+}
+
+fn path_identifies_file(path: &Path, handle_metadata: &fs::Metadata) -> io::Result<bool> {
+    let path_metadata = fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(path_metadata.dev() == handle_metadata.dev()
+            && path_metadata.ino() == handle_metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(path_metadata.is_file()
+            && path_metadata.len() == handle_metadata.len()
+            && path_metadata.modified().ok() == handle_metadata.modified().ok())
+    }
+}
+
+fn source_closure_too_large(location: ResolutionLocation) -> ResolutionFailure {
+    ResolutionFailure::new(ResolutionFailureKind::DigestInputTooLarge, location)
+}
+
+fn digest_source_closure(
+    closure: &BTreeMap<String, Arc<[u8]>>,
+) -> Result<WorkflowContentDigest, ResolutionFailure> {
+    let mut context = Context::new(&SHA256);
+    let mut framed_length = 0_u64;
+    hash_bytes(&mut context, &mut framed_length, CONTENT_CLOSURE_DOMAIN)?;
+
+    let entry_count = u64::try_from(closure.len()).map_err(|_| digest_too_large())?;
+    hash_bytes(&mut context, &mut framed_length, &entry_count.to_be_bytes())?;
+    for (path, content) in closure {
+        hash_length_prefixed(&mut context, &mut framed_length, path.as_bytes())?;
+        hash_length_prefixed(&mut context, &mut framed_length, content)?;
+    }
+
+    let digest = context.finish();
+    Ok(WorkflowContentDigest {
+        algorithm: ContentDigestAlgorithm::Sha256,
+        value: lowercase_hex(digest.as_ref()),
+    })
+}
+
+fn hash_length_prefixed(
+    context: &mut Context,
+    framed_length: &mut u64,
+    bytes: &[u8],
+) -> Result<(), ResolutionFailure> {
+    let length = u64::try_from(bytes.len()).map_err(|_| digest_too_large())?;
+    hash_bytes(context, framed_length, &length.to_be_bytes())?;
+    hash_bytes(context, framed_length, bytes)
+}
+
+fn hash_bytes(
+    context: &mut Context,
+    framed_length: &mut u64,
+    bytes: &[u8],
+) -> Result<(), ResolutionFailure> {
+    let length = u64::try_from(bytes.len()).map_err(|_| digest_too_large())?;
+    *framed_length = framed_length
+        .checked_add(length)
+        .filter(|length| *length <= MAX_SOURCE_CLOSURE_BYTES)
+        .ok_or_else(digest_too_large)?;
+    context.update(bytes);
+    Ok(())
+}
+
+fn digest_too_large() -> ResolutionFailure {
+    ResolutionFailure::new(
+        ResolutionFailureKind::DigestInputTooLarge,
+        ResolutionLocation::ContentDigest,
+    )
+}
+
+#[cfg(test)]
+mod tests;

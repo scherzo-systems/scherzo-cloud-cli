@@ -14,7 +14,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 [[profile.default.overrides]]
 # Pi adapter unit tests also launch process trees; share the process-capacity limit
 # without widening their cancellation deadlines or the default slow-test backstop.
-filter = "test(execution::workflow::pi_json_v1::adapter_tests)"
+filter = "package(scherzo-cloud-execution) & test(workflow::pi_json_v1::adapter_tests)"
 test-group = "external-process"
 
 [[profile.default.overrides]]

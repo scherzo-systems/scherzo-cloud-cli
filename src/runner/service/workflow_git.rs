@@ -24,7 +24,7 @@ use super::source::{
     ProviderCredential, SourceCredentialBroker, WorkflowGitRevocation, WorkflowGitRevocationOutcome,
 };
 use super::workspace::ProcessQuiescence;
-use crate::execution::{CaptureCancellation, EnvironmentSnapshot};
+use scherzo_cloud_execution::{CaptureCancellation, EnvironmentSnapshot};
 
 const INTERNAL_HELPER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_WORKFLOW_GIT_HELPER";
 const INTERNAL_HELPER_SOCKET_ENVIRONMENT: &str = "SCHERZO_INTERNAL_WORKFLOW_GIT_SOCKET";

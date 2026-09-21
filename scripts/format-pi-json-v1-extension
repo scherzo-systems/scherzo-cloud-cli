@@ -6,7 +6,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-package_root=$public_root/src/execution/workflow/pi-json-v1-extension
+package_root=$public_root/crates/execution/src/workflow/pi-json-v1-extension
 install_root=$(mktemp -d "${TMPDIR:-/tmp}/scherzo-pi-json-v1-format.XXXXXX")
 
 cleanup() {

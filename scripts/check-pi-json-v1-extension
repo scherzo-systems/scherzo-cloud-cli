@@ -2,7 +2,7 @@
 set -euo pipefail
 
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-package_root=$public_root/src/execution/workflow/pi-json-v1-extension
+package_root=$public_root/crates/execution/src/workflow/pi-json-v1-extension
 
 usage() {
   echo "usage: check-pi-json-v1-extension [--dependencies-only]" >&2

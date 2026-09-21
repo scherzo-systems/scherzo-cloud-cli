@@ -16,11 +16,11 @@ use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 
-use crate::execution::{
+use crate::runner::credential::Credential;
+use scherzo_cloud_execution::{
     CaptureCancellation, ResolvedAttachment, ResolvedFile, ResolvedInput, ResolvedInputs,
     ResolvedJsonInput,
 };
-use crate::runner::credential::Credential;
 use scherzo_cloud_runner_protocol::RunInputProjectionV1;
 
 const MANIFEST_RESPONSE_LIMIT: usize = 1024 * 1024;
@@ -563,7 +563,7 @@ pub(super) fn validate_projection(
         return Err(RunInputFailure::InvalidProjection);
     }
     if projection.manifest_digest.algorithm != "sha256"
-        || !crate::execution::is_lowercase_hex(&projection.manifest_digest.value, 64)
+        || !scherzo_cloud_execution::is_lowercase_hex(&projection.manifest_digest.value, 64)
     {
         return Err(RunInputFailure::InvalidProjection);
     }
@@ -597,7 +597,7 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
         || manifest
             .inputs
             .keys()
-            .any(|name| !crate::execution::is_input_name(name))
+            .any(|name| !scherzo_cloud_execution::is_input_name(name))
     {
         return Err(RunInputFailure::ManifestMismatch);
     }
@@ -607,7 +607,7 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
         match input {
             ManifestInput::Text { size_bytes, sha256 } => {
                 if *size_bytes > MAXIMUM_TEXT_BYTES
-                    || !crate::execution::is_lowercase_hex(sha256, 64)
+                    || !scherzo_cloud_execution::is_lowercase_hex(sha256, 64)
                 {
                     return Err(RunInputFailure::ManifestMismatch);
                 }
@@ -615,7 +615,7 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
             }
             ManifestInput::Json { size_bytes, sha256 } => {
                 if *size_bytes > MAXIMUM_JSON_BYTES
-                    || !crate::execution::is_lowercase_hex(sha256, 64)
+                    || !scherzo_cloud_execution::is_lowercase_hex(sha256, 64)
                 {
                     return Err(RunInputFailure::ManifestMismatch);
                 }
@@ -627,8 +627,8 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
                 sha256,
             } => {
                 if *size_bytes > MAXIMUM_ATTACHMENT_BYTES
-                    || !crate::execution::is_valid_media_type(media_type)
-                    || !crate::execution::is_lowercase_hex(sha256, 64)
+                    || !scherzo_cloud_execution::is_valid_media_type(media_type)
+                    || !scherzo_cloud_execution::is_lowercase_hex(sha256, 64)
                 {
                     return Err(RunInputFailure::ManifestMismatch);
                 }
@@ -642,11 +642,11 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
                 for (index, attachment) in items.iter().enumerate() {
                     if attachment.index != index
                         || attachment.size_bytes > MAXIMUM_ATTACHMENT_BYTES
-                        || !crate::execution::is_lowercase_hex(&attachment.sha256, 64)
-                        || !crate::execution::is_valid_input_display_name(
+                        || !scherzo_cloud_execution::is_lowercase_hex(&attachment.sha256, 64)
+                        || !scherzo_cloud_execution::is_valid_input_display_name(
                             attachment.display_name.as_deref(),
                         )
-                        || !crate::execution::is_valid_media_type(&attachment.media_type)
+                        || !scherzo_cloud_execution::is_valid_media_type(&attachment.media_type)
                     {
                         return Err(RunInputFailure::ManifestMismatch);
                     }
@@ -1139,7 +1139,7 @@ fn download_broker_failure(failure: BrokerFailure) -> RunInputFailure {
 }
 
 fn lowercase_hex_bytes(bytes: &[u8]) -> String {
-    crate::execution::lowercase_hex(bytes)
+    scherzo_cloud_execution::lowercase_hex(bytes)
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {

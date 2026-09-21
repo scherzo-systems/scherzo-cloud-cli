@@ -42,7 +42,7 @@ service.
 ## Local workflow validation
 
 `src/cli/workflow/validate.rs` is an offline typed Clap adapter around the shared
-resolver in `src/execution/workflow/resolution.rs`. The execution component embeds the
+resolver in `crates/execution/src/workflow/resolution.rs`. The execution component embeds the
 public `schemas/workflow-v1.schema.json` artifact for structural validation; no
 implementation-local schema copy exists. `src/cli/workflow/schema.rs` writes that same
 embedded asset unchanged to standard output. `src/cli/workflow/reference.rs` likewise
@@ -155,9 +155,10 @@ or arbitrary errors into either projection. Local or export queue saturation, JS
 failures, malformed export configuration, receiver failures, and export shutdown timeout
 do not change connection, acknowledgement, retry, terminal result, or shutdown behavior.
 
-These are component boundaries before they are separate packages or executables. A
-second runner binary should be introduced only if platform dependencies, privilege
-isolation, artifact size, or independent release cadence creates a demonstrated need.
+API, runner protocol, support, and execution are unpublished workspace packages; runner,
+human authentication, and command composition remain root modules. A second runner
+binary should be introduced only if platform dependencies, privilege isolation,
+artifact size, or independent release cadence creates a demonstrated need.
 
 ## Credential separation
 
@@ -259,9 +260,10 @@ those responsibilities. After start authorization, the service-scoped assignment
 invokes that component's one-run boundary and translates structured events and outcomes
 into the Cloud runner protocol.
 
-The execution component is organized as an internal source boundary; there is no
-evidence that a separately published crate or process is necessary. All of its
-production code is developed within this public source boundary.
+The execution component is an unpublished workspace crate with a private implementation
+tree and explicit facade; there is no evidence that a separately published crate or
+process is necessary. All of its production code is developed within this public source
+boundary.
 
 ## Workflow execution model
 
@@ -291,7 +293,7 @@ source preparation, assignment, lease, durable observation, and cleanup behavior
 it; the connection adapter still does not schedule steps or interpret workflow outputs.
 
 The private npm project under
-`src/execution/workflow/pi-json-v1-extension/` checks the single-file PiJsonV1 result
+`crates/execution/src/workflow/pi-json-v1-extension/` checks the single-file PiJsonV1 result
 extension and one deterministic materialization. It is not another execution component:
 Rust owns invocation identity, the retained schema and authoritative validation, and
 terminal workflow state. Workflow execution never invokes npm or reads this project's
@@ -353,54 +355,47 @@ second ID policy inside the API boundary.
 
 ## Rust source shape
 
-`cli/Cargo.toml` is both the workspace root and the sole binary package. Slice 1 adds
-exactly four unpublished library members at their final roots:
+`cli/Cargo.toml` is both the workspace root and the sole binary package. Five unpublished
+library members now occupy their final roots:
 
 - `scherzo-cloud-support` owns shared public-ID, timing, TLS-provider, and Workflow
   contract leaves and has no internal dependency;
-- `scherzo-cloud-test-support` owns the HTTP fixture and is reachable only through dev
-  dependencies;
+- `scherzo-cloud-test-support` owns the HTTP and hermetic Git fixtures and is reachable
+  only through dev dependencies;
 - `scherzo-cloud-runner-protocol` owns runner wire DTOs, its generated codec, and its
-  embedded schema and has no internal dependency; and
+  embedded schema and has no internal dependency;
 - `scherzo-cloud-api` owns the handwritten API and private generated client, depends on
-  support in production, and uses test-support only for tests.
+  support in production, and uses test-support only for tests; and
+- `scherzo-cloud-execution` owns execution, harness adapters, process containment,
+  workflow assets, and their tests, depends on support in production, and uses
+  test-support only for tests. Its test-only internal-worker example keeps package
+  suites independent of a previously built root executable.
 
-The binary depends on support, API, and runner-protocol in production and on test-support
-for tests. Commands, execution, runner service, human authentication, service
-credential files, process abstractions, build identity, and exit policy remain rooted in
-`src/`. Slice 2A does not move execution or process into a package, add compatibility
-aliases, or begin the Slice 2B package cutover. It preserves one executable,
-`CARGO_BIN_EXE_scherzo-cloud`, and the existing archive shape while Cargo can compile and
-test the four leaves independently.
+The binary depends on support, API, runner-protocol, and execution in production and on
+test-support for tests. Its dev dependency on execution enables only the `test-fixtures`
+feature used by root integration tests; the production dependency does not expose those
+fixture constructors. Commands, runner service, human authentication, service
+credential files, build identity, and exit policy remain rooted in `src/`. There is one
+`scherzo-cloud` executable, Cargo continues to provide `CARGO_BIN_EXE_scherzo-cloud`, and
+the archive shape is unchanged.
 
-The retained root-owned seams have this closed ownership matrix:
+The remaining seams have this closed ownership matrix:
 
 | Concern | Owner | Permitted consumption |
 | --- | --- | --- |
-| Execution implementation | Private modules beneath `src/execution/` | Non-execution code uses only the flat crate-private inventory re-exported by `src/execution/mod.rs`; implementation modules are not public. |
-| Process implementation | `src/process.rs` | Execution may use it directly. The only non-execution consumers are `src/runner/doctor/git.rs` and `src/runner/service/source.rs`; process is not forwarded through the execution facade. |
+| Execution implementation | Private modules beneath `crates/execution/src/` | Non-execution code uses only the explicit flat facade in `crates/execution/src/lib.rs`; implementation modules are not public. |
+| Process implementation | Private `crates/execution/src/process.rs` module | Execution uses it internally and its facade exports exactly `ManagedProcessGroup`, `CommandRunner`, `CommandRequest`, `CommandOutput`, `CommandProbeError`, and `SystemCommandRunner` for runner consumers. |
 | Build identity | `src/build_info.rs` and the crate root | Root CLI dispatch injects the resolved version into local agent dispatch and Runner Serve. Execution and runner code do not read build environment or root build policy. |
 | Exit policy | `src/exit_code.rs` and the crate root | Execution returns the closed `ExecutionOutcome` domain value. Root command dispatch maps that value to the unchanged process exit statuses. |
 
-The direct process inventory within execution is limited to
-`claude_code.rs`, `claude_code/tests.rs`, `codex.rs`,
-`harness_installation.rs`, `pi.rs`, `pi/tests.rs`,
-`workflow/child_guard.rs`, `workflow/git_capture.rs`, and
-`workflow/workspace_snapshot.rs`. This exception is deliberately narrow: Slice 2A keeps
-the process owner and call sites in place rather than
-creating a forwarding API that would become accidental package surface. The Rust
-unused-import lint keeps facade entries tied to real consumers, and architecture tests
-reject deep execution imports, public implementation modules, unlisted direct process
-consumers, and process forwarding.
-
 `tests/architecture.rs` enforces the exact member and internal-edge inventories, each
 member's inherited lint policy, the residual root-module graph, private generated API,
-and confinement of command parsing, HTTP, WebSocket, telemetry, and terminal dependencies
-to their owning packages. The crate-root `src/test_support.rs` module remains a
-`cfg(test)`-only leaf shared exclusively by execution and runner tests for hermetic Git
-command construction; it is distinct from the dev-only HTTP fixture package. The
-`src/service_auth.rs` boundary depends only on support's public-ID syntax and remains a
-root-owned policy for caller-managed service secrets. The API returns issued secrets in
+the final execution and process ownership, and confinement of command parsing, HTTP,
+WebSocket, telemetry, and terminal dependencies to their owning packages. The dev-only
+`scherzo-cloud-test-support` facade supplies the Git fixture to execution and runner tests
+without entering the production graph. The `src/service_auth.rs` boundary depends only
+on support's public-ID syntax and remains a root-owned policy for caller-managed service
+secrets. The API returns issued secrets in
 a redacted zeroizing value; the root validates the canonical service-key syntax before
 delivery. Changing a package or module boundary requires updating that test and this
 document in the same change.

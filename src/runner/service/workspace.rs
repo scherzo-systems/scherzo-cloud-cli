@@ -18,7 +18,7 @@ use rustix::fs::{
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitTeardownReport};
-use crate::execution::{
+use scherzo_cloud_execution::{
     RemovalError, open_directory_at, open_regular_file_at, remove_open_tree_at,
 };
 
@@ -2771,11 +2771,11 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let environment = crate::execution::EnvironmentSnapshot::new([(
+        let environment = scherzo_cloud_execution::EnvironmentSnapshot::new([(
             "PATH",
             std::env::var_os("PATH").unwrap(),
         )]);
-        let cancellation = crate::execution::CaptureCancellation::default();
+        let cancellation = scherzo_cloud_execution::CaptureCancellation::default();
         let authority = super::super::workflow_git::WorkflowGitAuthority::install(
             super::super::workflow_git::WorkflowGitInstall {
                 broker: super::super::source::test_support::unavailable_source_broker(),

@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Args;
 
-use crate::execution::{
+use crate::exit_code::ExitCode;
+use crate::runner::service::Config;
+use scherzo_cloud_execution::{
     ClaudeCodeInstallationFailure, CodexInstallationFailure, PiInstallationFailure,
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation,
 };
-use crate::exit_code::ExitCode;
-use crate::runner::service::Config;
 
 pub(super) const ABOUT: &str = "Connect to Scherzo Cloud and serve run assignments";
 
@@ -111,9 +111,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::execution::ClaudeCodeIncompatibility;
     use crate::runner::credential::test_credential;
     use crate::runner::service::ConfigFixture;
+    use scherzo_cloud_execution::ClaudeCodeIncompatibility;
 
     #[test]
     fn startup_retains_each_available_harness_snapshot_independently() {

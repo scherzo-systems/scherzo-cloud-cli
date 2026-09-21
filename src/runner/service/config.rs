@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
-use crate::execution::{
-    ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
-};
 use crate::runner::credential::Credential;
 use crate::runner::enrollment::{PendingCredential, RunnerStateAccess};
+use scherzo_cloud_execution::{
+    ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RepositoryUrlPolicy {

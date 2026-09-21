@@ -31,7 +31,6 @@ pub(crate) use config::Config;
 #[cfg(test)]
 pub(crate) use test_support::ConfigFixture;
 
-use crate::execution::MAXIMUM_CANCELLATION_GRACE;
 use crate::runner::control_protocol::{ConnectionFailure, ControlError};
 use crate::runner::telemetry::{self, Event, Outcome, Recorder};
 use assignment::{AssignmentDependencies, AssignmentManager};
@@ -43,6 +42,7 @@ use connection::{
 };
 use control::{ControlServer, ControlServerError, ControlTimeouts, LiveStatus, ReloadRequest};
 use lease_clock::{LeaseClock, LeaseClockError};
+use scherzo_cloud_execution::MAXIMUM_CANCELLATION_GRACE;
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type ConnectionFuture<'a> =
@@ -1500,12 +1500,12 @@ mod tests {
         Sleeper, TokioSleeper, record_startup_retention, run_connection_loop_with_work_root,
         run_until_cancelled_with_dependencies,
     };
-    use crate::execution::resolve;
     use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
     use crate::runner::credential::test_credential;
     use crate::runner::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
     use crate::runner::service::config::RepositoryUrlPolicy;
     use crate::runner::telemetry::{TestCapture, test_recorder};
+    use scherzo_cloud_execution::resolve;
 
     #[test]
     fn shutdown_timeout_accommodates_maximum_cancellation_grace() {
@@ -2589,7 +2589,7 @@ mod tests {
     }
 
     fn fixture_git(repository: &Path, arguments: &[&str]) -> String {
-        let output = crate::test_support::fixture_git_command("git")
+        let output = scherzo_cloud_test_support::fixture_git_command("git")
             .current_dir(repository)
             .args(arguments)
             .output()

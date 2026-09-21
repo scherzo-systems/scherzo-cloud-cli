@@ -532,7 +532,7 @@ exports:
 fn response_pi_execution() -> String {
     let frames = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/execution/workflow/pi_json_v1/fixtures/response-success.jsonl"
+        "/crates/execution/src/workflow/pi_json_v1/fixtures/response-success.jsonl"
     ));
     let remaining = frames
         .lines()
@@ -3296,7 +3296,7 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
         "../execution/.pi/extensions/fake-provider.ts",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/execution/workflow/pi-json-v1-extension/src/conformance/fake-provider.ts"
+            "/crates/execution/src/workflow/pi-json-v1-extension/src/conformance/fake-provider.ts"
         )),
     );
     bundle.write_source(

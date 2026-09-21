@@ -5,13 +5,13 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use crate::execution::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_execution::{
     ArchivedAttemptLoadError, ArchivedTerminalHostExit, ArchivedViewOutput,
     ArchivedWorkflowTerminalHost, PresentationConfig, PresentationFailure, PresentationMode,
     TerminalCapabilities, ineligibility_code, load_local_archived_attempt,
     normalize_terminal_scalar, operational_error_code,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "View a published local workflow attempt";
 pub(super) const AFTER_HELP: &str = "Presentation mode:

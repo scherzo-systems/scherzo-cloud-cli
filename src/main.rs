@@ -11,26 +11,22 @@
 mod build_info;
 mod cli;
 mod error;
-mod execution;
 mod exit_code;
 mod human_auth;
 mod idempotency;
-mod process;
 mod runner;
 mod service_auth;
-#[cfg(test)]
-mod test_support;
 
 use std::env;
 
 use crate::exit_code::ExitCode;
 
 fn main() -> ExitCode {
-    if execution::child_guard_worker_requested() {
-        return execution::run_child_guard_worker().into();
+    if scherzo_cloud_execution::child_guard_worker_requested() {
+        return scherzo_cloud_execution::run_child_guard_worker().into();
     }
-    if execution::result_validation_worker_requested() {
-        return execution::run_result_validation_worker().into();
+    if scherzo_cloud_execution::result_validation_worker_requested() {
+        return scherzo_cloud_execution::run_result_validation_worker().into();
     }
     if runner::service::workflow_git_helper_requested() {
         return if runner::service::run_workflow_git_helper() {

@@ -5,11 +5,11 @@ use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 
-use crate::execution::{
+use crate::exit_code::ExitCode;
+use scherzo_cloud_execution::{
     RejectionDiagnostic as Diagnostic, ResolutionFailure, ResolvedWorkflow,
     human_resolution_remedy, resolve_workflow_file,
 };
-use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Validate a local workflow definition";
 const COMMAND_NAME: &str = "scherzo-cloud workflow validate";
@@ -104,13 +104,13 @@ fn human_required_inputs(workflow: &ResolvedWorkflow) -> String {
         .join(", ")
 }
 
-fn input_kind(kind: crate::execution::WorkflowValueType) -> &'static str {
+fn input_kind(kind: scherzo_cloud_execution::WorkflowValueType) -> &'static str {
     match kind {
-        crate::execution::WorkflowValueType::Text => "text",
-        crate::execution::WorkflowValueType::AttachmentCollection => "attachments",
-        crate::execution::WorkflowValueType::Json => "json",
-        crate::execution::WorkflowValueType::File => "file",
-        crate::execution::WorkflowValueType::GitBranch => "git_branch",
+        scherzo_cloud_execution::WorkflowValueType::Text => "text",
+        scherzo_cloud_execution::WorkflowValueType::AttachmentCollection => "attachments",
+        scherzo_cloud_execution::WorkflowValueType::Json => "json",
+        scherzo_cloud_execution::WorkflowValueType::File => "file",
+        scherzo_cloud_execution::WorkflowValueType::GitBranch => "git_branch",
     }
 }
 

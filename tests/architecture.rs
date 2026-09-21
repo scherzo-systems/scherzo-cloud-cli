@@ -1,8 +1,8 @@
 //! Cargo-workspace and source-boundary architecture tests.
 //!
-//! Slice 2A retains execution in the root package behind its final facade. These
-//! tests keep Cargo's package graph, the residual root-module graph, execution
-//! and process seams, generated-source privacy, and external-crate ownership
+//! Slice 2B gives execution, process abstractions, assets, and owner tests one
+//! final package. These tests keep Cargo's package graph, residual root modules,
+//! the execution facade, generated-source privacy, and external-crate ownership
 //! aligned with `ARCHITECTURE.md`.
 
 #![allow(
@@ -26,16 +26,17 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const INTERNAL_PACKAGES: [&str; 5] = [
+const INTERNAL_PACKAGES: [&str; 6] = [
     "scherzo-cloud",
     "scherzo-cloud-api",
+    "scherzo-cloud-execution",
     "scherzo-cloud-runner-protocol",
     "scherzo-cloud-support",
     "scherzo-cloud-test-support",
 ];
 
 #[test]
-fn workspace_members_and_edges_match_slice_one() {
+fn workspace_members_and_edges_match_slice_two_b() {
     let root = cli_root();
     let metadata = cargo_metadata(&root);
     let packages = metadata["packages"]
@@ -51,6 +52,7 @@ fn workspace_members_and_edges_match_slice_one() {
     let expected_manifests = BTreeMap::from([
         ("scherzo-cloud", "Cargo.toml"),
         ("scherzo-cloud-api", "crates/api/Cargo.toml"),
+        ("scherzo-cloud-execution", "crates/execution/Cargo.toml"),
         (
             "scherzo-cloud-runner-protocol",
             "crates/runner-protocol/Cargo.toml",
@@ -83,7 +85,7 @@ fn workspace_members_and_edges_match_slice_one() {
     assert_eq!(
         workspace_packages.keys().copied().collect::<BTreeSet<_>>(),
         INTERNAL_PACKAGES.into_iter().collect(),
-        "Slice 1 must contain exactly the root package and four final leaf members"
+        "Slice 2B must contain the root package and five final component members"
     );
 
     for (name, relative_manifest) in expected_manifests {
@@ -131,11 +133,19 @@ fn workspace_members_and_edges_match_slice_one() {
     }
     let expected_edges = BTreeSet::from([
         ("scherzo-cloud", "scherzo-cloud-api", "normal"),
+        ("scherzo-cloud", "scherzo-cloud-execution", "normal"),
+        ("scherzo-cloud", "scherzo-cloud-execution", "dev"),
         ("scherzo-cloud", "scherzo-cloud-runner-protocol", "normal"),
         ("scherzo-cloud", "scherzo-cloud-support", "normal"),
         ("scherzo-cloud", "scherzo-cloud-test-support", "dev"),
         ("scherzo-cloud-api", "scherzo-cloud-support", "normal"),
         ("scherzo-cloud-api", "scherzo-cloud-test-support", "dev"),
+        ("scherzo-cloud-execution", "scherzo-cloud-support", "normal"),
+        (
+            "scherzo-cloud-execution",
+            "scherzo-cloud-test-support",
+            "dev",
+        ),
     ]);
     assert_eq!(
         actual_edges, expected_edges,
@@ -154,12 +164,32 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
         "src/tls.rs",
         "src/workflow_contract.rs",
         "src/workflow_contract",
+        "src/execution",
+        "src/process.rs",
+        "src/test_support.rs",
+        "tests/liv_2331_remediation_repro.rs",
+        "tests/fixtures/codex-app-server-v1-schema",
+        "tests/fixtures/workflow/v1",
     ] {
         assert!(
             !root.join(obsolete).exists(),
-            "moved Slice 1 source remains at obsolete path {obsolete}"
+            "moved source remains at obsolete path {obsolete}"
         );
     }
+    for owned in [
+        "crates/execution/tests/fixtures/codex-app-server-v1-schema",
+        "crates/execution/tests/fixtures/workflow/v1",
+    ] {
+        assert!(
+            root.join(owned).is_dir(),
+            "execution-owned fixture is absent from {owned}"
+        );
+    }
+    assert!(
+        root.join("crates/execution/examples/internal-worker.rs")
+            .is_file(),
+        "execution package test worker is absent"
+    );
 
     let api_facade = read_source(&root.join("crates/api/src/lib.rs"));
     assert!(api_facade.contains("mod generated;"));
@@ -167,6 +197,7 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
 
     for facade in [
         "crates/api/src/lib.rs",
+        "crates/execution/src/lib.rs",
         "crates/runner-protocol/src/lib.rs",
         "crates/support/src/lib.rs",
     ] {
@@ -212,7 +243,6 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             "cli",
             &[
                 "build_info",
-                "execution",
                 "exit_code",
                 "human_auth",
                 "idempotency",
@@ -221,14 +251,11 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             ],
         ),
         ("error", &["exit_code"]),
-        ("execution", &["process"]),
-        ("exit_code", &["execution"]),
+        ("exit_code", &[]),
         ("human_auth", &[]),
         ("idempotency", &[]),
-        ("process", &[]),
-        ("runner", &["execution", "idempotency", "process"]),
+        ("runner", &["idempotency"]),
         ("service_auth", &[]),
-        ("test_support", &[]),
     ];
     entries
         .iter()
@@ -237,10 +264,7 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
 }
 
 fn special_targets() -> Vec<(&'static str, BTreeSet<&'static str>)> {
-    vec![(
-        "test_support",
-        ["execution", "runner"].into_iter().collect(),
-    )]
+    Vec::new()
 }
 
 #[test]
@@ -321,72 +345,68 @@ const EXECUTION_IMPLEMENTATION_MODULES: [&str; 6] = [
     "workflow",
 ];
 
-const DIRECT_PROCESS_CONSUMERS: [&str; 11] = [
-    "src/execution/claude_code.rs",
-    "src/execution/claude_code/tests.rs",
-    "src/execution/codex.rs",
-    "src/execution/harness_installation.rs",
-    "src/execution/pi.rs",
-    "src/execution/pi/tests.rs",
-    "src/execution/workflow/child_guard.rs",
-    "src/execution/workflow/git_capture.rs",
-    "src/execution/workflow/workspace_snapshot.rs",
-    "src/runner/doctor/git.rs",
-    "src/runner/service/source.rs",
-];
-
 #[test]
-fn execution_facade_and_direct_process_exception_match_slice_two_a() {
+fn execution_facade_and_process_ownership_match_slice_two_b() {
     let root = cli_root();
-    let facade = read_source(&root.join("src/execution/mod.rs"));
-    let mut violations = execution_facade_violations("src/execution/mod.rs", &facade);
+    let facade_path = root.join("crates/execution/src/lib.rs");
+    let facade = read_source(&facade_path);
+    assert!(exposed_module_declarations(&facade).is_empty());
+    assert!(facade.contains("mod process;"));
 
+    let process_export = facade
+        .split_once("pub use process::{")
+        .and_then(|(_, suffix)| suffix.split_once("};"))
+        .map(|(body, _)| body)
+        .expect("execution facade should export its process inventory");
+    let actual_process_exports = source_tokens(process_export)
+        .into_iter()
+        .filter(|token| is_source_identifier(token.text))
+        .map(|token| token.text)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_process_exports,
+        BTreeSet::from([
+            "CommandOutput",
+            "CommandProbeError",
+            "CommandRequest",
+            "CommandRunner",
+            "ManagedProcessGroup",
+            "SystemCommandRunner",
+        ]),
+        "execution must expose exactly the six inventoried process interfaces",
+    );
+
+    let mut violations = Vec::new();
     for source in rust_sources(&root.join("src")) {
         let relative = source.strip_prefix(&root).unwrap();
-        if relative.starts_with("src/execution") {
-            continue;
-        }
-        let relative_text = relative.to_string_lossy().replace('\\', "/");
         let text = read_source(&source);
-        violations.extend(execution_consumer_violations(&relative_text, &text));
-    }
-
-    for source in rust_sources(&root.join("src")) {
-        let relative = source.strip_prefix(&root).unwrap();
-        let relative_text = relative.to_string_lossy().replace('\\', "/");
-        let text = read_source(&source);
-        if !DIRECT_PROCESS_CONSUMERS.contains(&relative_text.as_str()) {
-            for line_number in root_process_references(&relative_text, &text) {
+        for obsolete in ["crate::execution", "crate::process"] {
+            if text.contains(obsolete) {
                 violations.push(format!(
-                    "{relative_text}:{line_number} directly accesses root process outside the Slice 2A inventory"
+                    "{} retains obsolete root path `{obsolete}`",
+                    relative.display()
+                ));
+            }
+        }
+        for module in EXECUTION_IMPLEMENTATION_MODULES {
+            let deep_path = format!("scherzo_cloud_execution::{module}");
+            if text.contains(&deep_path) {
+                violations.push(format!(
+                    "{} names private execution module `{module}`",
+                    relative.display()
                 ));
             }
         }
     }
-
     assert!(
         violations.is_empty(),
-        "execution facade violations:\n{}",
+        "execution ownership violations:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn execution_boundary_policy_accepts_only_the_slice_two_a_seams() {
-    assert!(
-        execution_facade_violations(
-            "src/execution/mod.rs",
-            "mod workflow;\npub(crate) use workflow::ResolvedWorkflow;\n",
-        )
-        .is_empty()
-    );
-    assert!(
-        execution_consumer_violations(
-            "src/cli/workflow.rs",
-            "use crate::execution::ResolvedWorkflow;",
-        )
-        .is_empty()
-    );
+fn execution_boundary_policy_rejects_public_modules() {
     for exposed_module in [
         "pub mod workflow;\n",
         "pub(crate) mod workflow;\n",
@@ -394,86 +414,18 @@ fn execution_boundary_policy_accepts_only_the_slice_two_a_seams() {
         "pub(in crate) mod workflow;\n",
     ] {
         assert!(
-            !execution_facade_violations("src/execution/mod.rs", exposed_module).is_empty(),
+            !exposed_module_declarations(exposed_module).is_empty(),
             "accepted exposed execution module: {exposed_module}"
         );
     }
-    for deep_import in [
-        "use crate::execution::workflow::ResolvedWorkflow;",
-        "use crate::execution::{workflow::ResolvedWorkflow};",
-        "use crate::execution::{\n    workflow::ResolvedWorkflow,\n};",
-        "use crate::{execution::workflow::ResolvedWorkflow};",
-        "use crate::{execution::{workflow::ResolvedWorkflow}};",
-    ] {
-        assert!(
-            !execution_consumer_violations("src/cli/workflow.rs", deep_import).is_empty(),
-            "accepted deep execution import: {deep_import}"
-        );
-    }
-    for process_forwarding in [
-        "mod workflow;\npub(crate) use crate::process::CommandRunner;\n",
-        "mod workflow;\npub(crate) use crate::{process::CommandRunner};\n",
-        "mod workflow;\npub(crate) use super::{process::CommandRunner};\n",
-    ] {
-        assert!(
-            !execution_facade_violations("src/execution/mod.rs", process_forwarding).is_empty(),
-            "accepted process forwarding: {process_forwarding}"
-        );
-    }
-    for allowed_process_import in [
-        "use crate::process::CommandRunner;",
-        "use crate::{process::CommandRunner};",
-        "use super::super::super::{process::CommandRunner};",
-    ] {
-        assert!(
-            execution_consumer_violations("src/runner/doctor/git.rs", allowed_process_import)
-                .is_empty(),
-            "rejected inventoried process consumer: {allowed_process_import}"
-        );
-    }
-    for unlisted_process_import in [
-        "use crate::process::CommandRunner;",
-        "use crate::{process::CommandRunner};",
-        "use crate::{\n    process::CommandRunner,\n};",
-        "use super::super::super::{process::CommandRunner};",
-    ] {
-        assert!(
-            !execution_consumer_violations(
-                "src/runner/service/execution.rs",
-                unlisted_process_import,
-            )
-            .is_empty(),
-            "accepted unlisted process consumer: {unlisted_process_import}"
-        );
-    }
-
-    let top_modules = ["cli", "process"].into_iter().map(str::to_owned).collect();
-    let module_path = &["cli".to_owned(), "workflow".to_owned()];
-    assert_eq!(
-        referenced_targets(
-            "use crate::{\n    process::CommandRunner,\n};",
-            module_path,
-            &top_modules,
-        ),
-        vec![(2, "process".to_owned())],
-        "residual dependency scan missed a grouped crate path"
-    );
-    assert_eq!(
-        referenced_targets(
-            "use super::super::{\n    process::CommandRunner,\n};",
-            module_path,
-            &top_modules,
-        ),
-        vec![(2, "process".to_owned())],
-        "residual dependency scan missed a grouped escaping super path"
-    );
+    assert!(exposed_module_declarations("mod workflow;\n").is_empty());
 }
 
 #[test]
 fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
     let root = cli_root();
     let mut violations = Vec::new();
-    for owner in ["src/execution", "src/runner"] {
+    for owner in ["crates/execution/src", "src/runner"] {
         for source in rust_sources(&root.join(owner)) {
             let relative = source.strip_prefix(&root).unwrap();
             let text = read_source(&source);
@@ -498,38 +450,6 @@ fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
         "root policy leaked into execution or runner:\n{}",
         violations.join("\n")
     );
-}
-
-fn execution_facade_violations(path: &str, source: &str) -> Vec<String> {
-    let mut violations = exposed_module_declarations(source)
-        .into_iter()
-        .map(|line_number| {
-            format!("{path}:{line_number} exposes an execution implementation module")
-        })
-        .collect::<Vec<_>>();
-    for line_number in root_process_references(path, source) {
-        violations.push(format!(
-            "{path}:{line_number} forwards root process through execution"
-        ));
-    }
-    violations
-}
-
-fn execution_consumer_violations(path: &str, source: &str) -> Vec<String> {
-    let mut violations = private_execution_module_references(source)
-        .into_iter()
-        .map(|(line_number, module)| {
-            format!("{path}:{line_number} names private execution module `{module}`")
-        })
-        .collect::<Vec<_>>();
-    if !DIRECT_PROCESS_CONSUMERS.contains(&path) {
-        for line_number in root_process_references(path, source) {
-            violations.push(format!(
-                "{path}:{line_number} directly accesses root process outside the Slice 2A inventory"
-            ));
-        }
-    }
-    violations
 }
 
 #[derive(Clone, Copy)]
@@ -676,23 +596,6 @@ fn is_source_identifier(token: &str) -> bool {
         .is_some_and(|byte| is_ident_byte(*byte))
 }
 
-fn root_process_references(path: &str, source: &str) -> Vec<usize> {
-    let mut references = rooted_module_references(source, "crate");
-    if let Ok(relative) = Path::new(path).strip_prefix("src") {
-        references.extend(escaping_super_module_references(
-            source,
-            module_path_of(relative).len(),
-        ));
-    }
-    let mut line_numbers = references
-        .into_iter()
-        .filter_map(|(line_number, module)| (module == "process").then_some(line_number))
-        .collect::<Vec<_>>();
-    line_numbers.sort_unstable();
-    line_numbers.dedup();
-    line_numbers
-}
-
 fn exposed_module_declarations(source: &str) -> Vec<usize> {
     let tokens = source_tokens(source);
     let mut declarations = Vec::new();
@@ -726,42 +629,6 @@ fn exposed_module_declarations(source: &str) -> Vec<usize> {
     declarations
 }
 
-fn private_execution_module_references(source: &str) -> Vec<(usize, &'static str)> {
-    let tokens = source_tokens(source);
-    let mut references = Vec::new();
-    for index in 0..tokens.len() {
-        if tokens[index].text != "crate"
-            || tokens.get(index + 1).is_none_or(|token| token.text != "::")
-        {
-            continue;
-        }
-        for execution_index in module_token_indexes_at(&tokens, index + 2)
-            .into_iter()
-            .filter(|index| tokens[*index].text == "execution")
-        {
-            if tokens
-                .get(execution_index + 1)
-                .is_none_or(|token| token.text != "::")
-            {
-                continue;
-            }
-            for (line_number, name) in module_references_at(&tokens, execution_index + 2) {
-                if let Some(module) = execution_implementation_module(name) {
-                    references.push((line_number, module));
-                }
-            }
-        }
-    }
-    references
-}
-
-fn execution_implementation_module(name: &str) -> Option<&'static str> {
-    EXECUTION_IMPLEMENTATION_MODULES
-        .iter()
-        .copied()
-        .find(|module| *module == name)
-}
-
 /// External crates and the package-owned source prefixes that may use them.
 fn external_crate_containment() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
@@ -774,8 +641,8 @@ fn external_crate_containment() -> Vec<(&'static str, Vec<&'static str>)> {
         ("opentelemetry", vec!["src/runner/"]),
         ("opentelemetry_sdk", vec!["src/runner/"]),
         ("opentelemetry_proto", vec!["src/runner/"]),
-        ("ratatui", vec!["src/execution/workflow/"]),
-        ("crossterm", vec!["src/execution/workflow/"]),
+        ("ratatui", vec!["crates/execution/src/workflow/"]),
+        ("crossterm", vec!["crates/execution/src/workflow/"]),
     ]
 }
 

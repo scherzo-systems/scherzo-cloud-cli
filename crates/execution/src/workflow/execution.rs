@@ -1,0 +1,267 @@
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::future::{Future, ready};
+
+use super::admission::AdmittedWorkflow;
+use super::artifact::ArtifactStaging;
+use super::coordinator::{CommitPort, CommittedReduction, CoordinationError, CoordinatorClock};
+use super::diagnostic::StepDiagnosticLog;
+use super::input::InputStaging;
+use super::observation::{
+    ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
+};
+use super::process_group::ProcessGuardRegistry;
+use super::resolution::{WorkflowContentDigest, WorkflowSourceProvenance};
+use super::runtime::{
+    ExportSet, RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent, WorkflowState,
+};
+use super::step_runtime::{
+    AgentExecution, StepFailureCause, WorkflowAgentDispatcher, WorkflowCommitPort,
+    execute_workflow_observed,
+};
+use super::value::CapturedValue;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowExecutionResult<Deadline = ()> {
+    pub outcome: RunOutcome,
+    pub steps: BTreeMap<String, StepState<CapturedValue>>,
+    pub recoveries: BTreeMap<String, Option<super::runtime::StepRecoveryState<StepFailureCause>>>,
+    pub finalization_summary: Option<super::runtime::FinalizationSummary<Deadline>>,
+    pub force_abort: Option<super::runtime::ForceAbortEvidence>,
+    pub exports: ExportSet<CapturedValue>,
+    pub provenance: WorkflowSourceProvenance,
+    pub content_digest: WorkflowContentDigest,
+}
+
+pub struct NoopCommitPort;
+
+impl<Commit> CommitPort<Commit> for NoopCommitPort {
+    type Error = Infallible;
+
+    fn commit(&mut self, _commit: Commit) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
+    }
+}
+
+struct DurableObserverCommitPort<Commits, Observer> {
+    commits: Commits,
+    observer: Observer,
+}
+
+impl<Deadline, Commits, Observer>
+    CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Deadline>>
+    for DurableObserverCommitPort<Commits, Observer>
+where
+    Deadline: Clone + Send + 'static,
+    Commits: CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Deadline>>,
+    Observer: ExecutionObserver<Deadline>,
+{
+    type Error = Commits::Error;
+
+    fn commit(
+        &mut self,
+        commit: CommittedReduction<StepFailureCause, CapturedValue, Deadline>,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        let state = commit.state.clone();
+        let events = commit.events.clone();
+        let committed = self.commits.commit(commit);
+        let observer = self.observer.clone();
+        async move {
+            committed.await?;
+            for event in events {
+                let step = observed_step_transition(&event, &state);
+                observer
+                    .observe(ExecutionObservation::Transition(Box::new(
+                        TransitionObservation { event, step },
+                    )))
+                    .await;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn observed_step_transition<Deadline>(
+    event: &TransitionEvent<Deadline>,
+    state: &RuntimeState<StepFailureCause, CapturedValue, Deadline>,
+) -> Option<ObservedStepTransition> {
+    let TransitionEvent::Step { step, from, to, .. } = event else {
+        return None;
+    };
+    let runtime = state.steps.get(step)?;
+    if matches!(
+        to,
+        StepStateKind::Starting
+            | StepStateKind::Running
+            | StepStateKind::CapturingOutputs
+            | StepStateKind::Recovering
+    ) && let Some(recovery) = runtime
+        .recovery
+        .as_ref()
+        .filter(|recovery| !recovery.rounds.is_empty())
+        && let Some(active) = runtime.active_invocation
+        && let Some(active_invocation_id) = runtime.current_action
+    {
+        let settled_invocation = if matches!(
+            from,
+            StepStateKind::Running | StepStateKind::CapturingOutputs
+        ) {
+            recovery.rounds.last().map(|round| {
+                (
+                    round.failed_execution.invocation,
+                    super::runtime::ActiveStepInvocation::Target {
+                        execution_number: round.failed_execution.execution_number,
+                    },
+                )
+            })
+        } else {
+            None
+        };
+        let handler_state = match runtime.state {
+            StepState::Recovering { handler, .. } => Some(handler),
+            _ => None,
+        };
+        let decision = recovery.rounds.last().and_then(|round| {
+            round
+                .handler
+                .as_ref()
+                .and_then(|handler| match handler.outcome {
+                    super::runtime::RecoveryHandlerOutcome::Recheck { .. } => {
+                        Some(super::runtime::RecoveryDecisionKind::Recheck)
+                    }
+                    super::runtime::RecoveryHandlerOutcome::GaveUp { .. } => {
+                        Some(super::runtime::RecoveryDecisionKind::GaveUp)
+                    }
+                    super::runtime::RecoveryHandlerOutcome::Starting
+                    | super::runtime::RecoveryHandlerOutcome::Running
+                    | super::runtime::RecoveryHandlerOutcome::Failed { .. }
+                    | super::runtime::RecoveryHandlerOutcome::Cancelled => None,
+                })
+        });
+        return Some(ObservedStepTransition::Recovery {
+            active,
+            active_invocation_id,
+            settled_invocation,
+            configured_rounds: recovery.configured_rounds,
+            handler_kind: recovery.handler_kind,
+            handler_state,
+            decision,
+        });
+    }
+    match (to, &runtime.state) {
+        (StepStateKind::Succeeded, StepState::Succeeded { outputs }) => {
+            Some(ObservedStepTransition::OutputsCommitted {
+                outputs: outputs.keys().cloned().collect(),
+            })
+        }
+        (StepStateKind::Failed, StepState::Failed { detail }) => {
+            Some(ObservedStepTransition::Failed {
+                detail: detail.clone(),
+            })
+        }
+        (StepStateKind::Blocked, StepState::Blocked { detail }) => {
+            Some(ObservedStepTransition::Blocked {
+                detail: detail.clone(),
+            })
+        }
+        (StepStateKind::Skipped, StepState::Skipped { detail }) => {
+            Some(ObservedStepTransition::Skipped {
+                detail: detail.clone(),
+            })
+        }
+        (StepStateKind::NotRun, StepState::NotRun { detail }) => {
+            Some(ObservedStepTransition::NotRun { detail: *detail })
+        }
+        (StepStateKind::Cancelling, StepState::Cancelling { detail }) => {
+            Some(ObservedStepTransition::Cancelling { detail: *detail })
+        }
+        (StepStateKind::Cancelled, StepState::Cancelled { detail }) => {
+            Some(ObservedStepTransition::Cancelled { detail: *detail })
+        }
+        _ => None,
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the local adapter additionally supplies durable process-guard registration"
+)]
+pub async fn execute_workflow<Clock, Commits, Observer, Dispatcher>(
+    admitted: AdmittedWorkflow,
+    artifacts: &ArtifactStaging,
+    inputs: &InputStaging,
+    diagnostics: &StepDiagnosticLog,
+    agents: AgentExecution<Dispatcher>,
+    clock: Clock,
+    commits: Commits,
+    observer: Observer,
+    process_guards: ProcessGuardRegistry,
+) -> Result<WorkflowExecutionResult<Clock::Instant>, CoordinationError>
+// This result projection intentionally repeats the shared runtime's generic port
+// constraints so it can preserve its distinct domain result.
+// jscpd:ignore-start
+where
+    Clock: CoordinatorClock,
+    Clock::Instant: Sync,
+    Commits: WorkflowCommitPort<Clock>,
+    Observer: ExecutionObserver<Clock::Instant>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
+    // jscpd:ignore-end
+{
+    let provenance = admitted.workflow().source.clone();
+    let content_digest = admitted.workflow().content_digest.clone();
+    let coordinated = execute_workflow_observed(
+        admitted,
+        artifacts,
+        inputs,
+        diagnostics,
+        clock,
+        DurableObserverCommitPort {
+            commits,
+            observer: observer.clone(),
+        },
+        observer,
+        agents,
+        process_guards,
+    )
+    .await?;
+    let outcome = match coordinated.state.workflow {
+        WorkflowState::Succeeded => RunOutcome::Succeeded,
+        WorkflowState::Failed {
+            primary_issue,
+            later_cancellation,
+        } => RunOutcome::Failed {
+            primary_issue,
+            later_cancellation,
+        },
+        WorkflowState::Cancelled { reason } => RunOutcome::Cancelled { reason },
+        WorkflowState::Executing { .. } | WorkflowState::Finalizing { .. } => {
+            return Err(CoordinationError::ReducerStateUnavailable);
+        }
+    };
+    let (steps, recoveries) = coordinated
+        .state
+        .steps
+        .into_iter()
+        .map(|(step, runtime)| ((step.clone(), runtime.state), (step, runtime.recovery)))
+        .unzip();
+    let finalization_summary = coordinated.state.finalization_summary;
+    let force_abort = coordinated.state.force_abort;
+    let exports = coordinated
+        .state
+        .exports
+        .ok_or(CoordinationError::ReducerStateUnavailable)?;
+    Ok(WorkflowExecutionResult {
+        outcome,
+        steps,
+        recoveries,
+        finalization_summary,
+        force_abort,
+        exports,
+        provenance,
+        content_digest,
+    })
+}
+
+#[cfg(test)]
+mod tests;

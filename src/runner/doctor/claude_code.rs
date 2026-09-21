@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::{
     CheckDescriptor, DoctorCheck, Outcome, capability_failure_details, compatible_harness_outcome,
 };
-use crate::execution::{
+use scherzo_cloud_execution::{
     CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION, CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE,
     ClaudeCodeCompatibilityProfile, ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure,
     ClaudeCodeProbe, discover_and_validate_claude_code_installation,

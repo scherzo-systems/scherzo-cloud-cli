@@ -22,9 +22,9 @@ use super::source::{
 use super::test_support::{
     ConfigFixture, DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
 };
-use crate::execution::CaptureCancellation;
 use crate::runner::credential::test_credential;
 use crate::runner::telemetry::test_recorder;
+use scherzo_cloud_execution::CaptureCancellation;
 
 const REPLAY_BOOT_ID: &str = "rbt_00000000000000000000000001";
 const REPLAY_TIMESTAMP: &str = "2026-07-23T00:00:00Z";

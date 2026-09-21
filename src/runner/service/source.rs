@@ -18,12 +18,12 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 use zeroize::Zeroize as _;
 
-use crate::execution::{
-    CaptureCancellation, CloudGitCaptureProjection, EnvironmentSnapshot, ResolvedWorkflow, resolve,
-};
-use crate::process::ManagedProcessGroup;
 use crate::runner::credential::Credential;
 use crate::runner::service::config::RepositoryUrlPolicy;
+use scherzo_cloud_execution::ManagedProcessGroup;
+use scherzo_cloud_execution::{
+    CaptureCancellation, CloudGitCaptureProjection, EnvironmentSnapshot, ResolvedWorkflow, resolve,
+};
 use scherzo_cloud_runner_protocol::ExecutionSpecV1RunnerProjection;
 
 const SOURCE_BROKER_RESPONSE_LIMIT: usize = 128 * 1024;
@@ -1750,15 +1750,15 @@ mod tests {
     use nix::unistd::mkfifo;
 
     use super::*;
-    use crate::execution::{
+    use crate::runner::credential::test_credential;
+    use crate::runner::telemetry::test_recorder;
+    use scherzo_cloud_execution::{
         ArtifactStaging, CancellationPolicy, CancellationSource, CapturedDiagnosticStream,
         CapturedValue, CloudCarrierBody, ExecutionContext, ExportValue, FailurePolicy,
         ResolvedInputs, RunOutcome, StepDiagnostic, StepState, WorkflowNodeRole, WorkflowRunResult,
         WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
         admit_runner_workflow, default_execution_policy_limits, prepare_cloud_workflow_result,
     };
-    use crate::runner::credential::test_credential;
-    use crate::runner::telemetry::test_recorder;
 
     use super::test_support::{fixture_credential, materialize};
 
@@ -2243,7 +2243,7 @@ mod tests {
     }
 
     fn fixture_git_command() -> Command {
-        crate::test_support::fixture_git_command("git")
+        scherzo_cloud_test_support::fixture_git_command("git")
     }
 
     fn run_fixture_git(repository: &Path, arguments: &[&str]) {
@@ -2896,7 +2896,7 @@ mod tests {
                 CloudCarrierBody::Bytes(bytes) => fs::write(destination, bytes).unwrap(),
             }
         }
-        let validation = crate::execution::validate_portable_artifact_set(
+        let validation = scherzo_cloud_execution::validate_portable_artifact_set(
             portable.path(),
             &AtomicBool::new(false),
         )

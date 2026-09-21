@@ -9,11 +9,11 @@ use clap::Args;
 use serde::Serialize;
 // jscpd:ignore-end
 
-use crate::execution::{
+use crate::exit_code::{ExitCode, OutcomeClass};
+use scherzo_cloud_execution::{
     ArtifactDiagnostic, ArtifactValidationSummary, PortableArtifactValidation,
     PortableArtifactValidationFailure, validate_portable_artifact_set, visible_text,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "Validate a portable workflow artifact directory";
 const COMMAND: &str = "scherzo-cloud artifact validate";

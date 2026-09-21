@@ -2077,7 +2077,6 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
- "crossterm",
  "flate2",
  "fs4",
  "futures-util",
@@ -2089,11 +2088,11 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "ratatui",
  "reqwest",
  "ring",
  "rustix",
  "scherzo-cloud-api",
+ "scherzo-cloud-execution",
  "scherzo-cloud-runner-protocol",
  "scherzo-cloud-support",
  "scherzo-cloud-test-support",
@@ -2105,10 +2104,7 @@ dependencies = [
  "tokio-tungstenite",
  "trycmd",
  "ulid",
- "unicode-segmentation",
- "unicode-width",
  "url",
- "yaml-rust2",
  "zeroize",
 ]
 
@@ -2133,6 +2129,35 @@ dependencies = [
  "tokio",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "scherzo-cloud-execution"
+version = "0.0.0-dev"
+dependencies = [
+ "base64",
+ "crossterm",
+ "flate2",
+ "fs4",
+ "futures-util",
+ "getrandom 0.4.3",
+ "jsonschema",
+ "libc",
+ "nix",
+ "ratatui",
+ "ring",
+ "rustix",
+ "scherzo-cloud-support",
+ "scherzo-cloud-test-support",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "ulid",
+ "unicode-segmentation",
+ "unicode-width",
+ "yaml-rust2",
 ]
 
 [[package]]

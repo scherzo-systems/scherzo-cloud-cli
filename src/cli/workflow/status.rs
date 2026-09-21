@@ -5,13 +5,13 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::execution::{
+use crate::exit_code::ExitCode;
+use scherzo_cloud_execution::{
     ColorChoice, FailureDetail, LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot,
     LocalStatusError, LocalStatusResult, NodeDetail, PresentationConfig, RequestedPresentationMode,
     RetryIneligibilityReason, TerminalCapabilities, WorkflowResultV1, load_local_archived_attempt,
     read_local_run_status, reconcile_current_result_publication, styled_terminal_text as styled,
 };
-use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
 

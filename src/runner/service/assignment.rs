@@ -23,7 +23,9 @@ use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, RetentionReason,
     WorkRootLease, WorkspaceDisposition,
 };
-use crate::execution::{
+use crate::runner::control_protocol::AssignmentCounts;
+use crate::runner::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
+use scherzo_cloud_execution::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationReason, CancellationSource, CaptureCancellation, CloudGitCaptureProjection,
     EnvironmentSnapshot, ExecutionContext, MAXIMUM_CANCELLATION_GRACE, MAXIMUM_PARALLEL_STEPS,
@@ -32,8 +34,6 @@ use crate::execution::{
     ValidatedCodexInstallation, ValidatedPiInstallation, WorkflowCapacityBudget,
     admit_runner_workflow, default_execution_policy_limits,
 };
-use crate::runner::control_protocol::AssignmentCounts;
-use crate::runner::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 use scherzo_cloud_runner_protocol::{
     AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ExecutionLeaseGrant,
     ExecutionLeasePolicy, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection,
@@ -4890,10 +4890,6 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::execution::{
-        CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedClaudeCodeInstallation,
-        ValidatedCodexInstallation, ValidatedPiInstallation, resolve,
-    };
     use crate::runner::credential::test_credential;
     use crate::runner::service::assignment::test_support::{
         active_step_count, align_fixture_capacity,
@@ -4912,6 +4908,10 @@ mod tests {
     use crate::runner::service::workspace::{
         CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook,
         WorkspaceFilesystem,
+    };
+    use scherzo_cloud_execution::{
+        CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedClaudeCodeInstallation,
+        ValidatedCodexInstallation, ValidatedPiInstallation, resolve,
     };
     use scherzo_cloud_runner_protocol::{
         ArtifactRegistrationOutcome, ArtifactRegistrationResponse,
@@ -5071,7 +5071,7 @@ for argument in "$@"; do
   esac
 done
 exec "$CODEX_FIXTURE_HELPER" \
-  --exact execution::workflow::codex_app_server_v1::adapter_tests::codex_process_fixture \
+  --exact runner::service::assignment::tests::codex_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null
 "#;
@@ -5311,6 +5311,245 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         control.read_exact(&mut release).unwrap();
         assert_eq!(release, [1]);
     }
+
+    // The runner owns this narrow cross-package fixture because its tests launch the
+    // already-running root test binary. Keep only the success and process-quiescence
+    // scenarios needed to verify runner integration; the execution crate owns the full
+    // Codex protocol fixture and conformance matrix.
+    // jscpd:ignore-start
+    fn write_codex_fixture_frame(output: &mut impl std::io::Write, value: Value) {
+        serde_json::to_writer(&mut *output, &value).unwrap();
+        output.write_all(b"\n").unwrap();
+        output.flush().unwrap();
+    }
+
+    fn read_codex_fixture_frame(
+        input: &mut impl std::io::BufRead,
+        capture: &mut impl std::io::Write,
+    ) -> Value {
+        let mut line = String::new();
+        assert!(input.read_line(&mut line).unwrap() > 0);
+        capture.write_all(line.as_bytes()).unwrap();
+        capture.flush().unwrap();
+        serde_json::from_str(line.trim_end()).unwrap()
+    }
+
+    fn codex_fixture_thread(cwd: &str, version: &str) -> Value {
+        json!({
+            "id": "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12",
+            "sessionId": "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12",
+            "forkedFromId": null,
+            "parentThreadId": null,
+            "ephemeral": true,
+            "path": null,
+            "cliVersion": version,
+            "turns": [],
+            "cwd": cwd,
+            "modelProvider": "loopback",
+        })
+    }
+
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the runner process guard force-terminates and reaps this deliberate descendant"
+    )]
+    fn materialize_runner_stubborn_descendant() {
+        let descendant = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' INT TERM; while :; do sleep 60; done"])
+            .spawn()
+            .unwrap();
+        fs::write(
+            std::env::var_os("CODEX_FIXTURE_DESCENDANT").unwrap(),
+            format!("{}\n", descendant.id()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "launched only as the runner's deterministic Codex process fixture"]
+    fn codex_process_fixture() {
+        const THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
+        const TURN_ID: &str = "turn-fixture";
+
+        let scenario = std::env::var("CODEX_FIXTURE_SCENARIO").unwrap();
+        assert!(matches!(
+            scenario.as_str(),
+            "no-value" | "failure-after-start-stubborn" | "cancellation-stubborn"
+        ));
+        let sqlite_home = PathBuf::from(std::env::var_os("CODEX_FIXTURE_SQLITE_HOME").unwrap());
+        assert!(sqlite_home.is_absolute());
+        fs::write(
+            sqlite_home.join("state_5.sqlite"),
+            b"transient fixture state\n",
+        )
+        .unwrap();
+        fs::write(
+            std::env::var_os("CODEX_FIXTURE_PROCESS").unwrap(),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+
+        let mut capture =
+            fs::File::create(std::env::var_os("CODEX_FIXTURE_REQUESTS").unwrap()).unwrap();
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/fd/3")
+            .unwrap();
+        let version = std::env::var("CODEX_FIXTURE_VERSION").unwrap();
+
+        let initialize = read_codex_fixture_frame(&mut input, &mut capture);
+        assert_eq!(initialize["id"], 1);
+        write_codex_fixture_frame(
+            &mut output,
+            json!({"id": 1, "result": {
+                "userAgent": format!("codex/{version}"),
+                "codexHome": std::env::var("CODEX_HOME").unwrap(),
+            }}),
+        );
+        assert_eq!(
+            read_codex_fixture_frame(&mut input, &mut capture)["method"],
+            "initialized"
+        );
+        let config = read_codex_fixture_frame(&mut input, &mut capture);
+        assert_eq!(config["id"], 2);
+        write_codex_fixture_frame(
+            &mut output,
+            json!({
+                "method": "configWarning",
+                "params": {"summary": "synthetic effective configuration warning"},
+            }),
+        );
+        write_codex_fixture_frame(
+            &mut output,
+            json!({"id": 2, "result": {
+                "config": {
+                    "developer_instructions": "native developer instructions",
+                    "sqlite_home": std::env::var("CODEX_FIXTURE_SQLITE_HOME").unwrap(),
+                    "model_provider": "loopback",
+                    "model_providers": {"loopback": {"wire_api": "responses"}},
+                    "projects": {"fixture-project": {"trust_level": "trusted"}},
+                    "hooks": {"enabled": true},
+                    "mcp_servers": {"native": {"required": true}},
+                    "skills": {"enabled": true},
+                },
+                "origins": {"developer_instructions": {"name": {"type": "user"}}},
+                "layers": [{"name": {"type": "user"}}],
+            }}),
+        );
+
+        let thread = read_codex_fixture_frame(&mut input, &mut capture);
+        assert_eq!(thread["id"], 3);
+        let cwd = thread["params"]["cwd"].as_str().unwrap();
+        let thread = codex_fixture_thread(cwd, &version);
+        write_codex_fixture_frame(
+            &mut output,
+            json!({"id": 3, "result": {
+                "thread": thread,
+                "model": "gpt-5.4",
+                "modelProvider": "loopback",
+                "cwd": cwd,
+                "approvalPolicy": "never",
+                "sandbox": {"type": "dangerFullAccess"},
+            }}),
+        );
+        let turn = read_codex_fixture_frame(&mut input, &mut capture);
+        assert_eq!(turn["id"], 4);
+        write_codex_fixture_frame(
+            &mut output,
+            json!({"method": "thread/started", "params": {"thread": thread}}),
+        );
+        write_codex_fixture_frame(
+            &mut output,
+            json!({"id": 4, "result": {"turn": {
+                "id": TURN_ID, "items": [], "status": "inProgress"
+            }}}),
+        );
+        write_codex_fixture_frame(
+            &mut output,
+            json!({"method": "turn/started", "params": {
+                "threadId": THREAD_ID,
+                "turn": {"id": TURN_ID, "items": [], "status": "inProgress"},
+            }}),
+        );
+
+        if scenario == "cancellation-stubborn" {
+            fs::write(std::env::var_os("CODEX_FIXTURE_READY").unwrap(), b"ready\n").unwrap();
+            let interrupt = read_codex_fixture_frame(&mut input, &mut capture);
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            materialize_runner_stubborn_descendant();
+            loop {
+                std::thread::park();
+            }
+        }
+        if scenario == "failure-after-start-stubborn" {
+            materialize_runner_stubborn_descendant();
+            write_codex_fixture_frame(
+                &mut output,
+                json!({"method": "error", "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": TURN_ID,
+                    "error": {"message": "native execution diagnostic", "codexErrorInfo": "other"},
+                    "willRetry": false,
+                }}),
+            );
+            write_codex_fixture_frame(
+                &mut output,
+                json!({"method": "turn/completed", "params": {
+                    "threadId": THREAD_ID,
+                    "turn": {
+                        "id": TURN_ID,
+                        "items": [],
+                        "status": "failed",
+                        "error": {"message": "terminal prose differs", "codexErrorInfo": "other"},
+                    },
+                }}),
+            );
+        } else {
+            let response = std::env::var("CODEX_FIXTURE_RESPONSE").unwrap();
+            write_codex_fixture_frame(
+                &mut output,
+                json!({"method": "item/started", "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": TURN_ID,
+                    "item": {"id": "message-1", "type": "agentMessage", "text": "", "phase": null},
+                }}),
+            );
+            write_codex_fixture_frame(
+                &mut output,
+                json!({"method": "item/agentMessage/delta", "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": TURN_ID,
+                    "itemId": "message-1",
+                    "delta": response,
+                }}),
+            );
+            write_codex_fixture_frame(
+                &mut output,
+                json!({"method": "item/completed", "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": TURN_ID,
+                    "item": {"id": "message-1", "type": "agentMessage", "text": response, "phase": "final_answer"},
+                }}),
+            );
+            write_codex_fixture_frame(
+                &mut output,
+                json!({"method": "turn/completed", "params": {
+                    "threadId": THREAD_ID,
+                    "turn": {
+                        "id": TURN_ID,
+                        "items": [{"id": "message-1", "type": "agentMessage", "text": response, "phase": "final_answer"}],
+                        "status": "completed",
+                    },
+                }}),
+            );
+        }
+        let mut trailing = Vec::new();
+        input.read_to_end(&mut trailing).unwrap();
+        assert!(trailing.is_empty());
+    }
+    // jscpd:ignore-end
 
     // Keep commands alive until the test observes them. Bare `true` and `false`
     // commands can exit before the direct-child test path captures their process identity.
@@ -5617,7 +5856,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     fn run_fixture_git(repository: &Path, arguments: &[&str]) -> String {
-        let output = crate::test_support::fixture_git_command("git")
+        let output = scherzo_cloud_test_support::fixture_git_command("git")
             .current_dir(repository)
             .args(arguments)
             .output()

@@ -16,9 +16,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::unix::AsyncFd;
 
+use crate::exit_code::{ExitCode, OutcomeClass};
 #[cfg(test)]
-use crate::execution::admit_workflow;
-use crate::execution::{
+use scherzo_cloud_execution::admit_workflow;
+use scherzo_cloud_execution::{
     ActionId, AdmittedWorkflow, AgentExecution, AgentHarnessInstallationFailure, AgentInputStaging,
     ArtifactStaging, CancellationPolicy, CancellationReason, CancellationSource, ColorChoice,
     CoordinationError, CoordinatorClock, DisplayDeadline, DurableDeadline,
@@ -44,7 +45,6 @@ use crate::execution::{
     production_agent_dispatcher, publish_prepared_workflow_result, resolve_workflow_file,
     step_recovery_summary_v1, summary_disposition_matches,
 };
-use crate::exit_code::{ExitCode, OutcomeClass};
 
 pub(super) const ABOUT: &str = "Run a local command and agent workflow";
 pub(super) const AFTER_HELP: &str = "Interactive mode:
@@ -1026,7 +1026,7 @@ fn input_argument<'a>(value: Option<&'a OsString>, description: &str) -> anyhow:
 }
 
 fn validate_input_name(name: &str) -> anyhow::Result<()> {
-    if !crate::execution::is_input_name(name) {
+    if !scherzo_cloud_execution::is_input_name(name) {
         return Err(anyhow!("invalid Workflow V1 input name"));
     }
     Ok(())
@@ -2089,7 +2089,7 @@ mod tests {
     use time::format_description::well_known::Rfc3339;
 
     use super::*;
-    use crate::execution::{
+    use scherzo_cloud_execution::{
         ObservationTime, SchedulingGate, StepStateKind, TransitionEvent, TransitionObservation,
         TransitionSequence, WorkflowState, resolve,
     };

@@ -1,0 +1,1288 @@
+use std::ffi::OsString;
+use std::fs;
+use std::future::{Future, pending};
+use std::io;
+use std::num::NonZeroU64;
+use std::ops::Add as _;
+use std::os::unix::process::CommandExt as _;
+use std::path::Path;
+use std::pin::Pin;
+use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
+
+use rustix::process::Pid;
+use tokio::io::AsyncReadExt as _;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot};
+
+use super::input_transport::PreparedInputTransport;
+use super::result_bridge::{
+    IncomingResultRequest, PreparedResultBridge, ResultSocketEvent, ValidatePiResultV1Response,
+};
+use super::{
+    AcceptedPiJsonV1Result, PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits,
+};
+use crate::pi::{PiCompatibilityProfile, compatibility_profile_for_version};
+use crate::workflow::admission::{CancellationReason, CancellationSource};
+use crate::workflow::agent::{
+    AgentAdapter, AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentInputKind,
+    AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
+    AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
+    AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, check_agent_input_bound,
+    failed_agent_outcome, finish_agent_diagnostic_capture, run_cancellable_blocking_launch,
+};
+use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
+use crate::workflow::child_guard::{
+    ChildGuardCancellation, StoppedChildGuard, force_stop_direct_child,
+};
+use crate::workflow::coordinator::CoordinatorClock;
+use crate::workflow::diagnostic::StepDiagnosticLog;
+use crate::workflow::observation::{ExecutionObserver, NoopExecutionObserver};
+use crate::workflow::pi::PiConfig;
+use crate::workflow::process_group::{
+    ProcessGuardRegistration, interrupt_process_group, mark_process_guard_quiesced,
+    process_group_is_quiescent, reap_process_group_children, terminate_authenticated_process_group,
+    terminate_process_group,
+};
+use crate::workflow::result_validation::{
+    AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
+    ResultValidationOutcome, ResultValidationWorker,
+};
+
+pub(crate) struct PiJsonV1Adapter<
+    Clock,
+    Observer = NoopExecutionObserver,
+    Worker = ProcessResultValidationWorker,
+> {
+    diagnostics: StepDiagnosticLog,
+    maximum_diagnostic_stream_bytes: NonZeroU64,
+    clock: Clock,
+    observer: Observer,
+    validation_worker: Worker,
+}
+
+impl<Clock, Observer> PiJsonV1Adapter<Clock, Observer, ProcessResultValidationWorker> {
+    pub(crate) fn new(
+        diagnostics: StepDiagnosticLog,
+        maximum_diagnostic_stream_bytes: NonZeroU64,
+        clock: Clock,
+        observer: Observer,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            diagnostics,
+            maximum_diagnostic_stream_bytes,
+            clock,
+            observer,
+            validation_worker: ProcessResultValidationWorker::for_current_executable()?,
+        })
+    }
+}
+
+impl<Clock, Observer, Worker> PiJsonV1Adapter<Clock, Observer, Worker> {
+    #[cfg(test)]
+    pub(super) fn with_validation_worker(
+        diagnostics: StepDiagnosticLog,
+        maximum_diagnostic_stream_bytes: NonZeroU64,
+        clock: Clock,
+        observer: Observer,
+        validation_worker: Worker,
+    ) -> Self {
+        Self {
+            diagnostics,
+            maximum_diagnostic_stream_bytes,
+            clock,
+            observer,
+            validation_worker,
+        }
+    }
+}
+
+impl<Clock, Observer, Worker> Clone for PiJsonV1Adapter<Clock, Observer, Worker>
+where
+    Clock: Clone,
+    Observer: Clone,
+    Worker: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            diagnostics: self.diagnostics.clone(),
+            maximum_diagnostic_stream_bytes: self.maximum_diagnostic_stream_bytes,
+            clock: self.clock.clone(),
+            observer: self.observer.clone(),
+            validation_worker: self.validation_worker.clone(),
+        }
+    }
+}
+
+// The trait boilerplate matches the scripted adapter, but each adapter owns a
+// distinct lifecycle and keeping their invocation logic separate avoids coupling them.
+// jscpd:ignore-start
+impl<Clock, Observer, Worker, Sink> AgentAdapter<Sink> for PiJsonV1Adapter<Clock, Observer, Worker>
+where
+    Clock: CoordinatorClock,
+    Observer: ExecutionObserver<Clock::Instant>,
+    Worker: ResultValidationWorker,
+    Sink: AgentObservationSink,
+{
+    type NativeConfiguration = PiConfig;
+    type ProtocolLimits = PiJsonV1ProtocolLimits;
+
+    async fn invoke(
+        &self,
+        invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
+        started: AgentStartCallback,
+        terminal: AgentTerminalCallback,
+    ) {
+        let cancellation = invocation.cancellation().clone();
+        let outcome = self.invoke_inner(invocation, &started).await;
+        let outcome = cancellation
+            .cancellation_reason()
+            .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
+        let _ = terminal.report(outcome);
+    }
+}
+// jscpd:ignore-end
+
+impl<Clock, Observer, Worker> PiJsonV1Adapter<Clock, Observer, Worker>
+where
+    Clock: CoordinatorClock,
+    Observer: ExecutionObserver<Clock::Instant>,
+    Worker: ResultValidationWorker,
+{
+    async fn invoke_inner<Sink>(
+        &self,
+        invocation: AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+        started: &AgentStartCallback,
+    ) -> AgentOutcome
+    where
+        Sink: AgentObservationSink,
+    {
+        if let Some(reason) = invocation.cancellation().cancellation_reason() {
+            return AgentOutcome::Cancelled { reason };
+        }
+
+        let adapter = self.clone();
+        let (invocation, preparation) = match tokio::task::spawn_blocking(move || {
+            let preparation = prepare_launch(&invocation).and_then(|mut plan| {
+                let result_bridge = adapter.prepare_result_bridge(&invocation)?;
+                if let Some(result_bridge) = result_bridge.as_ref() {
+                    plan.add_result_extension(result_bridge.bridge.extension_path());
+                }
+                Ok((plan, result_bridge))
+            });
+            (invocation, preparation)
+        })
+        .await
+        {
+            Ok(preparation) => preparation,
+            Err(_) => return failed(AgentFailureCause::HarnessStartFailed),
+        };
+        let (plan, mut result_bridge) = match preparation {
+            Ok(preparation) => preparation,
+            Err(cause) => return failed(cause),
+        };
+        let launch = if invocation.process_guards().is_durable() {
+            let cancellation_source = invocation.cancellation().clone();
+            let diagnostics = self.diagnostics.clone();
+            let maximum_stream_bytes = self.maximum_diagnostic_stream_bytes;
+            match run_cancellable_blocking_launch(
+                &cancellation_source,
+                move |launch_cancellation| {
+                    let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
+                        log: &diagnostics,
+                        maximum_stream_bytes,
+                    };
+                    let launched = launch_guarded_process(
+                        &invocation,
+                        &plan,
+                        spawn_diagnostics,
+                        &launch_cancellation,
+                    );
+                    (invocation, plan, launched)
+                },
+            )
+            .await
+            {
+                Ok((launch, cancellation_reason)) => (launch, cancellation_reason),
+                Err(_) => {
+                    let _ = shutdown_result_bridge(result_bridge).await;
+                    return failed(AgentFailureCause::HarnessStartFailed);
+                }
+            }
+        } else {
+            let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
+                log: &self.diagnostics,
+                maximum_stream_bytes: self.maximum_diagnostic_stream_bytes,
+            };
+            let launched = launch_direct_process(&invocation, &plan, spawn_diagnostics).await;
+            ((invocation, plan, launched), None)
+        };
+        let ((mut invocation, plan, launched), cancellation_reason) = launch;
+        if let Some(reason) = cancellation_reason {
+            if let Ok((mut process, _)) = launched {
+                let _ = process.child.force_stop(process.process_group).await;
+            }
+            let _ = shutdown_result_bridge(result_bridge).await;
+            return AgentOutcome::Cancelled { reason };
+        }
+        let (process, standard_error) = match launched {
+            Ok(launched) => launched,
+            Err(cause) => {
+                let _ = shutdown_result_bridge(result_bridge).await;
+                return failed(cause);
+            }
+        };
+        let Some(process_directives) = invocation.take_process_directives() else {
+            let mut process = process;
+            let _ = process.child.force_stop(process.process_group).await;
+            let _ = shutdown_result_bridge(result_bridge).await;
+            return failed(AgentFailureCause::HarnessStartFailed);
+        };
+        let diagnostic = self.diagnostics.start_standard_error_capture(
+            invocation.identity().step().to_owned(),
+            invocation.identity().invocation(),
+            self.maximum_diagnostic_stream_bytes,
+            standard_error,
+            self.observer.clone(),
+        );
+        let expected_result_tool_name = result_bridge
+            .as_ref()
+            .map(|result_bridge| Arc::clone(result_bridge.bridge.tool_name()));
+        let parser = PiJsonV1Parser::new(
+            Arc::clone(&plan.expected_cwd),
+            invocation.value_mode().kind(),
+            invocation.limits().maximum_response_bytes(),
+            *invocation.limits().adapter_protocol(),
+            expected_result_tool_name,
+        );
+        let outcome = drive_process(
+            &invocation,
+            started,
+            process,
+            parser,
+            process_directives,
+            &mut result_bridge,
+            ResultSettlementConfiguration {
+                clock: self.clock.clone(),
+                grace: invocation.limits().result_settlement_grace(),
+            },
+        )
+        .await;
+        let bridge_shutdown = shutdown_result_bridge(result_bridge).await;
+        finish_agent_diagnostic_capture(invocation.diagnostic_session(), diagnostic, &outcome)
+            .await;
+        if bridge_shutdown.is_err() && matches!(outcome, AgentOutcome::Completed(_)) {
+            failed(AgentFailureCause::HarnessProtocolFailed)
+        } else {
+            outcome
+        }
+    }
+
+    fn prepare_result_bridge<Sink>(
+        &self,
+        invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    ) -> Result<Option<ActiveResultBridge<Clock, Worker>>, AgentFailureCause>
+    where
+        Sink: AgentObservationSink,
+    {
+        let AgentValueMode::Result { schema, .. } = invocation.value_mode() else {
+            return Ok(None);
+        };
+        let bridge = PreparedResultBridge::prepare(
+            invocation.identity(),
+            invocation.staging().result_endpoint_directory(),
+            schema,
+            *invocation.limits().adapter_protocol(),
+            invocation.limits().result_validation_deadline(),
+            self.clock.clone(),
+        )
+        .map_err(|()| AgentFailureCause::HarnessStartFailed)?;
+        let validator = AuthoritativeResultValidator::new(
+            schema.clone(),
+            invocation.limits().maximum_result_bytes(),
+            invocation
+                .limits()
+                .maximum_result_rejection_feedback_bytes(),
+            invocation.limits().result_validation_deadline(),
+            self.clock.clone(),
+            self.validation_worker.clone(),
+        );
+        Ok(Some(ActiveResultBridge { bridge, validator }))
+    }
+}
+
+struct ActiveResultBridge<Clock, Worker> {
+    bridge: PreparedResultBridge,
+    validator: AuthoritativeResultValidator<Clock, Worker>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct PiJsonV1LaunchPlan {
+    arguments: Vec<OsString>,
+    result_extension_argument_index: usize,
+    expected_cwd: Arc<str>,
+}
+
+impl PiJsonV1LaunchPlan {
+    fn add_result_extension(&mut self, extension_path: &std::path::Path) {
+        self.arguments.splice(
+            self.result_extension_argument_index..self.result_extension_argument_index,
+            [
+                OsString::from("--extension"),
+                extension_path.as_os_str().to_owned(),
+            ],
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn arguments(&self) -> &[OsString] {
+        &self.arguments
+    }
+}
+
+pub(super) fn prepare_launch<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+) -> Result<PiJsonV1LaunchPlan, AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
+    check_agent_input_bound(
+        invocation.prompt().message(),
+        invocation.limits().maximum_message_bytes(),
+        AgentInputKind::Message,
+    )?;
+
+    if invocation.adapter().profile() != AgentCompatibilityProfile::PiJsonV1
+        || compatibility_profile_for_version(invocation.adapter().version())
+            != Some(PiCompatibilityProfile::PiJsonV1)
+        || !invocation.adapter().executable().is_absolute()
+        || invocation
+            .diagnostic_session()
+            .verify_pi_native_session_path_binding()
+            .is_err()
+    {
+        return Err(AgentFailureCause::HarnessStartFailed);
+    }
+    let expected_cwd = invocation
+        .process()
+        .protocol_cwd()
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    let system_prompt = combined_system_prompt(
+        &expected_cwd,
+        invocation.prompt().system_prompt(),
+        invocation.limits().maximum_system_prompt_bytes(),
+    )?;
+    let expected_cwd = expected_cwd
+        .to_str()
+        .map(Arc::from)
+        .ok_or(AgentFailureCause::HarnessStartFailed)?;
+    let staged_system_prompt =
+        (system_prompt.len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES).then_some(system_prompt.as_str());
+    let staged_message = if invocation.prompt().message().len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
+        Some(
+            invocation
+                .staging()
+                .message_file()
+                .ok_or(AgentFailureCause::HarnessStartFailed)?,
+        )
+    } else {
+        None
+    };
+    let input_transport = PreparedInputTransport::prepare(
+        invocation.identity(),
+        invocation.staging().result_endpoint_directory(),
+        staged_system_prompt,
+        staged_message,
+    )
+    .map_err(|()| AgentFailureCause::HarnessStartFailed)?;
+
+    let config = invocation.adapter().native_configuration();
+    let mut arguments = Vec::with_capacity(15_usize.saturating_add(invocation.attachments().len()));
+    arguments.extend([
+        OsString::from("--mode"),
+        OsString::from("json"),
+        OsString::from("--approve"),
+        OsString::from("--session-dir"),
+        invocation
+            .diagnostic_session()
+            .pi_native_session_directory()
+            .ok_or(AgentFailureCause::HarnessStartFailed)?
+            .as_os_str()
+            .to_owned(),
+        OsString::from("--model"),
+        OsString::from(&config.model),
+        OsString::from("--thinking"),
+        OsString::from(config.thinking.as_str()),
+        OsString::from("--append-system-prompt"),
+        input_transport
+            .system_prompt_marker()
+            .map_or_else(|| OsString::from(system_prompt), OsString::from),
+    ]);
+    arguments.extend([
+        OsString::from("--extension"),
+        input_transport.extension_path().as_os_str().to_owned(),
+    ]);
+    let result_extension_argument_index = arguments.len();
+    for attachment in invocation.attachments() {
+        let mut argument = OsString::from("@");
+        argument.push(attachment.path());
+        arguments.push(argument);
+    }
+    if let Some(message_marker) = input_transport.message_marker() {
+        arguments.push(OsString::from(message_marker));
+    } else {
+        let mut message = OsString::from("\n");
+        message.push(invocation.prompt().message());
+        arguments.push(message);
+    }
+
+    Ok(PiJsonV1LaunchPlan {
+        arguments,
+        result_extension_argument_index,
+        expected_cwd,
+    })
+}
+
+pub(super) fn build_command<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    plan: &PiJsonV1LaunchPlan,
+) -> Result<Command, AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
+    invocation
+        .diagnostic_session()
+        .verify_pi_native_session_path_binding()
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    let mut command = Command::new(invocation.adapter().executable());
+    command
+        .args(&plan.arguments)
+        .env_clear()
+        .envs(invocation.process().environment().variables())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.as_std_mut().process_group(0);
+    invocation
+        .process()
+        .bind_command(command.as_std_mut())
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    Ok(command)
+}
+
+async fn launch_direct_process<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    plan: &PiJsonV1LaunchPlan,
+    spawn_diagnostics: ProcessSpawnDiagnosticCapture<'_>,
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
+    let mut command = build_command(invocation, plan)?;
+    let child = command
+        .spawn()
+        .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
+    finish_direct_process_launch(child).await
+}
+
+fn launch_guarded_process<Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    plan: &PiJsonV1LaunchPlan,
+    spawn_diagnostics: ProcessSpawnDiagnosticCapture<'_>,
+    cancellation: &ChildGuardCancellation,
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
+where
+    Sink: AgentObservationSink,
+{
+    let environment = invocation
+        .process()
+        .environment()
+        .variables()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let mut child = StoppedChildGuard::spawn_cancellable(
+        invocation.adapter().executable(),
+        &plan.arguments,
+        &environment,
+        cancellation,
+        |command| {
+            invocation
+                .process()
+                .bind_command(command)
+                .map_err(|_| io::Error::other("agent working directory is unavailable"))
+        },
+    )
+    .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
+    let process_group = child.identity().process_group();
+    let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
+    else {
+        let _ = child.force_stop_blocking();
+        return Err(AgentFailureCause::HarnessStartFailed);
+    };
+    let mut registration = match invocation.process_guards().register(
+        invocation.identity().step(),
+        invocation.identity().invocation().transition_sequence.get(),
+        child.identity(),
+    ) {
+        Ok(registration) => registration,
+        Err(_) => {
+            let _ = child.force_stop_blocking();
+            return Err(AgentFailureCause::HarnessStartFailed);
+        }
+    };
+    if let Err(failure) = release_guarded_pi(invocation.diagnostic_session(), || {
+        child
+            .continue_execution_cancellable(cancellation)
+            .map_err(GuardedPiReleaseFailure::ProcessExec)?;
+        registration
+            .mark_released()
+            .map_err(|_| GuardedPiReleaseFailure::GuardState)
+    }) {
+        let cause = match failure {
+            GuardedPiReleaseFailure::ProcessExec(error) => {
+                spawn_diagnostics.capture(invocation, &error)
+            }
+            GuardedPiReleaseFailure::SessionBinding | GuardedPiReleaseFailure::GuardState => {
+                AgentFailureCause::HarnessStartFailed
+            }
+        };
+        let _ = child.force_stop_blocking();
+        let _ = registration.mark_quiesced();
+        return Err(cause);
+    }
+
+    Ok((
+        LaunchedPiProcess {
+            child: PiChild::Guarded {
+                child,
+                registration: Some(registration),
+            },
+            process_group,
+            standard_output,
+        },
+        standard_error,
+    ))
+}
+
+enum GuardedPiReleaseFailure {
+    SessionBinding,
+    ProcessExec(io::Error),
+    GuardState,
+}
+
+fn release_guarded_pi(
+    diagnostic_session: &AgentDiagnosticSession,
+    release: impl FnOnce() -> Result<(), GuardedPiReleaseFailure>,
+) -> Result<(), GuardedPiReleaseFailure> {
+    diagnostic_session
+        .verify_pi_native_session_path_binding()
+        .map_err(|_| GuardedPiReleaseFailure::SessionBinding)?;
+    release()
+}
+
+async fn finish_direct_process_launch(
+    mut child: Child,
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause> {
+    let Some(process_group) = child
+        .id()
+        .and_then(|process_id| i32::try_from(process_id).ok())
+        .and_then(Pid::from_raw)
+    else {
+        stop_child(&mut child, None).await;
+        return Err(AgentFailureCause::HarnessStartFailed);
+    };
+    let (Some(standard_output), Some(standard_error)) = (child.stdout.take(), child.stderr.take())
+    else {
+        stop_child(&mut child, Some(process_group)).await;
+        return Err(AgentFailureCause::HarnessStartFailed);
+    };
+    Ok((
+        LaunchedPiProcess {
+            child: PiChild::Direct(child),
+            process_group,
+            standard_output,
+        },
+        standard_error,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct ProcessSpawnDiagnosticCapture<'a> {
+    log: &'a StepDiagnosticLog,
+    maximum_stream_bytes: NonZeroU64,
+}
+
+impl ProcessSpawnDiagnosticCapture<'_> {
+    fn capture<Sink>(
+        self,
+        invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+        error: &io::Error,
+    ) -> AgentFailureCause
+    where
+        Sink: AgentObservationSink,
+    {
+        let _ = self.log.record_process_spawn_failure(
+            invocation.identity().step().to_owned(),
+            invocation.identity().invocation(),
+            self.maximum_stream_bytes,
+            error,
+        );
+        AgentFailureCause::HarnessStartFailed
+    }
+}
+
+// Pi 0.84 treats the CLI append value as a replacement for the trusted
+// project's APPEND_SYSTEM.md, so preserve both inputs in the one native flag.
+fn combined_system_prompt(
+    working_directory: &Path,
+    workflow_prompt: &str,
+    maximum_bytes: NonZeroU64,
+) -> Result<String, AgentFailureCause> {
+    let project_prompt = match fs::read_to_string(working_directory.join(".pi/APPEND_SYSTEM.md")) {
+        Ok(prompt) => Some(prompt),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err(AgentFailureCause::HarnessStartFailed),
+    };
+    let combined = project_prompt.map_or_else(
+        || workflow_prompt.to_owned(),
+        |project_prompt| format!("{project_prompt}\n\n{workflow_prompt}"),
+    );
+    check_agent_input_bound(&combined, maximum_bytes, AgentInputKind::SystemPrompt)?;
+    Ok(combined)
+}
+
+struct LaunchedPiProcess {
+    child: PiChild,
+    process_group: Pid,
+    standard_output: ChildStdout,
+}
+
+enum PiChild {
+    Guarded {
+        child: StoppedChildGuard,
+        registration: Option<ProcessGuardRegistration>,
+    },
+    Direct(Child),
+}
+
+impl PiChild {
+    fn force_process_group(&self, process_group: Pid) {
+        match self {
+            Self::Guarded { child, .. } => {
+                let _ = terminate_authenticated_process_group(child.identity());
+            }
+            Self::Direct(_) => terminate_process_group(process_group),
+        }
+    }
+
+    async fn wait(&mut self) -> Result<ExitStatus, ()> {
+        let status = match self {
+            Self::Guarded { child, .. } => child.wait().await.map_err(|_| ()),
+            Self::Direct(child) => child.wait().await.map_err(|_| ()),
+        }?;
+        self.mark_quiesced().await?;
+        Ok(status)
+    }
+
+    async fn force_stop(&mut self, process_group: Pid) -> Result<(), ()> {
+        self.force_process_group(process_group);
+        match self {
+            Self::Guarded { child, .. } => child.force_stop().await.map_err(|_| ())?,
+            Self::Direct(child) => force_stop_direct_child(child).await?,
+        }
+        self.mark_quiesced().await
+    }
+
+    async fn mark_quiesced(&mut self) -> Result<(), ()> {
+        match self {
+            Self::Guarded { registration, .. } => mark_process_guard_quiesced(registration).await,
+            Self::Direct(_) => Ok(()),
+        }
+    }
+}
+
+pub(super) const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
+
+struct ResultSettlementConfiguration<Clock> {
+    clock: Clock,
+    grace: PositiveDuration,
+}
+
+async fn drive_process<Clock, Worker, Sink>(
+    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    started: &AgentStartCallback,
+    process: LaunchedPiProcess,
+    mut parser: PiJsonV1Parser,
+    process_directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
+    result_bridge: &mut Option<ActiveResultBridge<Clock, Worker>>,
+    settlement: ResultSettlementConfiguration<Clock>,
+) -> AgentOutcome
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+    Sink: AgentObservationSink,
+{
+    let LaunchedPiProcess {
+        mut child,
+        process_group,
+        mut standard_output,
+    } = process;
+    let cancellation_source = invocation.cancellation().clone();
+    let cancellation = cancellation_source.wait_for_cancellation();
+    tokio::pin!(cancellation);
+    let (stop_supervisor, supervisor_shutdown) = oneshot::channel();
+    let (begin_settlement, settlement_starts) = mpsc::unbounded_channel();
+    let (settlement_outcomes, mut settlement_outcome) = mpsc::unbounded_channel();
+    let mut process_group_probe_clock = settlement.clock.clone();
+    let process_supervisor = tokio::spawn(supervise_process_group(
+        process_group,
+        cancellation_source.clone(),
+        process_directives,
+        supervisor_shutdown,
+        settlement,
+        settlement_starts,
+        settlement_outcomes,
+    ));
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut standard_output_closed = false;
+    let mut process_completion = None;
+    let mut process_group_quiescent = false;
+    let mut process_group_termination_requested = false;
+    let mut settlement_admitted = false;
+    let mut settlement_active = false;
+    let mut pending_result_event = None;
+    let mut parser_enabled = true;
+    let mut start_reported = false;
+    let mut failure: Option<AgentFailure> = None;
+    let mut cancelled = None;
+    let mut wait_failed = false;
+
+    while !standard_output_closed
+        || (process_completion.is_none() && !wait_failed)
+        || !process_group_quiescent
+    {
+        tokio::select! {
+            biased;
+            reason = &mut cancellation, if cancelled.is_none() => {
+                cancelled = Some(reason);
+                parser_enabled = false;
+            }
+            read = standard_output.read(&mut buffer), if !standard_output_closed => {
+                match read {
+                    Ok(0) => standard_output_closed = true,
+                    Ok(read) if parser_enabled => {
+                        let mut observations = Vec::new();
+                        let parsed = parser.push_stdout(&buffer[..read], |observation| {
+                            observations.push(observation);
+                        });
+                        if parsed.is_ok()
+                            && parser.accepted_result_ready_for_settlement()
+                            && !settlement_admitted
+                        {
+                            if begin_settlement.send(()).is_err() {
+                                failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                                parser_enabled = false;
+                                child.force_process_group(process_group);
+                            } else {
+                                settlement_admitted = true;
+                                settlement_active = true;
+                            }
+                        }
+                        if parser_enabled {
+                            for observation in observations {
+                                let reports_start = matches!(
+                                    &observation,
+                                    AgentObservation::Lifecycle {
+                                        milestone: AgentLifecycleMilestone::HarnessStarted,
+                                    }
+                                );
+                                // Pi emits agent_start for each native retry, while the
+                                // workflow invocation start callback is intentionally one-shot.
+                                if reports_start && !start_reported {
+                                    if started.report().is_err() {
+                                        failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                                        parser_enabled = false;
+                                        child.force_process_group(process_group);
+                                        break;
+                                    }
+                                    start_reported = true;
+                                }
+                                let emitted = invocation.observations().emit(observation).await;
+                                if let Some(reason) = cancellation_source.cancellation_reason() {
+                                    cancelled = Some(reason);
+                                    parser_enabled = false;
+                                    break;
+                                }
+                                if emitted.is_err() {
+                                    failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                                    parser_enabled = false;
+                                    child.force_process_group(process_group);
+                                    break;
+                                }
+                            }
+                        }
+                        if parser_enabled && parsed.is_err() {
+                            failure = Some(parser.agent_failure_for_current_phase());
+                            parser_enabled = false;
+                            child.force_process_group(process_group);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        standard_output_closed = true;
+                        if cancelled.is_none() {
+                            if let Some(reason) = cancellation_source.cancellation_reason() {
+                                cancelled = Some(reason);
+                            } else {
+                                failure = Some(parser.agent_failure_for_current_phase());
+                                child.force_process_group(process_group);
+                            }
+                            parser_enabled = false;
+                        }
+                    }
+                }
+            }
+            event = receive_result_event(result_bridge),
+                if parser_enabled && pending_result_event.is_none() =>
+            {
+                pending_result_event = Some(event);
+            }
+            outcome = settlement_outcome.recv(), if parser_enabled && settlement_active => {
+                settlement_active = false;
+                match outcome {
+                    Some(SettlementDeadlineOutcome::Expired) | None => {
+                        standard_output_closed = true;
+                        failure = Some(AgentFailureCause::ResultSettlementFailed.into());
+                        parser_enabled = false;
+                        child.force_process_group(process_group);
+                    }
+                }
+            }
+            waited = child.wait(), if process_completion.is_none() && !wait_failed => {
+                match waited {
+                    Ok(status) => process_completion = Some(status),
+                    Err(_) => {
+                        wait_failed = true;
+                        parser_enabled = false;
+                        if cancelled.is_none() {
+                            failure = Some(parser.agent_failure_for_current_phase());
+                        }
+                        child.force_process_group(process_group);
+                    }
+                }
+            }
+            () = wait_for_process_group_probe(&mut process_group_probe_clock),
+                if process_group_termination_requested => {}
+        }
+
+        if parser_enabled && let Some(event) = pending_result_event.take() {
+            match handle_result_event(event, result_bridge, &mut parser, &cancellation_source).await
+            {
+                ResultEventProgress::Continue { observation } => {
+                    if let Some(observation) = observation {
+                        let emitted = invocation.observations().emit(observation).await;
+                        if let Some(reason) = cancellation_source.cancellation_reason() {
+                            cancelled = Some(reason);
+                            parser_enabled = false;
+                        } else if emitted.is_err() {
+                            failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                            parser_enabled = false;
+                            child.force_process_group(process_group);
+                        }
+                    }
+                }
+                ResultEventProgress::Pending(incoming) => {
+                    pending_result_event = Some(ResultSocketEvent::Request(incoming));
+                }
+                ResultEventProgress::Failed(result_failure) => {
+                    failure = Some(result_failure);
+                    parser_enabled = false;
+                    child.force_process_group(process_group);
+                }
+                ResultEventProgress::Cancelled(reason) => {
+                    cancelled = Some(reason);
+                    parser_enabled = false;
+                }
+            }
+        }
+
+        if standard_output_closed
+            && (process_completion.is_some() || wait_failed)
+            && !process_group_quiescent
+        {
+            reap_process_group_children(process_group);
+            if process_group_is_quiescent(process_group) {
+                process_group_quiescent = true;
+            } else if (!settlement_active || !parser_enabled)
+                && !process_group_termination_requested
+            {
+                child.force_process_group(process_group);
+                process_group_termination_requested = true;
+            }
+        }
+    }
+
+    if cancelled.is_none() {
+        cancelled = cancellation_source.cancellation_reason();
+    }
+    if !process_group_quiescent {
+        child.force_process_group(process_group);
+    }
+    if process_completion.is_none() {
+        process_completion = child.wait().await.ok();
+        if process_completion.is_none() {
+            let _ = child.force_stop(process_group).await;
+        }
+    }
+    let _ = stop_supervisor.send(());
+    let _ = process_supervisor.await;
+
+    if let Some(reason) = cancelled {
+        return parser.finish(PiJsonV1ProcessCompletion::cancelled(
+            process_completion.is_some_and(|status| status.success()),
+            reason,
+        ));
+    }
+    if let Some(failure) = failure {
+        return AgentOutcome::Failed(failure);
+    }
+    if wait_failed {
+        return AgentOutcome::Failed(parser.agent_failure_for_current_phase());
+    }
+    let Some(status) = process_completion else {
+        return AgentOutcome::Failed(parser.agent_failure_for_current_phase());
+    };
+    parser.finish(PiJsonV1ProcessCompletion::exited(status.success()))
+}
+
+async fn wait_for_process_group_probe<Clock: CoordinatorClock>(clock: &mut Clock) {
+    let deadline = clock.now().add(PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL);
+    clock.clone().wait_until(deadline).await;
+}
+
+enum ResultEventProgress {
+    Continue {
+        observation: Option<AgentObservation>,
+    },
+    Pending(IncomingResultRequest),
+    Failed(AgentFailure),
+    Cancelled(CancellationReason),
+}
+
+async fn receive_result_event<Clock, Worker>(
+    result_bridge: &mut Option<ActiveResultBridge<Clock, Worker>>,
+) -> ResultSocketEvent {
+    match result_bridge {
+        Some(result_bridge) => result_bridge.bridge.receive().await,
+        None => pending().await,
+    }
+}
+
+async fn handle_result_event<Clock, Worker>(
+    event: ResultSocketEvent,
+    result_bridge: &mut Option<ActiveResultBridge<Clock, Worker>>,
+    parser: &mut PiJsonV1Parser,
+    cancellation: &CancellationSource,
+) -> ResultEventProgress
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+{
+    let ResultSocketEvent::Request(incoming) = event else {
+        return ResultEventProgress::Failed(parser.agent_failure_for_current_phase());
+    };
+    let Some(result_bridge) = result_bridge.as_mut() else {
+        return ResultEventProgress::Failed(parser.agent_failure_for_current_phase());
+    };
+
+    let request = incoming.request();
+    let Some(candidate) = request.candidate().cloned() else {
+        return fail_correlated_request(incoming, parser, cancellation).await;
+    };
+    if request.tool_name() != result_bridge.bridge.tool_name().as_ref() {
+        return fail_correlated_request(incoming, parser, cancellation).await;
+    }
+    match parser.try_correlate_result_request(
+        request.tool_name(),
+        request.tool_call_id(),
+        request.arguments(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => return ResultEventProgress::Pending(incoming),
+        Err(_) => return fail_correlated_request(incoming, parser, cancellation).await,
+    }
+
+    let call_id = Arc::<str>::from(request.tool_call_id());
+    let tool_name = Arc::<str>::from(request.tool_name());
+    let arguments = Arc::new(request.arguments().clone());
+    match result_bridge
+        .validator
+        .validate(Arc::new(candidate), cancellation)
+        .await
+    {
+        ResultValidationOutcome::Cancelled { reason } => ResultEventProgress::Cancelled(reason),
+        ResultValidationOutcome::Decided(ResultValidationDecision::Rejected { feedback }) => {
+            match respond_with_cancellation(
+                incoming,
+                ValidatePiResultV1Response::rejected(&feedback),
+                cancellation,
+            )
+            .await
+            {
+                ResponseProgress::Delivered => ResultEventProgress::Continue {
+                    observation: Some(AgentObservation::ValueRejected {
+                        kind: AgentValueKind::Result,
+                        feedback,
+                    }),
+                },
+                ResponseProgress::Failed => {
+                    ResultEventProgress::Failed(parser.agent_failure_for_current_phase())
+                }
+                ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
+            }
+        }
+        ResultValidationOutcome::Decided(ResultValidationDecision::Fatal(fatal)) => {
+            let cause = AgentFailureCause::from(fatal);
+            match respond_with_cancellation(
+                incoming,
+                ValidatePiResultV1Response::fatal("Result validation could not continue."),
+                cancellation,
+            )
+            .await
+            {
+                ResponseProgress::Delivered | ResponseProgress::Failed => {
+                    ResultEventProgress::Failed(cause.into())
+                }
+                ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
+            }
+        }
+        ResultValidationOutcome::Decided(ResultValidationDecision::Valid(result)) => {
+            if parser
+                .accept_result(AcceptedPiJsonV1Result::new(
+                    call_id, tool_name, arguments, result,
+                ))
+                .is_err()
+            {
+                return fail_request_with_failure(
+                    incoming,
+                    parser.agent_failure_for_current_phase(),
+                    cancellation,
+                )
+                .await;
+            }
+            match respond_with_cancellation(
+                incoming,
+                ValidatePiResultV1Response::valid(),
+                cancellation,
+            )
+            .await
+            {
+                ResponseProgress::Delivered => ResultEventProgress::Continue { observation: None },
+                ResponseProgress::Failed => {
+                    ResultEventProgress::Failed(parser.agent_failure_for_current_phase())
+                }
+                ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
+            }
+        }
+    }
+}
+
+async fn fail_correlated_request(
+    incoming: IncomingResultRequest,
+    parser: &PiJsonV1Parser,
+    cancellation: &CancellationSource,
+) -> ResultEventProgress {
+    fail_request_with_failure(
+        incoming,
+        parser.agent_failure_for_current_phase(),
+        cancellation,
+    )
+    .await
+}
+
+async fn fail_request_with_failure(
+    incoming: IncomingResultRequest,
+    failure: AgentFailure,
+    cancellation: &CancellationSource,
+) -> ResultEventProgress {
+    match respond_with_cancellation(
+        incoming,
+        ValidatePiResultV1Response::fatal("Result validation channel correlation failed."),
+        cancellation,
+    )
+    .await
+    {
+        ResponseProgress::Delivered | ResponseProgress::Failed => {
+            ResultEventProgress::Failed(failure)
+        }
+        ResponseProgress::Cancelled(reason) => ResultEventProgress::Cancelled(reason),
+    }
+}
+
+enum ResponseProgress {
+    Delivered,
+    Failed,
+    Cancelled(CancellationReason),
+}
+
+async fn respond_with_cancellation(
+    incoming: IncomingResultRequest,
+    response: ValidatePiResultV1Response,
+    cancellation: &CancellationSource,
+) -> ResponseProgress {
+    let response = incoming.respond(response);
+    tokio::pin!(response);
+    let accepted_cancellation = cancellation.wait_for_cancellation();
+    tokio::pin!(accepted_cancellation);
+    tokio::select! {
+        biased;
+        reason = &mut accepted_cancellation => ResponseProgress::Cancelled(reason),
+        delivered = &mut response => {
+            if delivered.is_ok() {
+                ResponseProgress::Delivered
+            } else {
+                ResponseProgress::Failed
+            }
+        }
+    }
+}
+
+async fn shutdown_result_bridge<Clock, Worker>(
+    result_bridge: Option<ActiveResultBridge<Clock, Worker>>,
+) -> Result<(), ()> {
+    match result_bridge {
+        Some(result_bridge) => result_bridge.bridge.shutdown().await,
+        None => Ok(()),
+    }
+}
+
+enum SettlementDeadlineOutcome {
+    Expired,
+}
+
+type SettlementDeadlineWait = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+async fn wait_for_settlement_deadline(wait: &mut Option<SettlementDeadlineWait>) {
+    match wait {
+        Some(wait) => wait.await,
+        None => pending().await,
+    }
+}
+
+async fn supervise_process_group<Clock: CoordinatorClock>(
+    process_group: Pid,
+    cancellation: CancellationSource,
+    mut directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
+    mut shutdown: oneshot::Receiver<()>,
+    mut settlement: ResultSettlementConfiguration<Clock>,
+    mut settlement_starts: mpsc::UnboundedReceiver<()>,
+    settlement_outcomes: mpsc::UnboundedSender<SettlementDeadlineOutcome>,
+) {
+    let accepted_cancellation = cancellation.wait_for_cancellation();
+    tokio::pin!(accepted_cancellation);
+    let mut interrupted = false;
+    let mut cancellation_observed = false;
+    let mut directives_open = true;
+    let mut settlement_starts_open = true;
+    let mut settlement_deadline: Option<SettlementDeadlineWait> = None;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return,
+            _ = &mut accepted_cancellation, if !cancellation_observed => {
+                cancellation_observed = true;
+                settlement_deadline = None;
+                if !interrupted {
+                    interrupt_process_group(process_group);
+                    interrupted = true;
+                }
+            }
+            directive = directives.recv(), if directives_open => {
+                match directive {
+                    Some(AgentProcessDirective::Interrupt) if !interrupted => {
+                        interrupt_process_group(process_group);
+                        interrupted = true;
+                    }
+                    Some(AgentProcessDirective::Interrupt) => {}
+                    Some(AgentProcessDirective::Force) => {
+                        terminate_process_group(process_group);
+                        return;
+                    }
+                    None => directives_open = false,
+                }
+            }
+            start = settlement_starts.recv(), if settlement_starts_open => {
+                match start {
+                    Some(()) if settlement_deadline.is_none() && !cancellation_observed => {
+                        let deadline = settlement.clock.now().add(settlement.grace.get());
+                        let clock = settlement.clock.clone();
+                        settlement_deadline = Some(Box::pin(async move {
+                            clock.wait_until(deadline).await;
+                        }));
+                    }
+                    Some(()) => {
+                        terminate_process_group(process_group);
+                        let _ = settlement_outcomes.send(SettlementDeadlineOutcome::Expired);
+                        return;
+                    }
+                    None => settlement_starts_open = false,
+                }
+            }
+            () = wait_for_settlement_deadline(&mut settlement_deadline),
+                if settlement_deadline.is_some() =>
+            {
+                terminate_process_group(process_group);
+                let _ = settlement_outcomes.send(SettlementDeadlineOutcome::Expired);
+                return;
+            }
+        }
+    }
+}
+
+impl PiJsonV1Parser {
+    fn agent_failure_for_current_phase(&self) -> AgentFailure {
+        self.failure
+            .clone()
+            .unwrap_or_else(|| AgentFailure::new(self.protocol_failure()))
+    }
+}
+
+async fn stop_child(child: &mut Child, process_group: Option<Pid>) {
+    if let Some(process_group) = process_group {
+        terminate_process_group(process_group);
+    }
+    let _ = force_stop_direct_child(child).await;
+}
+
+fn failed(cause: AgentFailureCause) -> AgentOutcome {
+    failed_agent_outcome(cause)
+}
+
+#[cfg(test)]
+mod guarded_release_tests {
+    use super::*;
+
+    #[test]
+    fn session_binding_is_rechecked_before_releasing_pi() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_directory = temporary.path().join("session");
+        let diagnostic_session = AgentDiagnosticSession::fixture(session_directory.clone());
+        diagnostic_session
+            .verify_pi_native_session_path_binding()
+            .unwrap();
+        fs::rename(&session_directory, temporary.path().join("moved-session")).unwrap();
+        fs::create_dir(&session_directory).unwrap();
+        let mut release_attempted = false;
+
+        assert!(matches!(
+            release_guarded_pi(&diagnostic_session, || {
+                release_attempted = true;
+                Ok(())
+            }),
+            Err(GuardedPiReleaseFailure::SessionBinding)
+        ));
+        assert!(!release_attempted);
+    }
+}

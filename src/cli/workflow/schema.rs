@@ -1,6 +1,6 @@
 use clap::Args;
 
-use crate::execution::STRUCTURAL_SCHEMA;
+use scherzo_cloud_execution::STRUCTURAL_SCHEMA;
 
 pub(super) const ABOUT: &str = "Show the workflow structural schema";
 pub(super) const AFTER_HELP: &str = "Scope:

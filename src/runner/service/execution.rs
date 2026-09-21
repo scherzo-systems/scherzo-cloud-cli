@@ -27,27 +27,28 @@ use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
 };
 use super::workspace::{RetentionReason, WorkspaceDisposition};
-use crate::execution::{
+use scherzo_cloud_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
     AgentInputStaging, ArtifactStaging, AuthenticatedProcessGroup, CancellationReason,
     CancellationSource, CloudCarrierBody, CloudExecutionCapacityV1, CoordinatorClock, DigestV1,
     DurableProcessGuardStore, ExecutionObservation, ExecutionObserver, FailurePolicy,
     FinalizationGate, FinalizationSummary, FinalizerResult, ForceAbortEvidence, InputStaging,
     InvocationAccountingLog, NoopCommitPort, ObservedStepTransition, PreparedCloudWorkflowResult,
-    PrimaryIssue, ProcessGuardRegistry, ProcessIdentityInspector, ProcessIdentityObservation,
-    RecoveryDecisionKind, RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
-    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
-    RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnosticLog,
-    StepFailureCause, StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector,
-    TransitionEvent, TransitionObservation, ValidatedStep, WorkflowExecutionResult,
-    WorkflowNodeRole, WorkflowRunCancellation, WorkflowRunFinalization,
-    WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult, WorkflowRunStep,
-    WorkflowRunStepKind, WorkflowRunTiming, WorkflowState, WorkflowStepTiming, command_output_v1,
-    execute_workflow, prepare_cloud_workflow_result, production_agent_dispatcher,
-    step_recovery_summary_v1, summary_disposition_matches, terminate_authenticated_process_group,
+    PrimaryIssue, ProcessGuardRegistry, ProcessGuardStoreError, ProcessIdentityInspector,
+    ProcessIdentityObservation, RecoveryDecisionKind, RecoveryDiagnosticKindV1,
+    RecoveryHandlerActivity, RecoveryHandlerKind, RecoveryInvocationDiagnosticV1,
+    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryInvocationUsageV1,
+    RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnosticLog, StepFailureCause,
+    StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector, TransitionEvent,
+    TransitionObservation, ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole,
+    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
+    WorkflowRunId, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming,
+    WorkflowState, WorkflowStepTiming, command_output_v1, execute_workflow,
+    prepare_cloud_workflow_result, production_agent_dispatcher, step_recovery_summary_v1,
+    summary_disposition_matches, terminate_authenticated_process_group,
 };
 #[cfg(test)]
-use crate::execution::{
+use scherzo_cloud_execution::{
     BlockedDetail, FinalizationTrigger, Prerequisite, RecoveryRoundNumber, TargetExecutionNumber,
     TransitionSequence, spawn_isolated_command_launch,
 };
@@ -154,17 +155,17 @@ impl DurableProcessGuardStore for AssignmentProcessGuards {
         step: &str,
         action_id: u64,
         identity: &AuthenticatedProcessGroup,
-    ) -> Result<String, ()> {
+    ) -> Result<String, ProcessGuardStoreError> {
         let mut state = self.lock();
         if state.forced_containment_started
             || state.records.values().any(|record| {
                 record.lifecycle != GuardLifecycle::Quiesced && record.identity == *identity
             })
         {
-            return Err(());
+            return Err(ProcessGuardStoreError);
         }
         let id = format!("{step}:{action_id}:{}", state.next_id);
-        state.next_id = state.next_id.checked_add(1).ok_or(())?;
+        state.next_id = state.next_id.checked_add(1).ok_or(ProcessGuardStoreError)?;
         state.records.insert(
             id.clone(),
             GuardRecord {
@@ -175,23 +176,29 @@ impl DurableProcessGuardStore for AssignmentProcessGuards {
         Ok(id)
     }
 
-    fn mark_released(&self, guard_id: &str) -> Result<(), ()> {
+    fn mark_released(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
         let mut state = self.lock();
         if state.forced_containment_started {
-            return Err(());
+            return Err(ProcessGuardStoreError);
         }
-        let record = state.records.get_mut(guard_id).ok_or(())?;
+        let record = state
+            .records
+            .get_mut(guard_id)
+            .ok_or(ProcessGuardStoreError)?;
         match record.lifecycle {
             GuardLifecycle::Prepared => record.lifecycle = GuardLifecycle::Released,
             GuardLifecycle::Released => {}
-            GuardLifecycle::Quiesced => return Err(()),
+            GuardLifecycle::Quiesced => return Err(ProcessGuardStoreError),
         }
         Ok(())
     }
 
-    fn mark_quiesced(&self, guard_id: &str) -> Result<(), ()> {
+    fn mark_quiesced(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
         let mut state = self.lock();
-        let record = state.records.get_mut(guard_id).ok_or(())?;
+        let record = state
+            .records
+            .get_mut(guard_id)
+            .ok_or(ProcessGuardStoreError)?;
         record.lifecycle = GuardLifecycle::Quiesced;
         Ok(())
     }

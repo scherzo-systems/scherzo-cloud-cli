@@ -12,6 +12,7 @@ publish = false
 members = [
   ".",
   "crates/api",
+  "crates/execution",
   "crates/runner-protocol",
   "crates/support",
   "crates/test-support",
@@ -69,6 +70,7 @@ ring = "0.17.14"
 rustix = { version = "1.1.4", features = ["fs", "net", "process", "termios"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 scherzo-cloud-api = { path = "crates/api" }
+scherzo-cloud-execution = { path = "crates/execution" }
 scherzo-cloud-runner-protocol = { path = "crates/runner-protocol" }
 scherzo-cloud-support = { path = "crates/support" }
 scherzo-cloud-test-support = { path = "crates/test-support" }
@@ -93,7 +95,6 @@ workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
-crossterm.workspace = true
 flate2.workspace = true
 fs4.workspace = true
 futures-util.workspace = true
@@ -105,11 +106,11 @@ opentelemetry.workspace = true
 opentelemetry-proto.workspace = true
 opentelemetry_sdk.workspace = true
 prost.workspace = true
-ratatui.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustix.workspace = true
 scherzo-cloud-api.workspace = true
+scherzo-cloud-execution.workspace = true
 scherzo-cloud-runner-protocol.workspace = true
 scherzo-cloud-support.workspace = true
 serde.workspace = true
@@ -119,14 +120,12 @@ time.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 ulid.workspace = true
-unicode-segmentation.workspace = true
-unicode-width.workspace = true
 url.workspace = true
-yaml-rust2.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 rustix = { workspace = true, features = ["event", "pty"] }
+scherzo-cloud-execution = { workspace = true, features = ["test-fixtures"] }
 scherzo-cloud-test-support.workspace = true
 trycmd.workspace = true
 tokio = { workspace = true, features = ["sync"] }

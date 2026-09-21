@@ -1,0 +1,6524 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::File;
+use std::future::Future;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd as _, OwnedFd};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use ring::digest::{Context as DigestContext, SHA256, digest};
+use rustix::fs::{
+    AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, fcntl_lock, fstat,
+    mkdirat, openat, renameat_with, statat, unlinkat,
+};
+use rustix::io::{Errno, dup};
+use rustix::process::{Flock, FlockOffsetType, FlockType, fcntl_getlk};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+use super::admission::{
+    AdmittedWorkflow, CancellationReason, ResolvedAttachment, ResolvedInput, ResolvedInputs,
+    ResolvedJsonInput,
+};
+use super::agent::AgentCompatibilityProfile;
+use super::agent_diagnostics::AgentDiagnosticSessionStore;
+use super::artifact::{ArtifactStaging, GitObjectFormat};
+use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
+use super::coordinator::{
+    CommitPort, CommittedActionKind, CommittedReduction, CoordinationDiagnostic,
+};
+use super::diagnostic::{StepDiagnostic, StepDiagnosticLog};
+use super::document::FailurePolicy;
+use super::evidence::{NodeDetail, NonExecutionCode};
+use super::execution_root::AdmittedExecutionRoot;
+use super::force_abort_evidence::{
+    FirstForceAbortPhase, finalization_cancellation_matches_force_phase,
+    finalization_node_cancellation_matches, ordinary_node_cancellation_matches,
+};
+use super::git_capture::{GitCaptureContext, GitWorkspaceAdmissionFailure, LocalGitBaseline};
+use super::invocation_accounting::InvocationAccountingLog;
+use super::private_staging::{
+    create_staging_root, directory_entry_names, open_directory_path, remove_staging_root, same_file,
+};
+use super::process_group::{
+    AuthenticatedProcessGroup, AuthenticatedSignalResult, DurableProcessGuardStore,
+    ProcessGuardRegistry, ProcessGuardStoreError, ProcessIdentityObservation,
+    system_process_identity_observation, terminate_authenticated_process_group,
+};
+use super::publication::{
+    CancellationReasonV1, FinalizationTriggerV1, RunResultInvariant, cancellation_reason,
+    finalization_trigger,
+};
+use super::resolution::{ResolvedWorkflow, resolve_retained};
+use super::runtime::{
+    ActiveStepInvocation, FinalizationSummary, StepState, TargetExecutionNumber, WorkflowState,
+};
+use super::schema_common::{
+    is_canonical_absolute_path, is_canonical_relative_path, is_lowercase_hex, lowercase_hex,
+    utc_timestamp,
+};
+use super::step_runtime::StepFailureCause;
+use super::workspace_snapshot::{
+    WorkspaceSnapshotSettlementV1, WorkspaceSnapshotV1, capture_settlement_snapshot,
+};
+
+const RUN_FILE: &str = "run.json";
+const STATE_FILE: &str = "state.json";
+const LOCK_FILE: &str = "run.lock";
+const WORKFLOW_DIRECTORY: &str = "workflow";
+const WORKFLOW_FILES_DIRECTORY: &str = "files";
+const WORKFLOW_MANIFEST_FILE: &str = "manifest.json";
+const ATTEMPTS_DIRECTORY: &str = "attempts";
+const INVOCATIONS_DIRECTORY: &str = "invocations";
+const VALUES_DIRECTORY: &str = "values";
+const PRIVATE_DIRECTORY: &str = ".private";
+const INITIAL_ATTEMPT_NUMBER: u64 = 1;
+const INITIAL_ATTEMPT_DIRECTORY: &str = "000001";
+const STAGING_ATTEMPTS: usize = 16;
+const PRIVATE_STAGING_ATTEMPTS: usize = 16;
+const STATUS_SNAPSHOT_ATTEMPTS: usize = 8;
+pub(super) const MAXIMUM_DURABLE_JSON_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_RETAINED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_RETAINED_OUTPUTS: usize = 4_096;
+const MAXIMUM_RETAINED_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_RETAINED_TEXT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_RETAINED_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAXIMUM_RETAINED_CAPTURED_FILE_BYTES: u64 =
+    MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES + MAXIMUM_RETAINED_INPUT_BYTES;
+const MAXIMUM_RETAINED_RUN_JSON_BYTES: u64 =
+    3 * MAXIMUM_DURABLE_JSON_BYTES + super::result_metadata::MAXIMUM_RESULT_NON_STREAM_JSON_BYTES;
+// An archived-attempt read covers the immutable workflow/import captures, the base64
+// representation of both bounded diagnostic streams, and the run, state, manifest,
+// and result JSON envelopes. Each term is independently enforced while it is read.
+const MAXIMUM_RETAINED_TOTAL_BYTES: u64 = MAXIMUM_RETAINED_CAPTURED_FILE_BYTES
+    + super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+    + MAXIMUM_RETAINED_RUN_JSON_BYTES;
+const MAXIMUM_DIAGNOSTICS: usize = 256;
+const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const QUIESCENCE_POLL_ATTEMPTS: usize =
+    (MAXIMUM_CANCELLATION_GRACE.as_millis() / QUIESCENCE_POLL_INTERVAL.as_millis()) as usize;
+const SHA256_ALGORITHM: &str = "sha256";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalRunDirectoryError {
+    InvalidPath,
+    ParentUnavailable,
+    DestinationExists,
+    ExecutionRootOverlap,
+    StagingUnavailable,
+    LockUnavailable,
+    IdentityUnavailable,
+    HostIdentityUnavailable,
+    SerializationUnavailable,
+    StateInvalid,
+    RecoverySchemaUnsupported,
+    StateConflict,
+    StateWriteUnavailable,
+    AtomicCommitUnavailable,
+    PublicationUnavailable,
+}
+
+impl fmt::Display for LocalRunDirectoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "local run directory failure: {self:?}")
+    }
+}
+
+impl std::error::Error for LocalRunDirectoryError {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DigestV1 {
+    pub(super) algorithm: String,
+    pub(super) value: String,
+}
+
+impl DigestV1 {
+    fn sha256(bytes: &[u8]) -> Self {
+        Self {
+            algorithm: SHA256_ALGORITHM.to_owned(),
+            value: lowercase_hex(digest(&SHA256, bytes).as_ref()),
+        }
+    }
+
+    fn validate(&self) -> bool {
+        self.algorithm == SHA256_ALGORITHM && is_lowercase_hex(&self.value, 64)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct LocalRunV1 {
+    pub(super) schema_version: u8,
+    pub(super) local_run_id: String,
+    pub(super) created_at: String,
+    pub(super) workflow_digest: DigestV1,
+    pub(super) workflow_manifest_digest: DigestV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_baseline: Option<GitBaselineV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum GitBaselineV1 {
+    Available {
+        #[serde(rename = "objectFormat")]
+        object_format: String,
+        #[serde(rename = "commitOid")]
+        commit_oid: String,
+    },
+    Unavailable {
+        reason: GitBaselineUnavailableReasonV1,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitBaselineUnavailableReasonV1 {
+    Cancelled,
+    ExecutionRootRebound,
+    GitUnavailable,
+    GitTimedOut,
+    GitOutputLimitExceeded,
+    NotWorkTree,
+    ExecutionRootNotWorkTreeRoot,
+    UnsupportedObjectFormat,
+    BaselineUnavailable,
+    InitialWorkspaceDirty,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptDefinitionV1 {
+    digest: DigestV1,
+    manifest_digest: DigestV1,
+    locator: AttemptDefinitionLocatorV1,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AttemptDefinitionLocatorV1 {
+    Run,
+    Attempt {
+        #[serde(rename = "attemptNumber")]
+        attempt_number: u64,
+    },
+    PriorAttempt {
+        #[serde(rename = "attemptNumber")]
+        attempt_number: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowManifestV1 {
+    schema_version: u8,
+    workflow_path: String,
+    source_root: String,
+    maximum_parallel_steps: usize,
+    source_files: Vec<ManifestSourceFileV1>,
+    inputs: BTreeMap<String, ManifestInputV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManifestSourceFileV1 {
+    path: String,
+    #[serde(flatten)]
+    file: ManifestFileV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManifestFileV1 {
+    ordinal: u64,
+    relative_file: String,
+    size_bytes: u64,
+    digest: DigestV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestInputV1 {
+    Text {
+        #[serde(flatten)]
+        file: ManifestFileV1,
+    },
+    Json {
+        #[serde(flatten)]
+        file: ManifestFileV1,
+    },
+    File {
+        #[serde(rename = "mediaType")]
+        media_type: String,
+        #[serde(flatten)]
+        file: ManifestFileV1,
+    },
+    Attachments {
+        items: Vec<ManifestAttachmentV1>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManifestAttachmentV1 {
+    media_type: String,
+    #[serde(flatten)]
+    file: ManifestFileV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct LocalRunStateV1 {
+    pub(super) schema_version: u8,
+    pub(super) local_run_id: String,
+    pub(super) revision: u64,
+    pub(super) current_attempt_number: u64,
+    pub(super) attempts: Vec<LocalAttemptV1>,
+    diagnostics: Vec<LocalDiagnosticV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct LocalAttemptV1 {
+    attempt_id: String,
+    pub(super) attempt_number: u64,
+    pub(super) trigger: AttemptTriggerV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) prior_attempt_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) definition: Option<AttemptDefinitionV1>,
+    pub(super) state: AttemptStateV1,
+    pub(super) execution_root: String,
+    pub(super) created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) settled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) settlement_snapshot: Option<WorkspaceSnapshotV1>,
+    owner: AttemptOwnerV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cancellation: Option<AttemptCancellationV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) force_abort: Option<super::runtime::ForceAbortEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interruption: Option<AttemptInterruptionV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejection: Option<AttemptRejectionV1>,
+    pub(super) progress: AttemptProgressV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) finalization: Option<AttemptFinalizationV1>,
+    process_guards: Vec<ProcessGuardV1>,
+    pub(super) result: AttemptResultV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AttemptTriggerV1 {
+    Initial,
+    ExplicitRetry,
+    Continuation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AttemptStateV1 {
+    Created,
+    Running,
+    Cancelling,
+    Succeeded,
+    WorkflowFailed,
+    Cancelled,
+    Interrupted,
+    Rejected,
+}
+
+impl AttemptStateV1 {
+    pub(super) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::WorkflowFailed
+                | Self::Cancelled
+                | Self::Interrupted
+                | Self::Rejected
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttemptOwnerV1 {
+    owner_nonce: String,
+    execution_host: ExecutionHostV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecutionHostV1 {
+    kind: ExecutionHostKindV1,
+    value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionHostKindV1 {
+    HostBoot,
+    IsolationInstance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptCancellationV1 {
+    pub(super) reason: CancellationReasonV1,
+    pub(super) requested_at: String,
+    pub(super) force_stop_deadline: String,
+    workflow_confirmed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttemptInterruptionV1 {
+    cause: InterruptionCauseV1,
+    execution_may_have_started: bool,
+    cancellation_requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InterruptionCauseV1 {
+    ExecutorShutdown,
+    ExecutionLeaseExpired,
+    ExecutionOwnerLost,
+    ExecutorFault,
+    StatePersistenceFailure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttemptRejectionV1 {
+    code: RejectionCodeV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RejectionCodeV1 {
+    ImmutableSpecificationUnusable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptProgressV1 {
+    accepted_occurrence_ordinal: u64,
+    last_transition_sequence: u64,
+    pub(super) steps: Vec<AttemptStepV1>,
+    outstanding_actions: Vec<OutstandingActionV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) invocations: Vec<DurableInvocationV1>,
+    pub(super) accounting: DurableInvocationAccountingV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptStepV1 {
+    pub(super) id: String,
+    pub(super) role: AttemptNodeRoleV1,
+    pub(super) failure_policy: FailurePolicy,
+    pub(super) state: AttemptStepStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) outputs: Option<Vec<RetainedOutputV1>>,
+    #[serde(
+        default,
+        deserialize_with = "super::evidence::deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) detail: Option<NodeDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) recovery: Option<DurableStepRecoveryV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct RetainedCarrierV1 {
+    relative_path: String,
+    media_type: String,
+    size_bytes: u64,
+    digest: DigestV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum RetainedOutputV1 {
+    Text {
+        name: String,
+        carrier: RetainedCarrierV1,
+    },
+    Json {
+        name: String,
+        carrier: RetainedCarrierV1,
+    },
+    File {
+        name: String,
+        #[serde(rename = "mediaType")]
+        media_type: String,
+        carrier: RetainedCarrierV1,
+    },
+    GitBranch {
+        name: String,
+        #[serde(rename = "artifactVersion")]
+        artifact_version: u8,
+        #[serde(rename = "objectFormat")]
+        object_format: String,
+        #[serde(rename = "baseOid")]
+        base_oid: String,
+        #[serde(rename = "headOid")]
+        head_oid: String,
+        #[serde(rename = "treeOid")]
+        tree_oid: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        carrier: Option<RetainedCarrierV1>,
+    },
+}
+
+impl RetainedOutputV1 {
+    fn name(&self) -> &str {
+        match self {
+            Self::Text { name, .. }
+            | Self::Json { name, .. }
+            | Self::File { name, .. }
+            | Self::GitBranch { name, .. } => name,
+        }
+    }
+
+    fn carrier(&self) -> Option<&RetainedCarrierV1> {
+        match self {
+            Self::Text { carrier, .. }
+            | Self::Json { carrier, .. }
+            | Self::File { carrier, .. } => Some(carrier),
+            Self::GitBranch { carrier, .. } => carrier.as_ref(),
+        }
+    }
+
+    fn matches_export(&self, export: &super::publication::ExportV1) -> bool {
+        match (self, export) {
+            (Self::Text { carrier, .. }, export) => retained_carrier_matches_available_export(
+                carrier,
+                "text",
+                "text/plain; charset=utf-8",
+                export,
+            ),
+            (Self::Json { carrier, .. }, export) => retained_carrier_matches_available_export(
+                carrier,
+                "json",
+                "application/json",
+                export,
+            ),
+            (
+                Self::File {
+                    media_type,
+                    carrier,
+                    ..
+                },
+                export,
+            ) => retained_carrier_matches_available_export(carrier, "file", media_type, export),
+            (
+                Self::GitBranch {
+                    artifact_version,
+                    object_format,
+                    base_oid,
+                    head_oid,
+                    tree_oid,
+                    carrier,
+                    ..
+                },
+                super::publication::ExportV1::GitBranch {
+                    artifact_version: export_artifact_version,
+                    object_format: export_object_format,
+                    base_oid: export_base_oid,
+                    head_oid: export_head_oid,
+                    tree_oid: export_tree_oid,
+                    carrier: export_carrier,
+                },
+            ) => {
+                artifact_version == export_artifact_version
+                    && object_format == export_object_format
+                    && base_oid == export_base_oid
+                    && head_oid == export_head_oid
+                    && tree_oid == export_tree_oid
+                    && match (carrier, export_carrier) {
+                        (None, None) => true,
+                        (Some(retained), Some(export)) => retained_carrier_matches_metadata(
+                            retained,
+                            &export.media_type,
+                            export.size_bytes,
+                            &export.digest,
+                        ),
+                        (None, Some(_)) | (Some(_), None) => false,
+                    }
+            }
+            (
+                Self::GitBranch { .. },
+                super::publication::ExportV1::Available { .. }
+                | super::publication::ExportV1::Unavailable { .. },
+            ) => false,
+        }
+    }
+}
+
+fn retained_carrier_matches_available_export(
+    retained: &RetainedCarrierV1,
+    expected_kind: &str,
+    expected_media_type: &str,
+    export: &super::publication::ExportV1,
+) -> bool {
+    let super::publication::ExportV1::Available {
+        kind,
+        media_type,
+        size_bytes,
+        digest,
+        ..
+    } = export
+    else {
+        return false;
+    };
+    kind == expected_kind
+        && media_type == expected_media_type
+        && retained_carrier_matches_metadata(retained, media_type, *size_bytes, digest)
+}
+
+fn retained_carrier_matches_metadata(
+    retained: &RetainedCarrierV1,
+    media_type: &str,
+    size_bytes: u64,
+    digest: &super::publication::DigestV1,
+) -> bool {
+    retained.media_type == media_type
+        && retained.size_bytes == size_bytes
+        && retained.digest.algorithm == digest.algorithm
+        && retained.digest.value == digest.value
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableStepRecoveryV1 {
+    pub(super) schema_version: u8,
+    pub(super) configured_retries: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) handler_kind: Option<DurableRecoveryHandlerKindV1>,
+    pub(super) rounds: Vec<DurableRecoveryRoundV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) active: Option<DurableRecoveryActiveV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) termination: Option<super::publication::RecoveryTerminationV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DurableRecoveryHandlerKindV1 {
+    Cmd,
+    Agent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableRecoveryRoundV1 {
+    pub(super) number: u8,
+    pub(super) failed_execution: super::publication::RecoveryFailedExecutionV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) handler: Option<super::publication::RecoveryHandlerSummaryV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableRecoveryActiveV1 {
+    pub(super) role: super::publication::RecoveryInvocationRoleV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) target_execution: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) recovery_round: Option<u8>,
+    pub(super) invocation_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) handler_state: Option<DurableRecoveryHandlerStateV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) decision: Option<super::publication::RecoveryHandlerOutcomeV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DurableRecoveryHandlerStateV1 {
+    Starting,
+    Running,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableInvocationV1 {
+    pub invocation_id: u64,
+    pub step_id: String,
+    pub(crate) node_role: AttemptNodeRoleV1,
+    pub role: super::publication::RecoveryInvocationRoleV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_execution: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_round: Option<u8>,
+    pub state: DurableInvocationStateV1,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    pub usage: super::publication::RecoveryInvocationUsageV1,
+    pub diagnostics: Vec<DurableInvocationDiagnosticV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_reference: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableInvocationStateV1 {
+    Active,
+    Settled,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableInvocationDiagnosticV1 {
+    pub kind: super::publication::RecoveryDiagnosticKindV1,
+    pub reference: String,
+    pub retained_bytes: u64,
+    pub discarded_bytes: u64,
+    pub truncated: bool,
+    pub fully_drained: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableInvocationAccountingV1 {
+    pub(super) maximum_invocations: u64,
+    pub(super) observed_invocations: u64,
+    pub(super) settled_invocations: u64,
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) retained_diagnostic_bytes: u64,
+    pub(super) discarded_diagnostic_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttemptNodeRoleV1 {
+    Step,
+    Finalizer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(super) enum AttemptFinalizationV1 {
+    Progress(AttemptFinalizationProgressV1),
+    Complete(AttemptFinalizationCompleteV1),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptFinalizationProgressV1 {
+    complete: bool,
+    trigger: FinalizationTriggerV1,
+    finalizers: Vec<AttemptStepV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancellation: Option<DurableFinalizationCancellationV1>,
+    force_abort: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AttemptFinalizationCompleteV1 {
+    pub(super) complete: bool,
+    pub(super) trigger: FinalizationTriggerV1,
+    pub(super) finalizers: Vec<DurableFinalizerV1>,
+    pub(super) issues: Vec<DurableFinalizationIssueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cancellation: Option<DurableFinalizationCancellationV1>,
+    pub(super) force_abort: bool,
+}
+
+// Completed finalizers and live attempt nodes remain distinct durable envelopes even
+// though both carry the same canonical detail union.
+// jscpd:ignore-start
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableFinalizerV1 {
+    pub(super) id: String,
+    pub(super) role: AttemptNodeRoleV1,
+    pub(super) failure_policy: FailurePolicy,
+    pub(super) state: AttemptStepStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) outputs: Option<Vec<RetainedOutputV1>>,
+    #[serde(
+        default,
+        deserialize_with = "super::evidence::deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) detail: Option<NodeDetail>,
+}
+// jscpd:ignore-end
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableFinalizationIssueV1 {
+    pub(super) finalizer_id: String,
+    pub(super) impact: FailurePolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableFinalizationCancellationV1 {
+    pub(super) reason: CancellationReasonV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) force_stop_deadline: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AttemptStepStateV1 {
+    Pending,
+    Starting,
+    Running,
+    CapturingOutputs,
+    Cancelling,
+    Succeeded,
+    Failed,
+    Blocked,
+    Skipped,
+    NotRun,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OutstandingActionV1 {
+    action_id: u64,
+    kind: OutstandingActionKindV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_role: Option<AttemptNodeRoleV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_execution: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_round: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OutstandingActionKindV1 {
+    StartStep,
+    StartRecoveryHandler,
+    CaptureOutputs,
+    CancelStep,
+    FinishRun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessGuardV1 {
+    guard_id: String,
+    action_id: u64,
+    step_id: String,
+    node_role: AttemptNodeRoleV1,
+    state: ProcessGuardStateV1,
+    execution_host: ExecutionHostV1,
+    process_group_id: i64,
+    liveness: ProcessLivenessV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProcessGuardStateV1 {
+    Prepared,
+    Released,
+    Quiesced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessLivenessV1 {
+    kind: ProcessLivenessKindV1,
+    value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProcessLivenessKindV1 {
+    LeaderStartIdentity,
+    GuardHandleIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum AttemptResultV1 {
+    NotPublished {
+        reason: ResultAbsentReasonV1,
+    },
+    Published {
+        #[serde(rename = "relativeDirectory")]
+        relative_directory: String,
+    },
+    PublicationFailed {
+        phase: PublicationFailurePhaseV1,
+        #[serde(rename = "resultInvariant", skip_serializing_if = "Option::is_none")]
+        result_invariant: Option<RunResultInvariant>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ResultAbsentReasonV1 {
+    AttemptNonterminal,
+    PublicationPending,
+    Interrupted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationFailurePhaseV1 {
+    ExportCopy,
+    Serialization,
+    Close,
+    Verification,
+    Rename,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalDiagnosticV1 {
+    sequence: u64,
+    attempt_number: u64,
+    code: DiagnosticCodeV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guard_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticCodeV1 {
+    StaleOccurrence,
+    StatePersistenceFailure,
+    TransitionCapacityExceeded,
+    ResultPublicationFailure,
+    PrivateCleanupFailure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalStatusErrorCode {
+    RunDirectoryUnavailable,
+    RunDirectoryInvalid,
+    RecoverySchemaUnsupported,
+    LockQueryFailed,
+    StatusSnapshotUnstable,
+}
+
+impl LocalStatusErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunDirectoryUnavailable => "run_directory_unavailable",
+            Self::RunDirectoryInvalid => "run_directory_invalid",
+            Self::RecoverySchemaUnsupported => "recovery_schema_unsupported",
+            Self::LockQueryFailed => "lock_query_failed",
+            Self::StatusSnapshotUnstable => "status_snapshot_unstable",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::RunDirectoryUnavailable => "The run directory is unavailable.",
+            Self::RunDirectoryInvalid => "The run directory does not contain valid V1 state.",
+            Self::RecoverySchemaUnsupported => {
+                "The run uses an unsupported recovery summary schema version."
+            }
+            Self::LockQueryFailed => "The run lock could not be inspected.",
+            Self::StatusSnapshotUnstable => {
+                "The run state changed too quickly to obtain a stable snapshot."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStatusError {
+    pub code: LocalStatusErrorCode,
+    pub run_directory: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnershipUnprovenReason {
+    ExecutionHostIdentityUnavailable,
+    ProcessIdentityInspectionUnavailable,
+}
+
+impl OwnershipUnprovenReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionHostIdentityUnavailable => "execution_host_identity_unavailable",
+            Self::ProcessIdentityInspectionUnavailable => "process_identity_inspection_unavailable",
+        }
+    }
+
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::ExecutionHostIdentityUnavailable => {
+                "restore execution-host identity inspection or restart the host boundary"
+            }
+            Self::ProcessIdentityInspectionUnavailable => {
+                "restore process identity inspection or restart the host boundary"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalRecoveryStatus {
+    Active,
+    Settled,
+    Abandoned,
+    OwnershipUnproven {
+        guard_ids: Vec<String>,
+        reason: OwnershipUnprovenReason,
+    },
+}
+
+impl LocalRecoveryStatus {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Settled => "settled",
+            Self::Abandoned => "abandoned",
+            Self::OwnershipUnproven { .. } => "ownership_unproven",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryIneligibilityReason {
+    RunLocked,
+    LatestAttemptSucceeded,
+    LatestAttemptRejected,
+    OwnershipUnproven,
+}
+
+impl RetryIneligibilityReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunLocked => "run_locked",
+            Self::LatestAttemptSucceeded => "latest_attempt_succeeded",
+            Self::LatestAttemptRejected => "latest_attempt_rejected",
+            Self::OwnershipUnproven => "ownership_unproven",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalRetryEligibility {
+    Eligible,
+    Ineligible(RetryIneligibilityReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRetryRejection {
+    run_directory: PathBuf,
+    attempt_number: u64,
+    reason: RetryIneligibilityReason,
+    guard_ids: Vec<String>,
+    ownership_reason: Option<OwnershipUnprovenReason>,
+}
+
+impl LocalRetryRejection {
+    pub fn run_directory(&self) -> &Path {
+        &self.run_directory
+    }
+
+    pub(crate) const fn attempt_number(&self) -> u64 {
+        self.attempt_number
+    }
+
+    pub(crate) const fn reason(&self) -> RetryIneligibilityReason {
+        self.reason
+    }
+
+    pub(crate) fn guard_ids(&self) -> &[String] {
+        &self.guard_ids
+    }
+
+    pub(crate) const fn ownership_reason(&self) -> Option<OwnershipUnprovenReason> {
+        self.ownership_reason
+    }
+}
+
+pub enum LocalRetryOpen {
+    Acquired(Box<PendingLocalRetry>),
+    Rejected(LocalRetryRejection),
+}
+
+pub struct PendingLocalRetry {
+    normalized: PathBuf,
+    root: Arc<OwnedFd>,
+    lock: File,
+    state: Arc<StateStore>,
+    workflow: ResolvedWorkflow,
+    inputs: ResolvedInputs,
+    maximum_parallel_steps: usize,
+    definition: AttemptDefinitionV1,
+    git_baseline: Option<LocalGitBaseline>,
+}
+
+impl PendingLocalRetry {
+    pub fn run_directory(&self) -> &Path {
+        &self.normalized
+    }
+
+    pub fn execution_specification(&self) -> (&ResolvedWorkflow, &ResolvedInputs, usize) {
+        (&self.workflow, &self.inputs, self.maximum_parallel_steps)
+    }
+
+    pub fn git_baseline(&self) -> Option<&LocalGitBaseline> {
+        self.git_baseline.as_ref()
+    }
+
+    pub fn reused_execution_root_attempts(
+        &self,
+        admitted: &AdmittedWorkflow,
+    ) -> Result<Vec<u64>, LocalRunDirectoryError> {
+        let execution_root = admitted
+            .execution()
+            .root()
+            .to_str()
+            .ok_or(LocalRunDirectoryError::InvalidPath)?;
+        let state = lock_state(&self.state.current)?;
+        Ok(state
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.execution_root == execution_root)
+            .map(|attempt| attempt.attempt_number)
+            .collect())
+    }
+
+    pub fn begin(
+        self,
+        admitted: &AdmittedWorkflow,
+    ) -> Result<LocalAttemptOwner, LocalRetryBeginError> {
+        begin_local_retry(self, admitted, &SystemLocalRecoveryAuthority)
+    }
+}
+
+pub enum LocalRetryBeginError {
+    Rejected(LocalRetryRejection),
+    Operational(LocalRunDirectoryError),
+}
+
+impl From<LocalRunDirectoryError> for LocalRetryBeginError {
+    fn from(error: LocalRunDirectoryError) -> Self {
+        Self::Operational(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStatusAttempt {
+    pub attempt_number: u64,
+    pub trigger: &'static str,
+    pub state: &'static str,
+    pub result: LocalStatusResult,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalStatusResult {
+    NotPublished { reason: &'static str },
+    Published { relative_directory: String },
+    PublicationFailed { phase: &'static str },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalRunStatusSnapshot {
+    pub run_directory: PathBuf,
+    pub run: Value,
+    pub state: Value,
+    pub current_attempt_number: u64,
+    pub current_attempt_state: &'static str,
+    pub current_result: LocalStatusResult,
+    pub attempts: Vec<LocalStatusAttempt>,
+    pub recovery: LocalRecoveryStatus,
+    pub retry: LocalRetryEligibility,
+}
+
+pub trait DurableDeadline {
+    fn deadline_utc(&self) -> OffsetDateTime;
+}
+
+pub struct LocalAttemptOwner {
+    normalized: PathBuf,
+    lock: Option<File>,
+    private_directory: PathBuf,
+    attempt_directory: OwnedFd,
+    result_directory: PathBuf,
+    attempt_number: u64,
+    finalizers: Arc<[AttemptStepV1]>,
+    state: Arc<StateStore>,
+}
+
+pub type InitialLocalRun = LocalAttemptOwner;
+
+pub struct LocalAttemptOwnershipReleased {
+    _private: (),
+}
+
+impl LocalAttemptOwner {
+    pub fn create(
+        requested: &Path,
+        admitted: &AdmittedWorkflow,
+    ) -> Result<Self, LocalRunDirectoryError> {
+        create_with_observer(requested, admitted, &mut NoopInitialPublicationObserver)
+    }
+
+    pub fn run_directory(&self) -> &Path {
+        &self.normalized
+    }
+
+    pub fn private_directory(&self) -> &Path {
+        &self.private_directory
+    }
+
+    pub fn result_directory(&self) -> &Path {
+        &self.result_directory
+    }
+
+    pub fn attempt_directory_handle(&self) -> &OwnedFd {
+        &self.attempt_directory
+    }
+
+    pub fn private_directory_handle(&self) -> &OwnedFd {
+        &self.state.private
+    }
+
+    pub fn create_agent_diagnostic_sessions(
+        &self,
+    ) -> Result<AgentDiagnosticSessionStore, LocalRunDirectoryError> {
+        let state = lock_state(&self.state.current)?;
+        if state.current_attempt_number != self.attempt_number {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        let local_run_id = Arc::<str>::from(state.local_run_id.as_str());
+        drop(state);
+        let attempt_name = attempt_directory_name(self.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let attempt_path = self.normalized.join(ATTEMPTS_DIRECTORY).join(attempt_name);
+        AgentDiagnosticSessionStore::create(
+            &self.attempt_directory,
+            &attempt_path,
+            local_run_id,
+            self.attempt_number,
+        )
+        .map_err(|_| LocalRunDirectoryError::StagingUnavailable)
+    }
+
+    pub fn create_private_staging(&self) -> Result<AttemptPrivateStaging, LocalRunDirectoryError> {
+        let (identity, root) =
+            create_staging_root(&self.state.private, "workflow", PRIVATE_STAGING_ATTEMPTS)
+                .map_err(|()| LocalRunDirectoryError::StagingUnavailable)?;
+        Ok(AttemptPrivateStaging {
+            parent: Arc::clone(&self.state.private),
+            path: self.private_directory.join(identity.as_ref()),
+            identity,
+            root,
+            released: false,
+        })
+    }
+
+    pub const fn attempt_number(&self) -> u64 {
+        self.attempt_number
+    }
+
+    pub fn release(mut self) -> LocalAttemptOwnershipReleased {
+        self.release_lock();
+        LocalAttemptOwnershipReleased { _private: () }
+    }
+
+    pub fn commit_port(
+        &self,
+        diagnostics: StepDiagnosticLog,
+        accounting: InvocationAccountingLog,
+        artifacts: ArtifactStaging,
+    ) -> LocalRunCommitPort {
+        LocalRunCommitPort {
+            state: Arc::clone(&self.state),
+            finalizers: Arc::clone(&self.finalizers),
+            diagnostics,
+            accounting,
+            artifacts,
+        }
+    }
+
+    pub fn durable_invocations(&self) -> Result<Vec<DurableInvocationV1>, LocalRunDirectoryError> {
+        let state = lock_state(&self.state.current)?;
+        let attempt = state
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_number == self.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        Ok(attempt.progress.invocations.clone())
+    }
+
+    pub fn process_guard_registry(&self) -> ProcessGuardRegistry {
+        let state: Arc<dyn DurableProcessGuardStore> = self.state.clone();
+        ProcessGuardRegistry::durable(state)
+    }
+
+    pub fn record_result_published(&self) -> Result<(), LocalRunDirectoryError> {
+        self.state.update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            if !attempt.state.is_terminal() {
+                return Err(LocalRunDirectoryError::StateConflict);
+            }
+            attempt.result = AttemptResultV1::Published {
+                relative_directory: attempt_result_relative_path(attempt.attempt_number),
+            };
+            Ok(())
+        })
+    }
+
+    pub fn record_result_publication_failed(
+        &self,
+        phase: PublicationFailurePhaseV1,
+        invariant: Option<RunResultInvariant>,
+    ) -> Result<(), LocalRunDirectoryError> {
+        self.state.update(|state| {
+            let attempt_number = state.current_attempt_number;
+            let attempt = current_attempt_mut(state)?;
+            if !attempt.state.is_terminal() {
+                return Err(LocalRunDirectoryError::StateConflict);
+            }
+            attempt.result = AttemptResultV1::PublicationFailed {
+                phase,
+                result_invariant: invariant,
+            };
+            append_diagnostic(
+                state,
+                attempt_number,
+                DiagnosticCodeV1::ResultPublicationFailure,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_executor_fault_before_execution(
+        &self,
+    ) -> Result<(), LocalRunDirectoryError> {
+        record_executor_fault_before_execution(&self.state)
+    }
+
+    pub async fn record_executor_fault_before_execution_async(
+        &self,
+    ) -> Result<(), LocalRunDirectoryError> {
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || record_executor_fault_before_execution(&state))
+            .await
+            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?
+    }
+
+    pub async fn record_state_persistence_failure_async(
+        &self,
+    ) -> Result<(), LocalRunDirectoryError> {
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || record_state_persistence_failure(&state))
+            .await
+            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?
+    }
+
+    pub fn record_private_cleanup_failure(&self) -> Result<(), LocalRunDirectoryError> {
+        self.state.update(|state| {
+            append_diagnostic(
+                state,
+                state.current_attempt_number,
+                DiagnosticCodeV1::PrivateCleanupFailure,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_handle(&self) -> &OwnedFd {
+        &self.state.root
+    }
+
+    fn release_lock(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            // Closing normally releases the process-associated lock. Unlock explicitly so
+            // an orderly owner release is immediately visible to status and retry queries.
+            let _ = fcntl_lock(&lock, FlockOperation::Unlock);
+        }
+    }
+}
+
+fn record_executor_fault_before_execution(
+    state: &StateStore,
+) -> Result<(), LocalRunDirectoryError> {
+    let snapshot = settlement_snapshot(state, WorkspaceSnapshotSettlementV1::Engine)?;
+    state.update(|state| {
+        let attempt = current_attempt_mut(state)?;
+        if attempt.state != AttemptStateV1::Created {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        settle_interrupted_attempt(
+            attempt,
+            InterruptionCauseV1::ExecutorFault,
+            false,
+            Some(snapshot),
+        )
+    })
+}
+
+fn record_state_persistence_failure(state: &StateStore) -> Result<(), LocalRunDirectoryError> {
+    let snapshot = settlement_snapshot(state, WorkspaceSnapshotSettlementV1::Engine)?;
+    state.update(|state| {
+        let attempt_number = state.current_attempt_number;
+        {
+            let attempt = current_attempt_mut(state)?;
+            if attempt.state.is_terminal() {
+                return Ok(());
+            }
+            let execution_may_have_started = attempt.started_at.is_some();
+            settle_interrupted_attempt(
+                attempt,
+                InterruptionCauseV1::StatePersistenceFailure,
+                execution_may_have_started,
+                Some(snapshot.clone()),
+            )?;
+        }
+        append_diagnostic(
+            state,
+            attempt_number,
+            DiagnosticCodeV1::StatePersistenceFailure,
+        )
+    })
+}
+
+fn settlement_snapshot(
+    state: &StateStore,
+    settled_by: WorkspaceSnapshotSettlementV1,
+) -> Result<WorkspaceSnapshotV1, LocalRunDirectoryError> {
+    let current = lock_state(&state.current)?;
+    let attempt = current_attempt(&current)?;
+    Ok(capture_settlement_snapshot(
+        Path::new(&attempt.execution_root),
+        settled_by,
+    ))
+}
+
+pub struct AttemptPrivateStaging {
+    parent: Arc<OwnedFd>,
+    path: PathBuf,
+    identity: Arc<str>,
+    root: OwnedFd,
+    released: bool,
+}
+
+impl AttemptPrivateStaging {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn root_handle(&self) -> &OwnedFd {
+        &self.root
+    }
+
+    pub fn release(mut self) -> Result<(), LocalRunDirectoryError> {
+        remove_staging_root(&self.parent, &self.identity, &self.root)
+            .map_err(|_| LocalRunDirectoryError::StagingUnavailable)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for AttemptPrivateStaging {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = remove_staging_root(&self.parent, &self.identity, &self.root);
+        }
+    }
+}
+
+impl Drop for LocalAttemptOwner {
+    fn drop(&mut self) {
+        self.release_lock();
+    }
+}
+
+pub struct LocalRunCommitPort {
+    state: Arc<StateStore>,
+    finalizers: Arc<[AttemptStepV1]>,
+    diagnostics: StepDiagnosticLog,
+    accounting: InvocationAccountingLog,
+    artifacts: ArtifactStaging,
+}
+
+impl<Deadline>
+    CommitPort<CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>>
+    for LocalRunCommitPort
+where
+    Deadline: DurableDeadline + Send + 'static,
+{
+    type Error = LocalRunDirectoryError;
+
+    fn commit(
+        &mut self,
+        commit: CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        let state = Arc::clone(&self.state);
+        let finalizers = Arc::clone(&self.finalizers);
+        let diagnostics = self.diagnostics.clone();
+        let accounting = self.accounting.clone();
+        let artifacts = self.artifacts.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                state.commit_runtime(&commit, &finalizers, &diagnostics, &accounting, &artifacts)
+            })
+            .await
+            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?
+        }
+    }
+}
+
+type PendingRecoveryInvocationKey = (u64, String, u8);
+type PendingRecoveryInvocation = (u64, String);
+
+struct StateStore {
+    root: Arc<OwnedFd>,
+    private: Arc<OwnedFd>,
+    current: Mutex<LocalRunStateV1>,
+    pending_recovery_invocations:
+        Mutex<BTreeMap<PendingRecoveryInvocationKey, PendingRecoveryInvocation>>,
+}
+
+impl StateStore {
+    fn commit_runtime<Deadline>(
+        &self,
+        commit: &CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
+        finalizers: &[AttemptStepV1],
+        diagnostics: &StepDiagnosticLog,
+        accounting: &InvocationAccountingLog,
+        artifacts: &ArtifactStaging,
+    ) -> Result<(), LocalRunDirectoryError>
+    where
+        Deadline: DurableDeadline,
+    {
+        let retained_outputs = self.retain_outputs(&commit.state, finalizers, artifacts)?;
+        let settlement_snapshot = (commit.diagnostic.is_some()
+            || matches!(
+                &commit.state.workflow,
+                WorkflowState::Succeeded
+                    | WorkflowState::Failed { .. }
+                    | WorkflowState::Cancelled { .. }
+            ))
+        .then(|| {
+            let state = lock_state(&self.current)?;
+            let attempt = current_attempt(&state)?;
+            Ok(capture_settlement_snapshot(
+                Path::new(&attempt.execution_root),
+                WorkspaceSnapshotSettlementV1::Engine,
+            ))
+        })
+        .transpose()?;
+        self.update(|state| {
+            let now = timestamp(scherzo_cloud_support::utc_now())?;
+            let attempt_number = state.current_attempt_number;
+            {
+                let attempt = current_attempt_mut(state)?;
+                if attempt.state.is_terminal() {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+                attempt.started_at.get_or_insert_with(|| now.clone());
+                if let Some(diagnostic) = commit.diagnostic {
+                    let code = match diagnostic {
+                        CoordinationDiagnostic::TransitionCapacityExceeded => {
+                            DiagnosticCodeV1::TransitionCapacityExceeded
+                        }
+                    };
+                    settle_interrupted_attempt(
+                        attempt,
+                        InterruptionCauseV1::ExecutorFault,
+                        true,
+                        settlement_snapshot.clone(),
+                    )?;
+                    append_diagnostic(state, attempt_number, code)?;
+                    return Ok(());
+                }
+            }
+            let attempt = current_attempt_mut(state)?;
+            if commit.occurrence_accepted {
+                attempt.progress.accepted_occurrence_ordinal = commit.occurrence_ordinal.get();
+            }
+            attempt.progress.last_transition_sequence = commit.state.last_transition_sequence.get();
+            update_step_progress(attempt, &commit.state, finalizers, &retained_outputs)?;
+            update_invocation_ledger(self, attempt, commit, diagnostics, accounting, &now)?;
+            update_recovery_progress(
+                &mut attempt.progress.steps,
+                &attempt.progress.invocations,
+                &commit.state.steps,
+            )?;
+            attempt.progress.outstanding_actions =
+                outstanding_actions(attempt, &commit.state.steps)?;
+            for requested in &commit.actions {
+                if !matches!(requested.kind, CommittedActionKind::FinishRun)
+                    && !attempt.progress.outstanding_actions.iter().any(|action| {
+                        action.action_id == requested.id.transition_sequence.get()
+                            && action.step_id == requested.step
+                            && action.node_role
+                                == requested
+                                    .step
+                                    .as_deref()
+                                    .and_then(|id| attempt_node_role(attempt, id))
+                    })
+                {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+            }
+            for event in &commit.events {
+                if let super::runtime::TransitionEvent::CancellationAccepted {
+                    reason,
+                    deadline,
+                    ..
+                } = event
+                {
+                    attempt.cancellation = Some(AttemptCancellationV1 {
+                        reason: cancellation_reason(*reason),
+                        requested_at: now.clone(),
+                        force_stop_deadline: timestamp(deadline.deadline_utc())?,
+                        workflow_confirmed: false,
+                    });
+                }
+            }
+            attempt.state = match &commit.state.workflow {
+                WorkflowState::Executing {
+                    gate: super::runtime::SchedulingGate::Cancelling { .. },
+                }
+                | WorkflowState::Finalizing {
+                    gate: super::runtime::FinalizationGate::Cancelling { .. },
+                    ..
+                } => AttemptStateV1::Cancelling,
+                WorkflowState::Executing { .. }
+                | WorkflowState::Finalizing {
+                    gate: super::runtime::FinalizationGate::Open,
+                    ..
+                } => AttemptStateV1::Running,
+                WorkflowState::Succeeded => AttemptStateV1::Succeeded,
+                WorkflowState::Failed { .. } => AttemptStateV1::WorkflowFailed,
+                WorkflowState::Cancelled { .. } => AttemptStateV1::Cancelled,
+            };
+            if attempt.state.is_terminal() {
+                attempt.settled_at = Some(now);
+                attempt.settlement_snapshot = settlement_snapshot.clone();
+                attempt.progress.outstanding_actions.clear();
+                attempt.result = AttemptResultV1::NotPublished {
+                    reason: ResultAbsentReasonV1::PublicationPending,
+                };
+                if let Some(cancellation) = &mut attempt.cancellation
+                    && matches!(attempt.state, AttemptStateV1::Cancelled)
+                {
+                    cancellation.workflow_confirmed = true;
+                }
+            }
+            if !commit.occurrence_accepted {
+                let attempt_number = attempt.attempt_number;
+                append_diagnostic(state, attempt_number, DiagnosticCodeV1::StaleOccurrence)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn update(
+        &self,
+        mutate: impl FnOnce(&mut LocalRunStateV1) -> Result<(), LocalRunDirectoryError>,
+    ) -> Result<(), LocalRunDirectoryError> {
+        self.update_with_observer(mutate, &mut NoopStateCommitObserver)
+    }
+
+    fn update_with_observer(
+        &self,
+        mutate: impl FnOnce(&mut LocalRunStateV1) -> Result<(), LocalRunDirectoryError>,
+        observer: &mut impl StateCommitObserver,
+    ) -> Result<(), LocalRunDirectoryError> {
+        let mut current = lock_state(&self.current)?;
+        let authoritative_bytes = read_regular_file(&self.root, STATE_FILE)?;
+        let authoritative = decode_state(&authoritative_bytes)?;
+        if authoritative != *current {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        let mut next = current.clone();
+        mutate(&mut next)?;
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        validate_state(&next)?;
+        replace_state(
+            &self.root,
+            &self.private,
+            &authoritative_bytes,
+            &next,
+            observer,
+        )?;
+        *current = next;
+        Ok(())
+    }
+}
+
+impl DurableProcessGuardStore for StateStore {
+    fn register(
+        &self,
+        step: &str,
+        action_id: u64,
+        identity: &AuthenticatedProcessGroup,
+    ) -> Result<String, ProcessGuardStoreError> {
+        let guard_id = generate_uuid().map_err(|_| ProcessGuardStoreError)?;
+        self.update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let registered_action = attempt
+                .progress
+                .outstanding_actions
+                .iter()
+                .find(|action| {
+                    action.action_id == action_id
+                        && matches!(
+                            action.kind,
+                            OutstandingActionKindV1::StartStep
+                                | OutstandingActionKindV1::StartRecoveryHandler
+                        )
+                        && action.step_id.as_deref() == Some(step)
+                })
+                .and_then(|action| action.node_role)
+                .ok_or(LocalRunDirectoryError::StateConflict)?;
+            if attempt
+                .process_guards
+                .iter()
+                .any(|guard| guard.action_id == action_id || guard.guard_id == guard_id)
+            {
+                return Err(LocalRunDirectoryError::StateConflict);
+            }
+            attempt.process_guards.push(ProcessGuardV1 {
+                guard_id: guard_id.clone(),
+                action_id,
+                step_id: step.to_owned(),
+                node_role: registered_action,
+                state: ProcessGuardStateV1::Prepared,
+                execution_host: attempt.owner.execution_host.clone(),
+                process_group_id: i64::from(identity.process_group().as_raw_pid()),
+                liveness: ProcessLivenessV1 {
+                    kind: ProcessLivenessKindV1::LeaderStartIdentity,
+                    value: identity.leader_start_identity().to_owned(),
+                },
+            });
+            Ok(())
+        })
+        .map_err(|_| ProcessGuardStoreError)?;
+        Ok(guard_id)
+    }
+
+    fn mark_released(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
+        update_process_guard_state(self, guard_id, ProcessGuardStateV1::Released)
+    }
+
+    fn mark_quiesced(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
+        update_process_guard_state(self, guard_id, ProcessGuardStateV1::Quiesced)
+    }
+}
+
+fn update_process_guard_state(
+    store: &StateStore,
+    guard_id: &str,
+    next: ProcessGuardStateV1,
+) -> Result<(), ProcessGuardStoreError> {
+    store
+        .update(|state| {
+            let guard = current_attempt_mut(state)?
+                .process_guards
+                .iter_mut()
+                .find(|guard| guard.guard_id == guard_id)
+                .ok_or(LocalRunDirectoryError::StateConflict)?;
+            match (guard.state, next) {
+                (ProcessGuardStateV1::Prepared, ProcessGuardStateV1::Released)
+                | (_, ProcessGuardStateV1::Quiesced) => guard.state = next,
+                (ProcessGuardStateV1::Released, ProcessGuardStateV1::Released) => {}
+                _ => return Err(LocalRunDirectoryError::StateConflict),
+            }
+            Ok(())
+        })
+        .map_err(|_| ProcessGuardStoreError)
+}
+
+fn lock_state(
+    state: &Mutex<LocalRunStateV1>,
+) -> Result<MutexGuard<'_, LocalRunStateV1>, LocalRunDirectoryError> {
+    state
+        .lock()
+        .map_err(|_| LocalRunDirectoryError::StateConflict)
+}
+
+trait InitialPublicationObserver {
+    fn published(&mut self, _path: &Path, _lock: &File) -> Result<(), LocalRunDirectoryError> {
+        Ok(())
+    }
+}
+
+struct NoopInitialPublicationObserver;
+
+impl InitialPublicationObserver for NoopInitialPublicationObserver {}
+
+fn create_with_observer(
+    requested: &Path,
+    admitted: &AdmittedWorkflow,
+    observer: &mut impl InitialPublicationObserver,
+) -> Result<InitialLocalRun, LocalRunDirectoryError> {
+    let target = RunDirectoryTarget::validate(requested, admitted)?;
+    let (staging_name, staging_root) =
+        create_staging_root(&target.parent, ".run", STAGING_ATTEMPTS)
+            .map_err(|()| LocalRunDirectoryError::StagingUnavailable)?;
+    let mut staging = InitialStaging {
+        parent: &target.parent,
+        name: staging_name,
+        root: staging_root,
+        committed: false,
+    };
+    let run_staging = create_run_staging(&staging.root, &target.suffix)?;
+
+    let lock = create_file(&run_staging, LOCK_FILE, Mode::RUSR | Mode::WUSR)?;
+    fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive)
+        .map_err(|_| LocalRunDirectoryError::LockUnavailable)?;
+
+    mkdir(&run_staging, WORKFLOW_DIRECTORY)?;
+    let workflow_directory = open_directory_at(&run_staging, WORKFLOW_DIRECTORY)?;
+    mkdir(&workflow_directory, WORKFLOW_FILES_DIRECTORY)?;
+    let workflow_files = open_directory_at(&workflow_directory, WORKFLOW_FILES_DIRECTORY)?;
+    mkdir(&run_staging, ATTEMPTS_DIRECTORY)?;
+    let attempts = open_directory_at(&run_staging, ATTEMPTS_DIRECTORY)?;
+    mkdir(&attempts, INITIAL_ATTEMPT_DIRECTORY)?;
+    let attempt_directory = open_directory_at(&attempts, INITIAL_ATTEMPT_DIRECTORY)?;
+    mkdir(&run_staging, PRIVATE_DIRECTORY)?;
+    let private = open_directory_at(&run_staging, PRIVATE_DIRECTORY)?;
+
+    let manifest = retain_execution_specification(&workflow_files, admitted)?;
+    let manifest_bytes = encode_json(&manifest)?;
+    write_new_immutable_file(&workflow_directory, WORKFLOW_MANIFEST_FILE, &manifest_bytes)?;
+
+    let created_at = timestamp(scherzo_cloud_support::utc_now())?;
+    let local_run_id = generate_uuid()?;
+    let run = LocalRunV1 {
+        schema_version: 1,
+        local_run_id: local_run_id.clone(),
+        created_at: created_at.clone(),
+        workflow_digest: DigestV1 {
+            algorithm: admitted
+                .workflow()
+                .content_digest
+                .algorithm
+                .as_str()
+                .to_owned(),
+            value: admitted.workflow().content_digest.value.clone(),
+        },
+        workflow_manifest_digest: DigestV1::sha256(&manifest_bytes),
+        git_baseline: Some(capture_initial_git_baseline(admitted)),
+    };
+    validate_run(&run)?;
+    let run_bytes = encode_json(&run)?;
+    write_new_immutable_file(&run_staging, RUN_FILE, &run_bytes)?;
+
+    let initial_state = initial_state(admitted, &run, local_run_id, created_at)?;
+    validate_state(&initial_state)?;
+    let state_bytes = encode_json(&initial_state)?;
+    decode_state(&state_bytes)?;
+    write_new_state_file(&run_staging, &state_bytes)?;
+    sync_directory(&workflow_files)?;
+    sync_directory(&workflow_directory)?;
+    sync_directory(&attempts)?;
+    sync_directory(&private)?;
+    sync_directory(&run_staging)?;
+    sync_directory(&staging.root)?;
+    verify_initial_staging(&run_staging, &run, &initial_state)?;
+    let retained_root =
+        dup(&run_staging).map_err(|_| LocalRunDirectoryError::PublicationUnavailable)?;
+
+    target.verify_parent_and_absence()?;
+    renameat_with(
+        &target.parent,
+        staging.name.as_ref(),
+        &target.parent,
+        &target.name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|failure| match failure {
+        Errno::EXIST | Errno::NOTEMPTY => LocalRunDirectoryError::DestinationExists,
+        _ => LocalRunDirectoryError::PublicationUnavailable,
+    })?;
+    staging.committed = true;
+    // Process-termination recovery relies on atomic visibility, not host-power-loss
+    // durability; a post-rename directory sync cannot revoke the published commit.
+    let _ = sync_directory(&target.parent);
+    observer.published(&target.normalized, &lock)?;
+
+    let root = Arc::new(retained_root);
+    let private = Arc::new(private);
+    let state = Arc::new(StateStore {
+        root: Arc::clone(&root),
+        private,
+        current: Mutex::new(initial_state),
+        pending_recovery_invocations: Mutex::new(BTreeMap::new()),
+    });
+    let private_directory = target.normalized.join(PRIVATE_DIRECTORY);
+    let result_directory = target
+        .normalized
+        .join(ATTEMPTS_DIRECTORY)
+        .join(INITIAL_ATTEMPT_DIRECTORY)
+        .join("result");
+    Ok(LocalAttemptOwner {
+        normalized: target.normalized,
+        lock: Some(lock),
+        private_directory,
+        attempt_directory,
+        result_directory,
+        attempt_number: INITIAL_ATTEMPT_NUMBER,
+        finalizers: Arc::from(fresh_finalizer_progress(admitted)?),
+        state,
+    })
+}
+
+struct RunDirectoryTarget {
+    supplied_parent: PathBuf,
+    parent: OwnedFd,
+    name: OsString,
+    suffix: Vec<OsString>,
+    normalized: PathBuf,
+    execution_root: AdmittedExecutionRoot,
+}
+
+impl RunDirectoryTarget {
+    fn validate(
+        requested: &Path,
+        admitted: &AdmittedWorkflow,
+    ) -> Result<Self, LocalRunDirectoryError> {
+        let requested = if requested.is_absolute() {
+            requested.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?
+                .join(requested)
+        };
+        let (supplied_parent, suffix) = nearest_existing_parent(&requested)?;
+        let canonical_parent = std::fs::canonicalize(&supplied_parent)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        let parent = open_directory_path(&canonical_parent)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        let name = suffix
+            .first()
+            .ok_or(LocalRunDirectoryError::DestinationExists)?
+            .clone();
+        ensure_absent(&parent, &name)?;
+        let normalized = suffix
+            .iter()
+            .fold(canonical_parent, |path, component| path.join(component));
+        if normalized.to_str().is_none() {
+            return Err(LocalRunDirectoryError::InvalidPath);
+        }
+        let execution_root = admitted.execution().root_identity().clone();
+        if run_directory_overlaps_execution_root(
+            &normalized,
+            admitted.execution().root(),
+            &execution_root,
+            &parent,
+        )? {
+            return Err(LocalRunDirectoryError::ExecutionRootOverlap);
+        }
+        Ok(Self {
+            supplied_parent,
+            parent,
+            name,
+            suffix,
+            normalized,
+            execution_root,
+        })
+    }
+
+    fn verify_parent_and_absence(&self) -> Result<(), LocalRunDirectoryError> {
+        let rebound = std::fs::canonicalize(&self.supplied_parent)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        let rebound =
+            open_directory_path(&rebound).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        if !same_file(&self.parent, &rebound)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?
+        {
+            return Err(LocalRunDirectoryError::ParentUnavailable);
+        }
+        if run_directory_overlaps_execution_root(
+            &self.normalized,
+            self.execution_root.provenance_path(),
+            &self.execution_root,
+            &self.parent,
+        )? {
+            return Err(LocalRunDirectoryError::ExecutionRootOverlap);
+        }
+        ensure_absent(&self.parent, &self.name)
+    }
+}
+
+fn nearest_existing_parent(
+    requested: &Path,
+) -> Result<(PathBuf, Vec<OsString>), LocalRunDirectoryError> {
+    let mut candidate = requested.to_owned();
+    let mut suffix = VecDeque::new();
+    loop {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) if suffix.is_empty() => {
+                return Err(LocalRunDirectoryError::DestinationExists);
+            }
+            Ok(_) => break,
+            Err(failure) if failure.kind() == io::ErrorKind::NotFound => {
+                let component = candidate
+                    .file_name()
+                    .filter(|component| *component != "." && *component != "..")
+                    .ok_or(LocalRunDirectoryError::InvalidPath)?;
+                if component.to_str().is_none() {
+                    return Err(LocalRunDirectoryError::InvalidPath);
+                }
+                suffix.push_front(component.to_owned());
+                if !candidate.pop() {
+                    return Err(LocalRunDirectoryError::ParentUnavailable);
+                }
+            }
+            Err(_) => return Err(LocalRunDirectoryError::ParentUnavailable),
+        }
+    }
+    if suffix.is_empty() {
+        return Err(LocalRunDirectoryError::DestinationExists);
+    }
+    Ok((candidate, suffix.into_iter().collect()))
+}
+
+fn create_run_staging(
+    staging_root: &OwnedFd,
+    suffix: &[OsString],
+) -> Result<OwnedFd, LocalRunDirectoryError> {
+    let mut current = dup(staging_root).map_err(|_| LocalRunDirectoryError::StagingUnavailable)?;
+    for component in suffix.iter().skip(1) {
+        mkdir(&current, component)?;
+        current = open_directory_at(&current, component)?;
+    }
+    Ok(current)
+}
+
+struct InitialStaging<'a> {
+    parent: &'a OwnedFd,
+    name: Arc<str>,
+    root: OwnedFd,
+    committed: bool,
+}
+
+impl Drop for InitialStaging<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = remove_staging_root(self.parent, &self.name, &self.root);
+        }
+    }
+}
+
+fn retain_execution_specification(
+    files: &OwnedFd,
+    admitted: &AdmittedWorkflow,
+) -> Result<WorkflowManifestV1, LocalRunDirectoryError> {
+    let source_root = admitted
+        .workflow()
+        .source
+        .source_root
+        .to_str()
+        .ok_or(LocalRunDirectoryError::InvalidPath)?
+        .to_owned();
+    let mut ordinal = 0_u64;
+    let mut source_files = Vec::with_capacity(admitted.workflow().source_closure.len());
+    for (path, bytes) in &admitted.workflow().source_closure {
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+        let file = retain_file(files, ordinal, bytes)?;
+        source_files.push(ManifestSourceFileV1 {
+            path: path.clone(),
+            file,
+        });
+    }
+    let mut inputs = BTreeMap::new();
+    for (name, input) in admitted.inputs().values() {
+        let retained = match input {
+            ResolvedInput::Text(text) => {
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                ManifestInputV1::Text {
+                    file: retain_file(files, ordinal, text.as_bytes())?,
+                }
+            }
+            ResolvedInput::Json(json) => {
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                ManifestInputV1::Json {
+                    file: retain_file(files, ordinal, json.source())?,
+                }
+            }
+            ResolvedInput::File(value) => {
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                ManifestInputV1::File {
+                    media_type: value.media_type().to_owned(),
+                    file: retain_file(files, ordinal, value.bytes())?,
+                }
+            }
+            ResolvedInput::Attachments(attachments) => {
+                let mut items = Vec::with_capacity(attachments.len());
+                for attachment in attachments.iter() {
+                    ordinal = ordinal
+                        .checked_add(1)
+                        .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                    items.push(ManifestAttachmentV1 {
+                        media_type: attachment.media_type().to_owned(),
+                        file: retain_file(files, ordinal, attachment.bytes())?,
+                    });
+                }
+                ManifestInputV1::Attachments { items }
+            }
+        };
+        inputs.insert(name.clone(), retained);
+    }
+    let manifest = WorkflowManifestV1 {
+        schema_version: 1,
+        workflow_path: admitted.workflow().source.workflow_path.clone(),
+        source_root,
+        maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps().get(),
+        source_files,
+        inputs,
+    };
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn retain_file(
+    directory: &OwnedFd,
+    ordinal: u64,
+    bytes: &[u8],
+) -> Result<ManifestFileV1, LocalRunDirectoryError> {
+    let name = retained_file_name(ordinal)?;
+    write_new_immutable_file(directory, &name, bytes)?;
+    Ok(ManifestFileV1 {
+        ordinal,
+        relative_file: format!("{WORKFLOW_FILES_DIRECTORY}/{name}"),
+        size_bytes: u64::try_from(bytes.len())
+            .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?,
+        digest: DigestV1::sha256(bytes),
+    })
+}
+
+fn capture_initial_git_baseline(admitted: &AdmittedWorkflow) -> GitBaselineV1 {
+    let admitted_baseline = admitted.git_capture().map(GitCaptureContext::baseline);
+    let baseline = admitted_baseline.map_or_else(
+        || {
+            GitCaptureContext::admit_local(
+                admitted.execution(),
+                &super::artifact::CaptureCancellation::default(),
+            )
+            .map(|context| context.baseline())
+        },
+        Ok,
+    );
+    match baseline {
+        Ok(baseline) => GitBaselineV1::Available {
+            object_format: baseline.object_format().as_str().to_owned(),
+            commit_oid: baseline.commit_oid().to_owned(),
+        },
+        Err(failure) => GitBaselineV1::Unavailable {
+            reason: git_baseline_unavailable_reason(failure),
+        },
+    }
+}
+
+const fn git_baseline_unavailable_reason(
+    failure: GitWorkspaceAdmissionFailure,
+) -> GitBaselineUnavailableReasonV1 {
+    match failure {
+        GitWorkspaceAdmissionFailure::Cancelled => GitBaselineUnavailableReasonV1::Cancelled,
+        GitWorkspaceAdmissionFailure::ExecutionRootRebound => {
+            GitBaselineUnavailableReasonV1::ExecutionRootRebound
+        }
+        GitWorkspaceAdmissionFailure::GitUnavailable => {
+            GitBaselineUnavailableReasonV1::GitUnavailable
+        }
+        GitWorkspaceAdmissionFailure::GitTimedOut => GitBaselineUnavailableReasonV1::GitTimedOut,
+        GitWorkspaceAdmissionFailure::GitOutputLimitExceeded => {
+            GitBaselineUnavailableReasonV1::GitOutputLimitExceeded
+        }
+        GitWorkspaceAdmissionFailure::NotWorkTree => GitBaselineUnavailableReasonV1::NotWorkTree,
+        GitWorkspaceAdmissionFailure::ExecutionRootNotWorkTreeRoot => {
+            GitBaselineUnavailableReasonV1::ExecutionRootNotWorkTreeRoot
+        }
+        GitWorkspaceAdmissionFailure::UnsupportedObjectFormat => {
+            GitBaselineUnavailableReasonV1::UnsupportedObjectFormat
+        }
+        GitWorkspaceAdmissionFailure::BaselineUnavailable => {
+            GitBaselineUnavailableReasonV1::BaselineUnavailable
+        }
+        GitWorkspaceAdmissionFailure::InitialWorkspaceDirty => {
+            GitBaselineUnavailableReasonV1::InitialWorkspaceDirty
+        }
+    }
+}
+
+fn attempt_definition_for_run(run: &LocalRunV1) -> AttemptDefinitionV1 {
+    AttemptDefinitionV1 {
+        digest: run.workflow_digest.clone(),
+        manifest_digest: run.workflow_manifest_digest.clone(),
+        locator: AttemptDefinitionLocatorV1::Run,
+    }
+}
+
+fn initial_state(
+    admitted: &AdmittedWorkflow,
+    run: &LocalRunV1,
+    local_run_id: String,
+    created_at: String,
+) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
+    let attempt = fresh_attempt(
+        admitted,
+        INITIAL_ATTEMPT_NUMBER,
+        AttemptTriggerV1::Initial,
+        None,
+        attempt_definition_for_run(run),
+        created_at,
+    )?;
+    Ok(LocalRunStateV1 {
+        schema_version: 1,
+        local_run_id,
+        revision: 1,
+        current_attempt_number: INITIAL_ATTEMPT_NUMBER,
+        attempts: vec![attempt],
+        diagnostics: Vec::new(),
+    })
+}
+
+type RetainedOutputSets = BTreeMap<(AttemptNodeRoleV1, String), Vec<RetainedOutputV1>>;
+
+impl StateStore {
+    fn retain_outputs<Deadline>(
+        &self,
+        runtime: &super::runtime::RuntimeState<
+            StepFailureCause,
+            super::value::CapturedValue,
+            Deadline,
+        >,
+        finalizers: &[AttemptStepV1],
+        artifacts: &ArtifactStaging,
+    ) -> Result<RetainedOutputSets, LocalRunDirectoryError> {
+        let attempt_number = {
+            let state = lock_state(&self.current)?;
+            state.current_attempt_number
+        };
+        let attempts = open_directory_at(&self.root, ATTEMPTS_DIRECTORY)?;
+        let attempt_name =
+            attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let attempt = open_directory_at(&attempts, &attempt_name)?;
+        let values = create_or_open_directory(&attempt, VALUES_DIRECTORY)?;
+        let mut retained = BTreeMap::new();
+        for (node, runtime) in &runtime.steps {
+            let StepState::Succeeded { outputs } = &runtime.state else {
+                continue;
+            };
+            let role = if finalizers.iter().any(|finalizer| finalizer.id == *node) {
+                AttemptNodeRoleV1::Finalizer
+            } else {
+                AttemptNodeRoleV1::Step
+            };
+            let role_directory = create_or_open_directory(&values, retained_role_name(role))?;
+            let node_directory = create_or_open_directory(&role_directory, node)?;
+            let mut descriptors = Vec::with_capacity(outputs.len());
+            for (name, value) in outputs {
+                descriptors.push(retain_output_value(
+                    artifacts,
+                    &node_directory,
+                    role,
+                    node,
+                    name,
+                    value,
+                )?);
+            }
+            sync_directory(&node_directory)?;
+            sync_directory(&role_directory)?;
+            retained.insert((role, node.clone()), descriptors);
+        }
+        sync_directory(&values)?;
+        sync_directory(&attempt)?;
+        Ok(retained)
+    }
+}
+
+fn retain_output_value(
+    artifacts: &ArtifactStaging,
+    directory: &OwnedFd,
+    role: AttemptNodeRoleV1,
+    node: &str,
+    name: &str,
+    value: &super::value::CapturedValue,
+) -> Result<RetainedOutputV1, LocalRunDirectoryError> {
+    let relative_path = retained_value_relative_path(role, node, name);
+    match value {
+        super::value::CapturedValue::Text(text) => {
+            let carrier = retain_bytes_carrier(
+                directory,
+                name,
+                &relative_path,
+                "text/plain; charset=utf-8",
+                text.carrier(),
+            )?;
+            Ok(RetainedOutputV1::Text {
+                name: name.to_owned(),
+                carrier,
+            })
+        }
+        super::value::CapturedValue::Json(json) => {
+            let carrier = retain_bytes_carrier(
+                directory,
+                name,
+                &relative_path,
+                "application/json",
+                json.carrier(),
+            )?;
+            Ok(RetainedOutputV1::Json {
+                name: name.to_owned(),
+                carrier,
+            })
+        }
+        super::value::CapturedValue::File(file) => {
+            if file.output_identity() != name {
+                return Err(LocalRunDirectoryError::StateConflict);
+            }
+            let carrier =
+                retain_staged_carrier(artifacts, directory, name, &relative_path, file.carrier())?;
+            Ok(RetainedOutputV1::File {
+                name: name.to_owned(),
+                media_type: file.media_type().to_owned(),
+                carrier,
+            })
+        }
+        super::value::CapturedValue::GitBranch(branch) => {
+            if branch.output_identity() != name {
+                return Err(LocalRunDirectoryError::StateConflict);
+            }
+            let metadata = branch.metadata();
+            let carrier = branch
+                .carrier()
+                .map(|carrier| {
+                    retain_staged_carrier(
+                        artifacts,
+                        directory,
+                        name,
+                        &relative_path,
+                        carrier.staged(),
+                    )
+                })
+                .transpose()?;
+            Ok(RetainedOutputV1::GitBranch {
+                name: name.to_owned(),
+                artifact_version: metadata.artifact_version(),
+                object_format: metadata.object_format().as_str().to_owned(),
+                base_oid: metadata.base_oid().to_owned(),
+                head_oid: metadata.head_oid().to_owned(),
+                tree_oid: metadata.tree_oid().to_owned(),
+                carrier,
+            })
+        }
+    }
+}
+
+fn retain_bytes_carrier(
+    directory: &OwnedFd,
+    name: &str,
+    relative_path: &str,
+    media_type: &str,
+    bytes: &[u8],
+) -> Result<RetainedCarrierV1, LocalRunDirectoryError> {
+    write_or_verify_immutable_file(directory, name, bytes)?;
+    let size_bytes =
+        u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let carrier = RetainedCarrierV1 {
+        relative_path: relative_path.to_owned(),
+        media_type: media_type.to_owned(),
+        size_bytes,
+        digest: DigestV1::sha256(bytes),
+    };
+    verify_retained_carrier(directory, name, &carrier)?;
+    Ok(carrier)
+}
+
+fn retain_staged_carrier(
+    artifacts: &ArtifactStaging,
+    directory: &OwnedFd,
+    name: &str,
+    relative_path: &str,
+    staged: &super::artifact::StagedCarrier,
+) -> Result<RetainedCarrierV1, LocalRunDirectoryError> {
+    match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => {
+            let mut destination = create_file(directory, name, Mode::RUSR | Mode::WUSR)?;
+            let copied = artifacts
+                .copy_to(staged.handle(), &mut destination)
+                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            if copied != staged.size() {
+                return Err(LocalRunDirectoryError::StateWriteUnavailable);
+            }
+            destination
+                .flush()
+                .and_then(|()| destination.sync_all())
+                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            fchmod(destination.as_fd(), Mode::RUSR)
+                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            destination
+                .sync_all()
+                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+        }
+        Ok(metadata) if FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile => {}
+        Ok(_) | Err(_) => return Err(LocalRunDirectoryError::StateConflict),
+    }
+    let carrier = RetainedCarrierV1 {
+        relative_path: relative_path.to_owned(),
+        media_type: staged.media_type().to_owned(),
+        size_bytes: staged.size(),
+        digest: DigestV1 {
+            algorithm: SHA256_ALGORITHM.to_owned(),
+            value: staged.sha256().to_owned(),
+        },
+    };
+    verify_retained_carrier(directory, name, &carrier)?;
+    Ok(carrier)
+}
+
+fn verify_retained_carrier(
+    directory: &OwnedFd,
+    name: &str,
+    carrier: &RetainedCarrierV1,
+) -> Result<(), LocalRunDirectoryError> {
+    verify_retained_carrier_with_sync(directory, name, carrier, true)
+}
+
+fn verify_retained_carrier_with_sync(
+    directory: &OwnedFd,
+    name: &str,
+    carrier: &RetainedCarrierV1,
+    synchronize: bool,
+) -> Result<(), LocalRunDirectoryError> {
+    let descriptor = openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let opened = fstat(&descriptor).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || u64::try_from(opened.st_size) != Ok(carrier.size_bytes)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut file = File::from(descriptor);
+    if synchronize {
+        file.sync_all()
+            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    }
+    let mut context = DigestContext::new(&SHA256);
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(u64::try_from(read).map_err(|_| LocalRunDirectoryError::StateInvalid)?)
+            .filter(|bytes| *bytes <= carrier.size_bytes)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        context.update(&buffer[..read]);
+    }
+    let after = fstat(&file).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let named = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if observed != carrier.size_bytes
+        || lowercase_hex(context.finish().as_ref()) != carrier.digest.value
+        || opened.st_dev != after.st_dev
+        || opened.st_ino != after.st_ino
+        || opened.st_size != after.st_size
+        || opened.st_dev != named.st_dev
+        || opened.st_ino != named.st_ino
+        || FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(())
+}
+
+const fn retained_role_name(role: AttemptNodeRoleV1) -> &'static str {
+    match role {
+        AttemptNodeRoleV1::Step => "steps",
+        AttemptNodeRoleV1::Finalizer => "finalizers",
+    }
+}
+
+fn update_invocation_ledger<Deadline>(
+    store: &StateStore,
+    attempt: &mut LocalAttemptV1,
+    commit: &CommittedReduction<StepFailureCause, super::value::CapturedValue, Deadline>,
+    diagnostics: &StepDiagnosticLog,
+    accounting: &InvocationAccountingLog,
+    now: &str,
+) -> Result<(), LocalRunDirectoryError> {
+    for (step_id, runtime) in &commit.state.steps {
+        let Some(recovery) = runtime
+            .recovery
+            .as_ref()
+            .filter(|recovery| !recovery.rounds.is_empty())
+        else {
+            continue;
+        };
+        for round in &recovery.rounds {
+            let invocation_id = round.failed_execution.invocation.transition_sequence.get();
+            if attempt
+                .progress
+                .invocations
+                .iter()
+                .any(|invocation| invocation.invocation_id == invocation_id)
+            {
+                continue;
+            }
+            let execution_number = round.failed_execution.execution_number.get();
+            let pending = store
+                .pending_recovery_invocations
+                .lock()
+                .map_err(|_| LocalRunDirectoryError::StateConflict)?
+                .remove(&(attempt.attempt_number, step_id.clone(), execution_number));
+            let started_at = match pending {
+                Some((pending_invocation, started_at)) if pending_invocation == invocation_id => {
+                    started_at
+                }
+                Some(_) => return Err(LocalRunDirectoryError::StateConflict),
+                None => attempt.started_at.clone().unwrap_or_else(|| now.to_owned()),
+            };
+            attempt.progress.invocations.push(DurableInvocationV1 {
+                invocation_id,
+                step_id: step_id.clone(),
+                node_role: AttemptNodeRoleV1::Step,
+                role: super::publication::RecoveryInvocationRoleV1::Target,
+                target_execution: Some(execution_number),
+                recovery_round: None,
+                state: DurableInvocationStateV1::Active,
+                started_at,
+                finished_at: None,
+                usage: super::publication::RecoveryInvocationUsageV1::default(),
+                diagnostics: Vec::new(),
+                diagnostic_reference: None,
+            });
+        }
+    }
+    for action in &commit.actions {
+        let (role, target_execution, recovery_round) = match action.kind {
+            CommittedActionKind::StartStep => (
+                super::publication::RecoveryInvocationRoleV1::Target,
+                action.execution_number.map(TargetExecutionNumber::get),
+                None,
+            ),
+            CommittedActionKind::StartRecoveryHandler => (
+                super::publication::RecoveryInvocationRoleV1::RecoveryHandler,
+                None,
+                action
+                    .recovery_round
+                    .map(super::runtime::RecoveryRoundNumber::get),
+            ),
+            CommittedActionKind::CaptureOutputs
+            | CommittedActionKind::CancelStep
+            | CommittedActionKind::ForceAbortStep
+            | CommittedActionKind::FinishRun => continue,
+        };
+        let step_id = action
+            .step
+            .as_ref()
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        let runtime_recovery = commit
+            .state
+            .steps
+            .get(step_id)
+            .and_then(|runtime| runtime.recovery.as_ref());
+        let recovery_active = runtime_recovery.is_some_and(|recovery| !recovery.rounds.is_empty());
+        let invocation_id = action.id.transition_sequence.get();
+        if !recovery_active {
+            if runtime_recovery.is_some()
+                && matches!(action.kind, CommittedActionKind::StartStep)
+                && let Some(execution_number) = action.execution_number
+            {
+                let key = (
+                    attempt.attempt_number,
+                    step_id.clone(),
+                    execution_number.get(),
+                );
+                let mut pending = store
+                    .pending_recovery_invocations
+                    .lock()
+                    .map_err(|_| LocalRunDirectoryError::StateConflict)?;
+                if let Some(retained) = pending.get(&key) {
+                    if retained.0 != invocation_id {
+                        return Err(LocalRunDirectoryError::StateConflict);
+                    }
+                } else {
+                    pending.insert(key, (invocation_id, now.to_owned()));
+                }
+            }
+            continue;
+        }
+        let node_role =
+            attempt_node_role(attempt, step_id).ok_or(LocalRunDirectoryError::StateConflict)?;
+        if let Some(existing) = attempt
+            .progress
+            .invocations
+            .iter()
+            .find(|invocation| invocation.invocation_id == invocation_id)
+        {
+            if existing.step_id != *step_id
+                || existing.node_role != node_role
+                || existing.role != role
+                || existing.target_execution != target_execution
+                || existing.recovery_round != recovery_round
+            {
+                return Err(LocalRunDirectoryError::StateConflict);
+            }
+            continue;
+        }
+        if u64::try_from(attempt.progress.invocations.len())
+            .ok()
+            .is_none_or(|count| count >= attempt.progress.accounting.maximum_invocations)
+        {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        attempt.progress.invocations.push(DurableInvocationV1 {
+            invocation_id,
+            step_id: step_id.clone(),
+            node_role,
+            role,
+            target_execution,
+            recovery_round,
+            state: DurableInvocationStateV1::Active,
+            started_at: now.to_owned(),
+            finished_at: None,
+            usage: super::publication::RecoveryInvocationUsageV1::default(),
+            diagnostics: Vec::new(),
+            diagnostic_reference: None,
+        });
+    }
+
+    for index in 0..attempt.progress.invocations.len() {
+        let should_settle = {
+            let invocation = &attempt.progress.invocations[index];
+            invocation.state == DurableInvocationStateV1::Active
+                && !durable_invocation_is_active(invocation, &commit.state.steps)
+        };
+        if !should_settle {
+            continue;
+        }
+        let (step_id, invocation_id, role) = {
+            let invocation = &attempt.progress.invocations[index];
+            (
+                invocation.step_id.clone(),
+                invocation.invocation_id,
+                invocation.role,
+            )
+        };
+        let action = super::runtime::ActionId {
+            transition_sequence: super::runtime::TransitionSequence(invocation_id),
+        };
+        let diagnostic = diagnostics.get_invocation(&step_id, action);
+        let agent = accounting.native_session(action);
+        let retained = diagnostic
+            .as_ref()
+            .map(|diagnostic| {
+                store.retain_invocation_diagnostics(
+                    attempt.attempt_number,
+                    invocation_id,
+                    diagnostic,
+                    agent.is_some(),
+                )
+            })
+            .transpose()?;
+        let usage = accounting.usage(action).unwrap_or_default();
+        let diagnostic_reference = agent.map(|session| {
+            format!(
+                "diagnostics/{}/{}",
+                match session.profile {
+                    AgentCompatibilityProfile::PiJsonV1 => "pi-json-v1",
+                    AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => {
+                        "claude-code-stream-json-v1"
+                    }
+                    AgentCompatibilityProfile::CodexAppServerV1 => "codex-app-server-v1",
+                },
+                session.diagnostic_identity
+            )
+        });
+        let cancelled = commit
+            .state
+            .steps
+            .get(&step_id)
+            .is_some_and(|runtime| matches!(runtime.state, StepState::Cancelled { .. }));
+        let invocation = &mut attempt.progress.invocations[index];
+        invocation.state = if cancelled {
+            DurableInvocationStateV1::Cancelled
+        } else {
+            DurableInvocationStateV1::Settled
+        };
+        invocation.finished_at = Some(now.to_owned());
+        invocation.usage = super::publication::RecoveryInvocationUsageV1 {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        };
+        invocation.diagnostics = retained.unwrap_or_default();
+        invocation.diagnostic_reference = diagnostic_reference;
+        if role == super::publication::RecoveryInvocationRoleV1::RecoveryHandler
+            && !diagnostics.is_recovery_handler(&step_id, action)
+        {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+    }
+    attempt
+        .progress
+        .invocations
+        .sort_by_key(|invocation| invocation.invocation_id);
+    recalculate_invocation_accounting(&mut attempt.progress)
+}
+
+fn durable_invocation_is_active<Cause, Output>(
+    invocation: &DurableInvocationV1,
+    runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
+) -> bool {
+    let Some(active) = runtime_steps
+        .get(&invocation.step_id)
+        .and_then(|runtime| runtime.active_invocation)
+    else {
+        return false;
+    };
+    match (invocation.role, active) {
+        (
+            super::publication::RecoveryInvocationRoleV1::Target,
+            ActiveStepInvocation::Target { execution_number },
+        ) => invocation.target_execution == Some(execution_number.get()),
+        (
+            super::publication::RecoveryInvocationRoleV1::RecoveryHandler,
+            ActiveStepInvocation::RecoveryHandler { round },
+        ) => invocation.recovery_round == Some(round.get()),
+        _ => false,
+    }
+}
+
+fn recalculate_invocation_accounting(
+    progress: &mut AttemptProgressV1,
+) -> Result<(), LocalRunDirectoryError> {
+    let mut settled = 0_u64;
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut retained_diagnostic_bytes = 0_u64;
+    let mut discarded_diagnostic_bytes = 0_u64;
+    for invocation in &progress.invocations {
+        if invocation.state != DurableInvocationStateV1::Active {
+            settled = settled
+                .checked_add(1)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        }
+        input_tokens = input_tokens
+            .checked_add(invocation.usage.input_tokens)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        output_tokens = output_tokens
+            .checked_add(invocation.usage.output_tokens)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        for diagnostic in &invocation.diagnostics {
+            retained_diagnostic_bytes = retained_diagnostic_bytes
+                .checked_add(diagnostic.retained_bytes)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            discarded_diagnostic_bytes = discarded_diagnostic_bytes
+                .checked_add(diagnostic.discarded_bytes)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        }
+    }
+    let observed_invocations = u64::try_from(progress.invocations.len())
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if observed_invocations > progress.accounting.maximum_invocations {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    progress.accounting.observed_invocations = observed_invocations;
+    progress.accounting.settled_invocations = settled;
+    progress.accounting.input_tokens = input_tokens;
+    progress.accounting.output_tokens = output_tokens;
+    progress.accounting.retained_diagnostic_bytes = retained_diagnostic_bytes;
+    progress.accounting.discarded_diagnostic_bytes = discarded_diagnostic_bytes;
+    Ok(())
+}
+
+impl StateStore {
+    fn retain_invocation_diagnostics(
+        &self,
+        attempt_number: u64,
+        invocation_id: u64,
+        diagnostic: &StepDiagnostic,
+        agent: bool,
+    ) -> Result<Vec<DurableInvocationDiagnosticV1>, LocalRunDirectoryError> {
+        let attempts = open_directory_at(&self.root, ATTEMPTS_DIRECTORY)?;
+        let attempt_name =
+            attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let attempt = open_directory_at(&attempts, &attempt_name)?;
+        let invocations = create_or_open_directory(&attempt, INVOCATIONS_DIRECTORY)?;
+        let invocation_name = format!("{invocation_id:020}");
+        let invocation = create_or_open_directory(&invocations, &invocation_name)?;
+        let (stdout_kind, stderr_kind) = if agent {
+            (
+                super::publication::RecoveryDiagnosticKindV1::AgentHarnessStdout,
+                super::publication::RecoveryDiagnosticKindV1::AgentHarnessStderr,
+            )
+        } else {
+            (
+                super::publication::RecoveryDiagnosticKindV1::CommandStdout,
+                super::publication::RecoveryDiagnosticKindV1::CommandStderr,
+            )
+        };
+        let mut retained = Vec::with_capacity(2);
+        for (name, kind, stream) in [
+            ("stdout.bin", stdout_kind, diagnostic.standard_output()),
+            ("stderr.bin", stderr_kind, diagnostic.standard_error()),
+        ] {
+            write_or_verify_immutable_file(&invocation, name, stream.bytes())?;
+            let discarded_bytes = stream
+                .truncation()
+                .map_or(0, |truncation| truncation.discarded_bytes());
+            retained.push(DurableInvocationDiagnosticV1 {
+                kind,
+                reference: format!(
+                    "{ATTEMPTS_DIRECTORY}/{attempt_name}/{INVOCATIONS_DIRECTORY}/{invocation_name}/{name}"
+                ),
+                retained_bytes: u64::try_from(stream.bytes().len())
+                    .map_err(|_| LocalRunDirectoryError::StateInvalid)?,
+                discarded_bytes,
+                truncated: discarded_bytes != 0,
+                fully_drained: stream.fully_drained(),
+            });
+        }
+        sync_directory(&invocation)?;
+        sync_directory(&invocations)?;
+        sync_directory(&attempt)?;
+        Ok(retained)
+    }
+}
+
+fn create_or_open_directory(
+    parent: &OwnedFd,
+    name: &str,
+) -> Result<OwnedFd, LocalRunDirectoryError> {
+    match mkdirat(parent, name, Mode::RWXU) {
+        Ok(()) | Err(Errno::EXIST) => open_directory_at(parent, name),
+        Err(_) => Err(LocalRunDirectoryError::StagingUnavailable),
+    }
+}
+
+fn write_or_verify_immutable_file(
+    directory: &OwnedFd,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), LocalRunDirectoryError> {
+    match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => write_new_immutable_file(directory, name, bytes),
+        Ok(metadata) if FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile => {
+            let retained = read_regular_file(directory, name)?;
+            if retained == bytes {
+                Ok(())
+            } else {
+                Err(LocalRunDirectoryError::StateConflict)
+            }
+        }
+        Ok(_) | Err(_) => Err(LocalRunDirectoryError::StateConflict),
+    }
+}
+
+fn update_step_progress<Deadline>(
+    attempt: &mut LocalAttemptV1,
+    runtime: &super::runtime::RuntimeState<StepFailureCause, super::value::CapturedValue, Deadline>,
+    finalizers: &[AttemptStepV1],
+    retained_outputs: &RetainedOutputSets,
+) -> Result<(), LocalRunDirectoryError>
+where
+    Deadline: DurableDeadline,
+{
+    if attempt.progress.steps.len() + finalizers.len() != runtime.steps.len() {
+        return Err(LocalRunDirectoryError::StateConflict);
+    }
+    if let (Some(retained), Some(observed)) = (attempt.force_abort, runtime.force_abort)
+        && retained != observed
+    {
+        return Err(LocalRunDirectoryError::StateConflict);
+    }
+    attempt.force_abort = runtime.force_abort;
+    update_progress_nodes(
+        &mut attempt.progress.steps,
+        &runtime.steps,
+        retained_outputs,
+    )?;
+
+    if let Some(summary) = &runtime.finalization_summary {
+        if finalizers.is_empty() {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        let mut complete = durable_finalization_summary(summary)?;
+        let finalizer_count = complete.finalizers.len();
+        let mut retained = complete
+            .finalizers
+            .into_iter()
+            .map(|finalizer| (finalizer.id.clone(), finalizer))
+            .collect::<BTreeMap<_, _>>();
+        if retained.len() != finalizer_count || retained.len() != finalizers.len() {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        complete.finalizers = finalizers
+            .iter()
+            .map(|expected| {
+                let mut finalizer = retained
+                    .remove(&expected.id)
+                    .ok_or(LocalRunDirectoryError::StateConflict)?;
+                if finalizer.role != expected.role
+                    || finalizer.failure_policy != expected.failure_policy
+                {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+                finalizer.outputs = retained_outputs
+                    .get(&(AttemptNodeRoleV1::Finalizer, finalizer.id.clone()))
+                    .cloned()
+                    .or_else(|| (finalizer.state != AttemptStepStateV1::Succeeded).then(Vec::new));
+                if finalizer.outputs.is_none() {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+                Ok(finalizer)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !retained.is_empty() {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        complete.issues = durable_finalization_issues(&complete.finalizers);
+        attempt.finalization = Some(AttemptFinalizationV1::Complete(complete));
+        return Ok(());
+    }
+
+    let WorkflowState::Finalizing { trigger, gate, .. } = &runtime.workflow else {
+        if attempt.finalization.is_some()
+            || (!finalizers.is_empty()
+                && matches!(
+                    runtime.workflow,
+                    WorkflowState::Succeeded
+                        | WorkflowState::Failed { .. }
+                        | WorkflowState::Cancelled { .. }
+                ))
+        {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        return Ok(());
+    };
+
+    if finalizers.is_empty() {
+        return Err(LocalRunDirectoryError::StateConflict);
+    }
+    if attempt.finalization.is_none() {
+        attempt.finalization = Some(AttemptFinalizationV1::Progress(
+            AttemptFinalizationProgressV1 {
+                complete: false,
+                trigger: finalization_trigger(*trigger),
+                finalizers: finalizers.to_vec(),
+                cancellation: None,
+                force_abort: false,
+            },
+        ));
+    }
+    let Some(AttemptFinalizationV1::Progress(progress)) = &mut attempt.finalization else {
+        return Err(LocalRunDirectoryError::StateConflict);
+    };
+    progress.trigger = finalization_trigger(*trigger);
+    match gate {
+        super::runtime::FinalizationGate::Open => {
+            progress.cancellation = None;
+            progress.force_abort = false;
+        }
+        super::runtime::FinalizationGate::Cancelling {
+            reason,
+            deadline,
+            force_abort,
+        } => {
+            progress.cancellation = Some(DurableFinalizationCancellationV1 {
+                reason: cancellation_reason(*reason),
+                force_stop_deadline: deadline
+                    .as_ref()
+                    .map(|deadline| timestamp(deadline.deadline_utc()))
+                    .transpose()?,
+            });
+            progress.force_abort = *force_abort;
+        }
+    }
+    update_progress_nodes(&mut progress.finalizers, &runtime.steps, retained_outputs)
+}
+
+fn update_progress_nodes<Cause, Output>(
+    nodes: &mut [AttemptStepV1],
+    runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
+    retained_outputs: &RetainedOutputSets,
+) -> Result<(), LocalRunDirectoryError> {
+    for node in nodes {
+        let runtime = runtime_steps
+            .get(&node.id)
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        node.state = attempt_step_state(&runtime.state);
+        node.outputs = retained_outputs
+            .get(&(node.role, node.id.clone()))
+            .cloned()
+            .or_else(|| (node.state != AttemptStepStateV1::Succeeded).then(Vec::new));
+        if node.outputs.is_none() {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        node.detail = attempt_step_detail(&runtime.state);
+    }
+    Ok(())
+}
+
+fn update_recovery_progress(
+    nodes: &mut [AttemptStepV1],
+    invocations: &[DurableInvocationV1],
+    runtime_steps: &BTreeMap<
+        String,
+        super::runtime::StepRuntimeState<StepFailureCause, super::value::CapturedValue>,
+    >,
+) -> Result<(), LocalRunDirectoryError> {
+    for node in nodes {
+        let runtime = runtime_steps
+            .get(&node.id)
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        let Some(recovery) = runtime
+            .recovery
+            .as_ref()
+            .filter(|recovery| !recovery.rounds.is_empty())
+        else {
+            node.recovery = None;
+            continue;
+        };
+        let termination = if recovery.terminal_disposition.is_some() {
+            super::publication::step_recovery_summary_v1(Some(recovery))
+                .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?
+                .map(|summary| summary.termination)
+        } else {
+            None
+        };
+        let rounds = super::publication::recovery_round_summaries_v1(recovery, false)
+            .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?
+            .into_iter()
+            .map(|round| DurableRecoveryRoundV1 {
+                number: round.number,
+                failed_execution: round.failed_execution,
+                handler: round.handler,
+            })
+            .collect();
+        let active = runtime.active_invocation.and_then(|active| {
+            let (role, target_execution, recovery_round) = match active {
+                ActiveStepInvocation::Target { execution_number } => (
+                    super::publication::RecoveryInvocationRoleV1::Target,
+                    Some(execution_number.get()),
+                    None,
+                ),
+                ActiveStepInvocation::RecoveryHandler { round } => (
+                    super::publication::RecoveryInvocationRoleV1::RecoveryHandler,
+                    None,
+                    Some(round.get()),
+                ),
+            };
+            let invocation = invocations.iter().find(|invocation| {
+                invocation.step_id == node.id
+                    && invocation.role == role
+                    && invocation.target_execution == target_execution
+                    && invocation.recovery_round == recovery_round
+                    && invocation.state == DurableInvocationStateV1::Active
+            })?;
+            let (handler_state, decision) = match (&runtime.state, recovery.rounds.last()) {
+                (StepState::Recovering { handler, .. }, _) => (
+                    Some(match handler {
+                        super::runtime::RecoveryHandlerActivity::Starting => {
+                            DurableRecoveryHandlerStateV1::Starting
+                        }
+                        super::runtime::RecoveryHandlerActivity::Running => {
+                            DurableRecoveryHandlerStateV1::Running
+                        }
+                    }),
+                    None,
+                ),
+                (_, Some(round)) => (
+                    None,
+                    round
+                        .handler
+                        .as_ref()
+                        .and_then(|handler| match handler.outcome {
+                            super::runtime::RecoveryHandlerOutcome::Recheck { .. } => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::Recheck)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::GaveUp { .. } => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::GaveUp)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::Failed { .. } => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::Failed)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::Cancelled => {
+                                Some(super::publication::RecoveryHandlerOutcomeV1::Cancelled)
+                            }
+                            super::runtime::RecoveryHandlerOutcome::Starting
+                            | super::runtime::RecoveryHandlerOutcome::Running => None,
+                        }),
+                ),
+                (_, None) => (None, None),
+            };
+            Some(DurableRecoveryActiveV1 {
+                role,
+                target_execution,
+                recovery_round,
+                invocation_id: invocation.invocation_id,
+                handler_state,
+                decision,
+            })
+        });
+        node.recovery = Some(DurableStepRecoveryV1 {
+            schema_version: 1,
+            configured_retries: recovery.configured_rounds,
+            handler_kind: recovery.handler_kind.map(|kind| match kind {
+                super::runtime::RecoveryHandlerKind::Command => DurableRecoveryHandlerKindV1::Cmd,
+                super::runtime::RecoveryHandlerKind::Agent => DurableRecoveryHandlerKindV1::Agent,
+            }),
+            rounds,
+            active,
+            termination,
+        });
+    }
+    Ok(())
+}
+
+fn attempt_step_state<Output>(state: &StepState<Output>) -> AttemptStepStateV1 {
+    match state {
+        StepState::Pending => AttemptStepStateV1::Pending,
+        StepState::Starting => AttemptStepStateV1::Starting,
+        StepState::Running => AttemptStepStateV1::Running,
+        StepState::CapturingOutputs => AttemptStepStateV1::CapturingOutputs,
+        StepState::Recovering { .. } => AttemptStepStateV1::Running,
+        StepState::Cancelling { .. } => AttemptStepStateV1::Cancelling,
+        StepState::Succeeded { .. } => AttemptStepStateV1::Succeeded,
+        StepState::Failed { .. } => AttemptStepStateV1::Failed,
+        StepState::Blocked { .. } => AttemptStepStateV1::Blocked,
+        StepState::Skipped { .. } => AttemptStepStateV1::Skipped,
+        StepState::NotRun { .. } => AttemptStepStateV1::NotRun,
+        StepState::Cancelled { .. } => AttemptStepStateV1::Cancelled,
+    }
+}
+
+// Durable state copies detail while the live view model copies it into observation
+// facts; keeping both projections explicit avoids coupling persistence to presentation.
+// jscpd:ignore-start
+fn attempt_step_detail<Output>(state: &StepState<Output>) -> Option<NodeDetail> {
+    match state {
+        StepState::Failed { detail } => Some(NodeDetail::Failed(detail.clone())),
+        StepState::Blocked { detail } => Some(NodeDetail::Blocked(detail.clone())),
+        StepState::Skipped { detail } => Some(NodeDetail::Skipped(detail.clone())),
+        StepState::NotRun { detail } => Some(NodeDetail::NotRun(*detail)),
+        StepState::Cancelling { detail } | StepState::Cancelled { detail } => {
+            Some(NodeDetail::Cancellation(*detail))
+        }
+        StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
+        | StepState::Succeeded { .. } => None,
+    }
+}
+// jscpd:ignore-end
+
+fn durable_finalization_summary<Deadline>(
+    summary: &FinalizationSummary<Deadline>,
+) -> Result<AttemptFinalizationCompleteV1, LocalRunDirectoryError>
+where
+    Deadline: DurableDeadline,
+{
+    let finalizers = summary
+        .finalizers
+        .iter()
+        .map(|finalizer| {
+            let (state, detail) = match &finalizer.disposition {
+                StepState::Succeeded { .. } => (AttemptStepStateV1::Succeeded, None),
+                StepState::Failed { detail } => (
+                    AttemptStepStateV1::Failed,
+                    Some(NodeDetail::Failed(detail.clone())),
+                ),
+                StepState::Blocked { detail } => (
+                    AttemptStepStateV1::Blocked,
+                    Some(NodeDetail::Blocked(detail.clone())),
+                ),
+                StepState::Skipped { detail } => (
+                    AttemptStepStateV1::Skipped,
+                    Some(NodeDetail::Skipped(detail.clone())),
+                ),
+                StepState::NotRun { detail }
+                    if detail.code == NonExecutionCode::FinalizerTriggerNotSelected =>
+                {
+                    (
+                        AttemptStepStateV1::NotRun,
+                        Some(NodeDetail::NotRun(*detail)),
+                    )
+                }
+                StepState::Cancelled { detail } => (
+                    AttemptStepStateV1::Cancelled,
+                    Some(NodeDetail::Cancellation(*detail)),
+                ),
+                StepState::Pending
+                | StepState::Starting
+                | StepState::Running
+                | StepState::CapturingOutputs
+                | StepState::Recovering { .. }
+                | StepState::Cancelling { .. }
+                | StepState::NotRun { .. } => {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+            };
+            Ok(DurableFinalizerV1 {
+                id: finalizer.finalizer.clone(),
+                role: AttemptNodeRoleV1::Finalizer,
+                failure_policy: finalizer.failure_policy,
+                state,
+                outputs: Some(Vec::new()),
+                detail,
+            })
+        })
+        .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
+    let issues = durable_finalization_issues(&finalizers);
+    let cancellation = summary
+        .cancellation
+        .as_ref()
+        .map(|cancellation| {
+            Ok(DurableFinalizationCancellationV1 {
+                reason: cancellation_reason(cancellation.reason),
+                force_stop_deadline: cancellation
+                    .deadline
+                    .as_ref()
+                    .map(|deadline| timestamp(deadline.deadline_utc()))
+                    .transpose()?,
+            })
+        })
+        .transpose()?;
+    Ok(AttemptFinalizationCompleteV1 {
+        complete: true,
+        trigger: finalization_trigger(summary.trigger),
+        finalizers,
+        issues,
+        cancellation,
+        force_abort: summary.force_abort,
+    })
+}
+
+fn durable_finalization_issues(
+    finalizers: &[DurableFinalizerV1],
+) -> Vec<DurableFinalizationIssueV1> {
+    finalizers
+        .iter()
+        .filter(|finalizer| {
+            matches!(
+                finalizer.state,
+                AttemptStepStateV1::Failed | AttemptStepStateV1::Blocked
+            )
+        })
+        .map(|finalizer| DurableFinalizationIssueV1 {
+            finalizer_id: finalizer.id.clone(),
+            impact: finalizer.failure_policy,
+        })
+        .collect()
+}
+
+fn outstanding_actions<Cause, Output>(
+    attempt: &LocalAttemptV1,
+    runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
+) -> Result<Vec<OutstandingActionV1>, LocalRunDirectoryError> {
+    let ordered_nodes = attempt.progress.steps.iter().chain(
+        attempt
+            .finalization
+            .iter()
+            .filter_map(|finalization| match finalization {
+                AttemptFinalizationV1::Progress(progress) => Some(progress.finalizers.as_slice()),
+                AttemptFinalizationV1::Complete(_) => None,
+            })
+            .flatten(),
+    );
+    let mut actions = ordered_nodes
+        .filter_map(|node| {
+            let runtime = match runtime_steps.get(&node.id) {
+                Some(runtime) => runtime,
+                None => return Some(Err(LocalRunDirectoryError::StateConflict)),
+            };
+            let action = runtime.current_action?;
+            let kind = match runtime.state {
+                StepState::Starting | StepState::Running => OutstandingActionKindV1::StartStep,
+                StepState::Recovering { .. } => OutstandingActionKindV1::StartRecoveryHandler,
+                StepState::CapturingOutputs => OutstandingActionKindV1::CaptureOutputs,
+                StepState::Cancelling { .. } => OutstandingActionKindV1::CancelStep,
+                StepState::Pending
+                | StepState::Succeeded { .. }
+                | StepState::Failed { .. }
+                | StepState::Blocked { .. }
+                | StepState::Skipped { .. }
+                | StepState::NotRun { .. }
+                | StepState::Cancelled { .. } => {
+                    return Some(Err(LocalRunDirectoryError::StateConflict));
+                }
+            };
+            let (target_execution, recovery_round) = match runtime.active_invocation {
+                Some(ActiveStepInvocation::Target { execution_number }) => {
+                    (Some(execution_number.get()), None)
+                }
+                Some(ActiveStepInvocation::RecoveryHandler { round }) => (None, Some(round.get())),
+                None => (None, None),
+            };
+            Some(Ok(OutstandingActionV1 {
+                action_id: action.transition_sequence.get(),
+                kind,
+                step_id: Some(node.id.clone()),
+                node_role: Some(node.role),
+                target_execution,
+                recovery_round,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    actions.sort_unstable_by_key(|action| action.action_id);
+    Ok(actions)
+}
+
+fn attempt_node_role(attempt: &LocalAttemptV1, id: &str) -> Option<AttemptNodeRoleV1> {
+    if attempt.progress.steps.iter().any(|node| node.id == id) {
+        return Some(AttemptNodeRoleV1::Step);
+    }
+    attempt
+        .finalization
+        .as_ref()
+        .and_then(|finalization| match finalization {
+            AttemptFinalizationV1::Progress(progress) => progress
+                .finalizers
+                .iter()
+                .find(|node| node.id == id)
+                .map(|node| node.role),
+            AttemptFinalizationV1::Complete(complete) => complete
+                .finalizers
+                .iter()
+                .find(|node| node.id == id)
+                .map(|node| node.role),
+        })
+}
+
+fn settle_interrupted_attempt(
+    attempt: &mut LocalAttemptV1,
+    cause: InterruptionCauseV1,
+    execution_may_have_started: bool,
+    settlement_snapshot: Option<WorkspaceSnapshotV1>,
+) -> Result<(), LocalRunDirectoryError> {
+    let cancellation_requested = attempt.cancellation.is_some()
+        || attempt.force_abort.is_some()
+        || attempt
+            .finalization
+            .as_ref()
+            .is_some_and(|finalization| match finalization {
+                AttemptFinalizationV1::Progress(progress) => progress.cancellation.is_some(),
+                AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
+            });
+    attempt.state = AttemptStateV1::Interrupted;
+    attempt.settled_at = Some(timestamp(scherzo_cloud_support::utc_now())?);
+    attempt.settlement_snapshot = settlement_snapshot;
+    attempt.interruption = Some(AttemptInterruptionV1 {
+        cause,
+        execution_may_have_started,
+        cancellation_requested,
+    });
+    attempt.result = AttemptResultV1::NotPublished {
+        reason: ResultAbsentReasonV1::Interrupted,
+    };
+    attempt.progress.outstanding_actions.clear();
+    Ok(())
+}
+
+fn append_diagnostic(
+    state: &mut LocalRunStateV1,
+    attempt_number: u64,
+    code: DiagnosticCodeV1,
+) -> Result<(), LocalRunDirectoryError> {
+    let sequence = state
+        .diagnostics
+        .last()
+        .map_or(Some(1), |diagnostic| diagnostic.sequence.checked_add(1))
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    state.diagnostics.push(LocalDiagnosticV1 {
+        sequence,
+        attempt_number,
+        code,
+        step_id: None,
+        action_id: None,
+        guard_id: None,
+    });
+    if state.diagnostics.len() > MAXIMUM_DIAGNOSTICS {
+        state.diagnostics.remove(0);
+    }
+    Ok(())
+}
+
+fn current_attempt(state: &LocalRunStateV1) -> Result<&LocalAttemptV1, LocalRunDirectoryError> {
+    let attempt = state
+        .attempts
+        .last()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    if attempt.attempt_number != state.current_attempt_number {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(attempt)
+}
+
+fn current_attempt_mut(
+    state: &mut LocalRunStateV1,
+) -> Result<&mut LocalAttemptV1, LocalRunDirectoryError> {
+    let attempt = state
+        .attempts
+        .last_mut()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    if attempt.attempt_number != state.current_attempt_number {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(attempt)
+}
+
+pub(super) fn attempt_result_relative_path(attempt_number: u64) -> String {
+    format!(
+        "{ATTEMPTS_DIRECTORY}/{}/result",
+        attempt_directory_name(attempt_number).unwrap_or_else(|| attempt_number.to_string())
+    )
+}
+
+pub(crate) fn attempt_directory_name(attempt_number: u64) -> Option<String> {
+    if attempt_number == 0 {
+        None
+    } else if attempt_number < 1_000_000 {
+        Some(format!("{attempt_number:06}"))
+    } else {
+        Some(attempt_number.to_string())
+    }
+}
+
+fn retained_file_name(ordinal: u64) -> Result<String, LocalRunDirectoryError> {
+    if ordinal == 0 {
+        Err(LocalRunDirectoryError::SerializationUnavailable)
+    } else if ordinal < 10_000 {
+        Ok(format!("{ordinal:04}"))
+    } else {
+        Ok(ordinal.to_string())
+    }
+}
+
+fn replace_state(
+    root: &OwnedFd,
+    private: &OwnedFd,
+    expected_authoritative: &[u8],
+    state: &LocalRunStateV1,
+    observer: &mut impl StateCommitObserver,
+) -> Result<(), LocalRunDirectoryError> {
+    let bytes = encode_json(state)?;
+    decode_state(&bytes)?;
+    let (temporary_name, mut temporary) = create_state_temporary(private)?;
+    let mut cleanup = StateTemporary {
+        parent: private,
+        name: temporary_name.clone(),
+        committed: false,
+    };
+    observer
+        .write_temporary(&mut temporary, &bytes)
+        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    temporary
+        .flush()
+        .and_then(|()| temporary.sync_all())
+        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    drop(temporary);
+    observer.temporary_complete()?;
+    renameat_with(
+        private,
+        &temporary_name,
+        root,
+        STATE_FILE,
+        RenameFlags::EXCHANGE,
+    )
+    .map_err(|_| LocalRunDirectoryError::AtomicCommitUnavailable)?;
+    let replaced = read_regular_file(private, &temporary_name)?;
+    if replaced != expected_authoritative {
+        if renameat_with(
+            private,
+            &temporary_name,
+            root,
+            STATE_FILE,
+            RenameFlags::EXCHANGE,
+        )
+        .is_err()
+        {
+            cleanup.committed = true;
+            return Err(LocalRunDirectoryError::AtomicCommitUnavailable);
+        }
+        return Err(LocalRunDirectoryError::StateConflict);
+    }
+    sync_directory(root)?;
+    observer.replaced()?;
+    Ok(())
+}
+
+trait StateCommitObserver {
+    fn write_temporary(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        file.write_all(bytes)
+    }
+
+    fn temporary_complete(&mut self) -> Result<(), LocalRunDirectoryError> {
+        Ok(())
+    }
+
+    fn replaced(&mut self) -> Result<(), LocalRunDirectoryError> {
+        Ok(())
+    }
+}
+
+struct NoopStateCommitObserver;
+
+impl StateCommitObserver for NoopStateCommitObserver {}
+
+struct StateTemporary<'a> {
+    parent: &'a OwnedFd,
+    name: String,
+    committed: bool,
+}
+
+impl Drop for StateTemporary<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = unlinkat(self.parent, &self.name, AtFlags::empty());
+        }
+    }
+}
+
+fn create_state_temporary(parent: &OwnedFd) -> Result<(String, File), LocalRunDirectoryError> {
+    for _ in 0..STAGING_ATTEMPTS {
+        let name = format!(".state-{}", generate_uuid()?);
+        match openat(
+            parent,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(file) => return Ok((name, File::from(file))),
+            Err(Errno::EXIST) => {}
+            Err(_) => return Err(LocalRunDirectoryError::StateWriteUnavailable),
+        }
+    }
+    Err(LocalRunDirectoryError::StateWriteUnavailable)
+}
+
+fn verify_initial_staging(
+    root: &OwnedFd,
+    expected_run: &LocalRunV1,
+    expected_state: &LocalRunStateV1,
+) -> Result<(), LocalRunDirectoryError> {
+    let entries = directory_entries(root)?;
+    if entries != run_root_entries()
+        || read_run(root)? != *expected_run
+        || read_state(root)? != *expected_state
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(())
+}
+
+fn read_run(root: &OwnedFd) -> Result<LocalRunV1, LocalRunDirectoryError> {
+    read_run_with_size(root).map(|(run, _)| run)
+}
+
+fn read_run_with_size(root: &OwnedFd) -> Result<(LocalRunV1, u64), LocalRunDirectoryError> {
+    let bytes = read_regular_file(root, RUN_FILE)?;
+    let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    Ok((decode_run(&bytes)?, size))
+}
+
+fn read_state(root: &OwnedFd) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
+    read_state_with_size(root).map(|(state, _)| state)
+}
+
+fn read_state_with_size(root: &OwnedFd) -> Result<(LocalRunStateV1, u64), LocalRunDirectoryError> {
+    let bytes = read_regular_file(root, STATE_FILE)?;
+    let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    Ok((decode_state(&bytes)?, size))
+}
+
+pub(super) fn mark_validated_result_published(
+    requested: &Path,
+    attempt_number: u64,
+) -> Result<bool, LocalRunDirectoryError> {
+    let normalized =
+        std::fs::canonicalize(requested).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+    let root =
+        open_directory_path(&normalized).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+    let lock = open_retry_lock(&root)?;
+    match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(Errno::AGAIN | Errno::ACCESS) => return Ok(false),
+        Err(_) => return Err(LocalRunDirectoryError::LockUnavailable),
+    }
+    verify_retry_lock_identity(&root, &lock)?;
+    verify_existing_run_layout(&root)?;
+    let run = read_run(&root)?;
+    let state = read_state(&root)?;
+    validate_run_state_pair(&run, &state)?;
+    let expected = attempt_result_relative_path(attempt_number);
+    let attempt = state
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number == attempt_number)
+        .ok_or(LocalRunDirectoryError::StateConflict)?;
+    match &attempt.result {
+        AttemptResultV1::Published { relative_directory } if *relative_directory == expected => {
+            return Ok(true);
+        }
+        AttemptResultV1::NotPublished {
+            reason: ResultAbsentReasonV1::PublicationPending,
+        } if attempt.state.is_terminal() => {}
+        _ => return Err(LocalRunDirectoryError::StateConflict),
+    }
+
+    let attempts = open_directory_at(&root, ATTEMPTS_DIRECTORY)?;
+    let attempt_name =
+        attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let attempt_directory = open_directory_at(&attempts, &attempt_name)?;
+    open_directory_at(&attempt_directory, "result")?;
+
+    let private = Arc::new(open_directory_at(&root, PRIVATE_DIRECTORY)?);
+    let root = Arc::new(root);
+    let store = StateStore {
+        root,
+        private,
+        current: Mutex::new(state),
+        pending_recovery_invocations: Mutex::new(BTreeMap::new()),
+    };
+    store.update(|state| {
+        let attempt = state
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.attempt_number == attempt_number)
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        match attempt.result {
+            AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            } if attempt.state.is_terminal() => {
+                attempt.result = AttemptResultV1::Published {
+                    relative_directory: expected,
+                };
+                Ok(())
+            }
+            _ => Err(LocalRunDirectoryError::StateConflict),
+        }
+    })?;
+    Ok(true)
+}
+
+pub fn acquire_local_retry(requested: &Path) -> Result<LocalRetryOpen, LocalRunDirectoryError> {
+    for _ in 0..STATUS_SNAPSHOT_ATTEMPTS {
+        let normalized = std::fs::canonicalize(requested)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        if normalized.to_str().is_none() {
+            return Err(LocalRunDirectoryError::InvalidPath);
+        }
+        let root = open_directory_path(&normalized)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+        let lock = open_retry_lock(&root)?;
+        match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                verify_retry_lock_identity(&root, &lock)?;
+                return open_locked_retry(normalized, root, lock);
+            }
+            Err(Errno::AGAIN | Errno::ACCESS) => {
+                let snapshot = read_local_run_status(requested)
+                    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+                if snapshot.retry
+                    == LocalRetryEligibility::Ineligible(RetryIneligibilityReason::RunLocked)
+                {
+                    return Ok(LocalRetryOpen::Rejected(retry_rejection_from_snapshot(
+                        &snapshot,
+                        RetryIneligibilityReason::RunLocked,
+                    )));
+                }
+            }
+            Err(_) => return Err(LocalRunDirectoryError::LockUnavailable),
+        }
+    }
+    Err(LocalRunDirectoryError::StateConflict)
+}
+
+fn open_retry_lock(root: &OwnedFd) -> Result<File, LocalRunDirectoryError> {
+    let lock = openat(
+        root,
+        LOCK_FILE,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| LocalRunDirectoryError::LockUnavailable)?;
+    verify_retry_lock_identity(root, &lock)?;
+    Ok(lock)
+}
+
+fn verify_retry_lock_identity(root: &OwnedFd, lock: &File) -> Result<(), LocalRunDirectoryError> {
+    let opened = fstat(lock).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let current = statat(root, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
+        || opened.st_dev != current.st_dev
+        || opened.st_ino != current.st_ino
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(())
+}
+
+fn open_locked_retry(
+    normalized: PathBuf,
+    root: OwnedFd,
+    lock: File,
+) -> Result<LocalRetryOpen, LocalRunDirectoryError> {
+    verify_existing_run_layout(&root)?;
+    let run = read_run(&root)?;
+    let state = read_state(&root)?;
+    validate_run_state_pair(&run, &state)?;
+    let current = state
+        .attempts
+        .last()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let recovery = recovery_status(current, false);
+    if let LocalRetryEligibility::Ineligible(reason) =
+        retry_eligibility(current.state, &recovery, false)
+    {
+        return Ok(LocalRetryOpen::Rejected(retry_rejection(
+            normalized,
+            current.attempt_number,
+            reason,
+            &recovery,
+        )));
+    }
+
+    let (workflow, inputs, maximum_parallel_steps) = load_attempt_retained_execution_with_budget(
+        &root,
+        &run,
+        &state,
+        current,
+        &mut RetainedReadBudget::default(),
+    )?;
+    validate_retained_outputs_against_definition(current, &workflow)?;
+    verify_retained_output_evidence(&root, &state, current.attempt_number)?;
+    cleanup_unreferenced_retained_values(&root, &state, current.attempt_number)?;
+    let private = Arc::new(open_directory_at(&root, PRIVATE_DIRECTORY)?);
+    let root = Arc::new(root);
+    let state = Arc::new(StateStore {
+        root: Arc::clone(&root),
+        private,
+        current: Mutex::new(state),
+        pending_recovery_invocations: Mutex::new(BTreeMap::new()),
+    });
+    Ok(LocalRetryOpen::Acquired(Box::new(PendingLocalRetry {
+        normalized,
+        root,
+        lock,
+        state,
+        workflow,
+        inputs,
+        maximum_parallel_steps,
+        definition: attempt_definition_for_run(&run),
+        git_baseline: run.git_baseline.as_ref().and_then(local_git_baseline),
+    })))
+}
+
+fn attempt_retained_outputs(attempt: &LocalAttemptV1) -> Vec<&RetainedOutputV1> {
+    let mut outputs = attempt
+        .progress
+        .steps
+        .iter()
+        .flat_map(|step| step.outputs.iter().flatten())
+        .collect::<Vec<_>>();
+    if let Some(finalization) = &attempt.finalization {
+        match finalization {
+            AttemptFinalizationV1::Progress(progress) => outputs.extend(
+                progress
+                    .finalizers
+                    .iter()
+                    .flat_map(|finalizer| finalizer.outputs.iter().flatten()),
+            ),
+            AttemptFinalizationV1::Complete(complete) => outputs.extend(
+                complete
+                    .finalizers
+                    .iter()
+                    .flat_map(|finalizer| finalizer.outputs.iter().flatten()),
+            ),
+        }
+    }
+    outputs
+}
+
+fn cleanup_unreferenced_retained_values(
+    root: &OwnedFd,
+    state: &LocalRunStateV1,
+    attempt_number: u64,
+) -> Result<(), LocalRunDirectoryError> {
+    let attempts = open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+    let mut found = false;
+    for attempt in state
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.attempt_number == attempt_number)
+    {
+        found = true;
+        let expected = attempt_retained_outputs(attempt)
+            .into_iter()
+            .filter_map(RetainedOutputV1::carrier)
+            .map(|carrier| carrier.relative_path.clone())
+            .collect::<BTreeSet<_>>();
+        let attempt_name = attempt_directory_name(attempt.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let attempt_directory = open_directory_at(&attempts, &attempt_name)?;
+        let values = match openat(
+            &attempt_directory,
+            VALUES_DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(values) => values,
+            Err(Errno::NOENT) => continue,
+            Err(_) => return Err(LocalRunDirectoryError::StateInvalid),
+        };
+        cleanup_unreferenced_tree(&values, VALUES_DIRECTORY, &expected, 0)?;
+        sync_directory(&values)?;
+        sync_directory(&attempt_directory)?;
+    }
+    found
+        .then_some(())
+        .ok_or(LocalRunDirectoryError::StateInvalid)
+}
+
+fn cleanup_unreferenced_tree(
+    directory: &OwnedFd,
+    relative: &str,
+    expected: &BTreeSet<String>,
+    depth: usize,
+) -> Result<(), LocalRunDirectoryError> {
+    if depth > 3 {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for name in directory_entries(directory)? {
+        let name_string = std::str::from_utf8(&name).ok();
+        let child = name_string.map(|name| format!("{relative}/{name}"));
+        let metadata = statat(directory, name.as_slice(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        let kind = FileType::from_raw_mode(metadata.st_mode);
+        if kind == FileType::RegularFile {
+            if child.as_ref().is_some_and(|path| expected.contains(path)) {
+                continue;
+            }
+            unlinkat(directory, name.as_slice(), AtFlags::empty())
+                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            continue;
+        }
+        if kind == FileType::Directory {
+            let child_directory = openat(
+                directory,
+                name.as_slice(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+            let child_relative = child.as_deref().unwrap_or("");
+            cleanup_unreferenced_tree(&child_directory, child_relative, expected, depth + 1)?;
+            if directory_entries(&child_directory)?.is_empty() {
+                drop(child_directory);
+                unlinkat(directory, name.as_slice(), AtFlags::REMOVEDIR)
+                    .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            }
+            continue;
+        }
+        if child.as_ref().is_some_and(|path| expected.contains(path)) {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        unlinkat(directory, name.as_slice(), AtFlags::empty())
+            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    }
+    Ok(())
+}
+
+pub(super) fn verify_retained_output_evidence(
+    root: &OwnedFd,
+    state: &LocalRunStateV1,
+    attempt_number: u64,
+) -> Result<(), LocalRunDirectoryError> {
+    let attempts = open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+    let mut found = false;
+    let mut output_count = 0_usize;
+    let mut output_bytes = 0_u64;
+    for attempt in state
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.attempt_number == attempt_number)
+    {
+        found = true;
+        let attempt_name = attempt_directory_name(attempt.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let attempt_directory = open_directory_at(&attempts, &attempt_name)?;
+        for output in attempt_retained_outputs(attempt) {
+            output_count = output_count
+                .checked_add(1)
+                .filter(|count| *count <= MAXIMUM_RETAINED_OUTPUTS)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            if let Some(carrier) = output.carrier() {
+                output_bytes = output_bytes
+                    .checked_add(carrier.size_bytes)
+                    .filter(|bytes| *bytes <= MAXIMUM_RETAINED_OUTPUT_BYTES)
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            }
+            verify_retained_output(&attempt_directory, output)?;
+        }
+    }
+    if !found {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(())
+}
+
+fn verify_retained_output(
+    attempt: &OwnedFd,
+    output: &RetainedOutputV1,
+) -> Result<(), LocalRunDirectoryError> {
+    let Some(carrier) = output.carrier() else {
+        return Ok(());
+    };
+    let path = Path::new(&carrier.relative_path);
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let parent_path = path.parent().ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let mut parent = dup(attempt).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    for component in parent_path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        };
+        parent = open_directory_at(&parent, component)?;
+    }
+    verify_retained_carrier_with_sync(&parent, name, carrier, false)?;
+    let bytes = match output {
+        RetainedOutputV1::Text { .. } | RetainedOutputV1::Json { .. } => Some(
+            read_regular_file_bounded(&parent, name, MAXIMUM_RETAINED_FILE_BYTES)?,
+        ),
+        RetainedOutputV1::File { .. } | RetainedOutputV1::GitBranch { .. } => None,
+    };
+    match (output, bytes) {
+        (RetainedOutputV1::Text { .. }, Some(bytes)) => {
+            std::str::from_utf8(&bytes).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        }
+        (RetainedOutputV1::Json { .. }, Some(bytes)) => {
+            let value = scherzo_cloud_support::strict_json_from_slice(&bytes)
+                .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+            let canonical = super::canonical_json::to_bounded_bytes(&value, carrier.size_bytes)
+                .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+            if canonical.as_ref() != bytes {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+        (
+            RetainedOutputV1::GitBranch {
+                base_oid,
+                head_oid,
+                tree_oid,
+                carrier: Some(_),
+                ..
+            },
+            None,
+        ) => {
+            use std::sync::atomic::AtomicBool;
+            let descriptor = openat(
+                &parent,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+            let mut descriptor = descriptor;
+            super::git_artifact::validate_git_bundle(
+                &mut descriptor,
+                super::git_artifact::GitArtifactDescriptor {
+                    base_oid,
+                    head_oid,
+                    tree_oid,
+                },
+                &mut super::git_artifact::GitArtifactValidationBudget::default(),
+                &AtomicBool::new(false),
+            )
+            .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        }
+        (RetainedOutputV1::File { .. }, None)
+        | (RetainedOutputV1::GitBranch { carrier: None, .. }, None) => {}
+        _ => return Err(LocalRunDirectoryError::StateInvalid),
+    }
+    Ok(())
+}
+
+fn verify_existing_run_layout(root: &OwnedFd) -> Result<(), LocalRunDirectoryError> {
+    if directory_entries(root)? != run_root_entries() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+    Ok(())
+}
+
+fn run_root_entries() -> BTreeSet<Vec<u8>> {
+    BTreeSet::from([
+        RUN_FILE.as_bytes().to_vec(),
+        STATE_FILE.as_bytes().to_vec(),
+        LOCK_FILE.as_bytes().to_vec(),
+        WORKFLOW_DIRECTORY.as_bytes().to_vec(),
+        ATTEMPTS_DIRECTORY.as_bytes().to_vec(),
+        PRIVATE_DIRECTORY.as_bytes().to_vec(),
+    ])
+}
+
+pub(super) fn load_retained_execution_with_budget(
+    root: &OwnedFd,
+    run: &LocalRunV1,
+    budget: &mut RetainedReadBudget,
+) -> Result<(ResolvedWorkflow, ResolvedInputs, usize), LocalRunDirectoryError> {
+    let workflow_directory = open_directory_at(root, WORKFLOW_DIRECTORY)?;
+    load_retained_execution_directory(
+        workflow_directory,
+        &run.workflow_digest,
+        &run.workflow_manifest_digest,
+        budget,
+    )
+}
+
+pub(super) fn load_attempt_retained_execution_with_budget(
+    root: &OwnedFd,
+    run: &LocalRunV1,
+    state: &LocalRunStateV1,
+    selected: &LocalAttemptV1,
+    budget: &mut RetainedReadBudget,
+) -> Result<(ResolvedWorkflow, ResolvedInputs, usize), LocalRunDirectoryError> {
+    let Some(mut definition) = selected.definition.as_ref() else {
+        return load_retained_execution_with_budget(root, run, budget);
+    };
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(definition.locator.clone()) {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        match definition.locator {
+            AttemptDefinitionLocatorV1::Run => {
+                let workflow_directory = open_directory_at(root, WORKFLOW_DIRECTORY)?;
+                return load_retained_execution_directory(
+                    workflow_directory,
+                    &definition.digest,
+                    &definition.manifest_digest,
+                    budget,
+                );
+            }
+            AttemptDefinitionLocatorV1::Attempt { attempt_number } => {
+                let attempts = open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+                let name = attempt_directory_name(attempt_number)
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                let attempt = open_directory_at(&attempts, &name)?;
+                let workflow_directory = open_directory_at(&attempt, WORKFLOW_DIRECTORY)?;
+                return load_retained_execution_directory(
+                    workflow_directory,
+                    &definition.digest,
+                    &definition.manifest_digest,
+                    budget,
+                );
+            }
+            AttemptDefinitionLocatorV1::PriorAttempt { attempt_number } => {
+                let prior = state
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.attempt_number == attempt_number)
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                let Some(prior_definition) = prior.definition.as_ref() else {
+                    if definition.digest != run.workflow_digest
+                        || definition.manifest_digest != run.workflow_manifest_digest
+                    {
+                        return Err(LocalRunDirectoryError::StateInvalid);
+                    }
+                    return load_retained_execution_with_budget(root, run, budget);
+                };
+                if definition.digest != prior_definition.digest
+                    || definition.manifest_digest != prior_definition.manifest_digest
+                {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                }
+                definition = prior_definition;
+            }
+        }
+    }
+}
+
+fn load_retained_execution_directory(
+    workflow_directory: OwnedFd,
+    expected_workflow_digest: &DigestV1,
+    expected_manifest_digest: &DigestV1,
+    budget: &mut RetainedReadBudget,
+) -> Result<(ResolvedWorkflow, ResolvedInputs, usize), LocalRunDirectoryError> {
+    let expected_workflow_entries = BTreeSet::from([
+        WORKFLOW_MANIFEST_FILE.as_bytes().to_vec(),
+        WORKFLOW_FILES_DIRECTORY.as_bytes().to_vec(),
+    ]);
+    if directory_entries(&workflow_directory)? != expected_workflow_entries {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let manifest_bytes = read_regular_file(&workflow_directory, WORKFLOW_MANIFEST_FILE)?;
+    budget.account(&manifest_bytes)?;
+    if DigestV1::sha256(&manifest_bytes) != *expected_manifest_digest {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let manifest: WorkflowManifestV1 = decode_schema_one(&manifest_bytes)?;
+    validate_manifest(&manifest).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let files = open_directory_at(&workflow_directory, WORKFLOW_FILES_DIRECTORY)?;
+    let expected_entries = (1..retained_manifest_file_count(&manifest)?)
+        .map(retained_file_name)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(String::into_bytes)
+        .collect::<BTreeSet<_>>();
+    if directory_entries(&files)? != expected_entries {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+
+    let mut captured_file_bytes = 0;
+    let mut read_file = |file: &ManifestFileV1| {
+        let name = retained_file_name(file.ordinal)?;
+        let bytes = read_retained_file(&files, &name)?;
+        let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        account_retained_bytes(
+            &mut captured_file_bytes,
+            size,
+            MAXIMUM_RETAINED_CAPTURED_FILE_BYTES,
+        )?;
+        budget.account(&bytes)?;
+        if size != file.size_bytes || DigestV1::sha256(&bytes) != file.digest {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        Ok(bytes)
+    };
+
+    let mut source_closure = BTreeMap::new();
+    for source in &manifest.source_files {
+        if source_closure
+            .insert(
+                source.path.clone(),
+                Arc::<[u8]>::from(read_file(&source.file)?),
+            )
+            .is_some()
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    let mut input_bytes = 0_u64;
+    let mut attachment_count = 0_usize;
+    let mut inputs = BTreeMap::new();
+    for (name, input) in &manifest.inputs {
+        let value = match input {
+            ManifestInputV1::Text { file } | ManifestInputV1::Json { file } => {
+                let bytes = read_file(file)?;
+                if file.size_bytes > MAXIMUM_RETAINED_TEXT_BYTES {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                if matches!(input, ManifestInputV1::Json { .. }) {
+                    ResolvedInput::Json(
+                        ResolvedJsonInput::from_source(Arc::from(bytes))
+                            .map_err(|_| LocalRunDirectoryError::StateInvalid)?,
+                    )
+                } else {
+                    let text = String::from_utf8(bytes)
+                        .map(Arc::<str>::from)
+                        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+                    ResolvedInput::Text(text)
+                }
+            }
+            ManifestInputV1::File { media_type, file } => {
+                if file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES
+                    || !super::is_valid_media_type(media_type)
+                {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                ResolvedInput::File(super::admission::ResolvedFile::new(
+                    Arc::<str>::from(media_type.as_str()),
+                    Arc::<[u8]>::from(read_file(file)?),
+                ))
+            }
+            ManifestInputV1::Attachments { items } => {
+                attachment_count = attachment_count
+                    .checked_add(items.len())
+                    .filter(|count| *count <= 256)
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                let mut attachments = Vec::with_capacity(items.len());
+                for attachment in items {
+                    if attachment.file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES {
+                        return Err(LocalRunDirectoryError::StateInvalid);
+                    }
+                    account_retained_bytes(
+                        &mut input_bytes,
+                        attachment.file.size_bytes,
+                        MAXIMUM_RETAINED_INPUT_BYTES,
+                    )?;
+                    attachments.push(ResolvedAttachment::new(
+                        Arc::<str>::from(attachment.media_type.as_str()),
+                        Arc::<[u8]>::from(read_file(&attachment.file)?),
+                    ));
+                }
+                ResolvedInput::Attachments(Arc::from(attachments))
+            }
+        };
+        inputs.insert(name.clone(), value);
+    }
+    let workflow = resolve_retained(
+        PathBuf::from(&manifest.source_root),
+        &manifest.workflow_path,
+        source_closure,
+    )
+    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if workflow.content_digest.algorithm.as_str() != expected_workflow_digest.algorithm
+        || workflow.content_digest.value != expected_workflow_digest.value
+        || workflow.required_inputs().len() != inputs.len()
+        || workflow.required_inputs().iter().any(|(name, kind)| {
+            !matches!(
+                (kind, inputs.get(name)),
+                (
+                    super::validated::WorkflowValueType::Text,
+                    Some(ResolvedInput::Text(_))
+                ) | (
+                    super::validated::WorkflowValueType::Json,
+                    Some(ResolvedInput::Json(_))
+                ) | (
+                    super::validated::WorkflowValueType::File,
+                    Some(ResolvedInput::File(_))
+                ) | (
+                    super::validated::WorkflowValueType::AttachmentCollection,
+                    Some(ResolvedInput::Attachments(_))
+                )
+            )
+        })
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok((
+        workflow,
+        ResolvedInputs::new(inputs),
+        manifest.maximum_parallel_steps,
+    ))
+}
+
+fn retained_manifest_file_count(
+    manifest: &WorkflowManifestV1,
+) -> Result<u64, LocalRunDirectoryError> {
+    let input_files = manifest.inputs.values().try_fold(0_usize, |count, input| {
+        count.checked_add(match input {
+            ManifestInputV1::Text { .. }
+            | ManifestInputV1::Json { .. }
+            | ManifestInputV1::File { .. } => 1,
+            ManifestInputV1::Attachments { items } => items.len(),
+        })
+    });
+    let count = manifest
+        .source_files
+        .len()
+        .checked_add(input_files.ok_or(LocalRunDirectoryError::StateInvalid)?)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or(LocalRunDirectoryError::StateInvalid)
+}
+
+fn read_retained_file(parent: &OwnedFd, name: &str) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    read_regular_file_bounded(parent, name, MAXIMUM_RETAINED_FILE_BYTES)
+}
+
+fn retry_rejection_from_snapshot(
+    snapshot: &LocalRunStatusSnapshot,
+    reason: RetryIneligibilityReason,
+) -> LocalRetryRejection {
+    retry_rejection(
+        snapshot.run_directory.clone(),
+        snapshot.current_attempt_number,
+        reason,
+        &snapshot.recovery,
+    )
+}
+
+fn retry_rejection(
+    run_directory: PathBuf,
+    attempt_number: u64,
+    reason: RetryIneligibilityReason,
+    recovery: &LocalRecoveryStatus,
+) -> LocalRetryRejection {
+    let (guard_ids, ownership_reason) = match recovery {
+        LocalRecoveryStatus::OwnershipUnproven { guard_ids, reason } => {
+            (guard_ids.clone(), Some(*reason))
+        }
+        LocalRecoveryStatus::Active
+        | LocalRecoveryStatus::Settled
+        | LocalRecoveryStatus::Abandoned => (Vec::new(), None),
+    };
+    LocalRetryRejection {
+        run_directory,
+        attempt_number,
+        reason,
+        guard_ids,
+        ownership_reason,
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RetainedReadBudget {
+    total_bytes: u64,
+}
+
+impl RetainedReadBudget {
+    pub(super) fn with_bytes(total_bytes: u64) -> Result<Self, LocalRunDirectoryError> {
+        (total_bytes <= MAXIMUM_RETAINED_TOTAL_BYTES)
+            .then_some(Self { total_bytes })
+            .ok_or(LocalRunDirectoryError::StateInvalid)
+    }
+
+    pub(super) fn account(&mut self, bytes: &[u8]) -> Result<(), LocalRunDirectoryError> {
+        let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        account_retained_bytes(&mut self.total_bytes, size, MAXIMUM_RETAINED_TOTAL_BYTES)
+    }
+}
+
+fn account_retained_bytes(
+    total_bytes: &mut u64,
+    size: u64,
+    maximum_bytes: u64,
+) -> Result<(), LocalRunDirectoryError> {
+    *total_bytes = total_bytes
+        .checked_add(size)
+        .filter(|total| *total <= maximum_bytes)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    Ok(())
+}
+
+pub(super) struct StableLocalRunSnapshot {
+    pub(super) run_directory: PathBuf,
+    pub(super) root: OwnedFd,
+    pub(super) run: LocalRunV1,
+    pub(super) state: LocalRunStateV1,
+    pub(super) retained_json_bytes: u64,
+    pub(super) lock_held: bool,
+}
+
+pub(super) fn read_stable_local_run_snapshot(
+    requested: &Path,
+) -> Result<StableLocalRunSnapshot, LocalStatusError> {
+    let normalized = std::fs::canonicalize(requested).map_err(|_| LocalStatusError {
+        code: LocalStatusErrorCode::RunDirectoryUnavailable,
+        run_directory: None,
+    })?;
+    let reported_directory = normalized.to_str().map(|_| normalized.clone());
+    if reported_directory.is_none() {
+        return Err(LocalStatusError {
+            code: LocalStatusErrorCode::RunDirectoryUnavailable,
+            run_directory: None,
+        });
+    }
+    let root = open_directory_path(&normalized).map_err(|_| LocalStatusError {
+        code: LocalStatusErrorCode::RunDirectoryUnavailable,
+        run_directory: reported_directory.clone(),
+    })?;
+    let (run, run_bytes) =
+        read_run_with_size(&root).map_err(|_| invalid_status_error(&reported_directory))?;
+    let lock = open_status_lock(&root, &reported_directory)?;
+
+    for _ in 0..STATUS_SNAPSHOT_ATTEMPTS {
+        let (before, _) = read_state_with_size(&root)
+            .map_err(|error| status_state_error(error, &reported_directory))?;
+        if validate_run_state_pair(&run, &before).is_err() {
+            return Err(invalid_status_error(&reported_directory));
+        }
+        let lock_held = query_status_lock(&lock).map_err(|()| LocalStatusError {
+            code: LocalStatusErrorCode::LockQueryFailed,
+            run_directory: reported_directory.clone(),
+        })?;
+        let (after, state_bytes) = read_state_with_size(&root)
+            .map_err(|error| status_state_error(error, &reported_directory))?;
+        if validate_run_state_pair(&run, &after).is_err() {
+            return Err(invalid_status_error(&reported_directory));
+        }
+        verify_status_lock_identity(&root, &lock, &reported_directory)?;
+        if before.revision != after.revision {
+            continue;
+        }
+        let retained_json_bytes = run_bytes
+            .checked_add(state_bytes)
+            .ok_or_else(|| invalid_status_error(&reported_directory))?;
+        RetainedReadBudget::with_bytes(retained_json_bytes)
+            .map_err(|_| invalid_status_error(&reported_directory))?;
+        return Ok(StableLocalRunSnapshot {
+            run_directory: normalized,
+            root,
+            run,
+            state: after,
+            retained_json_bytes,
+            lock_held,
+        });
+    }
+
+    Err(LocalStatusError {
+        code: LocalStatusErrorCode::StatusSnapshotUnstable,
+        run_directory: reported_directory,
+    })
+}
+
+pub fn read_local_run_status(requested: &Path) -> Result<LocalRunStatusSnapshot, LocalStatusError> {
+    let snapshot = read_stable_local_run_snapshot(requested)?;
+    let reported_directory = Some(snapshot.run_directory.clone());
+    let run_value = serde_json::to_value(&snapshot.run)
+        .map_err(|_| invalid_status_error(&reported_directory))?;
+    status_snapshot(
+        snapshot.run_directory,
+        run_value,
+        snapshot.state,
+        snapshot.lock_held,
+    )
+    .map_err(|_| invalid_status_error(&reported_directory))
+}
+
+fn invalid_status_error(run_directory: &Option<PathBuf>) -> LocalStatusError {
+    LocalStatusError {
+        code: LocalStatusErrorCode::RunDirectoryInvalid,
+        run_directory: run_directory.clone(),
+    }
+}
+
+fn status_state_error(
+    error: LocalRunDirectoryError,
+    run_directory: &Option<PathBuf>,
+) -> LocalStatusError {
+    LocalStatusError {
+        code: if error == LocalRunDirectoryError::RecoverySchemaUnsupported {
+            LocalStatusErrorCode::RecoverySchemaUnsupported
+        } else {
+            LocalStatusErrorCode::RunDirectoryInvalid
+        },
+        run_directory: run_directory.clone(),
+    }
+}
+
+fn open_status_lock(
+    root: &OwnedFd,
+    run_directory: &Option<PathBuf>,
+) -> Result<File, LocalStatusError> {
+    let metadata = statat(root, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| invalid_status_error(run_directory))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        return Err(invalid_status_error(run_directory));
+    }
+    let lock = openat(
+        root,
+        LOCK_FILE,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| LocalStatusError {
+        code: LocalStatusErrorCode::LockQueryFailed,
+        run_directory: run_directory.clone(),
+    })?;
+    verify_status_lock_identity(root, &lock, run_directory)?;
+    Ok(lock)
+}
+
+fn verify_status_lock_identity(
+    root: &OwnedFd,
+    lock: &File,
+    run_directory: &Option<PathBuf>,
+) -> Result<(), LocalStatusError> {
+    let opened = fstat(lock).map_err(|_| invalid_status_error(run_directory))?;
+    let current = statat(root, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| invalid_status_error(run_directory))?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
+        || opened.st_dev != current.st_dev
+        || opened.st_ino != current.st_ino
+    {
+        return Err(invalid_status_error(run_directory));
+    }
+    Ok(())
+}
+
+fn query_status_lock(lock: &File) -> Result<bool, ()> {
+    let requested = Flock {
+        start: 0,
+        length: 0,
+        pid: None,
+        typ: FlockType::WriteLock,
+        offset_type: FlockOffsetType::Set,
+    };
+    fcntl_getlk(lock, &requested)
+        .map(|blocking| blocking.is_some())
+        .map_err(|_| ())
+}
+
+fn status_snapshot(
+    run_directory: PathBuf,
+    run: Value,
+    state: LocalRunStateV1,
+    lock_held: bool,
+) -> Result<LocalRunStatusSnapshot, ()> {
+    let current = state.attempts.last().ok_or(())?;
+    let recovery = recovery_status(current, lock_held);
+    let retry = retry_eligibility(current.state, &recovery, lock_held);
+    let current_result = status_result(&current.result);
+    let attempts = state
+        .attempts
+        .iter()
+        .map(|attempt| LocalStatusAttempt {
+            attempt_number: attempt.attempt_number,
+            trigger: attempt_trigger_name(attempt.trigger),
+            state: attempt_state_name(attempt.state),
+            result: status_result(&attempt.result),
+        })
+        .collect();
+    let mut state_value = serde_json::to_value(&state).map_err(|_| ())?;
+    for attempt in state_value
+        .get_mut("attempts")
+        .and_then(Value::as_array_mut)
+        .ok_or(())?
+    {
+        attempt
+            .as_object_mut()
+            .ok_or(())?
+            .entry("forceAbort")
+            .or_insert(Value::Null);
+    }
+    Ok(LocalRunStatusSnapshot {
+        run_directory,
+        run,
+        state: state_value,
+        current_attempt_number: current.attempt_number,
+        current_attempt_state: attempt_state_name(current.state),
+        current_result,
+        attempts,
+        recovery,
+        retry,
+    })
+}
+
+trait LocalRecoveryAuthority {
+    fn execution_host(&self) -> Result<ExecutionHostV1, ()>;
+
+    fn observe_process(&self, guard: &ProcessGuardV1) -> ProcessIdentityObservation;
+}
+
+struct SystemLocalRecoveryAuthority;
+
+impl LocalRecoveryAuthority for SystemLocalRecoveryAuthority {
+    fn execution_host(&self) -> Result<ExecutionHostV1, ()> {
+        execution_host().map_err(|_| ())
+    }
+
+    fn observe_process(&self, guard: &ProcessGuardV1) -> ProcessIdentityObservation {
+        process_identity_observation(guard)
+    }
+}
+
+trait LocalQuiescenceAuthority: LocalRecoveryAuthority {
+    fn terminate_process(&self, guard: &ProcessGuardV1) -> AuthenticatedSignalResult;
+
+    fn wait_for_process_change(&self);
+}
+
+impl LocalQuiescenceAuthority for SystemLocalRecoveryAuthority {
+    fn terminate_process(&self, guard: &ProcessGuardV1) -> AuthenticatedSignalResult {
+        authenticated_process_group(guard)
+            .map_or(AuthenticatedSignalResult::Unavailable, |identity| {
+                terminate_authenticated_process_group(&identity)
+            })
+    }
+
+    fn wait_for_process_change(&self) {
+        scherzo_cloud_support::sleep(QUIESCENCE_POLL_INTERVAL);
+    }
+}
+
+fn begin_local_retry(
+    pending: PendingLocalRetry,
+    admitted: &AdmittedWorkflow,
+    authority: &impl LocalQuiescenceAuthority,
+) -> Result<LocalAttemptOwner, LocalRetryBeginError> {
+    verify_retry_lock_identity(&pending.root, &pending.lock)?;
+    if admitted.workflow().content_digest.algorithm.as_str()
+        != pending.workflow.content_digest.algorithm.as_str()
+        || admitted.workflow().content_digest.value != pending.workflow.content_digest.value
+    {
+        return Err(LocalRunDirectoryError::StateConflict.into());
+    }
+    if existing_run_overlaps_execution_root(&pending, admitted)? {
+        return Err(LocalRunDirectoryError::ExecutionRootOverlap.into());
+    }
+
+    let current = lock_state(&pending.state.current)?.clone();
+    let prior = current
+        .attempts
+        .last()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let recovery = recovery_status_with(prior, false, authority);
+    if let LocalRetryEligibility::Ineligible(reason) =
+        retry_eligibility(prior.state, &recovery, false)
+    {
+        return Err(LocalRetryBeginError::Rejected(retry_rejection(
+            pending.normalized.clone(),
+            prior.attempt_number,
+            reason,
+            &recovery,
+        )));
+    }
+
+    let next_attempt_number = prior
+        .attempt_number
+        .checked_add(1)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let next_attempt = retry_attempt(
+        admitted,
+        next_attempt_number,
+        prior.attempt_number,
+        pending.definition.clone(),
+    )?;
+    if let Err((guard_ids, ownership_reason)) = quiesce_attempt(prior, authority) {
+        return Err(LocalRetryBeginError::Rejected(LocalRetryRejection {
+            run_directory: pending.normalized.clone(),
+            attempt_number: prior.attempt_number,
+            reason: RetryIneligibilityReason::OwnershipUnproven,
+            guard_ids,
+            ownership_reason: Some(ownership_reason),
+        }));
+    }
+    let abandonment_snapshot = (!prior.state.is_terminal()).then(|| {
+        capture_settlement_snapshot(
+            Path::new(&prior.execution_root),
+            WorkspaceSnapshotSettlementV1::AbandonmentRecovery,
+        )
+    });
+
+    let attempt_directory = create_or_verify_attempt_directory(&pending.root, next_attempt_number)?;
+    pending.state.update(|state| {
+        if state.current_attempt_number != prior.attempt_number {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        let current_attempt = current_attempt_mut(state)?;
+        if !current_attempt.state.is_terminal() {
+            for guard in &mut current_attempt.process_guards {
+                guard.state = ProcessGuardStateV1::Quiesced;
+            }
+            let execution_may_have_started = current_attempt.started_at.is_some();
+            settle_interrupted_attempt(
+                current_attempt,
+                InterruptionCauseV1::ExecutionOwnerLost,
+                execution_may_have_started,
+                abandonment_snapshot.clone(),
+            )?;
+        }
+        state.current_attempt_number = next_attempt_number;
+        state.attempts.push(next_attempt.clone());
+        Ok(())
+    })?;
+
+    let attempt_directory_name =
+        attempt_directory_name(next_attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let private_directory = pending.normalized.join(PRIVATE_DIRECTORY);
+    let result_directory = pending
+        .normalized
+        .join(ATTEMPTS_DIRECTORY)
+        .join(attempt_directory_name)
+        .join("result");
+    Ok(LocalAttemptOwner {
+        normalized: pending.normalized,
+        lock: Some(pending.lock),
+        private_directory,
+        attempt_directory,
+        result_directory,
+        attempt_number: next_attempt_number,
+        finalizers: Arc::from(fresh_finalizer_progress(admitted)?),
+        state: pending.state,
+    })
+}
+
+fn existing_run_overlaps_execution_root(
+    pending: &PendingLocalRetry,
+    admitted: &AdmittedWorkflow,
+) -> Result<bool, LocalRunDirectoryError> {
+    Ok(
+        paths_overlap(&pending.normalized, admitted.execution().root())
+            || admitted
+                .execution()
+                .root_identity()
+                .contains_directory(&pending.root)
+                .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?,
+    )
+}
+
+fn retry_attempt(
+    admitted: &AdmittedWorkflow,
+    attempt_number: u64,
+    prior_attempt_number: u64,
+    definition: AttemptDefinitionV1,
+) -> Result<LocalAttemptV1, LocalRunDirectoryError> {
+    fresh_attempt(
+        admitted,
+        attempt_number,
+        AttemptTriggerV1::ExplicitRetry,
+        Some(prior_attempt_number),
+        definition,
+        timestamp(scherzo_cloud_support::utc_now())?,
+    )
+}
+
+fn fresh_attempt(
+    admitted: &AdmittedWorkflow,
+    attempt_number: u64,
+    trigger: AttemptTriggerV1,
+    prior_attempt_number: Option<u64>,
+    definition: AttemptDefinitionV1,
+    created_at: String,
+) -> Result<LocalAttemptV1, LocalRunDirectoryError> {
+    let execution_root = admitted
+        .execution()
+        .root()
+        .to_str()
+        .ok_or(LocalRunDirectoryError::InvalidPath)?
+        .to_owned();
+    let steps = admitted
+        .workflow()
+        .definition
+        .presentation_order
+        .iter()
+        .map(|id| {
+            let node = admitted
+                .workflow()
+                .definition
+                .steps
+                .get(id)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            fresh_progress_node(id, AttemptNodeRoleV1::Step, node)
+        })
+        .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
+    Ok(LocalAttemptV1 {
+        attempt_id: generate_uuid()?,
+        attempt_number,
+        trigger,
+        prior_attempt_number,
+        definition: Some(definition),
+        state: AttemptStateV1::Created,
+        execution_root,
+        created_at,
+        started_at: None,
+        settled_at: None,
+        settlement_snapshot: None,
+        owner: AttemptOwnerV1 {
+            owner_nonce: generate_uuid()?,
+            execution_host: execution_host()?,
+        },
+        cancellation: None,
+        force_abort: None,
+        interruption: None,
+        rejection: None,
+        progress: AttemptProgressV1 {
+            accepted_occurrence_ordinal: 0,
+            last_transition_sequence: 0,
+            steps,
+            outstanding_actions: Vec::new(),
+            invocations: Vec::new(),
+            accounting: DurableInvocationAccountingV1 {
+                maximum_invocations: admitted
+                    .capacity()
+                    .resolved
+                    .requirements
+                    .maximum_invocations,
+                observed_invocations: 0,
+                settled_invocations: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                retained_diagnostic_bytes: 0,
+                discarded_diagnostic_bytes: 0,
+            },
+        },
+        finalization: None,
+        process_guards: Vec::new(),
+        result: AttemptResultV1::NotPublished {
+            reason: ResultAbsentReasonV1::AttemptNonterminal,
+        },
+    })
+}
+
+fn fresh_finalizer_progress(
+    admitted: &AdmittedWorkflow,
+) -> Result<Vec<AttemptStepV1>, LocalRunDirectoryError> {
+    admitted
+        .workflow()
+        .definition
+        .finalizer_presentation_order
+        .iter()
+        .map(|id| {
+            let node = &admitted
+                .workflow()
+                .definition
+                .finalizers
+                .get(id)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?
+                .body;
+            fresh_progress_node(id, AttemptNodeRoleV1::Finalizer, node)
+        })
+        .collect()
+}
+
+fn fresh_progress_node(
+    id: &str,
+    role: AttemptNodeRoleV1,
+    node: &super::validated::ValidatedStep,
+) -> Result<AttemptStepV1, LocalRunDirectoryError> {
+    let failure_policy = match node {
+        super::validated::ValidatedStep::Command(command) => command.common.failure_policy,
+        super::validated::ValidatedStep::Agent(agent) => agent.common.failure_policy,
+    };
+    Ok(AttemptStepV1 {
+        id: id.to_owned(),
+        role,
+        failure_policy,
+        state: AttemptStepStateV1::Pending,
+        outputs: Some(Vec::new()),
+        detail: None,
+        recovery: None,
+    })
+}
+
+fn quiesce_attempt(
+    attempt: &LocalAttemptV1,
+    authority: &impl LocalQuiescenceAuthority,
+) -> Result<(), (Vec<String>, OwnershipUnprovenReason)> {
+    let guards = attempt
+        .process_guards
+        .iter()
+        .filter(|guard| !matches!(guard.state, ProcessGuardStateV1::Quiesced))
+        .collect::<Vec<_>>();
+    if guards.is_empty() {
+        return Ok(());
+    }
+    let current_host = authority.execution_host().map_err(|()| {
+        (
+            guards.iter().map(|guard| guard.guard_id.clone()).collect(),
+            OwnershipUnprovenReason::ExecutionHostIdentityUnavailable,
+        )
+    })?;
+    let matching = guards
+        .iter()
+        .copied()
+        .filter(|guard| guard.execution_host == current_host)
+        .collect::<Vec<_>>();
+    let mut exact = Vec::new();
+    let mut unproven = Vec::new();
+    for guard in matching {
+        match authority.observe_process(guard) {
+            ProcessIdentityObservation::Exact { .. } => exact.push(guard),
+            ProcessIdentityObservation::Absent => {}
+            ProcessIdentityObservation::Unavailable => unproven.push(guard.guard_id.clone()),
+        }
+    }
+    if !unproven.is_empty() {
+        return Err(process_inspection_unproven(unproven));
+    }
+    for guard in &exact {
+        match authority.terminate_process(guard) {
+            AuthenticatedSignalResult::Signalled | AuthenticatedSignalResult::Absent => {}
+            AuthenticatedSignalResult::Unavailable => unproven.push(guard.guard_id.clone()),
+        }
+    }
+    if !unproven.is_empty() {
+        return Err(process_inspection_unproven(unproven));
+    }
+    for _ in 0..QUIESCENCE_POLL_ATTEMPTS {
+        let mut surviving = Vec::new();
+        let mut unavailable = Vec::new();
+        for guard in &exact {
+            match authority.observe_process(guard) {
+                ProcessIdentityObservation::Absent => {}
+                ProcessIdentityObservation::Exact { .. } => surviving.push(*guard),
+                ProcessIdentityObservation::Unavailable => {
+                    unavailable.push(guard.guard_id.clone());
+                }
+            }
+        }
+        if !unavailable.is_empty() {
+            return Err(process_inspection_unproven(unavailable));
+        }
+        if surviving.is_empty() {
+            return Ok(());
+        }
+        authority.wait_for_process_change();
+    }
+    Err(process_inspection_unproven(
+        exact.iter().map(|guard| guard.guard_id.clone()).collect(),
+    ))
+}
+
+fn process_inspection_unproven(guard_ids: Vec<String>) -> (Vec<String>, OwnershipUnprovenReason) {
+    (
+        guard_ids,
+        OwnershipUnprovenReason::ProcessIdentityInspectionUnavailable,
+    )
+}
+
+fn create_or_verify_attempt_directory(
+    root: &OwnedFd,
+    attempt_number: u64,
+) -> Result<OwnedFd, LocalRunDirectoryError> {
+    let attempts = open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+    let name =
+        attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+    match mkdirat(&attempts, &name, Mode::RWXU) {
+        Ok(()) => {
+            sync_directory(&attempts)?;
+            open_directory_at(&attempts, &name)
+        }
+        Err(Errno::EXIST) => {
+            let attempt = open_directory_at(&attempts, &name)?;
+            if directory_entries(&attempt)?.is_empty() {
+                Ok(attempt)
+            } else {
+                Err(LocalRunDirectoryError::StateConflict)
+            }
+        }
+        Err(_) => Err(LocalRunDirectoryError::StagingUnavailable),
+    }
+}
+
+fn recovery_status(attempt: &LocalAttemptV1, lock_held: bool) -> LocalRecoveryStatus {
+    recovery_status_with(attempt, lock_held, &SystemLocalRecoveryAuthority)
+}
+
+fn recovery_status_with(
+    attempt: &LocalAttemptV1,
+    lock_held: bool,
+    authority: &impl LocalRecoveryAuthority,
+) -> LocalRecoveryStatus {
+    if lock_held {
+        return LocalRecoveryStatus::Active;
+    }
+    if attempt.state.is_terminal() {
+        return LocalRecoveryStatus::Settled;
+    }
+    let guards = attempt
+        .process_guards
+        .iter()
+        .filter(|guard| !matches!(guard.state, ProcessGuardStateV1::Quiesced))
+        .collect::<Vec<_>>();
+    if guards.is_empty() {
+        return LocalRecoveryStatus::Abandoned;
+    }
+    let current_host = match authority.execution_host() {
+        Ok(host) => host,
+        Err(()) => {
+            return LocalRecoveryStatus::OwnershipUnproven {
+                guard_ids: guards.iter().map(|guard| guard.guard_id.clone()).collect(),
+                reason: OwnershipUnprovenReason::ExecutionHostIdentityUnavailable,
+            };
+        }
+    };
+    let guard_ids = guards
+        .iter()
+        .filter(|guard| guard.execution_host == current_host)
+        .filter(|guard| {
+            matches!(
+                authority.observe_process(guard),
+                ProcessIdentityObservation::Unavailable
+            )
+        })
+        .map(|guard| guard.guard_id.clone())
+        .collect::<Vec<_>>();
+    if guard_ids.is_empty() {
+        LocalRecoveryStatus::Abandoned
+    } else {
+        LocalRecoveryStatus::OwnershipUnproven {
+            guard_ids,
+            reason: OwnershipUnprovenReason::ProcessIdentityInspectionUnavailable,
+        }
+    }
+}
+
+fn retry_eligibility(
+    state: AttemptStateV1,
+    recovery: &LocalRecoveryStatus,
+    lock_held: bool,
+) -> LocalRetryEligibility {
+    let reason = if lock_held {
+        Some(RetryIneligibilityReason::RunLocked)
+    } else if matches!(recovery, LocalRecoveryStatus::OwnershipUnproven { .. }) {
+        Some(RetryIneligibilityReason::OwnershipUnproven)
+    } else if matches!(state, AttemptStateV1::Succeeded) {
+        Some(RetryIneligibilityReason::LatestAttemptSucceeded)
+    } else if matches!(state, AttemptStateV1::Rejected) {
+        Some(RetryIneligibilityReason::LatestAttemptRejected)
+    } else {
+        None
+    };
+    reason.map_or(
+        LocalRetryEligibility::Eligible,
+        LocalRetryEligibility::Ineligible,
+    )
+}
+
+fn status_result(result: &AttemptResultV1) -> LocalStatusResult {
+    match result {
+        AttemptResultV1::NotPublished { reason } => LocalStatusResult::NotPublished {
+            reason: result_absent_reason_name(*reason),
+        },
+        AttemptResultV1::Published { relative_directory } => LocalStatusResult::Published {
+            relative_directory: relative_directory.clone(),
+        },
+        AttemptResultV1::PublicationFailed { phase, .. } => LocalStatusResult::PublicationFailed {
+            phase: publication_failure_phase_name(*phase),
+        },
+    }
+}
+
+const fn attempt_trigger_name(trigger: AttemptTriggerV1) -> &'static str {
+    match trigger {
+        AttemptTriggerV1::Initial => "initial",
+        AttemptTriggerV1::ExplicitRetry => "explicit_retry",
+        AttemptTriggerV1::Continuation => "continuation",
+    }
+}
+
+const fn attempt_state_name(state: AttemptStateV1) -> &'static str {
+    match state {
+        AttemptStateV1::Created => "created",
+        AttemptStateV1::Running => "running",
+        AttemptStateV1::Cancelling => "cancelling",
+        AttemptStateV1::Succeeded => "succeeded",
+        AttemptStateV1::WorkflowFailed => "workflow_failed",
+        AttemptStateV1::Cancelled => "cancelled",
+        AttemptStateV1::Interrupted => "interrupted",
+        AttemptStateV1::Rejected => "rejected",
+    }
+}
+
+const fn result_absent_reason_name(reason: ResultAbsentReasonV1) -> &'static str {
+    match reason {
+        ResultAbsentReasonV1::AttemptNonterminal => "attempt_nonterminal",
+        ResultAbsentReasonV1::PublicationPending => "publication_pending",
+        ResultAbsentReasonV1::Interrupted => "interrupted",
+        ResultAbsentReasonV1::Rejected => "rejected",
+    }
+}
+
+const fn publication_failure_phase_name(phase: PublicationFailurePhaseV1) -> &'static str {
+    match phase {
+        PublicationFailurePhaseV1::ExportCopy => "export_copy",
+        PublicationFailurePhaseV1::Serialization => "serialization",
+        PublicationFailurePhaseV1::Close => "close",
+        PublicationFailurePhaseV1::Verification => "verification",
+        PublicationFailurePhaseV1::Rename => "rename",
+    }
+}
+
+fn process_identity_observation(guard: &ProcessGuardV1) -> ProcessIdentityObservation {
+    authenticated_process_group(guard).map_or(ProcessIdentityObservation::Unavailable, |identity| {
+        system_process_identity_observation(&identity)
+    })
+}
+
+fn authenticated_process_group(guard: &ProcessGuardV1) -> Option<AuthenticatedProcessGroup> {
+    if !matches!(
+        guard.liveness.kind,
+        ProcessLivenessKindV1::LeaderStartIdentity
+    ) {
+        return None;
+    }
+    let process_group = i32::try_from(guard.process_group_id)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)?;
+    AuthenticatedProcessGroup::new(process_group, guard.liveness.value.clone())
+}
+
+fn decode_run(bytes: &[u8]) -> Result<LocalRunV1, LocalRunDirectoryError> {
+    let run: LocalRunV1 = decode_schema_one(bytes)?;
+    validate_run(&run)?;
+    Ok(run)
+}
+
+fn decode_state(bytes: &[u8]) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
+    let document = decode_schema_one_value(bytes)?;
+    dispatch_durable_recovery_versions(&document)?;
+    let state =
+        serde_json::from_value(document).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    validate_state(&state)?;
+    Ok(state)
+}
+
+fn dispatch_durable_recovery_versions(document: &Value) -> Result<(), LocalRunDirectoryError> {
+    let Some(attempts) = document.get("attempts").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for attempt in attempts {
+        let ordinary = attempt
+            .get("progress")
+            .and_then(|progress| progress.get("steps"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        let finalizers = attempt
+            .get("finalization")
+            .and_then(|finalization| finalization.get("finalizers"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for recovery in ordinary
+            .chain(finalizers)
+            .filter_map(|step| step.get("recovery"))
+        {
+            if recovery
+                .get("schemaVersion")
+                .is_some_and(|version| version.as_u64() != Some(1))
+            {
+                return Err(LocalRunDirectoryError::RecoverySchemaUnsupported);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_schema_one<Document>(bytes: &[u8]) -> Result<Document, LocalRunDirectoryError>
+where
+    Document: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(decode_schema_one_value(bytes)?)
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)
+}
+
+fn decode_schema_one_value(bytes: &[u8]) -> Result<Value, LocalRunDirectoryError> {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) || !bytes.ends_with(b"\n") {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = DuplicateFreeValue::deserialize(&mut deserializer)
+        .and_then(|value| deserializer.end().map(|()| value.0))
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if contains_null(&value)
+        || value
+            .get("schemaVersion")
+            .and_then(Value::as_u64)
+            .is_none_or(|version| version != 1)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(value)
+}
+
+struct DuplicateFreeValue(Value);
+
+impl<'de> Deserialize<'de> for DuplicateFreeValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateFreeValueVisitor)
+    }
+}
+
+struct DuplicateFreeValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateFreeValueVisitor {
+    type Value = DuplicateFreeValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a duplicate-free JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(DuplicateFreeValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateFreeValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut sequence = Vec::new();
+        while let Some(value) = values.next_element::<DuplicateFreeValue>()? {
+            sequence.push(value.0);
+        }
+        Ok(DuplicateFreeValue(Value::Array(sequence)))
+    }
+
+    fn visit_map<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = values.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON object member"));
+            }
+            let value = values.next_value::<DuplicateFreeValue>()?;
+            object.insert(key, value.0);
+        }
+        Ok(DuplicateFreeValue(Value::Object(object)))
+    }
+}
+
+fn contains_null(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(values) => values.iter().any(contains_null),
+        Value::Object(properties) => properties.values().any(contains_null),
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+fn validate_run(run: &LocalRunV1) -> Result<(), LocalRunDirectoryError> {
+    if run.schema_version != 1
+        || !is_canonical_uuid(&run.local_run_id)
+        || !valid_timestamp(&run.created_at)
+        || !run.workflow_digest.validate()
+        || !run.workflow_manifest_digest.validate()
+        || run
+            .git_baseline
+            .as_ref()
+            .is_some_and(|baseline| match baseline {
+                GitBaselineV1::Available {
+                    object_format,
+                    commit_oid,
+                } => object_format != "sha1" || !is_lowercase_hex(commit_oid, 40),
+                GitBaselineV1::Unavailable { .. } => false,
+            })
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(())
+}
+
+fn local_git_baseline(baseline: &GitBaselineV1) -> Option<LocalGitBaseline> {
+    let GitBaselineV1::Available {
+        object_format,
+        commit_oid,
+    } = baseline
+    else {
+        return None;
+    };
+    let format = match object_format.as_str() {
+        "sha1" => GitObjectFormat::Sha1,
+        _ => return None,
+    };
+    LocalGitBaseline::new(format, Arc::from(commit_oid.as_str()))
+}
+
+fn validate_run_state_pair(
+    run: &LocalRunV1,
+    state: &LocalRunStateV1,
+) -> Result<(), LocalRunDirectoryError> {
+    if state.local_run_id != run.local_run_id {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for attempt in &state.attempts {
+        let Some(definition) = &attempt.definition else {
+            continue;
+        };
+        if matches!(
+            attempt.trigger,
+            AttemptTriggerV1::Initial | AttemptTriggerV1::ExplicitRetry
+        ) && (definition.digest != run.workflow_digest
+            || definition.manifest_digest != run.workflow_manifest_digest
+            || definition.locator != AttemptDefinitionLocatorV1::Run)
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirectoryError> {
+    if manifest.schema_version != 1
+        || !is_canonical_relative_path(&manifest.workflow_path)
+        || !is_canonical_absolute_path(&manifest.source_root)
+        || !(1..=256).contains(&manifest.maximum_parallel_steps)
+        || manifest.source_files.is_empty()
+        || manifest.inputs.len() > 256
+        || manifest
+            .inputs
+            .keys()
+            .any(|name| !super::is_input_name(name))
+    {
+        return Err(LocalRunDirectoryError::SerializationUnavailable);
+    }
+    let mut source_paths = BTreeSet::new();
+    let mut previous_source_path: Option<&[u8]> = None;
+    for source in &manifest.source_files {
+        if !is_canonical_relative_path(&source.path) {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+        if !source_paths.insert(source.path.as_str()) {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+        if previous_source_path.is_some_and(|path| path >= source.path.as_bytes()) {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+        previous_source_path = Some(source.path.as_bytes());
+    }
+    if !source_paths.contains(manifest.workflow_path.as_str()) {
+        return Err(LocalRunDirectoryError::SerializationUnavailable);
+    }
+    let mut retained_files = manifest
+        .source_files
+        .iter()
+        .map(|source| &source.file)
+        .collect::<Vec<_>>();
+    let mut input_bytes = 0_u64;
+    let mut attachment_count = 0_usize;
+    for input in manifest.inputs.values() {
+        match input {
+            ManifestInputV1::Text { file } | ManifestInputV1::Json { file } => {
+                if file.size_bytes > MAXIMUM_RETAINED_TEXT_BYTES {
+                    return Err(LocalRunDirectoryError::SerializationUnavailable);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                retained_files.push(file);
+            }
+            ManifestInputV1::File { media_type, file } => {
+                if file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES
+                    || !super::is_valid_media_type(media_type)
+                {
+                    return Err(LocalRunDirectoryError::SerializationUnavailable);
+                }
+                account_retained_bytes(
+                    &mut input_bytes,
+                    file.size_bytes,
+                    MAXIMUM_RETAINED_INPUT_BYTES,
+                )?;
+                retained_files.push(file);
+            }
+            ManifestInputV1::Attachments { items } => {
+                attachment_count = attachment_count
+                    .checked_add(items.len())
+                    .filter(|count| *count <= 256)
+                    .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+                for attachment in items {
+                    if attachment.file.size_bytes > MAXIMUM_RETAINED_FILE_BYTES
+                        || !super::is_valid_media_type(&attachment.media_type)
+                    {
+                        return Err(LocalRunDirectoryError::SerializationUnavailable);
+                    }
+                    account_retained_bytes(
+                        &mut input_bytes,
+                        attachment.file.size_bytes,
+                        MAXIMUM_RETAINED_INPUT_BYTES,
+                    )?;
+                    retained_files.push(&attachment.file);
+                }
+            }
+        }
+    }
+    let mut expected_ordinal = 1_u64;
+    for file in retained_files {
+        if file.ordinal != expected_ordinal
+            || file.relative_file
+                != format!(
+                    "{WORKFLOW_FILES_DIRECTORY}/{}",
+                    retained_file_name(expected_ordinal)?
+                )
+            || !file.digest.validate()
+        {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+        expected_ordinal = expected_ordinal
+            .checked_add(1)
+            .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+    }
+    Ok(())
+}
+
+fn validate_state(state: &LocalRunStateV1) -> Result<(), LocalRunDirectoryError> {
+    if state.schema_version != 1
+        || !is_canonical_uuid(&state.local_run_id)
+        || state.revision == 0
+        || state.current_attempt_number == 0
+        || state.attempts.is_empty()
+        || state.attempts.last().map(|attempt| attempt.attempt_number)
+            != Some(state.current_attempt_number)
+        || state.diagnostics.len() > MAXIMUM_DIAGNOSTICS
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for (index, attempt) in state.attempts.iter().enumerate() {
+        let number = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        validate_attempt(attempt, number)?;
+    }
+    let mut prior_sequence = 0;
+    for diagnostic in &state.diagnostics {
+        if diagnostic.sequence == 0
+            || diagnostic.sequence <= prior_sequence
+            || diagnostic.attempt_number == 0
+            || diagnostic.attempt_number > state.current_attempt_number
+            || diagnostic.action_id == Some(0)
+            || diagnostic
+                .guard_id
+                .as_deref()
+                .is_some_and(|guard| !is_canonical_uuid(guard))
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        prior_sequence = diagnostic.sequence;
+    }
+    Ok(())
+}
+
+fn validate_attempt(
+    attempt: &LocalAttemptV1,
+    expected_number: u64,
+) -> Result<(), LocalRunDirectoryError> {
+    let terminal = attempt.state.is_terminal();
+    let valid_trigger = match attempt.trigger {
+        AttemptTriggerV1::Initial => {
+            attempt.attempt_number == 1 && attempt.prior_attempt_number.is_none()
+        }
+        AttemptTriggerV1::ExplicitRetry | AttemptTriggerV1::Continuation => {
+            attempt.prior_attempt_number == Some(expected_number - 1)
+        }
+    };
+    if attempt.attempt_number != expected_number
+        || !valid_trigger
+        || !is_canonical_uuid(&attempt.attempt_id)
+        || !is_canonical_absolute_path(&attempt.execution_root)
+        || !valid_timestamp(&attempt.created_at)
+        || attempt
+            .started_at
+            .as_deref()
+            .is_some_and(|value| !valid_timestamp(value))
+        || attempt
+            .settled_at
+            .as_deref()
+            .is_some_and(|value| !valid_timestamp(value))
+        || terminal != attempt.settled_at.is_some()
+        || attempt.definition.as_ref().is_some_and(|definition| {
+            !definition.digest.validate()
+                || !definition.manifest_digest.validate()
+                || match definition.locator {
+                    AttemptDefinitionLocatorV1::Run => false,
+                    AttemptDefinitionLocatorV1::Attempt { attempt_number } => {
+                        attempt_number == 0 || attempt_number > attempt.attempt_number
+                    }
+                    AttemptDefinitionLocatorV1::PriorAttempt { attempt_number } => {
+                        attempt_number == 0 || attempt_number >= attempt.attempt_number
+                    }
+                }
+        })
+        || attempt
+            .settlement_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !terminal || !snapshot.validate(true))
+        || (attempt.definition.is_some() && terminal && attempt.settlement_snapshot.is_none())
+        || !validate_owner(&attempt.owner)
+        || attempt.progress.steps.is_empty()
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    if matches!(attempt.state, AttemptStateV1::Created) && attempt.started_at.is_some() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    if !matches!(
+        attempt.state,
+        AttemptStateV1::Created | AttemptStateV1::Rejected
+    ) && attempt.started_at.is_none()
+        && !matches!(
+            attempt.interruption,
+            Some(AttemptInterruptionV1 {
+                execution_may_have_started: false,
+                ..
+            })
+        )
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let finalization_cancelled =
+        attempt
+            .finalization
+            .as_ref()
+            .is_some_and(|finalization| match finalization {
+                AttemptFinalizationV1::Progress(progress) => progress.cancellation.is_some(),
+                AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
+            });
+    let first_force_abort_phase = attempt
+        .force_abort
+        .map(|force_abort| force_abort.phase.into());
+    if attempt.cancellation.as_ref().is_some_and(|cancellation| {
+        cancellation.reason == CancellationReasonV1::ForceAbort
+            || !valid_timestamp(&cancellation.requested_at)
+            || !valid_timestamp(&cancellation.force_stop_deadline)
+    }) || attempt.force_abort.is_some_and(|force_abort| {
+        force_abort.reason != CancellationReason::ForceAbort
+            || matches!(
+                attempt.state,
+                AttemptStateV1::Created | AttemptStateV1::Rejected | AttemptStateV1::Succeeded
+            )
+            || (force_abort.phase == super::runtime::RunCancellationPhase::Finalization
+                && attempt.finalization.is_none())
+    }) || matches!(
+        attempt.state,
+        AttemptStateV1::Cancelling | AttemptStateV1::Cancelled
+    ) && attempt.cancellation.is_none()
+        && attempt.force_abort.is_none()
+        && !finalization_cancelled
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    if attempt.cancellation.as_ref().is_some_and(|cancellation| {
+        cancellation.workflow_confirmed != matches!(attempt.state, AttemptStateV1::Cancelled)
+    }) || attempt.interruption.as_ref().is_some_and(|interruption| {
+        interruption.cancellation_requested
+            != (attempt.cancellation.is_some()
+                || attempt.force_abort.is_some()
+                || finalization_cancelled)
+    }) {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    if matches!(attempt.state, AttemptStateV1::Interrupted) != attempt.interruption.is_some()
+        || matches!(attempt.state, AttemptStateV1::Rejected) != attempt.rejection.is_some()
+        || (!matches!(attempt.state, AttemptStateV1::Interrupted) && attempt.interruption.is_some())
+        || (!matches!(attempt.state, AttemptStateV1::Rejected) && attempt.rejection.is_some())
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let ordinary_cancellation = attempt
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation.reason);
+    let mut step_ids = BTreeSet::new();
+    for step in &attempt.progress.steps {
+        if step.id.is_empty()
+            || step.role != AttemptNodeRoleV1::Step
+            || !step_ids.insert(step.id.as_str())
+            || !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref())
+            || !retained_output_set_valid(
+                step.role,
+                &step.id,
+                step.state,
+                step.outputs.as_deref(),
+                attempt.definition.is_some(),
+            )
+            || step.detail.as_ref().is_some_and(|detail| {
+                let NodeDetail::Cancellation(detail) = detail else {
+                    return false;
+                };
+                !ordinary_node_cancellation_matches(
+                    cancellation_reason(detail.code),
+                    ordinary_cancellation,
+                    CancellationReasonV1::ForceAbort,
+                    first_force_abort_phase,
+                )
+            })
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    validate_attempt_recovery(attempt, &step_ids)?;
+    validate_attempt_finalization(attempt, &mut step_ids)?;
+    let mut action_ids = BTreeSet::new();
+    let mut prior_action_id = 0;
+    for action in &attempt.progress.outstanding_actions {
+        let requires_step = !matches!(action.kind, OutstandingActionKindV1::FinishRun);
+        if action.action_id == 0
+            || action.action_id <= prior_action_id
+            || !action_ids.insert(action.action_id)
+            || requires_step != action.step_id.is_some()
+            || requires_step != action.node_role.is_some()
+            || action
+                .step_id
+                .as_deref()
+                .is_some_and(|id| attempt_node_role(attempt, id) != action.node_role)
+            || (requires_step
+                && (action.target_execution.is_some() == action.recovery_round.is_some()))
+            || (!requires_step
+                && (action.target_execution.is_some() || action.recovery_round.is_some()))
+            || (matches!(action.kind, OutstandingActionKindV1::StartRecoveryHandler)
+                && action.recovery_round.is_none())
+            || (matches!(action.kind, OutstandingActionKindV1::StartStep)
+                && action.target_execution.is_none())
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        prior_action_id = action.action_id;
+    }
+    if terminal && !attempt.progress.outstanding_actions.is_empty() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut guard_ids = BTreeSet::new();
+    for guard in &attempt.process_guards {
+        if !is_canonical_uuid(&guard.guard_id)
+            || !guard_ids.insert(guard.guard_id.as_str())
+            || guard.action_id == 0
+            || !step_ids.contains(guard.step_id.as_str())
+            || attempt_node_role(attempt, &guard.step_id) != Some(guard.node_role)
+            || !validate_execution_host(&guard.execution_host)
+            || guard.process_group_id <= 0
+            || guard.liveness.value.is_empty()
+            || guard.liveness.value.len() > 256
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    validate_attempt_result(attempt)
+}
+
+fn validate_attempt_recovery(
+    attempt: &LocalAttemptV1,
+    step_ids: &BTreeSet<&str>,
+) -> Result<(), LocalRunDirectoryError> {
+    if attempt.progress.accounting.maximum_invocations == 0
+        || u64::try_from(attempt.progress.invocations.len())
+            .ok()
+            .is_none_or(|count| count > attempt.progress.accounting.maximum_invocations)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut invocation_ids = BTreeSet::new();
+    let mut previous_invocation_id = 0_u64;
+    for invocation in &attempt.progress.invocations {
+        if invocation.invocation_id == 0
+            || invocation.invocation_id <= previous_invocation_id
+            || !invocation_ids.insert(invocation.invocation_id)
+            || !step_ids.contains(invocation.step_id.as_str())
+            || attempt_node_role(attempt, &invocation.step_id) != Some(invocation.node_role)
+            || invocation.target_execution.is_some() == invocation.recovery_round.is_some()
+            || (invocation.role == super::publication::RecoveryInvocationRoleV1::Target)
+                != invocation.target_execution.is_some()
+            || !valid_timestamp(&invocation.started_at)
+            || invocation
+                .finished_at
+                .as_deref()
+                .is_some_and(|finished| !valid_timestamp(finished))
+            || (invocation.state == DurableInvocationStateV1::Active)
+                != invocation.finished_at.is_none()
+            || invocation
+                .diagnostic_reference
+                .as_deref()
+                .is_some_and(|path| {
+                    !is_canonical_relative_path(path) || path.split('/').any(str::is_empty)
+                })
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        for diagnostic in &invocation.diagnostics {
+            if !is_canonical_relative_path(&diagnostic.reference)
+                || diagnostic.truncated != (diagnostic.discarded_bytes != 0)
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+        previous_invocation_id = invocation.invocation_id;
+    }
+    if attempt.state.is_terminal()
+        && attempt
+            .progress
+            .invocations
+            .iter()
+            .any(|invocation| invocation.state == DurableInvocationStateV1::Active)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut projected = attempt.progress.clone();
+    recalculate_invocation_accounting(&mut projected)?;
+    if projected.accounting != attempt.progress.accounting {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for step in &attempt.progress.steps {
+        let Some(recovery) = &step.recovery else {
+            continue;
+        };
+        if recovery.schema_version != 1
+            || !(1..=10).contains(&recovery.configured_retries)
+            || recovery.rounds.is_empty()
+            || recovery.rounds.len() > usize::from(recovery.configured_retries)
+            || recovery
+                .rounds
+                .iter()
+                .enumerate()
+                .any(|(index, round)| round.number != u8::try_from(index + 1).unwrap_or(u8::MAX))
+            || recovery.termination.is_some()
+                != matches!(
+                    step.state,
+                    AttemptStepStateV1::Succeeded
+                        | AttemptStepStateV1::Failed
+                        | AttemptStepStateV1::Cancelled
+                )
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        if let Some(active) = &recovery.active
+            && !attempt.progress.invocations.iter().any(|invocation| {
+                invocation.invocation_id == active.invocation_id
+                    && invocation.step_id == step.id
+                    && invocation.role == active.role
+                    && invocation.target_execution == active.target_execution
+                    && invocation.recovery_round == active.recovery_round
+                    && invocation.state == DurableInvocationStateV1::Active
+            })
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_attempt_finalization<'a>(
+    attempt: &'a LocalAttemptV1,
+    node_ids: &mut BTreeSet<&'a str>,
+) -> Result<(), LocalRunDirectoryError> {
+    let Some(finalization) = &attempt.finalization else {
+        return Ok(());
+    };
+    let force_abort = match finalization {
+        AttemptFinalizationV1::Progress(progress) => progress.force_abort,
+        AttemptFinalizationV1::Complete(complete) => complete.force_abort,
+    };
+    if force_abort != attempt.force_abort.is_some() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    match finalization {
+        AttemptFinalizationV1::Progress(progress) => {
+            if progress.complete
+                || progress.finalizers.is_empty()
+                || progress.finalizers.iter().any(|finalizer| {
+                    finalizer.role != AttemptNodeRoleV1::Finalizer
+                        || finalizer.id.is_empty()
+                        || !node_ids.insert(finalizer.id.as_str())
+                        || !attempt_step_detail_valid(
+                            finalizer.role,
+                            finalizer.state,
+                            finalizer.detail.as_ref(),
+                        )
+                        || !retained_output_set_valid(
+                            finalizer.role,
+                            &finalizer.id,
+                            finalizer.state,
+                            finalizer.outputs.as_deref(),
+                            attempt.definition.is_some(),
+                        )
+                        || !retained_finalization_cancellation_detail_valid(
+                            finalizer.detail.as_ref(),
+                            progress.cancellation.as_ref(),
+                            progress.force_abort,
+                        )
+                })
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if matches!(
+                attempt.state,
+                AttemptStateV1::Created | AttemptStateV1::Rejected
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if !valid_finalization_interruption(
+                progress.cancellation.as_ref(),
+                progress.force_abort,
+                attempt
+                    .force_abort
+                    .map(|force_abort| force_abort.phase.into()),
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if matches!(
+                attempt.state,
+                AttemptStateV1::Succeeded
+                    | AttemptStateV1::WorkflowFailed
+                    | AttemptStateV1::Cancelled
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+        AttemptFinalizationV1::Complete(complete) => {
+            if !complete.complete
+                || complete.finalizers.is_empty()
+                || !matches!(
+                    attempt.state,
+                    AttemptStateV1::Succeeded
+                        | AttemptStateV1::WorkflowFailed
+                        | AttemptStateV1::Cancelled
+                )
+                // Progress and complete finalizers have distinct durable types and phase
+                // invariants, so keeping their local validation explicit is clearer.
+                // jscpd:ignore-start
+                || complete.finalizers.iter().any(|finalizer| {
+                    finalizer.role != AttemptNodeRoleV1::Finalizer
+                        || finalizer.id.is_empty()
+                        || !node_ids.insert(finalizer.id.as_str())
+                        || !durable_finalizer_valid(finalizer)
+                        || !retained_output_set_valid(
+                            finalizer.role,
+                            &finalizer.id,
+                            finalizer.state,
+                            finalizer.outputs.as_deref(),
+                            attempt.definition.is_some(),
+                        )
+                        || !retained_finalization_cancellation_detail_valid(
+                            finalizer.detail.as_ref(),
+                            complete.cancellation.as_ref(),
+                            complete.force_abort,
+                        )
+                })
+            // jscpd:ignore-end
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            let expected_issues = complete
+                .finalizers
+                .iter()
+                .filter(|finalizer| {
+                    matches!(
+                        finalizer.state,
+                        AttemptStepStateV1::Failed | AttemptStepStateV1::Blocked
+                    )
+                })
+                .map(|finalizer| (finalizer.id.as_str(), finalizer.failure_policy))
+                .collect::<Vec<_>>();
+            if complete.issues.len() != expected_issues.len()
+                || complete
+                    .issues
+                    .iter()
+                    .zip(expected_issues)
+                    .any(|(issue, (id, impact))| issue.finalizer_id != id || issue.impact != impact)
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            if !valid_finalization_interruption(
+                complete.cancellation.as_ref(),
+                complete.force_abort,
+                attempt
+                    .force_abort
+                    .map(|force_abort| force_abort.phase.into()),
+            ) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn retained_finalization_cancellation_detail_valid(
+    detail: Option<&NodeDetail>,
+    cancellation: Option<&DurableFinalizationCancellationV1>,
+    force_abort: bool,
+) -> bool {
+    let Some(NodeDetail::Cancellation(detail)) = detail else {
+        return true;
+    };
+    finalization_node_cancellation_matches(
+        cancellation_reason(detail.code),
+        cancellation.map(|cancellation| cancellation.reason),
+        CancellationReasonV1::ForceAbort,
+        force_abort,
+    )
+}
+
+fn valid_finalization_interruption(
+    cancellation: Option<&DurableFinalizationCancellationV1>,
+    force_abort: bool,
+    first_force_abort_phase: Option<FirstForceAbortPhase>,
+) -> bool {
+    if !finalization_cancellation_matches_force_phase(
+        cancellation.map(|cancellation| cancellation.reason),
+        CancellationReasonV1::ForceAbort,
+        first_force_abort_phase,
+    ) {
+        return false;
+    }
+    match (cancellation, force_abort) {
+        (None, false) => true,
+        (Some(cancellation), false) => {
+            cancellation.reason != CancellationReasonV1::ForceAbort
+                && cancellation
+                    .force_stop_deadline
+                    .as_deref()
+                    .is_some_and(valid_timestamp)
+        }
+        (Some(cancellation), true) => {
+            (cancellation.reason == CancellationReasonV1::ForceAbort
+                && cancellation.force_stop_deadline.is_none())
+                || (cancellation.reason != CancellationReasonV1::ForceAbort
+                    && cancellation
+                        .force_stop_deadline
+                        .as_deref()
+                        .is_some_and(valid_timestamp))
+        }
+        (None, true) => false,
+    }
+}
+
+struct RetainedNodeOutputs<'a> {
+    id: &'a str,
+    role: AttemptNodeRoleV1,
+    state: AttemptStepStateV1,
+    outputs: Option<&'a [RetainedOutputV1]>,
+}
+
+impl<'a> From<&'a AttemptStepV1> for RetainedNodeOutputs<'a> {
+    fn from(node: &'a AttemptStepV1) -> Self {
+        Self {
+            id: &node.id,
+            role: node.role,
+            state: node.state,
+            outputs: node.outputs.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a DurableFinalizerV1> for RetainedNodeOutputs<'a> {
+    fn from(node: &'a DurableFinalizerV1) -> Self {
+        Self {
+            id: &node.id,
+            role: node.role,
+            state: node.state,
+            outputs: node.outputs.as_deref(),
+        }
+    }
+}
+
+pub(super) fn validate_retained_outputs_against_definition(
+    attempt: &LocalAttemptV1,
+    workflow: &ResolvedWorkflow,
+) -> Result<(), LocalRunDirectoryError> {
+    if attempt.definition.is_none() {
+        return Ok(());
+    }
+    if attempt.progress.steps.len() != workflow.definition.presentation_order.len() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for (step, expected_id) in attempt
+        .progress
+        .steps
+        .iter()
+        .zip(&workflow.definition.presentation_order)
+    {
+        let definition = workflow
+            .definition
+            .steps
+            .get(expected_id)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        if step.id != *expected_id
+            || step.role != AttemptNodeRoleV1::Step
+            || !retained_outputs_match_declarations(step.state, step.outputs.as_deref(), definition)
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+
+    let finalizers = match &attempt.finalization {
+        None => return Ok(()),
+        Some(AttemptFinalizationV1::Progress(progress)) => progress
+            .finalizers
+            .iter()
+            .map(RetainedNodeOutputs::from)
+            .collect::<Vec<_>>(),
+        Some(AttemptFinalizationV1::Complete(complete)) => complete
+            .finalizers
+            .iter()
+            .map(RetainedNodeOutputs::from)
+            .collect::<Vec<_>>(),
+    };
+    if finalizers.len() != workflow.definition.finalizer_presentation_order.len() {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for (finalizer, expected_id) in finalizers
+        .into_iter()
+        .zip(&workflow.definition.finalizer_presentation_order)
+    {
+        let definition = &workflow
+            .definition
+            .finalizers
+            .get(expected_id)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?
+            .body;
+        if finalizer.id != expected_id
+            || finalizer.role != AttemptNodeRoleV1::Finalizer
+            || !retained_outputs_match_declarations(finalizer.state, finalizer.outputs, definition)
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn retained_outputs_match_declarations(
+    state: AttemptStepStateV1,
+    retained: Option<&[RetainedOutputV1]>,
+    definition: &super::validated::ValidatedStep,
+) -> bool {
+    let Some(retained) = retained else {
+        return false;
+    };
+    if state != AttemptStepStateV1::Succeeded {
+        return retained.is_empty();
+    }
+    let declared = match definition {
+        super::validated::ValidatedStep::Command(command) => &command.common.outputs,
+        super::validated::ValidatedStep::Agent(agent) => &agent.common.outputs,
+    };
+    retained.len() == declared.len()
+        && declared.iter().all(|(name, declaration)| {
+            retained.iter().any(|output| {
+                output.name() == name
+                    && retained_output_matches_declaration(output, &declaration.definition)
+            })
+        })
+}
+
+fn retained_output_matches_declaration(
+    retained: &RetainedOutputV1,
+    declared: &super::document::Output,
+) -> bool {
+    matches!(
+        (retained, declared),
+        (
+            RetainedOutputV1::Text { .. },
+            super::document::Output::TextPath { .. } | super::document::Output::TextAgentResponse
+        ) | (
+            RetainedOutputV1::Json { .. },
+            super::document::Output::JsonPath { .. }
+                | super::document::Output::JsonAgentResult { .. }
+        ) | (
+            RetainedOutputV1::GitBranch { .. },
+            super::document::Output::GitBranchWorkspace
+        )
+    ) || matches!(
+        (retained, declared),
+        (
+            RetainedOutputV1::File { media_type, .. },
+            super::document::Output::FilePath {
+                media_type: declared_media_type,
+                ..
+            }
+        ) if media_type == declared_media_type
+    )
+}
+
+pub(super) fn retained_output_matches_export(
+    attempt: &LocalAttemptV1,
+    role: AttemptNodeRoleV1,
+    node: &str,
+    output_name: &str,
+    export: &super::publication::ExportV1,
+) -> bool {
+    let outputs = match role {
+        AttemptNodeRoleV1::Step => attempt
+            .progress
+            .steps
+            .iter()
+            .find(|step| step.id == node)
+            .and_then(|step| step.outputs.as_deref()),
+        AttemptNodeRoleV1::Finalizer => {
+            attempt
+                .finalization
+                .as_ref()
+                .and_then(|finalization| match finalization {
+                    AttemptFinalizationV1::Progress(progress) => progress
+                        .finalizers
+                        .iter()
+                        .find(|finalizer| finalizer.id == node)
+                        .and_then(|finalizer| finalizer.outputs.as_deref()),
+                    AttemptFinalizationV1::Complete(complete) => complete
+                        .finalizers
+                        .iter()
+                        .find(|finalizer| finalizer.id == node)
+                        .and_then(|finalizer| finalizer.outputs.as_deref()),
+                })
+        }
+    };
+    outputs
+        .and_then(|outputs| outputs.iter().find(|output| output.name() == output_name))
+        .is_some_and(|output| output.matches_export(export))
+}
+
+fn retained_output_set_valid(
+    role: AttemptNodeRoleV1,
+    node: &str,
+    state: AttemptStepStateV1,
+    outputs: Option<&[RetainedOutputV1]>,
+    required: bool,
+) -> bool {
+    let Some(outputs) = outputs else {
+        return !required;
+    };
+    if state != AttemptStepStateV1::Succeeded && !outputs.is_empty() {
+        return false;
+    }
+    let mut names = BTreeSet::new();
+    outputs.iter().all(|output| {
+        let name = output.name();
+        scherzo_cloud_support::is_identifier(name)
+            && names.insert(name)
+            && retained_output_valid(role, node, output)
+    })
+}
+
+fn retained_output_valid(role: AttemptNodeRoleV1, node: &str, output: &RetainedOutputV1) -> bool {
+    let expected_path = retained_value_relative_path(role, node, output.name());
+    let carrier_valid = |carrier: &RetainedCarrierV1, media_type: &str| {
+        carrier.relative_path == expected_path
+            && carrier.media_type == media_type
+            && carrier.size_bytes <= MAXIMUM_RETAINED_FILE_BYTES
+            && carrier.digest.validate()
+    };
+    match output {
+        RetainedOutputV1::Text { carrier, .. } => {
+            carrier_valid(carrier, "text/plain; charset=utf-8")
+        }
+        RetainedOutputV1::Json { carrier, .. } => carrier_valid(carrier, "application/json"),
+        RetainedOutputV1::File {
+            media_type,
+            carrier,
+            ..
+        } => super::is_valid_media_type(media_type) && carrier_valid(carrier, media_type),
+        RetainedOutputV1::GitBranch {
+            artifact_version,
+            object_format,
+            base_oid,
+            head_oid,
+            tree_oid,
+            carrier,
+            ..
+        } => {
+            *artifact_version == 1
+                && object_format == "sha1"
+                && is_lowercase_hex(base_oid, 40)
+                && is_lowercase_hex(head_oid, 40)
+                && is_lowercase_hex(tree_oid, 40)
+                && ((base_oid == head_oid && carrier.is_none())
+                    || (base_oid != head_oid
+                        && carrier.as_ref().is_some_and(|carrier| {
+                            carrier_valid(carrier, "application/vnd.git.bundle")
+                        })))
+        }
+    }
+}
+
+fn retained_value_relative_path(role: AttemptNodeRoleV1, node: &str, output: &str) -> String {
+    let role = match role {
+        AttemptNodeRoleV1::Step => "steps",
+        AttemptNodeRoleV1::Finalizer => "finalizers",
+    };
+    format!("{VALUES_DIRECTORY}/{role}/{node}/{output}")
+}
+
+fn durable_finalizer_valid(finalizer: &DurableFinalizerV1) -> bool {
+    attempt_step_detail_valid(finalizer.role, finalizer.state, finalizer.detail.as_ref())
+        && matches!(
+            finalizer.state,
+            AttemptStepStateV1::Succeeded
+                | AttemptStepStateV1::Failed
+                | AttemptStepStateV1::Blocked
+                | AttemptStepStateV1::Skipped
+                | AttemptStepStateV1::NotRun
+                | AttemptStepStateV1::Cancelled
+        )
+}
+
+fn attempt_step_detail_valid(
+    role: AttemptNodeRoleV1,
+    state: AttemptStepStateV1,
+    detail: Option<&NodeDetail>,
+) -> bool {
+    match (role, state, detail) {
+        (
+            _,
+            AttemptStepStateV1::Pending
+            | AttemptStepStateV1::Starting
+            | AttemptStepStateV1::Running
+            | AttemptStepStateV1::CapturingOutputs
+            | AttemptStepStateV1::Succeeded,
+            None,
+        ) => true,
+        (_, AttemptStepStateV1::Failed, Some(NodeDetail::Failed(_))) => true,
+        (_, AttemptStepStateV1::Blocked, Some(NodeDetail::Blocked(_))) => true,
+        (_, AttemptStepStateV1::Skipped, Some(NodeDetail::Skipped(_))) => true,
+        (AttemptNodeRoleV1::Step, AttemptStepStateV1::NotRun, Some(NodeDetail::NotRun(detail))) => {
+            detail.code == NonExecutionCode::FailureStop
+        }
+        (
+            AttemptNodeRoleV1::Finalizer,
+            AttemptStepStateV1::NotRun,
+            Some(NodeDetail::NotRun(detail)),
+        ) => detail.code == NonExecutionCode::FinalizerTriggerNotSelected,
+        (
+            AttemptNodeRoleV1::Step | AttemptNodeRoleV1::Finalizer,
+            AttemptStepStateV1::Cancelling | AttemptStepStateV1::Cancelled,
+            Some(NodeDetail::Cancellation(_)),
+        ) => true,
+        _ => false,
+    }
+}
+
+fn validate_attempt_result(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
+    let valid = match (&attempt.state, &attempt.result) {
+        (
+            AttemptStateV1::Created | AttemptStateV1::Running | AttemptStateV1::Cancelling,
+            AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::AttemptNonterminal,
+            },
+        ) => true,
+        (
+            AttemptStateV1::Succeeded | AttemptStateV1::WorkflowFailed | AttemptStateV1::Cancelled,
+            AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            },
+        ) => true,
+        (
+            AttemptStateV1::Succeeded | AttemptStateV1::WorkflowFailed | AttemptStateV1::Cancelled,
+            AttemptResultV1::PublicationFailed {
+                phase,
+                result_invariant,
+            },
+        ) => result_invariant.is_none() || *phase == PublicationFailurePhaseV1::Serialization,
+        (
+            AttemptStateV1::Interrupted,
+            AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::Interrupted,
+            },
+        ) => true,
+        (
+            AttemptStateV1::Rejected,
+            AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::Rejected,
+            },
+        ) => true,
+        (_, AttemptResultV1::Published { relative_directory }) => {
+            *relative_directory == attempt_result_relative_path(attempt.attempt_number)
+                && matches!(
+                    attempt.state,
+                    AttemptStateV1::Succeeded
+                        | AttemptStateV1::WorkflowFailed
+                        | AttemptStateV1::Cancelled
+                )
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(LocalRunDirectoryError::StateInvalid)
+    }
+}
+
+fn validate_owner(owner: &AttemptOwnerV1) -> bool {
+    is_canonical_uuid(&owner.owner_nonce) && validate_execution_host(&owner.execution_host)
+}
+
+fn validate_execution_host(host: &ExecutionHostV1) -> bool {
+    !host.value.is_empty() && host.value.len() <= 256
+}
+
+fn read_regular_file(parent: &OwnedFd, name: &str) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    read_regular_file_bounded(parent, name, MAXIMUM_DURABLE_JSON_BYTES)
+}
+
+fn read_regular_file_bounded(
+    parent: &OwnedFd,
+    name: &str,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    let file = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let metadata = fstat(&file).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_size < 0
+        || u64::try_from(metadata.st_size)
+            .ok()
+            .is_none_or(|size| size > maximum_bytes)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut file = File::from(file);
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if u64::try_from(bytes.len())
+        .ok()
+        .is_none_or(|size| size > maximum_bytes)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    Ok(bytes)
+}
+
+fn encode_json(document: &impl Serialize) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    let mut bytes = serde_json::to_vec_pretty(document)
+        .map_err(|_| LocalRunDirectoryError::SerializationUnavailable)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn write_new_immutable_file(
+    parent: &OwnedFd,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), LocalRunDirectoryError> {
+    let mut file = create_file(parent, name, Mode::RUSR | Mode::WUSR)?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    fchmod(file.as_fd(), Mode::RUSR).map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    file.sync_all()
+        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)
+}
+
+fn write_new_state_file(parent: &OwnedFd, bytes: &[u8]) -> Result<(), LocalRunDirectoryError> {
+    let mut file = create_file(parent, STATE_FILE, Mode::RUSR | Mode::WUSR)?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)
+}
+
+fn create_file(parent: &OwnedFd, name: &str, mode: Mode) -> Result<File, LocalRunDirectoryError> {
+    openat(
+        parent,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        mode,
+    )
+    .map(File::from)
+    .map_err(|_| LocalRunDirectoryError::StagingUnavailable)
+}
+
+fn mkdir(parent: &OwnedFd, name: impl rustix::path::Arg) -> Result<(), LocalRunDirectoryError> {
+    mkdirat(parent, name, Mode::RWXU).map_err(|_| LocalRunDirectoryError::StagingUnavailable)
+}
+
+pub(super) fn open_directory_at(
+    parent: &OwnedFd,
+    name: impl rustix::path::Arg,
+) -> Result<OwnedFd, LocalRunDirectoryError> {
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| LocalRunDirectoryError::StagingUnavailable)
+}
+
+fn sync_directory(directory: &OwnedFd) -> Result<(), LocalRunDirectoryError> {
+    let duplicate = dup(directory).map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    File::from(duplicate)
+        .sync_all()
+        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)
+}
+
+fn ensure_absent(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<(), LocalRunDirectoryError> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Err(LocalRunDirectoryError::DestinationExists),
+        Err(Errno::NOENT) => Ok(()),
+        Err(_) => Err(LocalRunDirectoryError::ParentUnavailable),
+    }
+}
+
+fn run_directory_overlaps_execution_root(
+    run_directory: &Path,
+    execution_path: &Path,
+    execution_root: &AdmittedExecutionRoot,
+    run_parent: &OwnedFd,
+) -> Result<bool, LocalRunDirectoryError> {
+    Ok(paths_overlap(run_directory, execution_path)
+        || execution_root
+            .contains_directory(run_parent)
+            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn directory_entries(directory: &OwnedFd) -> Result<BTreeSet<Vec<u8>>, LocalRunDirectoryError> {
+    directory_entry_names(directory).map_err(|_| LocalRunDirectoryError::StateInvalid)
+}
+
+fn timestamp(value: OffsetDateTime) -> Result<String, LocalRunDirectoryError> {
+    utc_timestamp(value).map_err(|_| LocalRunDirectoryError::SerializationUnavailable)
+}
+
+fn valid_timestamp(value: &str) -> bool {
+    value.ends_with('Z') && OffsetDateTime::parse(value, &Rfc3339).is_ok()
+}
+
+fn generate_uuid() -> Result<String, LocalRunDirectoryError> {
+    super::identity::random_uuid_v4().map_err(|()| LocalRunDirectoryError::IdentityUnavailable)
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn execution_host() -> Result<ExecutionHostV1, LocalRunDirectoryError> {
+    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|_| LocalRunDirectoryError::HostIdentityUnavailable)?;
+    let value = value.trim_end_matches(['\r', '\n']).to_ascii_lowercase();
+    validated_execution_host(value)
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(
+    unsafe_code,
+    reason = "the host-boot identity boundary reads the fixed kern.bootsessionuuid sysctl"
+)]
+fn execution_host() -> Result<ExecutionHostV1, LocalRunDirectoryError> {
+    let mut length = 0_usize;
+    // SAFETY: the fixed C string is valid and the null output pointer requests only the size.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || length == 0 || length > 257 {
+        return Err(LocalRunDirectoryError::HostIdentityUnavailable);
+    }
+    let mut bytes = vec![0_u8; length];
+    // SAFETY: sysctl writes at most the reported length into the allocated byte buffer.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(LocalRunDirectoryError::HostIdentityUnavailable);
+    }
+    bytes.truncate(length);
+    if bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    let value = String::from_utf8(bytes)
+        .map_err(|_| LocalRunDirectoryError::HostIdentityUnavailable)?
+        .to_ascii_lowercase();
+    validated_execution_host(value)
+}
+
+fn validated_execution_host(value: String) -> Result<ExecutionHostV1, LocalRunDirectoryError> {
+    if !is_canonical_uuid(&value) {
+        return Err(LocalRunDirectoryError::HostIdentityUnavailable);
+    }
+    Ok(ExecutionHostV1 {
+        kind: ExecutionHostKindV1::HostBoot,
+        value,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn execution_host() -> Result<ExecutionHostV1, LocalRunDirectoryError> {
+    Err(LocalRunDirectoryError::HostIdentityUnavailable)
+}
+
+#[cfg(test)]
+mod tests;
