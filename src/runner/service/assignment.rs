@@ -9844,7 +9844,14 @@ steps:
         select_codex_scenario(&mut manager, "failure-after-start-stubborn");
         manager.guard_processes = true;
 
-        let reports = offer_and_execute(&mut manager).await;
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        spawn_execution(&mut manager, &offered);
+        wait_for_fixture_path(&temporary.path().join("codex.descendant")).await;
+
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("failed workflow did not reap its process group");
 
         assert!(reports.iter().any(|report| matches!(
             report,
