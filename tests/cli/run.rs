@@ -87,6 +87,16 @@ fn run_body() -> serde_json::Value {
 }
 
 fn run_body_with_state(state: &str) -> serde_json::Value {
+    let interruption = if state == "interrupted" {
+        serde_json::json!({
+            "phase": "running",
+            "cause": "executor_shutdown",
+            "executorFault": null,
+            "stopConfirmed": true
+        })
+    } else {
+        serde_json::Value::Null
+    };
     serde_json::json!({
         "id": RUN_ID,
         "organizationId": ORGANIZATION_ID,
@@ -128,9 +138,21 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
             "source": "linear"
         },
         "publication": null,
+        "cancellation": null,
+        "interruption": interruption,
+        "artifactDelivery": null,
         "createdAt": "2026-08-10T12:00:00Z",
         "updatedAt": "2026-08-10T12:05:00Z"
     })
+}
+
+fn run_response(body: serde_json::Value) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&body).unwrap(),
+    )
 }
 
 fn create_args(json: bool) -> Vec<&'static str> {
@@ -3032,8 +3054,7 @@ fn precondition_replay_is_resolved_by_authoritative_sealing() {
 #[test]
 fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
     for json in [false, true] {
-        let (server, _directory, credential_path) =
-            prepared_run(vec![json_http_response("200 OK", run_body())]);
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(run_body())]);
         let environment = deployment_environment(&server.api_url, &credential_path);
         let mut args = vec!["run", "show", ORGANIZATION, RUN_ID];
         if json {
@@ -3094,6 +3115,90 @@ fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
 }
 
 #[test]
+fn run_show_distinguishes_pending_creation_and_creation_rejection() {
+    let pending_response = http_response_with_headers(
+        "202 Accepted",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({"runId": RUN_ID})).unwrap(),
+    );
+    let (output, server) = run_show_with_response(pending_response);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let pending: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(pending["outcome"], "pending");
+    assert_eq!(pending["organizationRef"], ORGANIZATION);
+    assert_eq!(pending["runId"], RUN_ID);
+    server.finish();
+
+    let rejected_response = http_response_with_headers(
+        "409 Conflict",
+        Some("application/problem+json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&serde_json::json!({
+            "type": "https://api.scherzo.dev/problems/run-creation-rejected",
+            "title": "Run creation rejected",
+            "status": 409
+        }))
+        .unwrap(),
+    );
+    let (output, server) = run_show_with_response(rejected_response);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let rejected: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rejected["outcome"], "creation_rejected");
+    assert_eq!(rejected["runId"], RUN_ID);
+    server.finish();
+}
+
+#[test]
+fn run_show_renders_cancellation_interruption_and_artifact_delivery() {
+    let mut body = run_body_with_state("interrupted");
+    body["cancellation"] = serde_json::json!({
+        "mode": "force",
+        "gracefulRequestId": "cmd_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "forceRequestId": "cmd_01k0z6r1w8f4jy2m7q9v3x5abd"
+    });
+    body["interruption"] = serde_json::json!({
+        "phase": "running",
+        "cause": "executor_fault",
+        "executorFault": "runner_internal_failure",
+        "stopConfirmed": true
+    });
+    body["artifactDelivery"] = serde_json::json!({
+        "state": "failed",
+        "phase": "upload",
+        "code": "carrier_upload_failed"
+    });
+    let (server, _directory, credential_path) = prepared_run(vec![run_response(body)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for field in [
+        "  mode: force",
+        "  force request: cmd_01k0z6r1w8f4jy2m7q9v3x5abd",
+        "  cause: executor_fault",
+        "  executor fault: runner_internal_failure",
+        "  stop confirmed: yes",
+        "  phase: upload",
+        "  code: carrier_upload_failed",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == field),
+            "missing {field:?} in {stdout:?}"
+        );
+    }
+    server.finish();
+}
+
+#[test]
 fn run_wait_emits_terminal_json_with_state_specific_exit_status() {
     for (state, expected_exit) in [
         ("succeeded", 0),
@@ -3102,10 +3207,8 @@ fn run_wait_emits_terminal_json_with_state_specific_exit_status() {
         ("interrupted", 1),
         ("rejected", 1),
     ] {
-        let (server, _directory, credential_path) = prepared_run(vec![json_http_response(
-            "200 OK",
-            run_body_with_state(state),
-        )]);
+        let (server, _directory, credential_path) =
+            prepared_run(vec![run_response(run_body_with_state(state))]);
         let environment = deployment_environment(&server.api_url, &credential_path);
 
         let output = run_with_env(
@@ -3138,10 +3241,8 @@ fn run_wait_emits_terminal_json_with_state_specific_exit_status() {
 
 #[test]
 fn run_wait_emits_the_terminal_plain_projection() {
-    let (server, _directory, credential_path) = prepared_run(vec![json_http_response(
-        "200 OK",
-        run_body_with_state("failed"),
-    )]);
+    let (server, _directory, credential_path) =
+        prepared_run(vec![run_response(run_body_with_state("failed"))]);
     let environment = deployment_environment(&server.api_url, &credential_path);
 
     let output = run_with_env(
@@ -3186,7 +3287,7 @@ fn run_wait_refreshes_authentication_and_recovers_from_one_server_failure() {
                 "status": 500
             }),
         ),
-        json_http_response("200 OK", run_body_with_state("succeeded")),
+        run_response(run_body_with_state("succeeded")),
     ]);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
@@ -3302,7 +3403,7 @@ fn run_show_rejects_a_projection_for_a_different_run() {
     let mut response_body = run_body();
     response_body["id"] = serde_json::json!("run_01k0z6r1w8f4jy2m7q9v3x5abd");
 
-    let (output, server) = run_show_with_response(json_http_response("200 OK", response_body));
+    let (output, server) = run_show_with_response(run_response(response_body));
 
     assert_invalid_response(&output);
     server.finish();
@@ -3407,6 +3508,54 @@ fn run_operations_reject_responses_larger_than_the_api_limit() {
 }
 
 #[test]
+fn run_show_requires_confirmed_stops_for_contained_interruptions() {
+    for (cause, executor_fault) in [
+        ("executor_shutdown", serde_json::Value::Null),
+        (
+            "executor_fault",
+            serde_json::json!("runner_internal_failure"),
+        ),
+    ] {
+        let mut body = run_body_with_state("interrupted");
+        body["interruption"] = serde_json::json!({
+            "phase": "running",
+            "cause": cause,
+            "executorFault": executor_fault,
+            "stopConfirmed": false
+        });
+
+        let (output, server) = run_show_with_response(run_response(body));
+
+        assert_invalid_response(&output);
+        server.finish();
+    }
+}
+
+#[test]
+fn run_show_accepts_lease_expiry_with_either_stop_confirmation() {
+    for stop_confirmed in [false, true] {
+        let mut body = run_body_with_state("interrupted");
+        body["interruption"] = serde_json::json!({
+            "phase": "running",
+            "cause": "execution_lease_expired",
+            "executorFault": null,
+            "stopConfirmed": stop_confirmed
+        });
+
+        let (output, server) = run_show_with_response(run_response(body));
+
+        assert!(output.status.success());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "found");
+        assert_eq!(
+            result["run"]["interruption"]["stopConfirmed"],
+            stop_confirmed
+        );
+        server.finish();
+    }
+}
+
+#[test]
 fn run_semantic_response_validation_rejects_contract_invalid_values() {
     let invalid_run_id = "run_invalid";
     let create_response = acceptance_response_for(
@@ -3431,7 +3580,7 @@ fn run_semantic_response_validation_rejects_contract_invalid_values() {
 
     let mut invalid_projection = run_body();
     invalid_projection["updatedAt"] = serde_json::json!("not-a-timestamp");
-    let (output, server) = run_show_with_response(json_http_response("200 OK", invalid_projection));
+    let (output, server) = run_show_with_response(run_response(invalid_projection));
 
     assert_invalid_response(&output);
     server.finish();
@@ -3600,10 +3749,7 @@ fn timeout_and_signals_stop_only_the_local_run_wait() {
 
     for (timeout, signal, expected_exit, expected_outcome) in cases {
         let mut server =
-            ScriptedServer::respond_with_paused_first_response(vec![json_http_response(
-                "200 OK",
-                run_body(),
-            )]);
+            ScriptedServer::respond_with_paused_first_response(vec![run_response(run_body())]);
         let credential_directory = private_credential_directory();
         let credential_path = credential_directory.path().join("credentials.json");
         write_credential_fixture(

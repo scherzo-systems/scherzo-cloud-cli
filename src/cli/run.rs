@@ -10,7 +10,10 @@ use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
 #[cfg(test)]
 use scherzo_cloud_api::HttpClient;
-use scherzo_cloud_api::{CreateRunInput, HttpTransportPolicy, Run, RunApi, RunFailure, RunState};
+use scherzo_cloud_api::{
+    CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunFailure, RunRead,
+    RunState,
+};
 use scherzo_cloud_execution::visible_text;
 
 use super::{OrganizationArg, ProjectArg};
@@ -571,11 +574,11 @@ impl WaitCommand {
 }
 
 trait RunObservationApi {
-    fn get_run(&self, organization: &str, run_id: &str) -> Result<Run, RunFailure>;
+    fn get_run(&self, organization: &str, run_id: &str) -> Result<RunRead, RunFailure>;
 }
 
 impl<'a> RunObservationApi for RunApi<'a> {
-    fn get_run(&self, organization: &str, run_id: &str) -> Result<Run, RunFailure> {
+    fn get_run(&self, organization: &str, run_id: &str) -> Result<RunRead, RunFailure> {
         self.get(organization, run_id)
     }
 }
@@ -630,14 +633,29 @@ fn wait_for_terminal_run(
     control: &super::BlockingObservationControl,
     clock: &impl super::ObservationClock,
 ) -> Result<WaitObservation, RunFailure> {
-    super::wait_for_terminal_observation(
+    match super::wait_for_terminal_observation(
         || api.get_run(organization, run_id),
-        |run| terminal_run_state(run.state),
+        |read| match read {
+            RunRead::Materialized(run) => terminal_run_state(run.state),
+            RunRead::Pending(_) => None,
+        },
         RunFailure::retryable_observation,
         timeout,
         control,
         clock,
-    )
+    )? {
+        super::TerminalObservation::Terminal { resource, state } => match *resource {
+            RunRead::Materialized(run) => Ok(super::TerminalObservation::Terminal {
+                resource: run,
+                state,
+            }),
+            RunRead::Pending(_) => Err(RunFailure::Protocol {
+                credential_rejected: false,
+            }),
+        },
+        super::TerminalObservation::TimedOut => Ok(super::TerminalObservation::TimedOut),
+        super::TerminalObservation::Stopped => Ok(super::TerminalObservation::Stopped),
+    }
 }
 
 const fn terminal_run_state(state: RunState) -> Option<TerminalRunState> {
@@ -646,7 +664,8 @@ const fn terminal_run_state(state: RunState) -> Option<TerminalRunState> {
         | RunState::Assigning
         | RunState::Preparing
         | RunState::Assigned
-        | RunState::Running => None,
+        | RunState::Running
+        | RunState::Cancelling => None,
         RunState::Succeeded => Some(TerminalRunState::Succeeded),
         RunState::Failed => Some(TerminalRunState::Failed),
         RunState::Cancelled => Some(TerminalRunState::Cancelled),
@@ -777,21 +796,40 @@ fn write_show(
     deployment: &str,
     organization: &str,
     requested_run_id: &str,
-    result: Result<Run, RunFailure>,
+    result: Result<RunRead, RunFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
-        Ok(run) => {
+        Ok(RunRead::Materialized(run)) => {
             if json {
                 write_json(&ShowResult {
                     schema_version: 1,
                     deployment,
                     outcome: "found",
-                    run: &run,
+                    run: run.as_ref(),
                 })?;
             } else {
-                write_run_human(deployment, "✓ Run found.", &run)?;
+                write_run_human(deployment, "✓ Run found.", run.as_ref())?;
+            }
+            Ok(ExitCode::Success)
+        }
+        Ok(RunRead::Pending(pending)) => {
+            if json {
+                write_json(&PendingShowResult {
+                    schema_version: 1,
+                    deployment,
+                    outcome: "pending",
+                    organization_ref: organization,
+                    run_id: &pending.run_id,
+                })?;
+            } else {
+                let stdout = io::stdout();
+                let mut stdout = stdout.lock();
+                writeln!(stdout, "✓ Run creation pending.\n")?;
+                writeln!(stdout, "run: {}", pending.run_id)?;
+                writeln!(stdout, "organization: {organization}")?;
+                writeln!(stdout, "deployment: {deployment}")?;
             }
             Ok(ExitCode::Success)
         }
@@ -964,6 +1002,75 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
             writeln!(stdout, "  {}: {}", visible_text(key), visible_text(value))?;
         }
     }
+    writeln!(stdout, "\ncancellation:")?;
+    if let Some(cancellation) = run.cancellation.as_deref() {
+        writeln!(stdout, "  mode: {}", enum_text(&cancellation.mode)?)?;
+        writeln!(
+            stdout,
+            "  graceful request: {}",
+            cancellation
+                .graceful_request_id
+                .as_deref()
+                .unwrap_or("none")
+        )?;
+        writeln!(
+            stdout,
+            "  force request: {}",
+            cancellation.force_request_id.as_deref().unwrap_or("none")
+        )?;
+    } else {
+        writeln!(stdout, "  none")?;
+    }
+    writeln!(stdout, "\ninterruption:")?;
+    if let Some(interruption) = run.interruption.as_deref() {
+        writeln!(stdout, "  phase: {}", enum_text(&interruption.phase)?)?;
+        writeln!(stdout, "  cause: {}", enum_text(&interruption.cause)?)?;
+        writeln!(
+            stdout,
+            "  executor fault: {}",
+            interruption
+                .executor_fault
+                .as_ref()
+                .map(enum_text)
+                .transpose()?
+                .as_deref()
+                .unwrap_or("none")
+        )?;
+        writeln!(
+            stdout,
+            "  stop confirmed: {}",
+            if interruption.stop_confirmed {
+                "yes"
+            } else {
+                "no"
+            }
+        )?;
+    } else {
+        writeln!(stdout, "  none")?;
+    }
+    writeln!(stdout, "\nartifact delivery:")?;
+    match run.artifact_delivery.as_deref() {
+        None => writeln!(stdout, "  none")?,
+        Some(RunArtifactDelivery::RunArtifactDeliverySucceeded(delivery)) => {
+            writeln!(stdout, "  state: succeeded")?;
+            writeln!(stdout, "  artifact set: {}", delivery.artifact_set_id)?;
+        }
+        Some(RunArtifactDelivery::RunArtifactDeliveryRegistrationFailed(delivery)) => {
+            writeln!(stdout, "  state: failed")?;
+            writeln!(stdout, "  phase: {}", enum_text(&delivery.phase)?)?;
+            writeln!(stdout, "  code: {}", enum_text(&delivery.code)?)?;
+        }
+        Some(RunArtifactDelivery::RunArtifactDeliveryUploadFailed(delivery)) => {
+            writeln!(stdout, "  state: failed")?;
+            writeln!(stdout, "  phase: {}", enum_text(&delivery.phase)?)?;
+            writeln!(stdout, "  code: {}", enum_text(&delivery.code)?)?;
+        }
+        Some(RunArtifactDelivery::RunArtifactDeliveryPreparationFailed(delivery)) => {
+            writeln!(stdout, "  state: failed")?;
+            writeln!(stdout, "  phase: {}", enum_text(&delivery.phase)?)?;
+            writeln!(stdout, "  code: {}", enum_text(&delivery.code)?)?;
+        }
+    }
     writeln!(stdout, "\ncreated: {}", run.created_at)?;
     writeln!(stdout, "updated: {}", run.updated_at)?;
     writeln!(stdout, "deployment: {deployment}")?;
@@ -1038,6 +1145,12 @@ fn write_failure_with_input_set(
             "conflict",
             None,
             "error: Cloud run request conflicts with current state\n\nCheck the resource state and try again.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        RunFailure::CreationRejected => (
+            "creation_rejected",
+            None,
+            "error: Cloud run creation was rejected before the run materialized\n\nInspect the run request and create a new run after correcting the rejection cause.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         RunFailure::Gone => (
@@ -1211,6 +1324,16 @@ struct ShowResult<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PendingShowResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    organization_ref: &'a str,
+    run_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WaitResult<'a> {
     schema_version: u8,
     deployment: &'a str,
@@ -1286,19 +1409,24 @@ mod tests {
     };
 
     struct ScriptedObservationApi {
-        responses: RefCell<VecDeque<Result<Run, RunFailure>>>,
+        responses: RefCell<VecDeque<Result<RunRead, RunFailure>>>,
     }
 
     impl ScriptedObservationApi {
         fn new(responses: impl IntoIterator<Item = Result<Run, RunFailure>>) -> Self {
             Self {
-                responses: RefCell::new(responses.into_iter().collect()),
+                responses: RefCell::new(
+                    responses
+                        .into_iter()
+                        .map(|response| response.map(Box::new).map(RunRead::Materialized))
+                        .collect(),
+                ),
             }
         }
     }
 
     impl RunObservationApi for ScriptedObservationApi {
-        fn get_run(&self, _organization: &str, _run_id: &str) -> Result<Run, RunFailure> {
+        fn get_run(&self, _organization: &str, _run_id: &str) -> Result<RunRead, RunFailure> {
             self.responses
                 .borrow_mut()
                 .pop_front()
@@ -1319,6 +1447,21 @@ mod tests {
             &super::super::BlockingObservationControl::new(),
             clock,
         )
+    }
+
+    fn assert_succeeded_after_single_poll(
+        result: Result<WaitObservation, RunFailure>,
+        clock: ControlledWaitClock,
+        context: &str,
+    ) {
+        assert!(matches!(
+            result.unwrap_or_else(|failure| panic!("{context}: {failure:?}")),
+            WaitObservation::Terminal {
+                state: TerminalRunState::Succeeded,
+                ..
+            }
+        ));
+        clock.assert_single_poll();
     }
 
     fn run(state: RunState) -> Run {
@@ -1361,6 +1504,9 @@ mod tests {
             },
             "integrationContext": {},
             "publication": null,
+            "cancellation": null,
+            "interruption": null,
+            "artifactDelivery": null,
             "createdAt": "2026-08-10T12:00:00Z",
             "updatedAt": "2026-08-10T12:00:00Z"
         }))
@@ -1588,6 +1734,7 @@ mod tests {
             RunState::Preparing,
             RunState::Assigned,
             RunState::Running,
+            RunState::Cancelling,
         ];
         let terminal = [
             (RunState::Succeeded, TerminalRunState::Succeeded),
@@ -1625,6 +1772,27 @@ mod tests {
     }
 
     #[test]
+    fn wait_treats_admitted_creation_as_nonterminal() {
+        let api = ScriptedObservationApi {
+            responses: RefCell::new(VecDeque::from([
+                Ok(RunRead::Pending(
+                    scherzo_cloud_api::RunCreationPending::new(
+                        "run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    ),
+                )),
+                Ok(RunRead::Materialized(Box::new(run(RunState::Succeeded)))),
+            ])),
+        };
+        let clock = ControlledWaitClock::new(scherzo_cloud_support::monotonic_now());
+
+        assert_succeeded_after_single_poll(
+            observe(&api, None, &clock),
+            clock,
+            "pending creation should remain observable",
+        );
+    }
+
+    #[test]
     fn wait_recovers_from_one_retryable_observation_failure() {
         let api = ScriptedObservationApi::new([
             Err(RunFailure::Unreachable(UnreachableCategory::Server)),
@@ -1633,17 +1801,11 @@ mod tests {
         let started_at = scherzo_cloud_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
-        let result = observe(&api, None, &clock)
-            .expect("one recoverable failure should not end observation");
-
-        assert!(matches!(
-            result,
-            WaitObservation::Terminal {
-                state: TerminalRunState::Succeeded,
-                ..
-            }
-        ));
-        clock.assert_single_poll();
+        assert_succeeded_after_single_poll(
+            observe(&api, None, &clock),
+            clock,
+            "one recoverable failure should not end observation",
+        );
     }
 
     #[test]

@@ -157,7 +157,16 @@ Banned from human prose:
   behavior, never as a leading adjective:
   `Nonexistent durable directory for exactly one workflow run` becomes
   `Directory to create for this run (must not already exist)`.
-- Shared flags keep word-identical descriptions across commands.
+- **Option help identity:** Help is word-identical for occurrences of the same
+  semantic option identity, not merely for options with the same long spelling.
+  An identity consists of the option's role and any repository-owned parameter
+  that changes its behavior or contract. Compose recurring identities from one
+  shared argument definition instead of copying local help. Parameterized
+  identities may vary their help: `JsonArgs<F>` names each JSON result family,
+  its streaming variant describes newline-delimited events, and
+  `PaginationArgs<MAX>` states the selected `--limit` bound. A command-local
+  option that happens to reuse a long spelling for a different concept is a
+  different identity and need not have equal help.
 - Value placeholders are semantic nouns (`<WHEN>`, `<PATH>`); enumerations
   appear only in `[possible values:]`; sentinel values like `-` are explained
   in the description; static defaults appear only in `[default:]`, dynamic
@@ -184,11 +193,14 @@ separate entity family.
   `input`, `invitation`, and `member`, never `identities`, `inputs`,
   `invitations`, or `members`.
 - **Verb lexicon:** the final token of every leaf below a command group is one
-  of this closed set: `create`, `issue`, `list`, `show`, `update`, `rename`,
-  `set`, `remove`, `revoke`, `retire`, `validate`, `run`, `retry`, `view`,
-  `wait`, `download`, `upload`, `enroll`, `serve`, `doctor`, `status`. A new
-  leaf verb requires an amendment to this list; an existing command is not
-  precedent for adding one.
+  of this closed set: `accept`, `begin`, `cancel`, `complete`, `create`,
+  `decline`, `delete`, `disable`, `doctor`, `download`, `drain`, `enable`,
+  `end`, `enroll`, `history`, `issue`, `leave`, `link`, `list`, `login`,
+  `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`,
+  `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`,
+  `set`, `show`, `signup`, `status`, `update`, `upload`, `validate`, `version`,
+  `view`, `wait`. A new leaf verb requires an amendment to this list; an
+  existing command is not precedent for adding one.
 - **Minting:** choose the creation verb from the immediate sibling leaf set. If
   that set contains `revoke`, the creation leaf is `issue`; otherwise it is
   `create`. This makes bearer secrets and capabilities, which can be
@@ -197,7 +209,9 @@ separate entity family.
   attributes is exactly `{name}`. Use `update` when two or more entity
   attributes are mutable. A family does not expose both verbs.
 - **Unbinding:** a leaf whose operation severs an existing binding is named
-  `remove`. `detach` and `disconnect` are not command verbs.
+  `remove`. `detach` and `disconnect` remain prohibited command verbs; renaming
+  the established leaves that still use them is owned by LIV-2426 and does not
+  expand the lexicon.
 
 ### Groups and flags
 
@@ -210,11 +224,16 @@ separate entity family.
   entity name without `_ID`: for example, `--pool-id <POOL>` and
   `--project-id <PROJECT>`. This applies to identifier-only flags, not
   selectors that also accept a name or slug.
-- **Destructive confirmation:** the qualifying verb set is exactly `remove`,
-  `revoke`, and `retire`. Every leaf with one of those final verbs has a
-  required `--yes` flag, and no leaf with another final verb has `--yes`. These
-  are the verbs whose effects are irreversible for the principal or invalidate
-  live access.
+- **Destructive confirmation:** a leaf requires `--yes` when its final token is
+  `delete`, `decline`, `end`, `leave`, `remove`, `revoke`, or `retire`, or when
+  its complete command identity is `account deletion request` or
+  `organization deletion request`. No other leaf has `--yes`. This mechanical
+  set covers permanent deletion, departure, delegation or invitation closure,
+  and operations that invalidate a binding, credential, or live access. The
+  current `remove`/`revoke`/`retire` leaves that do not yet require confirmation
+  are burn-down owned by LIV-2427. Reversible runner mode changes, including
+  `runner disable` and `runner drain`, are not destructive and do not take
+  `--yes`.
 - **Common flag order:** whenever they co-occur, common flags appear in this
   relative order: `--json`, then `--service-api-key-file`, then
   `--allow-insecure-http`. Other arguments and flags do not affect this

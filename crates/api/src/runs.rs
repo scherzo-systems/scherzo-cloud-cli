@@ -17,10 +17,22 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
+const PRIVATE_CACHE_CONTROL: &str = "private, no-store";
+const RUN_CREATION_REJECTED: &str = "https://api.scherzo.dev/problems/run-creation-rejected";
 
 pub type Run = models::Run;
 pub type RunState = models::run::State;
 pub type RunCreationAcceptance = models::RunCreationAcceptance;
+pub type RunCreationPending = models::RunCreationPending;
+pub type RunArtifactDelivery = models::RunArtifactDelivery;
+pub type RunCancellation = models::RunCancellation;
+pub type RunInterruption = models::RunInterruption;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunRead {
+    Materialized(Box<Run>),
+    Pending(RunCreationPending),
+}
 
 pub struct CreateRunInput<'a> {
     pub project_id: &'a str,
@@ -176,7 +188,7 @@ impl<'a> RunApi<'a> {
         Err(RunFailure::Unreachable(last_transport_failure))
     }
 
-    pub fn get(&self, organization: &str, run_id: &str) -> Result<Run, RunFailure> {
+    pub fn get(&self, organization: &str, run_id: &str) -> Result<RunRead, RunFailure> {
         let endpoint = format!(
             "{}/{}",
             self.collection_endpoint(organization),
@@ -236,6 +248,7 @@ pub enum RunFailure {
     InvalidInput,
     NotFound,
     Conflict,
+    CreationRejected,
     Gone,
     Unreachable(UnreachableCategory),
     InputUploadRejected,
@@ -286,13 +299,41 @@ fn decode_create_response(
 fn decode_get_response(
     response: ReceivedResponse,
     requested_run_id: &str,
-) -> Result<Run, RunFailure> {
-    if response.status != StatusCode::OK {
-        return Err(classify_failure(&response, RunOperation::Get));
+) -> Result<RunRead, RunFailure> {
+    match response.status {
+        StatusCode::OK => {
+            require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+            require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+            let run =
+                serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+            validate_run(run, requested_run_id)
+                .map(Box::new)
+                .map(RunRead::Materialized)
+        }
+        StatusCode::ACCEPTED => {
+            require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+            require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+            let pending: RunCreationPending =
+                serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+            if pending.run_id == requested_run_id
+                && scherzo_cloud_support::valid_typed_id(&pending.run_id, "run_")
+            {
+                Ok(RunRead::Pending(pending))
+            } else {
+                Err(RunFailure::protocol(false))
+            }
+        }
+        StatusCode::CONFLICT => {
+            require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+            Err(validated_problem_failure(
+                &response,
+                Some(RUN_CREATION_REJECTED),
+                RunFailure::CreationRejected,
+                false,
+            ))
+        }
+        _ => Err(classify_failure(&response, RunOperation::Get)),
     }
-    require_media_type(&response, JSON_MEDIA_TYPE, false)?;
-    let run = serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-    validate_run(run, requested_run_id)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -405,12 +446,76 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         )
+        && valid_cancellation(run.cancellation.as_deref())
+        && (run.state != models::run::State::Cancelling || run.cancellation.is_some())
+        && valid_interruption(run.state, run.interruption.as_deref())
+        && valid_artifact_delivery(run.artifact_delivery.as_deref())
         && valid_timestamp(&run.created_at)
         && valid_timestamp(&run.updated_at);
     if valid {
         Ok(run)
     } else {
         Err(RunFailure::protocol(false))
+    }
+}
+
+fn valid_cancellation(cancellation: Option<&models::RunCancellation>) -> bool {
+    let Some(cancellation) = cancellation else {
+        return true;
+    };
+    match cancellation.mode {
+        models::run_cancellation::Mode::Graceful => {
+            cancellation
+                .graceful_request_id
+                .as_deref()
+                .is_some_and(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+                && cancellation.force_request_id.is_none()
+        }
+        models::run_cancellation::Mode::Force => {
+            cancellation
+                .force_request_id
+                .as_deref()
+                .is_some_and(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+                && cancellation
+                    .graceful_request_id
+                    .as_deref()
+                    .is_none_or(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+        }
+    }
+}
+
+fn valid_interruption(
+    state: models::run::State,
+    interruption: Option<&models::RunInterruption>,
+) -> bool {
+    if state != models::run::State::Interrupted {
+        return interruption.is_none();
+    }
+    let Some(interruption) = interruption else {
+        return false;
+    };
+    match interruption.cause {
+        models::run_interruption::Cause::ExecutorFault => {
+            interruption.stop_confirmed && interruption.executor_fault.is_some()
+        }
+        models::run_interruption::Cause::ExecutorShutdown => {
+            interruption.stop_confirmed && interruption.executor_fault.is_none()
+        }
+        models::run_interruption::Cause::ExecutionLeaseExpired => {
+            interruption.executor_fault.is_none()
+        }
+    }
+}
+
+fn valid_artifact_delivery(delivery: Option<&models::RunArtifactDelivery>) -> bool {
+    match delivery {
+        None => true,
+        Some(models::RunArtifactDelivery::RunArtifactDeliverySucceeded(succeeded)) => {
+            scherzo_cloud_support::valid_typed_id(&succeeded.artifact_set_id, "ats_")
+        }
+        Some(models::RunArtifactDelivery::RunArtifactDeliveryRegistrationFailed(_))
+        | Some(models::RunArtifactDelivery::RunArtifactDeliveryUploadFailed(_))
+        | Some(models::RunArtifactDelivery::RunArtifactDeliveryPreparationFailed(_)) => true,
     }
 }
 

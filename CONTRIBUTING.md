@@ -20,7 +20,7 @@ the common choices:
 
 | Decision | Rule |
 |---|---|
-| Available leaf verb | Use only `create`, `issue`, `list`, `show`, `update`, `rename`, `set`, `remove`, `revoke`, `retire`, `validate`, `run`, `retry`, `view`, `wait`, `download`, `upload`, `enroll`, `serve`, `doctor`, or `status`. Amend the style guide before introducing another verb; an existing command is not precedent. |
+| Available leaf verb | Use only `accept`, `begin`, `cancel`, `complete`, `create`, `decline`, `delete`, `disable`, `doctor`, `download`, `drain`, `enable`, `end`, `enroll`, `history`, `issue`, `leave`, `link`, `list`, `login`, `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`, `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`, `set`, `show`, `signup`, `status`, `update`, `upload`, `validate`, `version`, `view`, or `wait`. Amend the style guide before introducing another verb; an existing command is not precedent. `detach` and `disconnect` remain prohibited; LIV-2426 owns their established rename debt. |
 | Print one / print many / interact | Use `show` / `list` / `view`. Use `validate`, `run`, and `retry` for those literal operations. |
 | Mint an entity | Use `issue` when the immediate sibling family contains `revoke`; otherwise use `create`. |
 | Change attributes | Use `rename` only when the complete mutable set is `{name}`; use `update` when two or more attributes are mutable. Never offer both in one family. |
@@ -31,14 +31,22 @@ Compose recurring flags from the shared argument types in `src/cli.rs`: `JsonArg
 `RequiredServiceAuthenticationArgs` for `--service-api-key-file`, `PaginationArgs` for
 `--limit` plus `--cursor`, `WaitTimeoutArgs` for `--timeout`, and `NamedInputArgs` for
 named inputs. Use `CommonArgs` wherever JSON, authentication, and HTTP policy co-occur so
-their relative order remains structural. If a flag will recur and has no shared type yet,
-introduce one rather than declaring the flag on each leaf.
+their relative order remains structural. Help equality follows this semantic option
+identity, not the long spelling alone: the same shared type and parameterization has the
+same help, while `JsonArgs` result families, streaming JSON output, and
+`PaginationArgs` bounds have their repository-owned parameterized help. If a flag will
+recur and has no shared type yet, introduce one rather than declaring the flag on each
+leaf.
 
-Require `--yes` exactly for leaves ending in `remove`, `revoke`, or `retire`; no other
-verb takes it. A command paginates when it returns one page and permits continuation: in
-that case expose `--limit` and `--cursor` together through `PaginationArgs`, which also
-supplies the exact `Pagination:` after-help from the style guide. Use its bound parameter
-for a family whose maximum differs from the standard 200 items.
+Require `--yes` for leaves ending in `delete`, `decline`, `end`, `leave`, `remove`,
+`revoke`, or `retire`, and for `account deletion request` and
+`organization deletion request`; no other leaf takes it. LIV-2427 owns the current
+confirmation burn-down for `remove`, `revoke`, and `retire`. Reversible modes such as
+`runner disable` and `runner drain` do not take `--yes`. A command paginates when it
+returns one page and permits continuation: in that case expose `--limit` and `--cursor`
+together through `PaginationArgs`, which also supplies the exact `Pagination:`
+after-help from the style guide. Use its bound parameter for a family whose maximum
+differs from the standard 200 items.
 
 Every new command path needs exactly one help snapshot under `tests/cmd/help/`;
 [`cli::tests::every_customer_command_has_one_help_snapshot`](src/cli.rs) is the topology

@@ -138,8 +138,8 @@ pub use runners::{
     RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub use runs::{
-    CreateRunInput, Run, RunApi, RunCreationAcceptance, RunFailure, RunState,
-    valid_integration_context,
+    CreateRunInput, Run, RunApi, RunArtifactDelivery, RunCancellation, RunCreationAcceptance,
+    RunCreationPending, RunFailure, RunInterruption, RunRead, RunState, valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

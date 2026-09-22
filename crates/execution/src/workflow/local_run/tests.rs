@@ -1189,19 +1189,12 @@ fn inherited_seed_loads_required_values_and_preserves_full_durable_references() 
         .private_capture_carrier()
         .unwrap();
     let staged = fstat(artifacts.open_artifact(staged_carrier.handle()).unwrap()).unwrap();
-    let original = fs::metadata(
-        run.run_directory()
-            .join("attempts/000001/values/steps/first/message"),
-    )
-    .unwrap();
-    assert_eq!(
-        staged.st_dev,
-        std::os::unix::fs::MetadataExt::dev(&original)
-    );
-    assert_eq!(
-        staged.st_ino,
-        std::os::unix::fs::MetadataExt::ino(&original)
-    );
+    let original_path = run
+        .run_directory()
+        .join("attempts/000001/values/steps/first/message");
+    let original = rustix::fs::stat(&original_path).unwrap();
+    assert_eq!(staged.st_dev, original.st_dev);
+    assert_eq!(staged.st_ino, original.st_ino);
 }
 
 #[test]
