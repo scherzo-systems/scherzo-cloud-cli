@@ -1,5 +1,6 @@
 use clap::Args;
 
+use crate::cli::OrganizationArg;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::leave_organization;
@@ -10,8 +11,8 @@ pub(super) const ABOUT: &str = "Leave a Scherzo Cloud organization";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: crate::cli::OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization_ref: OrganizationArg,
 
     #[arg(
         long,

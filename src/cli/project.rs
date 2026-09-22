@@ -6,10 +6,10 @@ use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
-    CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure,
+    CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure, RunnerFailure,
 };
 
-use super::OrganizationRef;
+use super::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud projects";
 const NAME: &str = "project";
@@ -56,13 +56,17 @@ struct Options {
 struct RepositorySelectionArgs {
     #[arg(
         long,
-        value_name = "INSTALLATION",
-        help = "Exact GitHub installation binding ID"
+        value_name = InstallationArg::VALUE_NAME,
+        help = InstallationArg::HELP
     )]
-    installation_id: String,
+    installation_id: InstallationArg,
 
-    #[arg(long, value_name = "REPOSITORY", help = "Exact provider repository ID")]
-    repository_id: String,
+    #[arg(
+        long,
+        value_name = RepositoryArg::VALUE_NAME,
+        help = RepositoryArg::HELP
+    )]
+    repository_id: RepositoryArg,
 
     #[arg(
         long,
@@ -77,8 +81,8 @@ struct RepositorySelectionArgs {
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(long, help = "Set the canonical project name")]
     name: String,
@@ -86,8 +90,8 @@ struct CreateCommand {
     #[command(flatten)]
     repository: RepositorySelectionArgs,
 
-    #[arg(long, value_name = "POOL", help = "Assign an exact runner pool ID")]
-    runner_pool_id: Option<String>,
+    #[arg(long, value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    pool: Option<PoolArg>,
 
     #[command(flatten)]
     options: Options,
@@ -99,8 +103,8 @@ struct CreateCommand {
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 struct ListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[command(flatten)]
     pagination: super::PaginationArgs,
@@ -111,11 +115,11 @@ struct ListCommand {
 
 #[derive(Debug, Args)]
 struct ProjectReference {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(value_name = "PROJECT", help = "Exact project ID")]
-    project_id: String,
+    #[arg(value_name = ProjectArg::VALUE_NAME, help = ProjectArg::HELP)]
+    project_id: ProjectArg,
 }
 
 #[derive(Debug, Args)]
@@ -176,8 +180,8 @@ enum InstallationSubcommand {
 
 #[derive(Debug, Args)]
 struct InstallationListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[command(flatten)]
     options: Options,
@@ -185,14 +189,11 @@ struct InstallationListCommand {
 
 #[derive(Debug, Args)]
 struct RepositoryListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(
-        value_name = "INSTALLATION",
-        help = "Exact GitHub installation binding ID"
-    )]
-    installation_id: String,
+    #[arg(value_name = InstallationArg::VALUE_NAME, help = InstallationArg::HELP)]
+    installation_id: InstallationArg,
 
     #[command(flatten)]
     options: Options,
@@ -263,8 +264,8 @@ struct RunnerPoolSetCommand {
     #[command(flatten)]
     project: ProjectReference,
 
-    #[arg(value_name = "POOL", help = "Exact runner pool ID")]
-    runner_pool_id: String,
+    #[arg(value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    pool: PoolArg,
 
     #[command(flatten)]
     options: Options,
@@ -368,11 +369,32 @@ fn execute_leaf<T>(
 
 impl CreateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        let transport_policy = self.options.http.transport_policy();
+        let runner_pool_id = match self.pool.as_ref() {
+            Some(pool) => match resolve_pool_id(
+                deployment,
+                transport_policy,
+                &self.options.authentication,
+                &self.organization,
+                pool,
+            )? {
+                Ok(pool_id) => Some(pool_id),
+                Err(failure) => {
+                    return super::runner::write_failure(
+                        deployment,
+                        &failure,
+                        &self.options.authentication,
+                        self.options.json,
+                    );
+                }
+            },
+            None => None,
+        };
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project creation request identity")?;
         let result = with_api(
             deployment,
-            self.options.http.transport_policy(),
+            transport_policy,
             &self.options.authentication,
             |api| {
                 api.create(
@@ -383,7 +405,7 @@ impl CreateCommand {
                         installation_id: &self.repository.installation_id,
                         repository_id: &self.repository.repository_id,
                         default_branch: self.repository.default_branch.as_deref(),
-                        runner_pool_id: self.runner_pool_id.as_deref(),
+                        runner_pool_id: runner_pool_id.as_deref(),
                     },
                 )
             },
@@ -605,18 +627,36 @@ impl RepositoryDetachCommand {
 
 impl RunnerPoolSetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        let transport_policy = self.options.http.transport_policy();
+        let runner_pool_id = match resolve_pool_id(
+            deployment,
+            transport_policy,
+            &self.options.authentication,
+            &self.project.organization,
+            &self.pool,
+        )? {
+            Ok(pool_id) => pool_id,
+            Err(failure) => {
+                return super::runner::write_failure(
+                    deployment,
+                    &failure,
+                    &self.options.authentication,
+                    self.options.json,
+                );
+            }
+        };
         let key = crate::idempotency::generate_idempotency_key()
             .context("generate project runner pool request identity")?;
         let result = with_api(
             deployment,
-            self.options.http.transport_policy(),
+            transport_policy,
             &self.options.authentication,
             |api| {
                 api.set_runner_pool(
                     &self.project.organization,
                     &self.project.project_id,
                     &key,
-                    &self.runner_pool_id,
+                    &runner_pool_id,
                 )
             },
         )?;
@@ -652,6 +692,18 @@ impl RunnerPoolRemoveCommand {
             self.options.json,
         )
     }
+}
+
+fn resolve_pool_id(
+    deployment: &Deployment,
+    transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
+    organization: &str,
+    pool: &PoolArg,
+) -> anyhow::Result<Result<String, RunnerFailure>> {
+    super::runner::with_api(deployment, transport_policy, authentication, |api| {
+        pool.resolve_id(api, organization)
+    })
 }
 
 // Human-session orchestration stays failure-domain-specific so project protocol

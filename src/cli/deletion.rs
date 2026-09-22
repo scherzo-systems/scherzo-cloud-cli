@@ -20,6 +20,8 @@ use scherzo_cloud_api::{
     request_current_principal_deletion, request_organization_deletion,
 };
 
+use super::OrganizationArg;
+
 const ACCOUNT_ABOUT: &str = "Manage your account deletion schedule";
 const ORGANIZATION_ABOUT: &str = "Manage an organization deletion schedule";
 const ACCOUNT_REQUEST_AFTER_HELP: &str = "Behavior:\n  A human request schedules deletion and removes this deployment's local credential.\n  A service request authenticated with --service-api-key-file deletes the service immediately.\n  Human cancellation requires a fresh browser proof from the same linked identity before the deadline.";
@@ -72,8 +74,8 @@ struct AccountRequestCommand {
 
 #[derive(Debug, Args)]
 struct OrganizationRequestCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: super::OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization_ref: OrganizationArg,
 
     #[command(flatten)]
     request: RequestOptions,
@@ -87,8 +89,8 @@ struct CancelCommand {
 
 #[derive(Debug, Args)]
 struct OrganizationCancelCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: super::OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization_ref: OrganizationArg,
 
     #[command(flatten)]
     options: CancellationOptions,
@@ -154,7 +156,7 @@ impl OrganizationCommand {
                     .map_err(super::CommandFailure::from),
                 OrganizationDeletionCommand::Cancel(command) => command.options.execute(
                     deployment,
-                    DeletionTarget::Organization(command.organization_ref.0),
+                    DeletionTarget::Organization(command.organization_ref.into_string()),
                 ),
             },
         )
@@ -230,7 +232,7 @@ impl AccountRequestCommand {
 
 impl OrganizationRequestCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let organization_ref = self.organization_ref.0;
+        let organization_ref = self.organization_ref.into_string();
         let idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate organization deletion request identity")?;
         let client = HttpClient::new(self.request.http.transport_policy())

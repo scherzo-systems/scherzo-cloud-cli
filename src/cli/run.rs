@@ -13,7 +13,7 @@ use scherzo_cloud_api::HttpClient;
 use scherzo_cloud_api::{CreateRunInput, HttpTransportPolicy, Run, RunApi, RunFailure, RunState};
 use scherzo_cloud_execution::visible_text;
 
-use super::OrganizationRef;
+use super::{OrganizationArg, ProjectArg};
 
 mod acquisition;
 mod input_set;
@@ -71,11 +71,11 @@ struct CloudInputOptions {
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(long, value_name = "PROJECT", help = "Exact Project ID")]
-    project_id: String,
+    #[arg(long, value_name = ProjectArg::VALUE_NAME, help = ProjectArg::HELP)]
+    project_id: ProjectArg,
     // jscpd:ignore-end
     #[arg(
         long,
@@ -131,8 +131,8 @@ struct CreateCommand {
 
 #[derive(Debug, Args)]
 struct RunReference {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(value_name = "RUN", help = "Exact Run ID")]
     run_id: String,

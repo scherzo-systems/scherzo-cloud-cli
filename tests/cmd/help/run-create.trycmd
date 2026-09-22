@@ -9,7 +9,7 @@ Arguments:
 
 Options:
       --project-id <PROJECT>
-          Exact Project ID
+          Project ID
       --workflow-path <WORKFLOW>
           Canonical repository-relative workflow path
       --source-branch <SOURCE_BRANCH>

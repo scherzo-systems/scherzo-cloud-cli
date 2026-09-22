@@ -1113,8 +1113,9 @@ installation ID.
 
 Project commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when an API operation permits a service actor. Project
-IDs, GitHub installation binding IDs, provider repository IDs, and runner pool IDs remain
-exact authority inputs; repository full names are display metadata only. Start by
+IDs, GitHub installation binding IDs, and provider repository IDs remain exact authority
+inputs; repository full names are display metadata only. Runner pools can be selected by ID
+or exact name. Start by
 discovering those values:
 
 ```sh
@@ -1129,12 +1130,12 @@ scherzo-cloud project repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 
-# Discover existing runner pools and copy an exact pool ID when needed.
+# Discover existing runner pools and copy a pool ID or exact name when needed.
 scherzo-cloud runner pool list acme-labs
 ```
 
 Create a project from one discovered repository. Omit `--default-branch` to select the
-provider-observed default branch, and omit `--runner-pool-id` to create a valid project
+provider-observed default branch, and omit `--pool` to create a valid project
 that reports `runner_pool_unassigned` until configured:
 
 ```sh
@@ -1143,7 +1144,7 @@ scherzo-cloud project create acme-labs \
   --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
   --repository-id 123456789 \
   --default-branch release \
-  --runner-pool-id rpl_01k0z6r1w8f4jy2m7q9v3x5abc
+  --pool rpl_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Page projects and show one complete configuration and readiness projection.
 scherzo-cloud project list acme-labs --limit 50

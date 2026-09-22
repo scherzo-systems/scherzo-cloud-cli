@@ -11,13 +11,13 @@ Options:
       --name <NAME>
           Set the canonical project name
       --installation-id <INSTALLATION>
-          Exact GitHub installation binding ID
+          GitHub installation binding ID
       --repository-id <REPOSITORY>
-          Exact provider repository ID
+          Provider repository ID
       --default-branch <DEFAULT_BRANCH>
           Set the configured default branch (the provider default when omitted)
-      --runner-pool-id <POOL>
-          Assign an exact runner pool ID
+      --pool <POOL>
+          Runner pool ID or exact name
       --json
           Print the project result as JSON
       --service-api-key-file <PATH|->

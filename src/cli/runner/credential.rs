@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use anyhow::Context;
 use clap::{Args, Subcommand};
 
-use super::{CloudOptions, OrganizationRef, PaginationArgs, cloud};
+use super::{CloudOptions, OrganizationArg, PaginationArgs, cloud};
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::idempotency::generate_idempotency_key;
@@ -33,8 +33,8 @@ enum CredentialCommand {
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 struct ListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
     #[command(flatten)]
@@ -45,8 +45,8 @@ struct ListCommand {
 
 #[derive(Debug, Args)]
 struct MutationCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
     #[arg(value_name = "CREDENTIAL", help = "Runner credential ID")]

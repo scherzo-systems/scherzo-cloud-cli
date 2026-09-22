@@ -6,13 +6,13 @@ Usage: scherzo-cloud project repository set [OPTIONS] --installation-id <INSTALL
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <PROJECT>       Exact project ID
+  <PROJECT>       Project ID
 
 Options:
       --installation-id <INSTALLATION>
-          Exact GitHub installation binding ID
+          GitHub installation binding ID
       --repository-id <REPOSITORY>
-          Exact provider repository ID
+          Provider repository ID
       --default-branch <DEFAULT_BRANCH>
           Set the configured default branch (the provider default when omitted)
       --json

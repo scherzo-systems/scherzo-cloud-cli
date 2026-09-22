@@ -9,7 +9,7 @@ Arguments:
 
 Options:
       --project-id <PROJECT>
-          Cloud project identifier
+          Project ID
       --input-text <NAME> <TEXT>
           Supply one required named Text value
       --input-text-file <NAME> <PATH>

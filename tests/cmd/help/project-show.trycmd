@@ -6,7 +6,7 @@ Usage: scherzo-cloud project show [OPTIONS] <ORGANIZATION> <PROJECT>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <PROJECT>       Exact project ID
+  <PROJECT>       Project ID
 
 Options:
       --json                           Print the project result as JSON

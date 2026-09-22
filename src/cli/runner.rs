@@ -16,7 +16,7 @@ use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use crate::idempotency::generate_idempotency_key;
 
-use super::{OrganizationRef, PaginationArgs};
+use super::{OrganizationArg, PaginationArgs, PoolArg};
 
 pub(super) const ABOUT: &str = "Work with the Scherzo Cloud runner";
 const NAME: &str = "runner";
@@ -96,11 +96,11 @@ impl CloudOptions {
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(long, value_name = "POOL", help = "Runner pool ID or exact name")]
-    pool: String,
+    #[arg(long, value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    pool: PoolArg,
 
     #[arg(long, help = "Set the exact runner name")]
     name: Option<String>,
@@ -119,8 +119,8 @@ struct CreateCommand {
 
 #[derive(Debug, Args)]
 struct ListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[command(flatten)]
     pagination: PaginationArgs,
@@ -131,8 +131,8 @@ struct ListCommand {
 
 #[derive(Debug, Args)]
 struct RegistrationTarget {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
@@ -161,8 +161,8 @@ struct MoveCommand {
     #[command(flatten)]
     target: RegistrationTarget,
 
-    #[arg(long, value_name = "POOL", help = "Destination pool ID or exact name")]
-    pool: String,
+    #[arg(long, value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    pool: PoolArg,
 
     #[command(flatten)]
     options: CloudOptions,
@@ -170,8 +170,8 @@ struct MoveCommand {
 
 #[derive(Debug, Args)]
 struct RenameCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(value_name = "RUNNER", help = "Runner ID or exact name")]
     runner: String,
@@ -287,11 +287,11 @@ impl CreateCommand {
             self.options.http.transport_policy(),
             &self.options.authentication,
             |api| {
-                let pool = api.get_pool(&self.organization, &self.pool)?;
+                let pool_id = self.pool.resolve_id(api, &self.organization)?;
                 let registration = api.create_registration(
                     &self.organization,
                     &registration_key,
-                    &pool.id,
+                    &pool_id,
                     self.name.as_deref(),
                 )?;
                 committed_registration = Some(registration.clone());
@@ -584,20 +584,20 @@ enum DeletionKind {
 }
 
 struct DeletionInvocation {
-    organization: OrganizationRef,
+    organization: OrganizationArg,
     resource_ref: String,
     options: CloudOptions,
     kind: DeletionKind,
 }
 
 fn execute_pool_deletion(
-    organization: OrganizationRef,
-    pool: String,
+    organization: OrganizationArg,
+    pool: PoolArg,
     options: CloudOptions,
 ) -> super::CommandResult {
     execute_deletion_command(DeletionInvocation {
         organization,
-        resource_ref: pool,
+        resource_ref: pool.into_string(),
         options,
         kind: DeletionKind::Pool,
     })
@@ -733,6 +733,29 @@ fn deletion_target<'a>(kind: DeletionKind, resource_id: &'a str) -> cloud::Delet
         DeletionKind::Runner => cloud::DeletionTarget::Runner(resource_id),
         DeletionKind::Pool => cloud::DeletionTarget::Pool(resource_id),
     }
+}
+
+pub(super) fn with_api<T>(
+    deployment: &Deployment,
+    transport_policy: scherzo_cloud_api::HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
+    operation: impl FnMut(&scherzo_cloud_api::RunnerApi) -> Result<T, scherzo_cloud_api::RunnerFailure>,
+) -> anyhow::Result<Result<T, scherzo_cloud_api::RunnerFailure>> {
+    cloud::with_api(deployment, transport_policy, authentication, operation)
+}
+
+pub(super) fn write_failure(
+    deployment: &Deployment,
+    failure: &scherzo_cloud_api::RunnerFailure,
+    authentication: &super::PrincipalAuthenticationArgs,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    cloud::write_failure(
+        deployment.fingerprint().api_url(),
+        failure,
+        authentication.kind(),
+        json,
+    )
 }
 
 fn execute_cloud<T>(

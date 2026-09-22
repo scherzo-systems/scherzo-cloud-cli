@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use super::{
-    CloudOptions, Deployment, ExitCode, OrganizationRef, PaginationArgs, cloud,
+    CloudOptions, Deployment, ExitCode, OrganizationArg, PaginationArgs, PoolArg, cloud,
     generate_idempotency_key,
 };
 
@@ -31,8 +31,8 @@ enum PoolCommand {
 
 #[derive(Debug, Args)]
 struct CreateCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(long, help = "Set the exact runner pool name")]
     name: String,
@@ -46,8 +46,8 @@ struct CreateCommand {
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 struct ListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[command(flatten)]
     pagination: PaginationArgs,
@@ -58,11 +58,11 @@ struct ListCommand {
 
 #[derive(Debug, Args)]
 struct ShowCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(value_name = "POOL", help = "Runner pool ID or exact name")]
-    pool: String,
+    #[arg(value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    pool: PoolArg,
 
     #[command(flatten)]
     options: CloudOptions,
@@ -70,11 +70,11 @@ struct ShowCommand {
 
 #[derive(Debug, Args)]
 struct RenameCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(value_name = "POOL", help = "Runner pool ID or exact name")]
-    pool: String,
+    #[arg(value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    pool: PoolArg,
 
     #[arg(long, help = "Set the exact runner pool name")]
     name: String,
@@ -86,11 +86,11 @@ struct RenameCommand {
 
 #[derive(Debug, Args)]
 struct DeleteCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(value_name = "POOL", help = "Runner pool ID or exact name")]
-    pool: String,
+    #[arg(value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    pool: PoolArg,
 
     #[arg(
         long,

@@ -21,7 +21,7 @@ use scherzo_cloud_api::{
     revoke_invitation,
 };
 
-use super::{OrganizationRef, PaginationArgs};
+use super::{OrganizationArg, PaginationArgs};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud invitations";
 const NAME: &str = "invitation";
@@ -199,8 +199,8 @@ struct DeclineCommand {
         .args(["principal_id", "email"])
 ))]
 struct IssueCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(
         long = "principal",
@@ -227,8 +227,8 @@ struct IssueCommand {
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 struct OrganizationListCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[command(flatten)]
     pagination: PaginationArgs,
@@ -240,8 +240,8 @@ struct OrganizationListCommand {
 
 #[derive(Debug, Args)]
 struct RevokeCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(
         value_name = "INVITATION",

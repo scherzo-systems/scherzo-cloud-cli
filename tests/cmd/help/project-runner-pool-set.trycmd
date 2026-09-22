@@ -6,8 +6,8 @@ Usage: scherzo-cloud project runner-pool set [OPTIONS] <ORGANIZATION> <PROJECT> 
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <PROJECT>       Exact project ID
-  <POOL>          Exact runner pool ID
+  <PROJECT>       Project ID
+  <POOL>          Runner pool ID or exact name
 
 Options:
       --json                           Print the project result as JSON

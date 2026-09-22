@@ -12,6 +12,7 @@ use scherzo_cloud_api::{
     input_set_state_name,
 };
 
+use super::super::{OrganizationArg, ProjectArg};
 use super::acquisition::{self, AcquiredInputs};
 
 pub(super) const ABOUT: &str = "Administer single-use Run Input Sets";
@@ -45,13 +46,16 @@ enum InputSetCommand {
     Delete(DeleteCommand),
 }
 
+// Input-set creation and runner-pool creation share only generic CLI shape; their
+// project/input and pool-name operations remain clearer as separate command types.
+// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: super::super::OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(long, value_name = "PROJECT", help = "Cloud project identifier")]
-    project_id: String,
+    #[arg(long, value_name = ProjectArg::VALUE_NAME, help = ProjectArg::HELP)]
+    project_id: ProjectArg,
 
     #[command(flatten)]
     inputs: super::super::NamedInputArgs,
@@ -59,11 +63,12 @@ struct CreateCommand {
     #[command(flatten)]
     options: super::CloudInputOptions,
 }
+// jscpd:ignore-end
 
 #[derive(Clone, Debug, Args)]
 struct InputSetReference {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: super::super::OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(
         value_name = "INPUT_SET",

@@ -7,7 +7,7 @@ use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{GitHubApi, GitHubFailure, HttpClient, HttpTransportPolicy};
 
-use super::OrganizationRef;
+use super::{InstallationArg, OrganizationArg};
 
 pub(super) const ABOUT: &str = "Manage GitHub connections";
 const NAME: &str = "github";
@@ -87,8 +87,8 @@ struct GitHubOptions {
 
 #[derive(Debug, Args)]
 struct OrganizationTarget {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[command(flatten)]
     options: GitHubOptions,
@@ -96,8 +96,8 @@ struct OrganizationTarget {
 
 #[derive(Debug, Args)]
 struct CompleteCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(
         value_name = "SETUP_SESSION",
@@ -118,11 +118,11 @@ struct CompleteCommand {
 
 #[derive(Debug, Args)]
 struct InstallationTarget {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
-    #[arg(value_name = "INSTALLATION", help = "GitHub installation binding ID")]
-    installation: String,
+    #[arg(value_name = InstallationArg::VALUE_NAME, help = InstallationArg::HELP)]
+    installation: InstallationArg,
 
     #[command(flatten)]
     options: GitHubOptions,

@@ -9,7 +9,7 @@ use scherzo_cloud_api::{
 };
 
 use super::{LeafOptions, output};
-use crate::cli::PaginationArgs;
+use crate::cli::{OrganizationArg, PaginationArgs};
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organization members";
 const LIST_ABOUT: &str = "List organization members";
@@ -84,8 +84,8 @@ impl Command {
 
 #[derive(Debug, Args)]
 struct PageCommand {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: crate::cli::OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization_ref: OrganizationArg,
 
     #[command(flatten)]
     pagination: PaginationArgs,
@@ -133,8 +133,8 @@ impl PageCommand {
 
 #[derive(Debug, Args)]
 struct MembershipTarget {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization_ref: crate::cli::OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization_ref: OrganizationArg,
 
     #[arg(
         value_name = "MEMBERSHIP",

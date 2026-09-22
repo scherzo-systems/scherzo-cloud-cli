@@ -6,7 +6,7 @@ Usage: scherzo-cloud project repository list [OPTIONS] <ORGANIZATION> <INSTALLAT
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <INSTALLATION>  Exact GitHub installation binding ID
+  <INSTALLATION>  GitHub installation binding ID
 
 Options:
       --json                           Print the project result as JSON

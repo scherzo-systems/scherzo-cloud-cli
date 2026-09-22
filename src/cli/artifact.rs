@@ -51,8 +51,11 @@ struct RemoteArtifactOptions {
 
 #[derive(Debug, Args)]
 pub(super) struct RunArtifactReference {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: super::OrganizationRef,
+    #[arg(
+        value_name = super::OrganizationArg::VALUE_NAME,
+        help = super::OrganizationArg::HELP
+    )]
+    organization: super::OrganizationArg,
 
     #[arg(
         value_name = "RUN",

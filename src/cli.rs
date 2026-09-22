@@ -34,6 +34,7 @@ mod atomic_directory;
 mod auth;
 mod delegation;
 mod deletion;
+mod entity;
 mod github;
 mod invitation;
 mod organization;
@@ -61,6 +62,7 @@ use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
+use self::entity::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::cancellation::Cancellation;
 use crate::human_auth::deployment::Deployment;
@@ -170,29 +172,6 @@ fn open_regular_file_nonblocking(path: &Path) -> Result<File, OpenRegularFileErr
         return Err(OpenRegularFileError::NotRegular);
     }
     Ok(file)
-}
-
-#[derive(Clone, Debug)]
-struct OrganizationRef(String);
-
-impl FromStr for OrganizationRef {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if scherzo_cloud_support::valid_organization_ref(value) {
-            Ok(Self(value.to_owned()))
-        } else {
-            Err("must be an organization ID or lowercase organization slug".to_owned())
-        }
-    }
-}
-
-impl Deref for OrganizationRef {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
 }
 
 #[derive(Clone, Debug)]

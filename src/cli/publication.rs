@@ -12,7 +12,7 @@ use scherzo_cloud_api::{
     PublicationState,
 };
 
-use super::OrganizationRef;
+use super::OrganizationArg;
 
 pub(super) const ABOUT: &str = "Work with Scherzo Cloud publications";
 const NAME: &str = "publication";
@@ -35,8 +35,8 @@ enum PublicationCommand {
 
 #[derive(Debug, Args)]
 struct PublicationRunReference {
-    #[arg(value_name = "ORGANIZATION", help = "Organization ID or exact slug")]
-    organization: OrganizationRef,
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
 
     #[arg(value_name = "RUN", value_parser = parse_run_id, help = "Exact Run ID")]
     run_id: String,
