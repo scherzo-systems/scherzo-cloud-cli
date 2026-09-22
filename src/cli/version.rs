@@ -2,7 +2,6 @@ use std::env;
 use std::io::{self, Write};
 
 use anyhow::Context;
-use clap::Args;
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
@@ -10,11 +9,7 @@ use crate::exit_code::ExitCode;
 pub(super) const ABOUT: &str = "Print version information";
 const COMMAND_NAME: &str = "scherzo-cloud";
 
-#[derive(Debug, Args)]
-pub(super) struct Command {
-    #[arg(long, help = "Print version information as JSON")]
-    json: bool,
-}
+pub(super) type Command = super::JsonArgs<super::VersionJson>;
 
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {

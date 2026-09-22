@@ -23,9 +23,6 @@ pub(super) const ABOUT: &str = "Sign in to Scherzo Cloud";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(long, help = "Emit newline-delimited JSON events")]
-    json: bool,
-
     // Login keeps its force option and three-way completion mapping local;
     // sharing this command shell with status would couple distinct result contracts.
     // jscpd:ignore-start
@@ -33,7 +30,17 @@ pub(super) struct Command {
     force: bool,
 
     #[command(flatten)]
-    http: super::super::HttpOptions,
+    common:
+        super::super::CommonArgs<super::super::StreamingJson, super::super::NoAuthenticationArgs>,
+}
+
+impl std::ops::Deref for Command {
+    type Target =
+        super::super::CommonArgs<super::super::StreamingJson, super::super::NoAuthenticationArgs>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 
 impl Command {

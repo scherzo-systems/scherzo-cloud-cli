@@ -53,6 +53,7 @@ pub(crate) struct ClaudeCodeStreamJsonV1ProtocolRejection {
 pub(crate) enum ClaudeCodeStreamJsonV1ProtocolStage {
     FrameRead,
     FrameDecode,
+    InitialInput,
     Initialization,
     ExchangeLifecycle,
     EventEnvelope,
@@ -79,6 +80,9 @@ pub(crate) enum ClaudeCodeStreamJsonV1RejectionReason {
     FrameTooLarge,
     FrameDecodeFailed,
     FrameNotObject,
+    StandardInputWriteFailed,
+    StandardInputWriteTimedOut,
+    StandardInputCloseFailed,
     InitializationInvalid,
     ExchangeInitializationMissing,
     ExchangeLifecycleInvalid,
@@ -1672,6 +1676,21 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
     }
 
+    fn fail_initial_input(
+        &mut self,
+        reason: ClaudeCodeStreamJsonV1RejectionReason,
+    ) -> AgentFailureCause {
+        let stage = ClaudeCodeStreamJsonV1ProtocolStage::InitialInput;
+        self.prepare_rejection(stage);
+        self.record_rejection(reason, stage);
+        self.invalidate_values();
+        let failure = AgentFailureCause::HarnessSetupFailed {
+            stage: super::agent::AgentHarnessSetupStage::Initialization,
+        };
+        self.failure = Some(failure.clone());
+        failure
+    }
+
     fn agent_failure(&self, cause: AgentFailureCause) -> AgentFailure {
         match &self.protocol_rejection {
             Some(rejection) => AgentFailure::with_protocol_rejection(cause, rejection.clone()),
@@ -1831,6 +1850,9 @@ fn default_rejection_reason(
         }
         ClaudeCodeStreamJsonV1ProtocolStage::FrameDecode => {
             ClaudeCodeStreamJsonV1RejectionReason::FrameDecodeFailed
+        }
+        ClaudeCodeStreamJsonV1ProtocolStage::InitialInput => {
+            ClaudeCodeStreamJsonV1RejectionReason::StandardInputWriteFailed
         }
         ClaudeCodeStreamJsonV1ProtocolStage::Initialization => {
             ClaudeCodeStreamJsonV1RejectionReason::InitializationInvalid

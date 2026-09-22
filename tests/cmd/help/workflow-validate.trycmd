@@ -9,7 +9,7 @@ Arguments:
 
 Options:
       --source-root <ROOT>  Directory boundary for workflow source files
-      --json                Print the validation result as JSON
+      --json                Print the workflow result as JSON
   -h, --help                Print help
 
 ```

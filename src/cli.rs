@@ -50,6 +50,7 @@ mod workflow;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -236,7 +237,7 @@ impl From<anyhow::Error> for CommandFailure {
 const AFTER_HELP: &str =
     "Documentation:\n  Public API contract: https://docs.scherzo.dev/openapi/public-api.yaml";
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Args)]
 #[command(
     name = "scherzo-cloud",
     about = "Scherzo Cloud CLI",
@@ -246,6 +247,146 @@ const AFTER_HELP: &str =
 pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+impl CommandFactory for Cli {
+    fn command() -> clap::Command {
+        with_pagination_after_help(<Self as Args>::augment_args(clap::Command::new(
+            "scherzo-cloud",
+        )))
+    }
+
+    fn command_for_update() -> clap::Command {
+        with_pagination_after_help(<Self as Args>::augment_args_for_update(clap::Command::new(
+            "scherzo-cloud",
+        )))
+    }
+}
+
+impl Parser for Cli {}
+
+const PAGINATION_AFTER_HELP: &str =
+    "Pagination:\n  This command returns one page. Pass --cursor <CURSOR> to continue.";
+
+fn with_pagination_after_help(mut command: clap::Command) -> clap::Command {
+    for subcommand in command.get_subcommands_mut() {
+        *subcommand = with_pagination_after_help(std::mem::take(subcommand));
+    }
+
+    let paginates = command
+        .get_arguments()
+        .any(|argument| argument.get_id() == "cursor");
+    if paginates {
+        let existing = command.get_after_help().map(ToString::to_string);
+        if !existing
+            .as_deref()
+            .is_some_and(|help| help.contains(PAGINATION_AFTER_HELP))
+        {
+            let help = existing.map_or_else(
+                || PAGINATION_AFTER_HELP.to_owned(),
+                |help| format!("{help}\n\n{PAGINATION_AFTER_HELP}"),
+            );
+            command = command.after_help(help);
+        }
+    }
+    command
+}
+
+#[derive(Clone, Copy, Debug)]
+enum JsonOutput {
+    Family(&'static str),
+    StreamingEvents,
+}
+
+trait JsonOutputKind: std::fmt::Debug {
+    const OUTPUT: JsonOutput;
+}
+
+macro_rules! json_family {
+    ($name:ident, $noun:literal) => {
+        #[derive(Debug)]
+        struct $name;
+
+        impl JsonOutputKind for $name {
+            const OUTPUT: JsonOutput = JsonOutput::Family($noun);
+        }
+    };
+}
+
+json_family!(AccountJson, "account");
+json_family!(ArtifactJson, "artifact");
+json_family!(DelegationJson, "delegation");
+json_family!(DeletionJson, "deletion");
+json_family!(GithubJson, "GitHub");
+json_family!(IdentityJson, "identity");
+json_family!(InvitationJson, "invitation");
+json_family!(OrganizationJson, "organization");
+json_family!(ProjectJson, "project");
+json_family!(PublicationJson, "publication");
+json_family!(RunJson, "run");
+json_family!(RunnerJson, "runner");
+json_family!(ServicePrincipalJson, "service-principal");
+json_family!(SignInJson, "sign-in");
+json_family!(VersionJson, "version");
+json_family!(WorkflowJson, "workflow");
+
+#[derive(Debug)]
+struct StreamingJson;
+
+impl JsonOutputKind for StreamingJson {
+    const OUTPUT: JsonOutput = JsonOutput::StreamingEvents;
+}
+
+fn json_help<F: JsonOutputKind>() -> String {
+    match F::OUTPUT {
+        JsonOutput::Family(noun) => format!("Print the {noun} result as JSON"),
+        JsonOutput::StreamingEvents => "Emit newline-delimited JSON events".to_owned(),
+    }
+}
+
+#[derive(Debug, Args)]
+struct JsonArgs<F: JsonOutputKind> {
+    #[arg(long, help = json_help::<F>())]
+    json: bool,
+
+    #[arg(skip)]
+    output: PhantomData<F>,
+}
+
+#[derive(Debug, Args, Default)]
+struct NoAuthenticationArgs {}
+
+#[derive(Debug, Args)]
+struct CommonArgs<F: JsonOutputKind, A: Args> {
+    #[command(flatten)]
+    output: JsonArgs<F>,
+
+    #[command(flatten)]
+    authentication: A,
+
+    #[command(flatten)]
+    http: HttpOptions,
+}
+
+impl<F: JsonOutputKind, A: Args> CommonArgs<F, A> {
+    fn new(json: bool, authentication: A, http: HttpOptions) -> Self {
+        Self {
+            output: JsonArgs {
+                json,
+                output: PhantomData,
+            },
+            authentication,
+            http,
+        }
+    }
+}
+
+impl<F: JsonOutputKind, A: Args> Deref for CommonArgs<F, A> {
+    type Target = JsonArgs<F>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.output
+    }
 }
 
 #[derive(Debug, Args)]
@@ -377,11 +518,12 @@ struct WaitTimeoutArgs {
 }
 
 #[derive(Debug, Args)]
-struct PaginationArgs {
+#[command(after_help = PAGINATION_AFTER_HELP)]
+struct PaginationArgs<const MAX: u16 = 200> {
     #[arg(
         long,
-        value_parser = clap::value_parser!(u16).range(1..=200),
-        help = "Maximum items to return (1-200)"
+        value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX)),
+        help = format!("Maximum items to return (1-{MAX})")
     )]
     limit: Option<u16>,
 

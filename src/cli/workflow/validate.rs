@@ -19,15 +19,15 @@ pub(super) struct Command {
     #[command(flatten)]
     source: super::LocalWorkflowSource,
 
-    #[arg(long, help = "Print the validation result as JSON")]
-    json: bool,
+    #[command(flatten)]
+    output: super::super::JsonArgs<super::super::WorkflowJson>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         match resolve_workflow_file(&self.source.source_root, &self.source.workflow_file) {
             Ok(workflow) => {
-                let result = if self.json {
+                let result = if self.output.json {
                     write_json_valid(&workflow)
                 } else {
                     write_human_valid(&workflow)
@@ -35,7 +35,7 @@ impl Command {
                 finish_output(result, ExitCode::Success)
             }
             Err(failure) => {
-                let result = if self.json {
+                let result = if self.output.json {
                     write_json_invalid(&failure)
                 } else {
                     write_human_invalid(&failure)

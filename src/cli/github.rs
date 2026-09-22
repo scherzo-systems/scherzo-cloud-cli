@@ -69,21 +69,7 @@ enum RepositoryLeaf {
     List(InstallationTarget),
 }
 
-// GitHub and run leaves keep domain-specific JSON help and result contracts even though
-// both flatten the same explicit principal-authentication controls.
-// jscpd:ignore-start
-#[derive(Debug, Args)]
-struct GitHubOptions {
-    #[arg(long, help = "Print the GitHub result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
-// jscpd:ignore-end
+type GitHubOptions = super::CommonArgs<super::GithubJson, super::PrincipalAuthenticationArgs>;
 
 #[derive(Debug, Args)]
 struct OrganizationTarget {

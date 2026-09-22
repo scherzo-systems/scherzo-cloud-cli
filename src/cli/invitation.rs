@@ -56,29 +56,18 @@ pub(super) struct OrganizationCommand {
 enum OrganizationInvitationCommand {
     #[command(about = "Issue an organization invitation")]
     Issue(IssueCommand),
-    #[command(
-        about = "List organization invitation history",
-        after_help = "Pagination:\n  This command returns one page. Pass --cursor <CURSOR> to continue."
-    )]
+    #[command(about = "List organization invitation history")]
     List(OrganizationListCommand),
     #[command(about = "Revoke an organization invitation")]
     Revoke(RevokeCommand),
 }
 
-// Invitation leaves keep operation-local option wording and error context rather than exposing
-// organization-profile terminology through a shared options abstraction.
+type InvitationOptions =
+    super::CommonArgs<super::InvitationJson, super::PrincipalAuthenticationArgs>;
+
+// Invitation leaves keep operation-local execution and error context rather than exposing
+// organization-profile terminology through a shared operation abstraction.
 // jscpd:ignore-start
-#[derive(Debug, Args)]
-struct InvitationOptions {
-    #[arg(long, help = "Print the invitation result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
 
 impl InvitationOptions {
     fn execute<O>(

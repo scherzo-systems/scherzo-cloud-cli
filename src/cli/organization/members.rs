@@ -16,7 +16,8 @@ const LIST_ABOUT: &str = "List organization members";
 const HISTORY_ABOUT: &str = "List organization membership history";
 const UPDATE_ABOUT: &str = "Update an organization member's role";
 const REMOVE_ABOUT: &str = "Remove an organization member";
-const HISTORY_AFTER_HELP: &str = "Authorization:\n  Only an active organization owner can list membership history.\n\nPagination:\n  This command returns one page. Pass --cursor <CURSOR> to continue.";
+const HISTORY_AFTER_HELP: &str =
+    "Authorization:\n  Only an active organization owner can list membership history.";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

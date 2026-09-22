@@ -22,12 +22,16 @@ pub(super) struct Command {
     )]
     list_checks: bool,
 
-    #[arg(long, help = "Print the report as JSON")]
-    json: bool,
+    // Doctor and enrollment have unrelated operation inputs and execution paths; sharing their
+    // command shells would couple those contracts merely because both use runner JSON output.
+    // jscpd:ignore-start
+    #[command(flatten)]
+    output: super::super::JsonArgs<super::super::RunnerJson>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
+        // jscpd:ignore-end
         let registry = built_in_registry().map_err(|error| anyhow!(error))?;
 
         if self.list_checks {
@@ -38,7 +42,7 @@ impl Command {
         let report = registry.run(&self.checks).map_err(|error| {
             super::super::CommandFailure::with_exit_code(anyhow!(error), ExitCode::UsageError)
         })?;
-        if self.json {
+        if self.output.json {
             write_json_report(&report)?;
         } else {
             write_human_report(&report).context("write runner doctor report")?;

@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 
 use anyhow::{Context, anyhow};
-use clap::Args;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
@@ -13,14 +12,8 @@ use super::super::principal::PrincipalResult;
 
 pub(super) const ABOUT: &str = "Show your Scherzo Cloud sign-in status";
 
-#[derive(Debug, Args)]
-pub(super) struct Command {
-    #[arg(long, help = "Print sign-in status as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    options: super::PrincipalNetworkOptions,
-}
+pub(super) type Command =
+    super::super::CommonArgs<super::super::SignInJson, super::super::PrincipalAuthenticationArgs>;
 
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {
@@ -28,11 +21,11 @@ impl Command {
     }
 
     fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let client = HttpClient::new(self.options.http.transport_policy())
+        let client = HttpClient::new(self.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare status networking")?;
-        let authentication = self.options.authentication.kind();
-        let service_api_key = self.options.authentication.service_api_key()?;
+        let authentication = self.authentication.kind();
+        let service_api_key = self.authentication.service_api_key()?;
         let status = match service_api_key {
             Some(api_key) => {
                 status::check_with_service_api_key(&client, deployment, api_key.expose())

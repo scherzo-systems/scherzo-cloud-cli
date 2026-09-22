@@ -301,7 +301,7 @@ pub(super) fn presentation_config_with(
     capabilities: TerminalCapabilities,
 ) -> PresentationConfig {
     PresentationConfig {
-        requested_mode: if presentation.json {
+        requested_mode: if presentation.output.json {
             RequestedPresentationMode::Json
         } else if presentation.plain {
             RequestedPresentationMode::Plain
@@ -2489,7 +2489,10 @@ mod tests {
             max_parallel: 2,
             presentation: super::super::PresentationOptions {
                 plain: false,
-                json: true,
+                output: super::super::super::JsonArgs {
+                    json: true,
+                    output: std::marker::PhantomData,
+                },
                 color: super::super::ColorArgument::Always,
             },
         };

@@ -48,7 +48,7 @@ impl Command {
         reconcile_current_result_publication(&self.run.run_dir);
         let snapshot = read_local_run_status(&self.run.run_dir);
         super::super::complete_read_only_output(control, || {
-            let exit = if self.presentation.json {
+            let exit = if self.presentation.output.json {
                 render_json(snapshot).context("write workflow status output")?
             } else {
                 let snapshot = snapshot

@@ -19,9 +19,6 @@ pub(super) type Command = super::RemoteArtifactCommand<Operation>;
 pub(super) struct Operation {
     #[command(flatten)]
     pagination: super::super::PaginationArgs,
-
-    #[arg(long, help = "Print the Artifact Set result as JSON")]
-    json: bool,
 }
 
 impl super::RemoteArtifactOperation for Operation {
@@ -53,7 +50,7 @@ impl super::RemoteArtifactOperation for Operation {
             &output.run.run_id,
             output.result,
             output.authentication,
-            self.json,
+            output.json,
         )
     }
 }

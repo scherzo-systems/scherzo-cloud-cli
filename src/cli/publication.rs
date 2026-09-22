@@ -42,21 +42,7 @@ struct PublicationRunReference {
     run_id: String,
 }
 
-// Publication and run options intentionally remain distinct so each command keeps its
-// domain-specific JSON help instead of exposing another command's terminology.
-// jscpd:ignore-start
-#[derive(Debug, Args)]
-struct Options {
-    #[arg(long, help = "Print the publication result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
-// jscpd:ignore-end
+type Options = super::CommonArgs<super::PublicationJson, super::PrincipalAuthenticationArgs>;
 
 #[derive(Debug, Args)]
 struct PublicationWaitArgs {

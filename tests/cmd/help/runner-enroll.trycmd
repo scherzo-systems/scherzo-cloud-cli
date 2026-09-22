@@ -9,7 +9,7 @@ Options:
       --resume                    Resend the exact unresolved enrollment journal
       --replace-credential        Stage the enrolled credential as a replacement for this runner
       --config <PATH>             Read the closed runner operator configuration
-      --json                      Print the non-secret enrollment result as JSON
+      --json                      Print the runner result as JSON
   -h, --help                      Print help
 
 ```

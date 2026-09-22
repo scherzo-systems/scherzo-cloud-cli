@@ -33,7 +33,7 @@ Options:
       --plain
           Force plain human presentation
       --json
-          Print the result as JSON
+          Print the workflow result as JSON
       --color <WHEN>
           Select renderer color behavior [default: auto] [possible values: auto, always, never]
   -h, --help

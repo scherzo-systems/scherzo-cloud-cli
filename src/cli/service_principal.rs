@@ -50,14 +50,9 @@ enum CredentialSubcommand {
     Revoke(RevokeCommand),
 }
 
-#[derive(Debug, Args)]
-struct ServiceOptions {
-    #[arg(long, help = "Print the service-principal result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
+type ServiceOptions = super::CommonArgs<super::ServicePrincipalJson, super::NoAuthenticationArgs>;
+type RequiredServiceOptions =
+    super::CommonArgs<super::ServicePrincipalJson, super::RequiredServiceAuthenticationArgs>;
 
 #[derive(Debug, Args)]
 struct CreateCommand {
@@ -81,10 +76,7 @@ struct ListCommand {
     pagination: super::PaginationArgs,
 
     #[command(flatten)]
-    authentication: super::RequiredServiceAuthenticationArgs,
-
-    #[command(flatten)]
-    options: ServiceOptions,
+    options: RequiredServiceOptions,
 }
 
 #[derive(Debug, Args)]
@@ -97,10 +89,7 @@ struct IssueCommand {
     api_key_file: String,
 
     #[command(flatten)]
-    authentication: super::RequiredServiceAuthenticationArgs,
-
-    #[command(flatten)]
-    options: ServiceOptions,
+    options: RequiredServiceOptions,
 }
 
 #[derive(Debug, Args)]
@@ -113,10 +102,7 @@ struct RevokeCommand {
     credential_id: String,
 
     #[command(flatten)]
-    authentication: super::RequiredServiceAuthenticationArgs,
-
-    #[command(flatten)]
-    options: ServiceOptions,
+    options: RequiredServiceOptions,
 }
 
 impl Command {
@@ -273,7 +259,7 @@ impl CreateCommand {
 
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let api_key = self.authentication.api_key()?;
+        let api_key = self.options.authentication.api_key()?;
         let client = service_client(deployment, &self.options)?;
         let outcome = list_service_credentials(
             &client,
@@ -296,7 +282,7 @@ impl IssueCommand {
         validate_secret_output(&self.api_key_file, self.options.json)?;
         // Read a potentially blocking stdin credential before installing the bounded mutation
         // owner. No output destination or server mutation exists yet if a signal stops this read.
-        let api_key = self.authentication.api_key()?;
+        let api_key = self.options.authentication.api_key()?;
         super::execute_bounded_mutation_with_signals(
             "service-credential issuance",
             move |control| self.execute_blocking(&deployment, control, &api_key),
@@ -357,7 +343,7 @@ impl IssueCommand {
 
 impl RevokeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let api_key = self.authentication.api_key()?;
+        let api_key = self.options.authentication.api_key()?;
         let idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate service-credential revocation request identity")?;
         let client = service_client(deployment, &self.options)?;
@@ -378,9 +364,9 @@ impl RevokeCommand {
     }
 }
 
-fn service_client(
+fn service_client<A: Args>(
     _deployment: &Deployment,
-    options: &ServiceOptions,
+    options: &super::CommonArgs<super::ServicePrincipalJson, A>,
 ) -> anyhow::Result<HttpClient> {
     HttpClient::new(options.http.transport_policy())
         .map_err(|error| anyhow!(error))

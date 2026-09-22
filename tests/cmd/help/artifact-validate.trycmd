@@ -8,7 +8,7 @@ Arguments:
   <ARTIFACT_DIR>  Portable workflow artifact directory
 
 Options:
-      --json  Print the artifact validation result as JSON
+      --json  Print the artifact result as JSON
   -h, --help  Print help
 
 ```

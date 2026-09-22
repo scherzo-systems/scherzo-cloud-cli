@@ -43,10 +43,15 @@ struct RemoteArtifactOptions {
     run: RunArtifactReference,
 
     #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
+    common: super::CommonArgs<super::ArtifactJson, super::PrincipalAuthenticationArgs>,
+}
 
-    #[command(flatten)]
-    http: super::HttpOptions,
+impl std::ops::Deref for RemoteArtifactOptions {
+    type Target = super::CommonArgs<super::ArtifactJson, super::PrincipalAuthenticationArgs>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +84,7 @@ pub(super) struct RemoteArtifactResult<'a, T, E> {
     run: &'a RunArtifactReference,
     authentication: super::PrincipalAuthenticationKind,
     result: Result<T, E>,
+    json: bool,
 }
 
 pub(super) trait RemoteArtifactOperation {
@@ -113,6 +119,7 @@ impl<O: RemoteArtifactOperation + Args> RemoteArtifactCommand<O> {
                     run: &self.remote.run,
                     authentication: self.remote.authentication.kind(),
                     result,
+                    json: self.remote.json,
                 })
             },
         )

@@ -62,18 +62,14 @@ fn execute_leaf<T>(
     execute(command, deployment).map_err(Into::into)
 }
 
-#[derive(Debug, Args)]
-struct OutputOptions {
-    #[arg(long, help = "Print the identity result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    principal: super::PrincipalNetworkOptions,
-}
+type OutputOptions =
+    super::super::CommonArgs<super::super::IdentityJson, super::super::PrincipalAuthenticationArgs>;
 
 impl OutputOptions {
     fn client(&self) -> anyhow::Result<HttpClient> {
-        self.principal.client()
+        HttpClient::new(self.http.transport_policy())
+            .map_err(|error| anyhow!(error))
+            .context("prepare identity networking")
     }
 }
 

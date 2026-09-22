@@ -23,9 +23,9 @@ use tokio::process::ChildStdout;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1ProtocolLimits, CompletedResultExchange,
-    FIXED_INVOCATION_ENVIRONMENT, initial_user_text_frame, normal_mode_arguments,
-    result_mode_arguments, user_content_frame,
+    ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1ProtocolLimits,
+    ClaudeCodeStreamJsonV1RejectionReason, CompletedResultExchange, FIXED_INVOCATION_ENVIRONMENT,
+    initial_user_text_frame, normal_mode_arguments, result_mode_arguments, user_content_frame,
 };
 use crate::claude_code::compatibility_profile_for_version;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
@@ -60,6 +60,9 @@ use crate::workflow::result_validation::{
 
 const SYSTEM_PROMPT_FILE_PREFIX: &str = "claude-code-system-prompt-";
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+pub(super) const MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const STANDARD_INPUT_WRITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 pub(super) const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(10);
 const AMBIGUOUS_CANDIDATE_FEEDBACK: &str =
@@ -636,14 +639,10 @@ where
     if invocation.attachments().len() > invocation.limits().maximum_attachments().get() {
         return Err(AgentFailureCause::HarnessStartFailed);
     }
-    let mut content = Vec::new();
-    content
-        .try_reserve_exact(invocation.attachments().len().saturating_add(1))
+    let mut validated = Vec::new();
+    validated
+        .try_reserve_exact(invocation.attachments().len())
         .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
-    content.push(json!({
-        "type": "text",
-        "text": invocation.prompt().message(),
-    }));
     let mut total_bytes = 0_u64;
     for (index, attachment) in invocation.attachments().iter().enumerate() {
         let expected_identity = format!("{index:06}");
@@ -665,20 +664,91 @@ where
             .checked_add(metadata.len())
             .filter(|total| *total <= invocation.limits().maximum_attachment_bytes().get())
             .ok_or(AgentFailureCause::HarnessStartFailed)?;
-        content.push(attachment_content_block(
-            attachment,
-            identity,
-            metadata.len(),
-        )?);
+        validated.push((attachment, identity.to_owned(), metadata.len()));
     }
-    user_content_frame(content).map_err(|_| AgentFailureCause::HarnessStartFailed)
+
+    let mut content = Vec::new();
+    content
+        .try_reserve_exact(validated.len().saturating_add(1))
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    content.push(json!({
+        "type": "text",
+        "text": invocation.prompt().message(),
+    }));
+    for (attachment, identity, _) in &validated {
+        content.push(attachment_reference_content_block(attachment, identity)?);
+    }
+
+    let empty_frame_bytes = user_content_frame(Vec::new())
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)?
+        .len();
+    let mut block_bytes = content
+        .iter()
+        .map(serialized_content_block_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut frame_bytes = block_bytes
+        .iter()
+        .try_fold(empty_frame_bytes, |total, bytes| total.checked_add(*bytes))
+        .and_then(|total| total.checked_add(content.len().saturating_sub(1)))
+        .ok_or(AgentFailureCause::HarnessStartFailed)?;
+    if frame_bytes > MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES {
+        return Err(AgentFailureCause::HarnessStartFailed);
+    }
+
+    for (index, (attachment, identity, expected_bytes)) in validated.iter().enumerate() {
+        let content_index = index.saturating_add(1);
+        let reference_bytes = block_bytes
+            .get(content_index)
+            .copied()
+            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        let frame_without_reference = frame_bytes
+            .checked_sub(reference_bytes)
+            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        let replacement_budget = MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES
+            .checked_sub(frame_without_reference)
+            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        if *expected_bytes > u64::try_from(replacement_budget).unwrap_or(u64::MAX) {
+            continue;
+        }
+        let Some(inline) = attachment_inline_content_block(attachment, identity, *expected_bytes)?
+        else {
+            continue;
+        };
+        let inline_bytes = serialized_content_block_bytes(&inline)?;
+        let candidate_frame_bytes = frame_without_reference
+            .checked_add(inline_bytes)
+            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        if candidate_frame_bytes <= MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES {
+            let content_slot = content
+                .get_mut(content_index)
+                .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            *content_slot = inline;
+            let block_bytes_slot = block_bytes
+                .get_mut(content_index)
+                .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            *block_bytes_slot = inline_bytes;
+            frame_bytes = candidate_frame_bytes;
+        }
+    }
+
+    let frame = user_content_frame(content).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    if frame.len() > MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES {
+        return Err(AgentFailureCause::HarnessStartFailed);
+    }
+    Ok(frame)
 }
 
-fn attachment_content_block(
+fn serialized_content_block_bytes(block: &Value) -> Result<usize, AgentFailureCause> {
+    serde_json::to_vec(block)
+        .map(|bytes| bytes.len())
+        .map_err(|_| AgentFailureCause::HarnessStartFailed)
+}
+
+fn attachment_inline_content_block(
     attachment: &StagedAgentAttachment,
     identity: &str,
     expected_bytes: u64,
-) -> Result<Value, AgentFailureCause> {
+) -> Result<Option<Value>, AgentFailureCause> {
     let media_type = attachment.media_type();
     let base_media_type = media_type
         .split_once(';')
@@ -694,29 +764,36 @@ fn attachment_content_block(
     } else {
         None
     };
-
-    if text_media || native_media.is_some() {
-        let bytes = read_staged_attachment(attachment, expected_bytes)?;
-        if text_media && let Ok(text) = std::str::from_utf8(&bytes) {
-            return Ok(json!({
-                "type": "text",
-                "text": format!(
-                    "Scherzo attachment {identity} ({media_type}) follows:\n{text}"
-                ),
-            }));
-        }
-        if let Some((block_type, native_media_type)) = native_media {
-            return Ok(json!({
-                "type": block_type,
-                "source": {
-                    "type": "base64",
-                    "media_type": native_media_type,
-                    "data": BASE64.encode(bytes),
-                },
-            }));
-        }
+    if !text_media && native_media.is_none() {
+        return Ok(None);
     }
 
+    let bytes = read_staged_attachment(attachment, expected_bytes)?;
+    if text_media && let Ok(text) = std::str::from_utf8(&bytes) {
+        return Ok(Some(json!({
+            "type": "text",
+            "text": format!(
+                "Scherzo attachment {identity} ({media_type}) follows:\n{text}"
+            ),
+        })));
+    }
+    Ok(native_media.map(|(block_type, native_media_type)| {
+        json!({
+            "type": block_type,
+            "source": {
+                "type": "base64",
+                "media_type": native_media_type,
+                "data": BASE64.encode(bytes),
+            },
+        })
+    }))
+}
+
+fn attachment_reference_content_block(
+    attachment: &StagedAgentAttachment,
+    identity: &str,
+) -> Result<Value, AgentFailureCause> {
+    let media_type = attachment.media_type();
     let sealed_path = attachment
         .path()
         .to_str()
@@ -919,29 +996,19 @@ where
         process_directives,
         supervisor_shutdown,
     ));
-    let mut standard_input = Some(standard_input);
-    let mut parser_enabled = true;
-    let mut failure = None;
-    let mut cancelled = None;
-    match initialize_standard_input(
-        &mut standard_input,
+    let initial_input = initialize_standard_input(
+        standard_input,
         input,
         invocation.value_mode().kind() != AgentValueKind::Result,
         &cancellation_source,
-    )
-    .await
-    {
-        InitialInputProgress::Ready => {}
-        InitialInputProgress::Cancelled(reason) => {
-            cancelled = Some(reason);
-            parser_enabled = false;
-        }
-        InitialInputProgress::Failed => {
-            failure = Some(AgentFailureCause::HarnessStartFailed);
-            parser_enabled = false;
-            child.force_process_group(process_group);
-        }
-    }
+        clock.clone(),
+    );
+    tokio::pin!(initial_input);
+    let mut initial_input_pending = true;
+    let mut standard_input = None;
+    let mut parser_enabled = true;
+    let mut failure = None;
+    let mut cancelled = None;
 
     let cancellation = cancellation_source.wait_for_cancellation();
     tokio::pin!(cancellation);
@@ -949,7 +1016,7 @@ where
     let mut standard_output_closed = false;
     let mut process_completion: Option<ExitStatus> = None;
     let mut process_group_quiescent = false;
-    let mut process_group_termination_requested = failure.is_some();
+    let mut process_group_termination_requested = false;
     let mut wait_failed = false;
     let mut settlement_deadline: Option<SettlementDeadlineWait> = None;
     let mut process_group_probe_clock = clock.clone();
@@ -957,7 +1024,8 @@ where
     // Claude's result closes an exchange without closing the process; retain a separate
     // driver loop even where stream-drain mechanics resemble Pi's terminal loop.
     // jscpd:ignore-start
-    while !standard_output_closed
+    while initial_input_pending
+        || !standard_output_closed
         || (process_completion.is_none() && !wait_failed)
         || !process_group_quiescent
     {
@@ -971,6 +1039,24 @@ where
                 parser_enabled = false;
                 settlement_deadline = None;
                 standard_input.take();
+            }
+            progress = &mut initial_input, if initial_input_pending => {
+                initial_input_pending = false;
+                match progress {
+                    InitialInputProgress::Ready(input) => standard_input = input,
+                    InitialInputProgress::Cancelled(reason) => {
+                        cancelled.get_or_insert(reason);
+                        parser_enabled = false;
+                    }
+                    InitialInputProgress::Failed(reason) => {
+                        if cancelled.is_none() && failure.is_none() {
+                            failure = Some(parser.fail_initial_input(reason));
+                        }
+                        parser_enabled = false;
+                        child.force_process_group(process_group);
+                        process_group_termination_requested = true;
+                    }
+                }
             }
             read = standard_output.read(&mut buffer), if !standard_output_closed => {
                 match read {
@@ -1030,6 +1116,7 @@ where
                                 validator,
                                 &mut parser,
                                 &mut standard_input,
+                                &mut clock,
                             ).await {
                                 ResultExchangeProgress::Continue => {}
                                 ResultExchangeProgress::Accepted => {
@@ -1202,26 +1289,30 @@ where
 }
 
 enum InitialInputProgress {
-    Ready,
+    Ready(Option<UnixStream>),
     Cancelled(CancellationReason),
-    Failed,
+    Failed(ClaudeCodeStreamJsonV1RejectionReason),
 }
 
 enum WriteProgress {
     Completed,
     Cancelled(CancellationReason),
     Failed,
+    TimedOut,
 }
 
-async fn write_with_cancellation(
+async fn write_with_cancellation<Clock: CoordinatorClock>(
     input: &mut UnixStream,
     bytes: &[u8],
     cancellation: &CancellationSource,
+    mut clock: Clock,
 ) -> WriteProgress {
     let write = input.write_all(bytes);
     tokio::pin!(write);
     let cancelled = cancellation.wait_for_cancellation();
     tokio::pin!(cancelled);
+    let deadline = clock.now().add(STANDARD_INPUT_WRITE_TIMEOUT);
+    let deadline_clock = clock.clone();
     tokio::select! {
         biased;
         reason = &mut cancelled => WriteProgress::Cancelled(reason),
@@ -1234,29 +1325,26 @@ async fn write_with_cancellation(
                 WriteProgress::Failed
             }
         }
+        () = deadline_clock.wait_until(deadline) => WriteProgress::TimedOut,
     }
 }
 
-async fn initialize_standard_input(
-    standard_input: &mut Option<UnixStream>,
+async fn initialize_standard_input<Clock: CoordinatorClock>(
+    mut standard_input: UnixStream,
     bytes: &[u8],
     close_after_write: bool,
     cancellation: &CancellationSource,
+    clock: Clock,
 ) -> InitialInputProgress {
     if let Some(reason) = cancellation.cancellation_reason() {
-        standard_input.take();
         return InitialInputProgress::Cancelled(reason);
     }
-    let Some(input) = standard_input.as_mut() else {
-        return InitialInputProgress::Failed;
-    };
-    match write_with_cancellation(input, bytes, cancellation).await {
-        WriteProgress::Completed if !close_after_write => InitialInputProgress::Ready,
+    match write_with_cancellation(&mut standard_input, bytes, cancellation, clock).await {
+        WriteProgress::Completed if !close_after_write => {
+            InitialInputProgress::Ready(Some(standard_input))
+        }
         WriteProgress::Completed => {
-            let Some(mut input) = standard_input.take() else {
-                return InitialInputProgress::Failed;
-            };
-            let shutdown = input.shutdown();
+            let shutdown = standard_input.shutdown();
             tokio::pin!(shutdown);
             let cancelled = cancellation.wait_for_cancellation();
             tokio::pin!(cancelled);
@@ -1272,23 +1360,24 @@ async fn initialize_standard_input(
                             error.kind() == io::ErrorKind::NotConnected
                         })
                     {
-                        InitialInputProgress::Ready
+                        InitialInputProgress::Ready(None)
                     } else if let Some(reason) = cancellation.cancellation_reason() {
                         InitialInputProgress::Cancelled(reason)
                     } else {
-                        InitialInputProgress::Failed
+                        InitialInputProgress::Failed(
+                            ClaudeCodeStreamJsonV1RejectionReason::StandardInputCloseFailed,
+                        )
                     }
                 }
             }
         }
-        WriteProgress::Cancelled(reason) => {
-            standard_input.take();
-            InitialInputProgress::Cancelled(reason)
-        }
-        WriteProgress::Failed => {
-            standard_input.take();
-            InitialInputProgress::Failed
-        }
+        WriteProgress::Cancelled(reason) => InitialInputProgress::Cancelled(reason),
+        WriteProgress::Failed => InitialInputProgress::Failed(
+            ClaudeCodeStreamJsonV1RejectionReason::StandardInputWriteFailed,
+        ),
+        WriteProgress::TimedOut => InitialInputProgress::Failed(
+            ClaudeCodeStreamJsonV1RejectionReason::StandardInputWriteTimedOut,
+        ),
     }
 }
 
@@ -1406,6 +1495,7 @@ async fn handle_result_exchange<Clock, Worker, Sink>(
     validator: Option<&AuthoritativeResultValidator<Clock, Worker>>,
     parser: &mut ClaudeCodeStreamJsonV1Parser,
     standard_input: &mut Option<UnixStream>,
+    clock: &mut Clock,
 ) -> ResultExchangeProgress
 where
     Clock: CoordinatorClock,
@@ -1435,7 +1525,9 @@ where
                 }
                 ResultValidationOutcome::Decided(ResultValidationDecision::Rejected {
                     feedback,
-                }) => reject_and_continue(invocation, parser, standard_input, feedback).await,
+                }) => {
+                    reject_and_continue(invocation, parser, standard_input, feedback, clock).await
+                }
                 ResultValidationOutcome::Decided(ResultValidationDecision::Fatal(fatal)) => {
                     ResultExchangeProgress::Failed(AgentFailureCause::from(fatal))
                 }
@@ -1449,7 +1541,7 @@ where
                     .maximum_result_rejection_feedback_bytes()
                     .get(),
             );
-            reject_and_continue(invocation, parser, standard_input, feedback).await
+            reject_and_continue(invocation, parser, standard_input, feedback, clock).await
         }
         CompletedResultExchange::MissingCandidate | CompletedResultExchange::NativeFailure => {
             if close_standard_input(standard_input).await.is_err() {
@@ -1461,11 +1553,12 @@ where
     }
 }
 
-async fn reject_and_continue<Sink: AgentObservationSink>(
+async fn reject_and_continue<Clock: CoordinatorClock, Sink: AgentObservationSink>(
     invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
     parser: &mut ClaudeCodeStreamJsonV1Parser,
     standard_input: &mut Option<UnixStream>,
     feedback: Arc<str>,
+    clock: &mut Clock,
 ) -> ResultExchangeProgress {
     match emit_observation(
         invocation.observations(),
@@ -1498,13 +1591,13 @@ async fn reject_and_continue<Sink: AgentObservationSink>(
     let Some(input) = standard_input.as_mut() else {
         return ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed);
     };
-    match write_with_cancellation(input, &frame, invocation.cancellation()).await {
+    match write_with_cancellation(input, &frame, invocation.cancellation(), clock.clone()).await {
         WriteProgress::Completed => ResultExchangeProgress::Continue,
         WriteProgress::Cancelled(reason) => {
             standard_input.take();
             ResultExchangeProgress::Cancelled(reason)
         }
-        WriteProgress::Failed => {
+        WriteProgress::Failed | WriteProgress::TimedOut => {
             ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed)
         }
     }

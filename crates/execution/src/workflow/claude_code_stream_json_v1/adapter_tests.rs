@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
 use super::adapter::{
-    ClaudeCodeStreamJsonV1Adapter, NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC,
+    ClaudeCodeStreamJsonV1Adapter, MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES,
+    NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, STANDARD_INPUT_WRITE_TIMEOUT,
     native_project_slug, prepare_launch,
 };
 use super::test_support::{
@@ -26,10 +27,11 @@ use super::test_support::{
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationLimits,
-    AgentInvocationStaging, AgentProcessContext, AgentPrompt, AgentStartReceiver,
-    AgentTerminalReceiver, AgentValueMode, PositiveDuration, RetainedJsonSchema,
-    StagedAgentAttachment, agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
+    AgentAdapter, AgentCompatibilityProfile, AgentHarnessSetupStage, AgentInvocation,
+    AgentInvocationLimits, AgentInvocationStaging, AgentProcessContext, AgentPrompt,
+    AgentStartReceiver, AgentTerminalReceiver, AgentValueMode, PositiveDuration,
+    RetainedJsonSchema, StagedAgentAttachment, agent_start_channel, agent_terminal_channel,
+    invoke_agent_adapter,
 };
 use crate::workflow::agent_diagnostics::{AgentDiagnosticSession, AgentDiagnosticSessionStore};
 use crate::workflow::claude_code::ClaudeCodeConfig;
@@ -110,6 +112,20 @@ exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
 const STUBBORN_DESCENDANT_FAKE_CLAUDE: &str = r#"#!/bin/sh
 exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
   --exact workflow::claude_code_stream_json_v1::adapter_tests::stubborn_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null 2>&1
+"#;
+
+const STDOUT_BEFORE_INPUT_FAKE_CLAUDE: &str = r#"#!/bin/sh
+exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
+  --exact workflow::claude_code_stream_json_v1::adapter_tests::stdout_before_input_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null 2>&1
+"#;
+
+const BLOCKED_INPUT_FAKE_CLAUDE: &str = r#"#!/bin/sh
+exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
+  --exact workflow::claude_code_stream_json_v1::adapter_tests::blocked_input_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null 2>&1
 "#;
@@ -372,7 +388,7 @@ fn invocation_limits(
         NonZeroU64::new(1024).unwrap(),
         NonZeroU64::new(1024).unwrap(),
         NonZeroUsize::new(16).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
+        NonZeroU64::new(16 * 1024 * 1024).unwrap(),
         NonZeroU64::new(maximum_response_bytes).unwrap(),
         NonZeroU64::new(1024).unwrap(),
         NonZeroU64::new(512).unwrap(),
@@ -1037,27 +1053,43 @@ fn fixture_process(path: &std::path::Path) -> Pid {
     Pid::from_raw(process).unwrap()
 }
 
+fn open_fixture_protocol() -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/fd/3")
+        .unwrap()
+}
+
+fn write_fixture_initialization(
+    protocol: &mut std::fs::File,
+    session: &str,
+    padding: Option<String>,
+) {
+    let mut initialization = json!({
+        "type": "system",
+        "subtype": "init",
+        "cwd": std::env::current_dir().unwrap(),
+        "session_id": session,
+        "model": MODEL,
+        "permissionMode": "bypassPermissions",
+        "claude_code_version": "2.1.263",
+    });
+    if let Some(padding) = padding {
+        initialization["padding"] = Value::String(padding);
+    }
+    serde_json::to_writer(&mut *protocol, &initialization).unwrap();
+    protocol.write_all(b"\n").unwrap();
+}
+
 fn write_fixture_init() {
     let mut initial = String::new();
     assert!(std::io::stdin().lock().read_line(&mut initial).unwrap() > 0);
-    let mut protocol = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/fd/3")
-        .unwrap();
-    serde_json::to_writer(
+    let mut protocol = open_fixture_protocol();
+    write_fixture_initialization(
         &mut protocol,
-        &json!({
-            "type": "system",
-            "subtype": "init",
-            "cwd": std::env::current_dir().unwrap(),
-            "session_id": std::env::var("CLAUDE_FIXTURE_SESSION").unwrap(),
-            "model": MODEL,
-            "permissionMode": "bypassPermissions",
-            "claude_code_version": "2.1.263",
-        }),
-    )
-    .unwrap();
-    protocol.write_all(b"\n").unwrap();
+        &std::env::var("CLAUDE_FIXTURE_SESSION").unwrap(),
+        None,
+    );
 }
 
 #[test]
@@ -1094,6 +1126,39 @@ fn stubborn_descendant_process_fixture() {
     let _interrupt = process_fixture_interrupt_receiver();
     write_process_fixture_id("CLAUDE_FIXTURE_CWD");
     write_process_fixture_signal("CLAUDE_FIXTURE_DESCENDANT_READY", b"ready\n");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+#[ignore = "launched as the stdout-before-input Claude Code process fixture"]
+fn stdout_before_input_process_fixture() {
+    let session = std::env::var("CLAUDE_FIXTURE_SESSION").unwrap();
+    let mut protocol = open_fixture_protocol();
+    write_fixture_initialization(&mut protocol, &session, Some("x".repeat(1024 * 1024)));
+    protocol.flush().unwrap();
+
+    let mut initial = String::new();
+    assert!(std::io::stdin().lock().read_line(&mut initial).unwrap() > 0);
+    serde_json::to_writer(
+        &mut protocol,
+        &json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": "completed",
+            "result": "completed after input",
+            "session_id": session,
+        }),
+    )
+    .unwrap();
+    protocol.write_all(b"\n").unwrap();
+}
+
+#[test]
+#[ignore = "launched as the blocked-input Claude Code process fixture"]
+fn blocked_input_process_fixture() {
     loop {
         std::thread::park();
     }
@@ -1314,6 +1379,108 @@ fn attachment_transport_is_ordered_lossless_and_uses_only_sealed_identities() {
     for diagnostic_name in ["../../caller-name.txt", "duplicate", "000999", "@escape"] {
         assert!(!serialized.contains(diagnostic_name));
     }
+}
+
+#[test]
+fn native_attachment_above_the_inline_cap_uses_a_bounded_path_reference() {
+    let oversized = vec![0x5a; MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES + 1];
+    let fixture = ProcessFixture::with_attachments(
+        AgentValueMode::None,
+        1024,
+        &[AttachmentFixture {
+            media_type: "image/png",
+            bytes: &oversized,
+            diagnostic_source_name: None,
+        }],
+    );
+    let invocation = fixture.invocation.as_ref().unwrap();
+    let sealed_path = invocation.attachments()[0].path().to_str().unwrap();
+    let plan = prepare_launch(invocation).unwrap();
+    assert!(plan.input().len() <= MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES);
+
+    let frame = serde_json::from_slice::<Value>(&plan.input()[..plan.input().len() - 1]).unwrap();
+    let reference = &frame["message"]["content"][1];
+    assert_eq!(reference["type"], "text");
+    assert!(reference.get("source").is_none());
+    assert!(reference["text"].as_str().unwrap().contains(sealed_path));
+}
+
+fn process_fixture_with_large_native_attachment(script: &str, fill: u8) -> ProcessFixture {
+    let attachment = vec![fill; 1024 * 1024];
+    let fixture = ProcessFixture::with_attachments(
+        AgentValueMode::None,
+        1024,
+        &[AttachmentFixture {
+            media_type: "image/png",
+            bytes: &attachment,
+            diagnostic_source_name: None,
+        }],
+    );
+    std::fs::write(
+        fixture.invocation.as_ref().unwrap().adapter().executable(),
+        script,
+    )
+    .unwrap();
+    fixture
+}
+
+#[tokio::test]
+async fn initial_input_is_written_while_large_stdout_is_pumped() {
+    with_watchdog(async {
+        let fixture =
+            process_fixture_with_large_native_attachment(STDOUT_BEFORE_INPUT_FAKE_CLAUDE, 0x42);
+        let (_, outcome) = run_fixture(fixture).await;
+        assert_eq!(
+            outcome,
+            AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn stalled_initial_input_write_reaches_a_typed_deadline() {
+    with_watchdog(async {
+        let mut fixture =
+            process_fixture_with_large_native_attachment(BLOCKED_INPUT_FAKE_CLAUDE, 0x24);
+        let invocation = fixture.invocation.take().unwrap();
+        let value_mode = invocation.value_mode().clone();
+        let (clock, mut registered, release) = controlled_clock();
+        let adapter = ClaudeCodeStreamJsonV1Adapter::with_validation_worker(
+            fixture.diagnostics.clone(),
+            NonZeroU64::new(1024).unwrap(),
+            clock,
+            NoopExecutionObserver,
+            InlineValidationWorker,
+        );
+        let (started, start) = agent_start_channel();
+        let (terminal, outcome) = agent_terminal_channel(&value_mode);
+        let task = tokio::spawn(async move {
+            invoke_agent_adapter(&adapter, invocation, started, terminal).await;
+        });
+
+        assert_eq!(registered.recv().await, Some(STANDARD_INPUT_WRITE_TIMEOUT));
+        release.send_replace(true);
+        task.await.unwrap();
+        let outcome = outcome.receive().await.unwrap();
+        assert!(start.receive().await.is_err());
+        assert_agent_failure(
+            &outcome,
+            AgentFailureCause::HarnessSetupFailed {
+                stage: AgentHarnessSetupStage::Initialization,
+            },
+        );
+        let AgentOutcome::Failed(failure) = outcome else {
+            panic!("stalled stdin write did not fail");
+        };
+        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        assert_eq!(rejection["detail"]["stage"], "initial_input");
+        assert_eq!(
+            rejection["detail"]["reason"],
+            "standard_input_write_timed_out"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

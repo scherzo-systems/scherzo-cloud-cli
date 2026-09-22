@@ -66,10 +66,7 @@ enum OrganizationDeletionCommand {
 #[derive(Debug, Args)]
 struct AccountRequestCommand {
     #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    request: RequestOptions,
+    request: RequestOptions<super::PrincipalAuthenticationArgs>,
 }
 
 #[derive(Debug, Args)]
@@ -78,7 +75,7 @@ struct OrganizationRequestCommand {
     organization_ref: OrganizationArg,
 
     #[command(flatten)]
-    request: RequestOptions,
+    request: RequestOptions<super::NoAuthenticationArgs>,
 }
 
 #[derive(Debug, Args)]
@@ -97,7 +94,7 @@ struct OrganizationCancelCommand {
 }
 
 #[derive(Debug, Args)]
-struct RequestOptions {
+struct RequestOptions<A: Args> {
     #[arg(
         long,
         required = true,
@@ -106,21 +103,19 @@ struct RequestOptions {
     )]
     yes: bool,
 
-    #[arg(long, help = "Print the deletion result as JSON")]
-    json: bool,
-
     #[command(flatten)]
-    http: super::HttpOptions,
+    common: super::CommonArgs<super::DeletionJson, A>,
 }
 
-#[derive(Debug, Args)]
-struct CancellationOptions {
-    #[arg(long, help = "Emit newline-delimited JSON events")]
-    json: bool,
+impl<A: Args> std::ops::Deref for RequestOptions<A> {
+    type Target = super::CommonArgs<super::DeletionJson, A>;
 
-    #[command(flatten)]
-    http: super::HttpOptions,
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
+
+type CancellationOptions = super::CommonArgs<super::StreamingJson, super::NoAuthenticationArgs>;
 
 // Account deletion keeps its own nested command path and credential cleanup while organization
 // deletion retains target-bound authorization, so the two family dispatchers stay explicit.
@@ -173,7 +168,7 @@ impl AccountRequestCommand {
         let (outcome, binding) = request_deletion_with_credential(
             &client,
             deployment,
-            &self.authentication,
+            &self.request.authentication,
             format!(
                 "request account deletion through {}",
                 deployment.fingerprint().api_url()
@@ -214,7 +209,7 @@ impl AccountRequestCommand {
             deployment.fingerprint().api_url(),
             &outcome,
             credential,
-            self.authentication.kind(),
+            self.request.authentication.kind(),
             self.request.json,
         )?;
         if let Some(error) = cleanup_error {

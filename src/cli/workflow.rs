@@ -31,8 +31,8 @@ pub(super) struct PresentationOptions {
     #[arg(long, conflicts_with = "json", help = "Force plain human presentation")]
     pub(super) plain: bool,
 
-    #[arg(long, help = "Print the result as JSON")]
-    pub(super) json: bool,
+    #[command(flatten)]
+    output: super::JsonArgs<super::WorkflowJson>,
 
     #[arg(
         long,

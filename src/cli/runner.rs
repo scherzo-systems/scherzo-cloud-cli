@@ -63,17 +63,7 @@ enum RunnerCommand {
     Status(status::Command),
 }
 
-#[derive(Debug, Args)]
-struct CloudOptions {
-    #[arg(long, help = "Print the runner result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
+type CloudOptions = super::CommonArgs<super::RunnerJson, super::PrincipalAuthenticationArgs>;
 
 impl CloudOptions {
     fn write_failure(

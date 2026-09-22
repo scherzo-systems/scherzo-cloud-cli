@@ -51,17 +51,7 @@ enum OrganizationCommand {
     Members(members::Command),
 }
 
-#[derive(Debug, Args)]
-struct LeafOptions {
-    #[arg(long, help = "Print the organization result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
+type LeafOptions = super::CommonArgs<super::OrganizationJson, super::PrincipalAuthenticationArgs>;
 
 impl LeafOptions {
     fn execute<O>(

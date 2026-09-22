@@ -24,7 +24,7 @@ impl Command {
         let outcome = with_principal_credential(
             &client,
             deployment,
-            &self.options.principal.authentication,
+            &self.options.authentication,
             |access_token| {
                 list_identities(
                     &client,
@@ -38,7 +38,7 @@ impl Command {
         output::write_list(
             deployment.fingerprint().api_url(),
             &outcome,
-            self.options.principal.authentication.kind(),
+            self.options.authentication.kind(),
             self.options.json,
         )
     }

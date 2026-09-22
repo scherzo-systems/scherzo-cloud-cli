@@ -26,18 +26,19 @@ the common choices:
 | Change attributes | Use `rename` only when the complete mutable set is `{name}`; use `update` when two or more attributes are mutable. Never offer both in one family. |
 | Sever a binding | Use `remove`, never `detach` or `disconnect`. |
 
-Compose recurring flags from the shared argument types in `src/cli.rs`: `HttpOptions` for
-`--allow-insecure-http`, `PrincipalAuthenticationArgs` or
+Compose recurring flags from the shared argument types in `src/cli.rs`: `JsonArgs` for
+`--json`, `HttpOptions` for `--allow-insecure-http`, `PrincipalAuthenticationArgs` or
 `RequiredServiceAuthenticationArgs` for `--service-api-key-file`, `PaginationArgs` for
 `--limit` plus `--cursor`, `WaitTimeoutArgs` for `--timeout`, and `NamedInputArgs` for
-named inputs. Reuse a family's options type for flags such as `--json`. If a flag will
-recur and has no shared type yet, introduce one rather than declaring the flag on each
-leaf.
+named inputs. Use `CommonArgs` wherever JSON, authentication, and HTTP policy co-occur so
+their relative order remains structural. If a flag will recur and has no shared type yet,
+introduce one rather than declaring the flag on each leaf.
 
 Require `--yes` exactly for leaves ending in `remove`, `revoke`, or `retire`; no other
 verb takes it. A command paginates when it returns one page and permits continuation: in
-that case expose `--limit` and `--cursor` together through `PaginationArgs` and include
-the exact `Pagination:` after-help from the style guide.
+that case expose `--limit` and `--cursor` together through `PaginationArgs`, which also
+supplies the exact `Pagination:` after-help from the style guide. Use its bound parameter
+for a family whose maximum differs from the standard 200 items.
 
 Every new command path needs exactly one help snapshot under `tests/cmd/help/`;
 [`cli::tests::every_customer_command_has_one_help_snapshot`](src/cli.rs) is the topology

@@ -42,29 +42,8 @@ enum RunCommand {
     Wait(WaitCommand),
 }
 
-#[derive(Debug, Args)]
-struct RunOptions {
-    #[arg(long, help = "Print the run result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
-
-#[derive(Debug, Args)]
-struct CloudInputOptions {
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-
-    #[arg(long, help = "Write one JSON result to standard output")]
-    json: bool,
-}
+type RunOptions = super::CommonArgs<super::RunJson, super::PrincipalAuthenticationArgs>;
+type CloudInputOptions = super::CommonArgs<super::RunJson, super::PrincipalAuthenticationArgs>;
 
 // This leaf keeps its API identities explicit; sharing Clap fields with runner-pool
 // creation would couple unrelated command contracts and their help text.

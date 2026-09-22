@@ -72,20 +72,12 @@ struct UpdateCommand {
     clear_display_name: bool,
 
     #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    options: LeafOptions,
+    options: PrincipalLeafOptions,
 }
 
-#[derive(Debug, Args)]
-struct LeafOptions {
-    #[arg(long, help = "Print the account result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
+type LeafOptions = super::CommonArgs<super::AccountJson, super::NoAuthenticationArgs>;
+type PrincipalLeafOptions =
+    super::CommonArgs<super::AccountJson, super::PrincipalAuthenticationArgs>;
 
 fn execute_mutation<O>(
     deployment: &Deployment,
@@ -136,7 +128,7 @@ fn execute_update(
     let outcome = super::execute_with_principal_credential(
         deployment,
         command.options.http.transport_policy(),
-        &command.authentication,
+        &command.options.authentication,
         "prepare account update networking",
         "update Scherzo Cloud account through",
         |client, api_url, access_token| {
@@ -151,7 +143,11 @@ fn execute_update(
     )?;
     update::write_outcome(
         command.options.json,
-        command.authentication.service_api_key_file.is_some(),
+        command
+            .options
+            .authentication
+            .service_api_key_file
+            .is_some(),
         command.clear_display_name,
         deployment.fingerprint().api_url(),
         &outcome,

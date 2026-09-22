@@ -5,7 +5,7 @@ Print version information
 Usage: scherzo-cloud version [OPTIONS]
 
 Options:
-      --json  Print version information as JSON
+      --json  Print the version result as JSON
   -h, --help  Print help
 
 ```

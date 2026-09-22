@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 
 use anyhow::{Context, anyhow};
-use clap::Args;
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
@@ -10,18 +9,8 @@ use crate::human_auth::session::{self, LogoutOutcome, RevocationState};
 
 pub(super) const ABOUT: &str = "Sign out of Scherzo Cloud on this device";
 
-// Logout and status intentionally retain command-local output contracts even
-// though both expose JSON and transport-policy flags.
-// jscpd:ignore-start
-#[derive(Debug, Args)]
-pub(super) struct Command {
-    #[arg(long, help = "Print the sign-out result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    http: super::super::HttpOptions,
-}
-// jscpd:ignore-end
+pub(super) type Command =
+    super::super::CommonArgs<super::super::SignInJson, super::super::NoAuthenticationArgs>;
 
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> super::super::CommandResult {

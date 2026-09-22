@@ -36,21 +36,7 @@ enum ProjectCommand {
     RunnerPool(RunnerPoolCommand),
 }
 
-// Project leaves require project-specific JSON help while sharing only HTTP policy;
-// keeping this Clap type local avoids coupling it to runner output terminology.
-// jscpd:ignore-start
-#[derive(Debug, Args)]
-struct Options {
-    #[arg(long, help = "Print the project result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
-// jscpd:ignore-end
+type Options = super::CommonArgs<super::ProjectJson, super::PrincipalAuthenticationArgs>;
 
 #[derive(Debug, Args)]
 struct RepositorySelectionArgs {

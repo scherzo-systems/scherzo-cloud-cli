@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-use crate::cli::{ContinuationCursor, OrganizationArg};
+use crate::cli::OrganizationArg;
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{HttpClient, list_organization_audit_records};
@@ -9,7 +9,7 @@ use super::{LeafOptions, output};
 
 pub(super) const ABOUT: &str = "Work with organization audit records";
 const LIST_ABOUT: &str = "List organization audit records";
-const LIST_AFTER_HELP: &str = "Authorization:\n  Only an active organization owner can list audit records.\n\nPagination:\n  This command returns one page. Pass --cursor <CURSOR> to continue.\n\nPrivacy:\n  Records with unavailable details retain only record, occurrence, and retention metadata.\n  The command does not infer actor, action, or target details.";
+const LIST_AFTER_HELP: &str = "Authorization:\n  Only an active organization owner can list audit records.\n\nPrivacy:\n  Records with unavailable details retain only record, occurrence, and retention metadata.\n  The command does not infer actor, action, or target details.";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -41,29 +41,11 @@ struct ListCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization_ref: OrganizationArg,
 
-    #[arg(
-        long,
-        value_parser = parse_audit_list_limit,
-        help = "Maximum audit records to return (1-100)"
-    )]
-    limit: Option<u16>,
-
-    #[arg(long, help = "Opaque continuation cursor")]
-    cursor: Option<ContinuationCursor>,
+    #[command(flatten)]
+    pagination: crate::cli::PaginationArgs<100>,
 
     #[command(flatten)]
     options: LeafOptions,
-}
-
-fn parse_audit_list_limit(value: &str) -> Result<u16, String> {
-    let limit = value
-        .parse::<u16>()
-        .map_err(|_| "must be an integer from 1 through 100".to_owned())?;
-    if (1..=100).contains(&limit) {
-        Ok(limit)
-    } else {
-        Err("must be an integer from 1 through 100".to_owned())
-    }
 }
 
 impl ListCommand {
@@ -76,8 +58,8 @@ impl ListCommand {
                     api_url,
                     access_token,
                     &self.organization_ref,
-                    self.limit,
-                    self.cursor.as_deref(),
+                    self.pagination.limit,
+                    self.pagination.cursor.as_deref(),
                 )
             },
             output::write_audit_list,

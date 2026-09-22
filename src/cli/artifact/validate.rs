@@ -20,8 +20,8 @@ const COMMAND: &str = "scherzo-cloud artifact validate";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(long, help = "Print the artifact validation result as JSON")]
-    json: bool,
+    #[command(flatten)]
+    output: super::super::JsonArgs<super::super::ArtifactJson>,
 
     #[arg(
         value_name = "ARTIFACT_DIR",
@@ -66,7 +66,7 @@ impl Command {
         if control.is_cancelled() {
             return Ok(OutcomeClass::Interrupted.exit_code());
         }
-        if !self.json
+        if !self.output.json
             && validation
                 .diagnostics
                 .iter()
@@ -88,7 +88,7 @@ impl Command {
             ExitCode::GeneralFailure
         };
         super::super::complete_read_only_output(control, || {
-            if self.json {
+            if self.output.json {
                 write_json(&validation).context("write artifact validation output")?;
             } else {
                 write_human(&validation).context("write artifact validation output")?;

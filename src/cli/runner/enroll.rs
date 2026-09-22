@@ -45,8 +45,8 @@ pub(super) struct Command {
     )]
     config: PathBuf,
 
-    #[arg(long, help = "Print the non-secret enrollment result as JSON")]
-    json: bool,
+    #[command(flatten)]
+    output: super::super::JsonArgs<super::super::RunnerJson>,
 }
 
 impl Command {
@@ -69,7 +69,7 @@ impl Command {
                 response,
                 replacement: false,
             } => {
-                write_initial_enrollment(&mut io::stdout().lock(), &response, self.json)?;
+                write_initial_enrollment(&mut io::stdout().lock(), &response, self.output.json)?;
                 Ok(ExitCode::Success)
             }
             EnrollmentOutcome::Enrolled {
@@ -87,7 +87,7 @@ impl Command {
                 cloud_outcome: "already_enrolled",
             }),
             EnrollmentOutcome::Gone { activation_id } => {
-                if self.json {
+                if self.output.json {
                     serde_json::to_writer_pretty(
                         &mut io::stdout().lock(),
                         &serde_json::json!({
@@ -110,7 +110,7 @@ impl Command {
 
     fn finish_replacement(&self, enrollment: ReplacementEnrollment) -> anyhow::Result<ExitCode> {
         let promotion = promote_replacement(&self.config, &enrollment);
-        if self.json {
+        if self.output.json {
             write_replacement_json(&mut io::stdout().lock(), &enrollment, promotion)?;
         } else {
             write_replacement_human(&mut io::stdout().lock(), &enrollment, promotion)?;

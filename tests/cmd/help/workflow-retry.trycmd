@@ -10,7 +10,7 @@ Arguments:
 Options:
       --execution-root <PATH>  Directory for workflow execution (must already exist)
       --plain                  Force plain human presentation
-      --json                   Print the result as JSON
+      --json                   Print the workflow result as JSON
       --color <WHEN>           Select renderer color behavior [default: auto] [possible values: auto, always, never]
   -h, --help                   Print help
 

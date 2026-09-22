@@ -19,9 +19,6 @@ pub(super) struct Operation {
         help = "Directory to create for the complete Artifact Set (must not already exist)"
     )]
     output: PathBuf,
-
-    #[arg(long, help = "Print the artifact download receipt as JSON")]
-    json: bool,
 }
 
 impl super::RemoteArtifactError for ArtifactAssemblyError {
@@ -56,10 +53,11 @@ impl super::RemoteArtifactOperation for Operation {
             run,
             authentication,
             result,
+            json,
         } = output;
         match result {
             Ok(assembled) => {
-                if self.json {
+                if json {
                     super::super::write_pretty_json(&DownloadReceipt {
                         schema_version: 1,
                         deployment,

@@ -10,7 +10,7 @@ Arguments:
 Options:
       --attempt <NUMBER>  Attempt number to view (defaults to the current attempt)
       --plain             Force plain human presentation
-      --json              Print the result as JSON
+      --json              Print the workflow result as JSON
       --color <WHEN>      Select renderer color behavior [default: auto] [possible values: auto, always, never]
   -h, --help              Print help
 

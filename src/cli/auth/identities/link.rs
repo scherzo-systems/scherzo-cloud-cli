@@ -19,12 +19,6 @@ pub(super) const ABOUT: &str = "Link another sign-in identity";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(long, help = "Emit newline-delimited JSON events")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::super::super::PrincipalAuthenticationArgs,
-
     #[arg(
         long,
         value_name = "PATH|-",
@@ -33,7 +27,21 @@ pub(super) struct Command {
     workload_token_file: Option<PathBuf>,
 
     #[command(flatten)]
-    http: super::super::super::HttpOptions,
+    common: super::super::super::CommonArgs<
+        super::super::super::StreamingJson,
+        super::super::super::PrincipalAuthenticationArgs,
+    >,
+}
+
+impl std::ops::Deref for Command {
+    type Target = super::super::super::CommonArgs<
+        super::super::super::StreamingJson,
+        super::super::super::PrincipalAuthenticationArgs,
+    >;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 
 impl Command {
@@ -56,13 +64,11 @@ impl Command {
         if self.workload_token_file.is_some() {
             return Err(anyhow!("--workload-token-file requires --service-api-key-file").into());
         }
-        let options = OutputOptions {
-            json: self.json,
-            principal: super::super::PrincipalNetworkOptions {
-                authentication: super::super::super::PrincipalAuthenticationArgs::default(),
-                http: self.http,
-            },
-        };
+        let options = OutputOptions::new(
+            self.json,
+            super::super::super::PrincipalAuthenticationArgs::default(),
+            self.common.http,
+        );
         let client = options.client()?;
         let mut output = output::LinkOutput::new(options.json);
 
@@ -172,14 +178,14 @@ impl Command {
                 "--workload-token-file is required when --service-api-key-file is used for identity linking"
             )
         })?;
-        if self.authentication.uses_stdin() && workload_token_file == Path::new("-") {
+        if self.common.authentication.uses_stdin() && workload_token_file == Path::new("-") {
             return Err(anyhow!(
                 "standard input cannot supply both a service API key and a workload identity token"
             )
             .into());
         }
-        let mut output = output::LinkOutput::new(self.json);
-        let authentication = self.authentication;
+        let mut output = output::LinkOutput::new(self.common.json);
+        let authentication = self.common.authentication;
         let Some(api_key) = read_secret_cancellable(cancellation, move || {
             authentication.required_service_api_key()
         })?
@@ -197,7 +203,7 @@ impl Command {
                 .cancelled(deployment.fingerprint().api_url())
                 .map_err(Into::into);
         };
-        let client = scherzo_cloud_api::HttpClient::new(self.http.transport_policy())
+        let client = scherzo_cloud_api::HttpClient::new(self.common.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare identity networking")?;
         let idempotency_key = crate::idempotency::generate_idempotency_key()

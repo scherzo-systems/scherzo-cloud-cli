@@ -20,8 +20,6 @@ use scherzo_cloud_api::{
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud delegations";
 const NAME: &str = "delegation";
 const ERROR_CONTEXT: &str = "configure Scherzo Cloud delegation access";
-const LIST_AFTER_HELP: &str =
-    "Pagination:\n  This command returns one page. Pass --cursor <CURSOR> to continue.";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -31,7 +29,7 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum DelegationCommand {
-    #[command(about = "List your delegation history", after_help = LIST_AFTER_HELP)]
+    #[command(about = "List your delegation history")]
     List(ListCommand),
     #[command(about = "Propose delegation to a service principal")]
     Propose(ProposeCommand),
@@ -43,17 +41,8 @@ enum DelegationCommand {
     End(EndCommand),
 }
 
-#[derive(Debug, Args)]
-struct DelegationOptions {
-    #[arg(long, help = "Print the delegation result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    authentication: super::PrincipalAuthenticationArgs,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
+type DelegationOptions =
+    super::CommonArgs<super::DelegationJson, super::PrincipalAuthenticationArgs>;
 
 // Participant-selected reads and mutations share one credential decision, while mutations add a
 // non-optional request identity. Keeping both paths here makes that distinction explicit.
@@ -115,14 +104,10 @@ impl DelegationOptions {
 }
 // jscpd:ignore-end
 
-#[derive(Debug, Args)]
-struct DelegationOutputOptions {
-    #[arg(long, help = "Print the delegation result as JSON")]
-    json: bool,
-
-    #[command(flatten)]
-    http: super::HttpOptions,
-}
+type DelegationOutputOptions =
+    super::CommonArgs<super::DelegationJson, super::NoAuthenticationArgs>;
+type RequiredDelegationOptions =
+    super::CommonArgs<super::DelegationJson, super::RequiredServiceAuthenticationArgs>;
 
 #[derive(Debug, Args)]
 struct ListCommand {
@@ -171,10 +156,7 @@ struct AcceptCommand {
     target: DelegationTarget,
 
     #[command(flatten)]
-    authentication: super::RequiredServiceAuthenticationArgs,
-
-    #[command(flatten)]
-    options: DelegationOutputOptions,
+    options: RequiredDelegationOptions,
 }
 
 #[derive(Debug, Args)]
@@ -284,7 +266,7 @@ impl ShowCommand {
 // jscpd:ignore-start
 impl AcceptCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let api_key = self.authentication.api_key()?;
+        let api_key = self.options.authentication.api_key()?;
         let idempotency_key = crate::idempotency::generate_idempotency_key()
             .context("generate delegation acceptance request identity")?;
         let client = HttpClient::new(self.options.http.transport_policy())

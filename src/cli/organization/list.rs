@@ -6,7 +6,7 @@ use crate::human_auth::deployment::Deployment;
 use super::LeafOptions;
 
 pub(super) const ABOUT: &str = "List your Scherzo Cloud organization memberships";
-const AFTER_HELP: &str = "Visibility:\n  Organization names and slugs appear only for active memberships in active\n  organizations. Historical rows retain organization IDs and lifecycle states.\n\nPagination:\n  This command returns one page. Pass --cursor <CURSOR> to continue.";
+const AFTER_HELP: &str = "Visibility:\n  Organization names and slugs appear only for active memberships in active\n  organizations. Historical rows retain organization IDs and lifecycle states.";
 
 #[derive(Debug, Args)]
 #[command(after_help = AFTER_HELP)]
