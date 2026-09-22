@@ -16,23 +16,34 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
+/// CreateLinearAuthorizationSessionRequest : Connect omits connectionId; reauthorize requires it.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UpdateProjectRepositoryPatch {
-    #[serde(rename = "defaultBranch")]
-    pub default_branch: String,
-    /// An optional active human delegator used only for service-action audit attribution.
-    #[serde(
-        rename = "delegatorPrincipalId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub delegator_principal_id: Option<String>,
+pub struct CreateLinearAuthorizationSessionRequest {
+    #[serde(rename = "operation")]
+    pub operation: Operation,
+    #[serde(rename = "connectionId", skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
 }
 
-impl UpdateProjectRepositoryPatch {
-    pub fn new(default_branch: String) -> UpdateProjectRepositoryPatch {
-        UpdateProjectRepositoryPatch {
-            default_branch,
-            delegator_principal_id: None,
+impl CreateLinearAuthorizationSessionRequest {
+    /// Connect omits connectionId; reauthorize requires it.
+    pub fn new(operation: Operation) -> CreateLinearAuthorizationSessionRequest {
+        CreateLinearAuthorizationSessionRequest {
+            operation,
+            connection_id: None,
         }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Operation {
+    #[serde(rename = "connect")]
+    Connect,
+    #[serde(rename = "reauthorize")]
+    Reauthorize,
+}
+
+impl Default for Operation {
+    fn default() -> Operation {
+        Self::Connect
     }
 }

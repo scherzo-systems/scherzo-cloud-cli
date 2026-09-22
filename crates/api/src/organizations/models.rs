@@ -179,6 +179,8 @@ pub enum OrganizationAuditSubjectKind {
     RunnerActivation,
     RunnerCredential,
     GithubInstallation,
+    LinearAuthorizationSession,
+    LinearConnection,
     Project,
     RepositoryConnection,
     Assignment,
@@ -944,6 +946,11 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             Kind::RunnerActivation => (OrganizationAuditSubjectKind::RunnerActivation, "rna_"),
             Kind::RunnerCredential => (OrganizationAuditSubjectKind::RunnerCredential, "rrc_"),
             Kind::GithubInstallation => (OrganizationAuditSubjectKind::GithubInstallation, "ghi_"),
+            Kind::LinearAuthorizationSession => (
+                OrganizationAuditSubjectKind::LinearAuthorizationSession,
+                "las_",
+            ),
+            Kind::LinearConnection => (OrganizationAuditSubjectKind::LinearConnection, "lcn_"),
             Kind::Project => (OrganizationAuditSubjectKind::Project, "prj_"),
             Kind::RepositoryConnection => {
                 (OrganizationAuditSubjectKind::RepositoryConnection, "rpc_")

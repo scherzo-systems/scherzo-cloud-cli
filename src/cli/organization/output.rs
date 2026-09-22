@@ -465,6 +465,8 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
         OrganizationAuditSubjectKind::Project => "project",
         OrganizationAuditSubjectKind::RepositoryConnection => "repository_connection",
         OrganizationAuditSubjectKind::Assignment => "assignment",
+        OrganizationAuditSubjectKind::LinearAuthorizationSession => "linear_authorization_session",
+        OrganizationAuditSubjectKind::LinearConnection => "linear_connection",
     }
 }
 

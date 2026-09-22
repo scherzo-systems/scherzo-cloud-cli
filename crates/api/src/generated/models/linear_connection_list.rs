@@ -17,22 +17,18 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UpdateProjectRepositoryPatch {
-    #[serde(rename = "defaultBranch")]
-    pub default_branch: String,
-    /// An optional active human delegator used only for service-action audit attribution.
-    #[serde(
-        rename = "delegatorPrincipalId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub delegator_principal_id: Option<String>,
+pub struct LinearConnectionList {
+    #[serde(rename = "items")]
+    pub items: Vec<models::LinearConnection>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
-impl UpdateProjectRepositoryPatch {
-    pub fn new(default_branch: String) -> UpdateProjectRepositoryPatch {
-        UpdateProjectRepositoryPatch {
-            default_branch,
-            delegator_principal_id: None,
+impl LinearConnectionList {
+    pub fn new(items: Vec<models::LinearConnection>) -> LinearConnectionList {
+        LinearConnectionList {
+            items,
+            next_cursor: None,
         }
     }
 }

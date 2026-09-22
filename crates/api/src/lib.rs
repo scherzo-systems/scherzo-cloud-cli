@@ -316,4 +316,29 @@ mod tests {
                 .any(|line| line == "content-type: application/merge-patch+json")
         );
     }
+
+    #[test]
+    fn generated_linear_callback_accepts_declared_html_response() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let body = "<!doctype html><p>Authorization received.</p>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let server = ScriptedHttpServer::respond(response);
+        let mut configuration = generated::apis::configuration::Configuration::new();
+        configuration.base_path = server.api_url.trim_end_matches("/api/").to_owned();
+
+        let result = generated::apis::source_connections_api::complete_linear_o_auth_callback(
+            &configuration,
+            "state",
+            Some("code"),
+            None,
+        );
+
+        assert_eq!(result.unwrap(), body);
+        let request = server.finish_one();
+        assert!(request.starts_with("GET /v1/integrations/linear/oauth/callback?"));
+    }
 }
