@@ -985,6 +985,555 @@ fn retained_output_carriers_are_verified_and_orphans_are_removed() {
 }
 
 #[test]
+fn inherited_seed_loads_required_values_and_preserves_full_durable_references() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message:\n        kind: text\n        from: path\n        path: message.txt\n      unused:\n        kind: text\n        from: path\n        path: unused.txt\n",
+    );
+    let run = InitialLocalRun::create(
+        &fixture.run_path("inherited-output-chain"),
+        &fixture.admitted,
+    )
+    .unwrap();
+    let private = run.create_private_staging().unwrap();
+    let artifacts = ArtifactStaging::create_bound(
+        fixture.admitted.execution(),
+        private.path(),
+        private.root_handle(),
+    )
+    .unwrap();
+    let mut state = read_state(run.root_handle()).unwrap();
+    let producer_attempt_id = state.attempts[0].attempt_id.clone();
+    let producer = crate::workflow::runtime::OutputProducer {
+        attempt_id: producer_attempt_id.clone(),
+        attempt_number: 1,
+        node: "first".to_owned(),
+        output: "message".to_owned(),
+    };
+    let unused_producer = crate::workflow::runtime::OutputProducer {
+        output: "unused".to_owned(),
+        ..producer.clone()
+    };
+    let producers = BTreeMap::from([
+        (("first".to_owned(), "message".to_owned()), producer.clone()),
+        (("first".to_owned(), "unused".to_owned()), unused_producer),
+    ]);
+    let attempts = open_directory_at(run.root_handle(), ATTEMPTS_DIRECTORY).unwrap();
+    let attempt = open_directory_at(&attempts, "000001").unwrap();
+    let values = create_or_open_directory(&attempt, VALUES_DIRECTORY).unwrap();
+    let steps = create_or_open_directory(&values, "steps").unwrap();
+    let first = create_or_open_directory(&steps, "first").unwrap();
+    let source_message = retain_output_value_with_producer(
+        &artifacts,
+        &first,
+        AttemptNodeRoleV1::Step,
+        "first",
+        "message",
+        &crate::workflow::value::CapturedValue::text(Arc::from("evidence\n")),
+        None,
+    )
+    .unwrap();
+    let source_unused = retain_output_value_with_producer(
+        &artifacts,
+        &first,
+        AttemptNodeRoleV1::Step,
+        "first",
+        "unused",
+        &crate::workflow::value::CapturedValue::text(Arc::from("unused\n")),
+        None,
+    )
+    .unwrap();
+    sync_directory(&first).unwrap();
+    sync_directory(&steps).unwrap();
+    sync_directory(&values).unwrap();
+    sync_directory(&attempt).unwrap();
+    state.attempts[0].progress.steps[0].state = AttemptStepStateV1::Succeeded;
+    state.attempts[0].progress.steps[0].outputs = Some(vec![source_message, source_unused]);
+    let retained = inherited_retained_outputs(
+        &state,
+        2,
+        "first",
+        &BTreeMap::from([
+            (
+                "message".to_owned(),
+                crate::workflow::value::CapturedValue::text(Arc::from("evidence\n")),
+            ),
+            (
+                "unused".to_owned(),
+                crate::workflow::value::CapturedValue::text(Arc::from("unused\n")),
+            ),
+        ]),
+        &producers,
+    )
+    .unwrap();
+    let retained_message = retained
+        .iter()
+        .find(|output| output.name() == "message")
+        .unwrap()
+        .clone();
+
+    let run_metadata = read_run(run.root_handle()).unwrap();
+    let mut second = fresh_attempt(
+        &fixture.admitted,
+        2,
+        AttemptTriggerV1::Continuation,
+        Some(1),
+        attempt_definition_for_run(&run_metadata),
+        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+    )
+    .unwrap();
+    second.progress.steps[0].state = AttemptStepStateV1::Inherited;
+    second.progress.steps[0].detail = Some(NodeDetail::Inherited(
+        crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: producer_attempt_id,
+            prior_attempt_number: 1,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+            definition_changed: false,
+        },
+    ));
+    second.progress.steps[0].outputs = Some(retained.clone());
+    let second_attempt_id = second.attempt_id.clone();
+    state.attempts.push(second);
+
+    let mut third = fresh_attempt(
+        &fixture.admitted,
+        3,
+        AttemptTriggerV1::Continuation,
+        Some(2),
+        attempt_definition_for_run(&run_metadata),
+        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+    )
+    .unwrap();
+    third.progress.steps[0].state = AttemptStepStateV1::Inherited;
+    third.progress.steps[0].detail = Some(NodeDetail::Inherited(
+        crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: second_attempt_id,
+            prior_attempt_number: 2,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Inherited,
+            definition_changed: true,
+        },
+    ));
+    third.progress.steps[0].outputs = Some(retained.clone());
+    state.attempts.push(third);
+    state.current_attempt_number = 3;
+
+    let replacement_source = "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message:\n        kind: text\n        from: path\n        path: message.txt\n      added:\n        kind: text\n        from: path\n        path: added.txt\nexports:\n  message:\n    ref: outputs.first.message\n";
+    fs::write(
+        fixture
+            .admitted
+            .workflow()
+            .source
+            .source_root
+            .join("workflow.yaml"),
+        replacement_source,
+    )
+    .unwrap();
+    let replacement = admit_workflow(
+        resolution::resolve(
+            &fixture.admitted.workflow().source.source_root,
+            Path::new("workflow.yaml"),
+        )
+        .unwrap(),
+        ResolvedInputs::default(),
+        ExecutionContext::new(
+            fixture.execution_root.clone(),
+            ExecutionPolicyLimits::new(
+                2,
+                CaptureLimits::new(16, 1024, 4096),
+                InputLimits::new(16, 1024, 4096, 4096),
+                1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
+        ),
+    )
+    .unwrap();
+    let current = Mutex::new(state);
+    let seed =
+        load_execution_seed(run.root_handle(), &current, 3, &replacement, &artifacts).unwrap();
+    let inherited = seed.inherited_step("first").unwrap();
+    assert_eq!(inherited.disposition, InheritedDisposition::Succeeded);
+    assert_eq!(inherited.producers["message"], producer);
+    assert!(matches!(
+        &inherited.outputs["message"],
+        CapturedValue::Text(value) if value.as_str() == "evidence\n"
+    ));
+    assert!(!inherited.outputs.contains_key("unused"));
+
+    let reduction = super::super::runtime::initialize_seeded_with_operation::<
+        (),
+        StepFailureCause,
+        CapturedValue,
+        (),
+    >(&replacement, seed.clone(), None);
+    let mut durable_nodes = lock_state(&current).unwrap().attempts[2]
+        .progress
+        .steps
+        .clone();
+    update_progress_nodes(
+        &mut durable_nodes,
+        &reduction.state.steps,
+        &BTreeMap::from([(
+            (AttemptNodeRoleV1::Step, "first".to_owned()),
+            vec![retained_message],
+        )]),
+    )
+    .unwrap();
+    assert_eq!(durable_nodes[0].outputs.as_ref(), Some(&retained));
+    assert!(
+        !run.run_directory()
+            .join("attempts/000002/values/steps/first/message")
+            .exists()
+    );
+
+    let staged_carrier = inherited.outputs["message"]
+        .private_capture_carrier()
+        .unwrap();
+    let staged = fstat(artifacts.open_artifact(staged_carrier.handle()).unwrap()).unwrap();
+    let original = fs::metadata(
+        run.run_directory()
+            .join("attempts/000001/values/steps/first/message"),
+    )
+    .unwrap();
+    assert_eq!(
+        staged.st_dev,
+        std::os::unix::fs::MetadataExt::dev(&original)
+    );
+    assert_eq!(
+        staged.st_ino,
+        std::os::unix::fs::MetadataExt::ino(&original)
+    );
+}
+
+#[test]
+fn continuation_validation_binds_inheritance_to_the_immediate_prior_step() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1
+steps:
+  first:
+    kind: cmd
+    command: {argv: [\"true\"]}
+    outputs:
+      message:
+        kind: text
+        from: path
+        path: message.txt
+  second:
+    kind: cmd
+    dependsOn: [first]
+    command: {argv: [\"true\"]}
+",
+    );
+    let run = InitialLocalRun::create(
+        &fixture.run_path("continuation-prior-step-binding"),
+        &fixture.admitted,
+    )
+    .unwrap();
+    settle_as_succeeded(&run);
+    let mut state = read_state(run.root_handle()).unwrap();
+    let run_metadata = read_run(run.root_handle()).unwrap();
+    let producer_attempt_id = state.attempts[0].attempt_id.clone();
+    let source = RetainedOutputV1::Text {
+        name: "message".to_owned(),
+        producer: None,
+        carrier: RetainedCarrierV1 {
+            relative_path: retained_value_relative_path(
+                AttemptNodeRoleV1::Step,
+                "first",
+                "message",
+            ),
+            media_type: "text/plain; charset=utf-8".to_owned(),
+            size_bytes: 9,
+            digest: DigestV1::sha256(b"evidence\n"),
+        },
+    };
+    state.attempts[0].progress.steps[0].outputs = Some(vec![source.clone()]);
+
+    let mut second = fresh_attempt(
+        &fixture.admitted,
+        2,
+        AttemptTriggerV1::ExplicitRetry,
+        Some(1),
+        attempt_definition_for_run(&run_metadata),
+        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+    )
+    .unwrap();
+    let second_settled = second.created_at.clone();
+    second.started_at = Some(second_settled.clone());
+    second.settled_at = Some(second_settled);
+    second.settlement_snapshot = Some(fixture_settlement_snapshot());
+    let second_settlement_snapshot = second.settlement_snapshot.clone().unwrap();
+    second.state = AttemptStateV1::Succeeded;
+    second.progress.steps[0].state = AttemptStepStateV1::Skipped;
+    second.progress.steps[0].detail = Some(NodeDetail::Skipped(
+        crate::workflow::evidence::ConditionFalseDetail::new([
+            crate::workflow::evidence::EvaluatedPredicateEvidence {
+                path: String::new(),
+                result: false,
+            },
+        ])
+        .unwrap(),
+    ));
+    second.progress.steps[1].state = AttemptStepStateV1::Succeeded;
+    second.result = AttemptResultV1::NotPublished {
+        reason: ResultAbsentReasonV1::PublicationPending,
+    };
+    let second_attempt_id = second.attempt_id.clone();
+    let second_execution_root = second.execution_root.clone();
+    state.attempts.push(second);
+
+    let mut third = fresh_attempt(
+        &fixture.admitted,
+        3,
+        AttemptTriggerV1::Continuation,
+        Some(2),
+        attempt_definition_for_run(&run_metadata),
+        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+    )
+    .unwrap();
+    third.progress.steps[0].state = AttemptStepStateV1::Inherited;
+    third.progress.steps[0].detail = Some(NodeDetail::Inherited(
+        crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: second_attempt_id.clone(),
+            prior_attempt_number: 2,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Skipped,
+            definition_changed: false,
+        },
+    ));
+    let execution_root = third.execution_root.clone();
+    third.continuation = Some(
+        serde_json::from_value(json!({
+            "request": {
+                "fromSteps": ["second"],
+                "definition": "inherited"
+            },
+            "fromSteps": ["second"],
+            "reexecutedSteps": ["second"],
+            "inheritedSteps": [{
+                "id": "first",
+                "priorState": "skipped",
+                "definitionChanged": false
+            }],
+            "definitionSource": {
+                "kind": "inherited",
+                "manifestDigest": {"algorithm": "sha256", "value": "2".repeat(64)},
+                "priorManifestDigest": {"algorithm": "sha256", "value": "2".repeat(64)}
+            },
+            "workspace": {
+                "executionRoot": execution_root,
+                "priorExecutionRoot": second_execution_root,
+                "startSnapshot": {
+                    "algorithm": "git_worktree_sha256_v1",
+                    "unavailable": "not_work_tree"
+                },
+                "priorSettlementSnapshot": second_settlement_snapshot,
+                "modified": "unknown",
+                "quiescence": {
+                    "groupsRecorded": 0,
+                    "groupsTerminated": 0,
+                    "groupsAbsent": 0,
+                    "provenAt": "2026-08-02T12:01:42Z"
+                }
+            }
+        }))
+        .unwrap(),
+    );
+    state.current_attempt_number = 3;
+    state.attempts.push(third);
+    assert_eq!(validate_state(&state), Ok(()));
+
+    let mut missing_full_reexecution_record = state.clone();
+    let current = missing_full_reexecution_record.attempts.last_mut().unwrap();
+    current.continuation = None;
+    current.progress.steps[0].state = AttemptStepStateV1::Pending;
+    current.progress.steps[0].detail = None;
+    current.progress.steps[0].outputs = None;
+    assert_eq!(
+        validate_state(&missing_full_reexecution_record),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut explicit_request_root = state.clone();
+    let execution_root = explicit_request_root.attempts[2]
+        .continuation
+        .as_ref()
+        .unwrap()
+        .workspace
+        .execution_root
+        .clone();
+    explicit_request_root.attempts[2]
+        .continuation
+        .as_mut()
+        .unwrap()
+        .request
+        .execution_root = Some(execution_root);
+    assert_eq!(validate_state(&explicit_request_root), Ok(()));
+
+    let mut mismatched_request_root = state.clone();
+    mismatched_request_root
+        .attempts
+        .last_mut()
+        .unwrap()
+        .continuation
+        .as_mut()
+        .unwrap()
+        .request
+        .execution_root = Some("/different-execution-root".to_owned());
+    assert_eq!(
+        validate_state(&mismatched_request_root),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut mismatched_prior_workspace = state.clone();
+    mismatched_prior_workspace
+        .attempts
+        .last_mut()
+        .unwrap()
+        .continuation
+        .as_mut()
+        .unwrap()
+        .workspace
+        .prior_execution_root = "/different-prior-root".to_owned();
+    assert_eq!(
+        validate_state(&mismatched_prior_workspace),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut missing_prior_snapshot = state.clone();
+    missing_prior_snapshot
+        .attempts
+        .last_mut()
+        .unwrap()
+        .continuation
+        .as_mut()
+        .unwrap()
+        .workspace
+        .prior_settlement_snapshot = None;
+    assert_eq!(
+        validate_state(&missing_prior_snapshot),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut mismatched_prior_state = state.clone();
+    let current = mismatched_prior_state.attempts.last_mut().unwrap();
+    let Some(NodeDetail::Inherited(detail)) = &mut current.progress.steps[0].detail else {
+        panic!("fixture must contain inherited detail");
+    };
+    detail.prior_state = crate::workflow::evidence::InheritedPriorState::Succeeded;
+    current.continuation.as_mut().unwrap().inherited_steps[0].prior_state =
+        crate::workflow::evidence::InheritedPriorState::Succeeded;
+    assert_eq!(
+        validate_state(&mismatched_prior_state),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut impossible_skipped_output = state.clone();
+    let mut inherited = source.clone();
+    inherited.set_producer(crate::workflow::runtime::OutputProducer {
+        attempt_id: producer_attempt_id.clone(),
+        attempt_number: 1,
+        node: "first".to_owned(),
+        output: "message".to_owned(),
+    });
+    impossible_skipped_output.attempts[2].progress.steps[0].outputs = Some(vec![inherited]);
+    assert_eq!(
+        validate_state(&impossible_skipped_output),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut flattened_chain = state.clone();
+    let initial_attempt_id = flattened_chain.attempts[0].attempt_id.clone();
+    let initial_execution_root = flattened_chain.attempts[0].execution_root.clone();
+    let initial_settlement_snapshot = flattened_chain.attempts[0].settlement_snapshot.clone();
+    let mut flattened = source.clone();
+    flattened.set_producer(crate::workflow::runtime::OutputProducer {
+        attempt_id: initial_attempt_id.clone(),
+        attempt_number: 1,
+        node: "first".to_owned(),
+        output: "message".to_owned(),
+    });
+    let mut second_record = flattened_chain.attempts[2].continuation.clone().unwrap();
+    let second = &mut flattened_chain.attempts[1];
+    second.trigger = AttemptTriggerV1::Continuation;
+    second.progress.steps[0].state = AttemptStepStateV1::Inherited;
+    second.progress.steps[0].detail = Some(NodeDetail::Inherited(
+        crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: initial_attempt_id,
+            prior_attempt_number: 1,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+            definition_changed: false,
+        },
+    ));
+    second.progress.steps[0].outputs = Some(vec![flattened.clone()]);
+    second_record.inherited_steps[0].prior_state =
+        crate::workflow::evidence::InheritedPriorState::Succeeded;
+    second_record.workspace.prior_execution_root = initial_execution_root;
+    second_record.workspace.prior_settlement_snapshot = initial_settlement_snapshot;
+    second.continuation = Some(second_record);
+    let third = &mut flattened_chain.attempts[2];
+    let Some(NodeDetail::Inherited(detail)) = &mut third.progress.steps[0].detail else {
+        panic!("fixture must contain inherited detail");
+    };
+    detail.prior_state = crate::workflow::evidence::InheritedPriorState::Inherited;
+    third.continuation.as_mut().unwrap().inherited_steps[0].prior_state =
+        crate::workflow::evidence::InheritedPriorState::Inherited;
+    third.progress.steps[0].outputs = Some(vec![flattened]);
+    assert_eq!(validate_state(&flattened_chain), Ok(()));
+
+    let mut false_flattening = flattened_chain;
+    false_flattening.attempts[2].progress.steps[0]
+        .outputs
+        .as_mut()
+        .unwrap()[0]
+        .set_producer(crate::workflow::runtime::OutputProducer {
+            attempt_id: second_attempt_id.clone(),
+            attempt_number: 2,
+            node: "first".to_owned(),
+            output: "message".to_owned(),
+        });
+    assert_eq!(
+        validate_state(&false_flattening),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+
+    let mut direct_prior_producer = state;
+    direct_prior_producer.attempts[1].progress.steps[0].state = AttemptStepStateV1::Succeeded;
+    direct_prior_producer.attempts[1].progress.steps[0].detail = None;
+    direct_prior_producer.attempts[1].progress.steps[0].outputs = Some(vec![source.clone()]);
+    let current = &mut direct_prior_producer.attempts[2];
+    let Some(NodeDetail::Inherited(detail)) = &mut current.progress.steps[0].detail else {
+        panic!("fixture must contain inherited detail");
+    };
+    detail.prior_state = crate::workflow::evidence::InheritedPriorState::Succeeded;
+    current.continuation.as_mut().unwrap().inherited_steps[0].prior_state =
+        crate::workflow::evidence::InheritedPriorState::Succeeded;
+    let mut inherited = source;
+    inherited.set_producer(crate::workflow::runtime::OutputProducer {
+        attempt_id: second_attempt_id,
+        attempt_number: 2,
+        node: "first".to_owned(),
+        output: "message".to_owned(),
+    });
+    current.progress.steps[0].outputs = Some(vec![inherited]);
+    assert_eq!(validate_state(&direct_prior_producer), Ok(()));
+
+    let mut stale_producer = direct_prior_producer;
+    stale_producer.attempts[2].progress.steps[0]
+        .outputs
+        .as_mut()
+        .unwrap()[0]
+        .set_producer(crate::workflow::runtime::OutputProducer {
+            attempt_id: producer_attempt_id,
+            attempt_number: 1,
+            node: "first".to_owned(),
+            output: "message".to_owned(),
+        });
+    assert_eq!(
+        validate_state(&stale_producer),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+}
+
+#[test]
 fn retained_output_verification_rejects_a_fifo_without_waiting_for_a_writer() {
     let fixture = AdmittedFixture::from_source(
         "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message:\n        kind: text\n        from: path\n        path: message.txt\n",
@@ -1141,7 +1690,9 @@ fn attempt_definition_locator_resolves_attempt_retention_without_run_fallback() 
     retry
         .state
         .update(|state| {
+            let prior = state.attempts[0].clone();
             let current = current_attempt_mut(state)?;
+            let manifest_digest = DigestV1::sha256(&manifest_bytes);
             current.trigger = AttemptTriggerV1::Continuation;
             current.definition = Some(AttemptDefinitionV1 {
                 digest: DigestV1 {
@@ -1154,9 +1705,46 @@ fn attempt_definition_locator_resolves_attempt_retention_without_run_fallback() 
                         .to_owned(),
                     value: fixture.admitted.workflow().content_digest.value.clone(),
                 },
-                manifest_digest: DigestV1::sha256(&manifest_bytes),
+                manifest_digest: manifest_digest.clone(),
                 locator: AttemptDefinitionLocatorV1::Attempt { attempt_number: 2 },
             });
+            current.continuation = Some(
+                serde_json::from_value(json!({
+                    "request": {
+                        "fromSteps": ["first"],
+                        "definition": {
+                            "replaced": {
+                                "path": fixture.admitted.workflow().source.source_root.join("workflow.yaml")
+                            }
+                        }
+                    },
+                    "fromSteps": ["first"],
+                    "reexecutedSteps": ["first", "second"],
+                    "inheritedSteps": [],
+                    "definitionSource": {
+                        "kind": "replaced",
+                        "manifestDigest": manifest_digest,
+                        "priorManifestDigest": prior.definition.as_ref().unwrap().manifest_digest
+                    },
+                    "workspace": {
+                        "executionRoot": current.execution_root,
+                        "priorExecutionRoot": prior.execution_root,
+                        "startSnapshot": {
+                            "algorithm": "git_worktree_sha256_v1",
+                            "unavailable": "not_work_tree"
+                        },
+                        "priorSettlementSnapshot": prior.settlement_snapshot,
+                        "modified": "unknown",
+                        "quiescence": {
+                            "groupsRecorded": 0,
+                            "groupsTerminated": 0,
+                            "groupsAbsent": 0,
+                            "provenAt": "2026-08-02T12:01:42Z"
+                        }
+                    }
+                }))
+                .unwrap(),
+            );
             Ok(())
         })
         .unwrap();
@@ -1499,6 +2087,7 @@ fn retain_text_output_for_step(
     fs::write(path, bytes).unwrap();
     let retained = RetainedOutputV1::Text {
         name: output_name.to_owned(),
+        producer: None,
         carrier: RetainedCarrierV1 {
             relative_path,
             media_type: "text/plain; charset=utf-8".to_owned(),
@@ -1540,6 +2129,7 @@ fn retain_file_outputs_for_step(
         fs::write(path, bytes).unwrap();
         retained.push(RetainedOutputV1::File {
             name: (*name).to_owned(),
+            producer: None,
             media_type: (*media_type).to_owned(),
             carrier: RetainedCarrierV1 {
                 relative_path,
@@ -2631,6 +3221,7 @@ fn archived_attempt_binds_retained_output_kind_and_export_metadata() {
             };
             outputs[0] = RetainedOutputV1::Json {
                 name: "message".to_owned(),
+                producer: None,
                 carrier: RetainedCarrierV1 {
                     media_type: "application/json".to_owned(),
                     ..carrier

@@ -16,7 +16,9 @@ use crate::workflow::admission::{
     ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,
 };
 use crate::workflow::agent::{AgentOutcome, AgentValueKind};
-use crate::workflow::artifact::{ArtifactReadFailure, CaptureDeclaration, CapturedArtifact};
+use crate::workflow::artifact::{
+    ArtifactReadFailure, CaptureCancellation, CaptureDeclaration, CapturedArtifact,
+};
 use crate::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::workflow::evidence::{
     CancellationDetail, PrimaryIssue, failure_detail as canonical_failure_detail,
@@ -25,6 +27,7 @@ use crate::workflow::pi_json_v1::{
     PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits,
 };
 use crate::workflow::resolution;
+use crate::workflow::result_validation::RetainedJsonSchema;
 use crate::workflow::runtime::{ForceAbortEvidence, OutputSet, RunCancellationPhase};
 use crate::workflow::validated::{WorkflowNode, WorkflowNodeRole};
 
@@ -107,6 +110,37 @@ impl PublicationFixture {
             .unwrap()
     }
 
+    fn capture_json(&self, identity: &str, relative_path: &str, bytes: &[u8]) -> CapturedValue {
+        let path = self.execution_root.join(relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        let schema_document = Arc::new(serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object"
+        }));
+        let schema = RetainedJsonSchema::compile(
+            Arc::from(
+                br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#
+                    .as_slice(),
+            ),
+            schema_document,
+        )
+        .unwrap();
+        self.artifacts
+            .capture_file_candidates(
+                &[CaptureDeclaration::json(
+                    identity,
+                    Path::new(relative_path),
+                    &schema,
+                )],
+                &CaptureCancellation::default(),
+            )
+            .unwrap()
+            .commit()
+            .remove(identity)
+            .unwrap()
+    }
+
     fn destination(&self, name: &str) -> PathBuf {
         self.results_parent.join(name)
     }
@@ -177,6 +211,8 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
     WorkflowRunResult {
         run_directory: fixture.results_parent.clone(),
         attempt_number: 1,
+        continuation: None,
+        output_producers: BTreeMap::new(),
         workflow_path: "workflow.yaml".to_owned(),
         source_root: fixture.source_root.clone(),
         content_digest: fixture.content_digest.clone(),
@@ -375,6 +411,109 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     assert!(prepared.carriers.is_empty());
     let document: serde_json::Value = serde_json::from_slice(&prepared.result_json).unwrap();
     assert_eq!(document["exports"], serde_json::json!({}));
+}
+
+#[test]
+fn continuation_publication_records_and_binds_export_sources() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    run.attempt_number = 2;
+    let outputs = match std::mem::replace(&mut run.steps[0].state, StepState::Pending) {
+        StepState::Succeeded { outputs } => outputs,
+        _ => panic!("fixture producer must have succeeded"),
+    };
+    run.steps[0].state = StepState::Inherited {
+        detail: crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            prior_attempt_number: 1,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+            definition_changed: false,
+        },
+        disposition: crate::workflow::runtime::InheritedDisposition::Succeeded,
+        outputs,
+    };
+    run.steps[0].timing = None;
+    run.steps[0].command_output = None;
+    run.output_producers = BTreeMap::from([(
+        "produce".to_owned(),
+        BTreeMap::from([
+            (
+                "lower".to_owned(),
+                OutputProducer {
+                    attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+                    attempt_number: 1,
+                    node: "produce".to_owned(),
+                    output: "lower".to_owned(),
+                },
+            ),
+            (
+                "upper".to_owned(),
+                OutputProducer {
+                    attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+                    attempt_number: 1,
+                    node: "produce".to_owned(),
+                    output: "upper".to_owned(),
+                },
+            ),
+        ]),
+    )]);
+    let execution_root = fixture.execution_root.to_str().unwrap();
+    run.continuation = Some(
+        serde_json::from_value(json!({
+            "request": {
+                "fromSteps": ["terminal"],
+                "definition": "inherited"
+            },
+            "fromSteps": ["terminal"],
+            "reexecutedSteps": ["terminal"],
+            "inheritedSteps": [{
+                "id": "produce",
+                "priorState": "succeeded",
+                "definitionChanged": false
+            }],
+            "definitionSource": {
+                "kind": "inherited",
+                "manifestDigest": {"algorithm": "sha256", "value": "2".repeat(64)},
+                "priorManifestDigest": {"algorithm": "sha256", "value": "2".repeat(64)}
+            },
+            "workspace": {
+                "executionRoot": execution_root,
+                "priorExecutionRoot": execution_root,
+                "startSnapshot": {
+                    "algorithm": "git_worktree_sha256_v1",
+                    "unavailable": "not_work_tree"
+                },
+                "modified": "unknown",
+                "quiescence": {
+                    "groupsRecorded": 0,
+                    "groupsTerminated": 0,
+                    "groupsAbsent": 0,
+                    "provenAt": "2026-08-02T12:01:42Z"
+                }
+            }
+        }))
+        .unwrap(),
+    );
+
+    publish_workflow_result(
+        &fixture.destination("continuation-export-sources"),
+        &fixture.artifacts,
+        &run,
+    )
+    .unwrap();
+    let (_, document) = read_result(&fixture.destination("continuation-export-sources"));
+    assert_eq!(
+        document["exportSources"]["reportA"],
+        json!({
+            "node": {"id": "produce", "role": "step"},
+            "output": "upper"
+        })
+    );
+    assert_eq!(document["exports"]["reportA"]["provenance"], "inherited");
+    assert_eq!(
+        document["exports"]["reportA"]["producer"],
+        document["outputProducers"]["produce"]["upper"]
+    );
 }
 
 #[test]
@@ -595,6 +734,26 @@ fn publishes_text_json_and_file_exports_with_typed_canonical_metadata() {
     );
     assert_eq!(result["exports"]["result"]["kind"], "json");
     assert_eq!(result["exports"]["result"]["mediaType"], "application/json");
+}
+
+#[test]
+fn path_backed_json_exports_use_canonical_semantic_bytes() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let output = fixture.capture_json("result", "result.json", b"{\n  \"z\": 2,\n  \"a\": 1\n}\n");
+    run.exports = BTreeMap::from([("result".to_owned(), ExportValue::Available { output })]);
+    run.export_sources = BTreeMap::from([(
+        "result".to_owned(),
+        export_source("produce", "result", WorkflowValueType::Json),
+    )]);
+    let destination = fixture.destination("path-json");
+
+    publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+
+    assert_eq!(
+        fs::read(destination.join("exports/0001")).unwrap(),
+        br#"{"a":1,"z":2}"#
+    );
 }
 
 #[test]

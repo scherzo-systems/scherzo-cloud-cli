@@ -19,7 +19,9 @@ use super::force_abort_evidence::{
     ordinary_node_cancellation_matches,
 };
 use super::publication::{
-    CancellationReasonV1, DiagnosticStreamV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1,
+    CancellationReasonV1, ContinuationDefinitionSourceV1, ContinuationRecordV1,
+    ContinuationRequestedDefinitionV1, DiagnosticStreamV1, ExportProvenanceV1, ExportSourceV1,
+    ExportUnavailableReasonV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1,
     FinalizationTriggerV1, ForceAbortPhaseV1, RecoveryHandlerFailureCodeV1,
     RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
     RecoveryTerminationV1, RunResultInvariant, WorkflowNodeRoleV1, WorkflowOutcomeV1,
@@ -104,6 +106,11 @@ pub(crate) fn validate_document_envelope(document: &mut Value) -> Result<(), Res
         .and_then(|object| object.get_mut("exports"))
         .filter(|exports| exports.is_object())
         .map(|exports| std::mem::replace(exports, Value::Object(serde_json::Map::new())));
+    let retained_export_sources = document
+        .as_object_mut()
+        .and_then(|object| object.get_mut("exportSources"))
+        .filter(|sources| sources.is_object())
+        .map(|sources| std::mem::replace(sources, Value::Object(serde_json::Map::new())));
     let validation = serde_json::from_value::<WorkflowResultV1>(document.clone())
         .map_err(|_| ResultMetadataError)
         .and_then(|result| validate(&result));
@@ -113,6 +120,13 @@ pub(crate) fn validate_document_envelope(document: &mut Value) -> Result<(), Res
             .and_then(|object| object.get_mut("exports"))
     {
         *exports = retained_exports;
+    }
+    if let Some(retained_export_sources) = retained_export_sources
+        && let Some(export_sources) = document
+            .as_object_mut()
+            .and_then(|object| object.get_mut("exportSources"))
+    {
+        *export_sources = retained_export_sources;
     }
     validation
 }
@@ -221,9 +235,224 @@ pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), R
         validate_finalization(finalization, result.force_abort)
             .map_err(|_| RunResultInvariant::FinalizationMetadata)?;
     }
+    validate_continuation(result).map_err(|_| RunResultInvariant::Continuation)?;
     validate_force_abort(result).map_err(|_| RunResultInvariant::OutcomeMetadata)?;
     validate_outcome(result).map_err(|_| RunResultInvariant::OutcomeMetadata)?;
-    validate_exports(&result.exports).map_err(|_| RunResultInvariant::ExportMetadata)
+    validate_exports(result).map_err(|_| RunResultInvariant::ExportMetadata)
+}
+
+fn validate_continuation(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
+    let inherited_steps = result
+        .steps
+        .iter()
+        .filter(|step| step.state == WorkflowStepStateV1::Inherited)
+        .collect::<Vec<_>>();
+    let Some(continuation) = &result.continuation else {
+        return (inherited_steps.is_empty()
+            && result.output_producers.is_empty()
+            && result.export_sources.is_empty())
+        .then_some(())
+        .ok_or(ResultMetadataError);
+    };
+    if result.attempt_number <= 1 || !validate_continuation_record(continuation) {
+        return Err(ResultMetadataError);
+    }
+    let local_request = match &continuation.request.definition {
+        ContinuationRequestedDefinitionV1::Inherited(_) => None,
+        ContinuationRequestedDefinitionV1::Replaced { replaced } => Some(matches!(
+            replaced,
+            super::publication::ContinuationReplacementDefinitionSourceV1::Local(_)
+        )),
+    };
+    let request_valid = match &result.workflow.provenance {
+        WorkflowProvenanceV1::Local { .. } => {
+            local_request != Some(false) && continuation.request.expected_run_version.is_none()
+        }
+        WorkflowProvenanceV1::Cloud { .. } => {
+            local_request != Some(true) && continuation.request.execution_root.is_none()
+        }
+    };
+    let reexecuted = result
+        .steps
+        .iter()
+        .filter(|step| step.state != WorkflowStepStateV1::Inherited)
+        .map(|step| step.id.as_str())
+        .collect::<Vec<_>>();
+    if !request_valid
+        || !result.export_sources.keys().eq(result.exports.keys())
+        || reexecuted
+            != continuation
+                .reexecuted_steps
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        || inherited_steps.len() != continuation.inherited_steps.len()
+        || inherited_steps
+            .iter()
+            .zip(&continuation.inherited_steps)
+            .any(|(step, inherited)| {
+                let Some(NodeDetail::Inherited(detail)) = &step.detail else {
+                    return true;
+                };
+                step.id != inherited.id
+                    || detail.prior_attempt_number.checked_add(1) != Some(result.attempt_number)
+                    || detail.prior_state != inherited.prior_state
+                    || detail.definition_changed != inherited.definition_changed
+            })
+    {
+        return Err(ResultMetadataError);
+    }
+
+    for (node, outputs) in &result.output_producers {
+        let step = inherited_steps
+            .iter()
+            .find(|step| step.id == *node)
+            .ok_or(ResultMetadataError)?;
+        let NodeDetail::Inherited(detail) = step.detail.as_ref().ok_or(ResultMetadataError)? else {
+            return Err(ResultMetadataError);
+        };
+        if detail.prior_state == super::evidence::InheritedPriorState::Skipped || outputs.is_empty()
+        {
+            return Err(ResultMetadataError);
+        }
+        for (output, producer) in outputs {
+            if !is_identifier(output)
+                || producer.node != *node
+                || producer.output != *output
+                || !output_producer_matches_inherited_detail(producer, detail)
+            {
+                return Err(ResultMetadataError);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn output_producer_matches_inherited_detail(
+    producer: &super::runtime::OutputProducer,
+    detail: &super::evidence::InheritedDetail,
+) -> bool {
+    if !super::local_run::is_canonical_uuid(&producer.attempt_id) {
+        return false;
+    }
+    match detail.prior_state {
+        super::evidence::InheritedPriorState::Succeeded => {
+            producer.attempt_id == detail.prior_attempt_id
+                && producer.attempt_number == detail.prior_attempt_number
+        }
+        super::evidence::InheritedPriorState::Inherited => {
+            producer.attempt_number > 0 && producer.attempt_number < detail.prior_attempt_number
+        }
+        super::evidence::InheritedPriorState::Skipped => false,
+    }
+}
+
+pub(super) fn validate_continuation_record(record: &ContinuationRecordV1) -> bool {
+    let mut requested = BTreeSet::new();
+    let mut partition = BTreeSet::new();
+    if record.request.from_steps.is_empty()
+        || record.request.from_steps != record.from_steps
+        || record
+            .from_steps
+            .iter()
+            .any(|id| !is_identifier(id) || !requested.insert(id.as_str()))
+        || record
+            .reexecuted_steps
+            .iter()
+            .any(|id| !is_identifier(id) || !partition.insert(id.as_str()))
+        || record
+            .inherited_steps
+            .iter()
+            .any(|step| !is_identifier(&step.id) || !partition.insert(step.id.as_str()))
+        || !requested.iter().all(|requested| {
+            record
+                .reexecuted_steps
+                .iter()
+                .any(|step| step == *requested)
+        })
+    {
+        return false;
+    }
+    let definition_valid = match (&record.request.definition, &record.definition_source) {
+        (
+            ContinuationRequestedDefinitionV1::Inherited(_),
+            ContinuationDefinitionSourceV1::Inherited {
+                manifest_digest,
+                prior_manifest_digest,
+            },
+        ) => valid_digest(manifest_digest) && manifest_digest == prior_manifest_digest,
+        (
+            ContinuationRequestedDefinitionV1::Replaced { replaced },
+            ContinuationDefinitionSourceV1::Replaced {
+                manifest_digest,
+                prior_manifest_digest,
+            },
+        ) => {
+            let source_valid = match replaced {
+                super::publication::ContinuationReplacementDefinitionSourceV1::Local(source) => {
+                    is_canonical_absolute_path(&source.path)
+                }
+                super::publication::ContinuationReplacementDefinitionSourceV1::Cloud(source) => {
+                    is_lowercase_hex(&source.commit_oid, 40)
+                        && is_canonical_relative_path(&source.workflow_path)
+                }
+            };
+            source_valid && valid_digest(manifest_digest) && valid_digest(prior_manifest_digest)
+        }
+        _ => false,
+    };
+    let workspace = &record.workspace;
+    let quiescence_valid = workspace
+        .quiescence
+        .groups_terminated
+        .checked_add(workspace.quiescence.groups_absent)
+        == Some(workspace.quiescence.groups_recorded)
+        && parse_canonical_utc_timestamp(&workspace.quiescence.proven_at).is_some();
+    definition_valid
+        && record
+            .request
+            .execution_root
+            .as_deref()
+            .is_none_or(is_canonical_absolute_path)
+        && record
+            .request
+            .expected_run_version
+            .is_none_or(|version| version > 0)
+        && is_canonical_absolute_path(&workspace.execution_root)
+        && is_canonical_absolute_path(&workspace.prior_execution_root)
+        && workspace.start_snapshot.validate(false)
+        && workspace
+            .prior_settlement_snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.validate(true))
+        && workspace_modified_valid(workspace)
+        && quiescence_valid
+}
+
+fn workspace_modified_valid(workspace: &super::publication::ContinuationWorkspaceV1) -> bool {
+    let comparable = workspace.execution_root == workspace.prior_execution_root
+        && workspace.start_snapshot.unavailable.is_none()
+        && workspace.start_snapshot.value.is_some()
+        && workspace
+            .prior_settlement_snapshot
+            .as_ref()
+            .is_some_and(|prior| {
+                prior.unavailable.is_none()
+                    && prior.value.is_some()
+                    && prior.algorithm == workspace.start_snapshot.algorithm
+                    && prior.settled_by
+                        == Some(super::workspace_snapshot::WorkspaceSnapshotSettlementV1::Engine)
+            });
+    match &workspace.modified {
+        super::publication::WorkspaceModifiedV1::Known(modified) if comparable => workspace
+            .prior_settlement_snapshot
+            .as_ref()
+            .is_some_and(|prior| *modified == (prior.value != workspace.start_snapshot.value)),
+        super::publication::WorkspaceModifiedV1::Unknown(
+            super::publication::WorkspaceModifiedUnknownV1::Unknown,
+        ) => !comparable,
+        super::publication::WorkspaceModifiedV1::Known(_) => false,
+    }
 }
 
 fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
@@ -403,6 +632,15 @@ fn step_succeeds_workflow(step: &WorkflowStepV1) -> bool {
     matches!(
         step.state,
         WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Skipped
+    ) || matches!(
+        &step.detail,
+        Some(NodeDetail::Inherited(detail))
+            if matches!(
+                detail.prior_state,
+                super::evidence::InheritedPriorState::Succeeded
+                    | super::evidence::InheritedPriorState::Skipped
+                    | super::evidence::InheritedPriorState::Inherited
+            )
     ) || (step.failure_policy == FailurePolicy::Advisory
         && matches!(
             step.state,
@@ -613,6 +851,14 @@ fn validate_steps(
         }
         let exact_fields = match (expected_role, step.state, step.detail.as_ref()) {
             (_, WorkflowStepStateV1::Succeeded, None) => true,
+            (
+                WorkflowNodeRoleV1::Step,
+                WorkflowStepStateV1::Inherited,
+                Some(NodeDetail::Inherited(detail)),
+            ) => {
+                detail.prior_attempt_number > 0
+                    && super::local_run::is_canonical_uuid(&detail.prior_attempt_id)
+            }
             (_, WorkflowStepStateV1::Failed, Some(NodeDetail::Failed(_))) => true,
             (_, WorkflowStepStateV1::Blocked, Some(NodeDetail::Blocked(_))) => true,
             (_, WorkflowStepStateV1::Skipped, Some(NodeDetail::Skipped(_))) => true,
@@ -645,7 +891,8 @@ fn validate_steps(
                             if detail.phase == super::evidence::FailurePhase::Condition
                     )
             }
-            WorkflowStepStateV1::Blocked
+            WorkflowStepStateV1::Inherited
+            | WorkflowStepStateV1::Blocked
             | WorkflowStepStateV1::Skipped
             | WorkflowStepStateV1::NotRun => !timing_present,
             WorkflowStepStateV1::Cancelled => !output_present || timing_present,
@@ -669,7 +916,8 @@ fn validate_steps(
             }
             (
                 "cmd",
-                WorkflowStepStateV1::Blocked
+                WorkflowStepStateV1::Inherited
+                | WorkflowStepStateV1::Blocked
                 | WorkflowStepStateV1::Skipped
                 | WorkflowStepStateV1::NotRun,
             ) => !output_present,
@@ -1191,12 +1439,13 @@ fn valid_stream(stream: &DiagnosticStreamV1, maximum_stream_bytes: u64) -> bool 
     })
 }
 
-fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMetadataError> {
+fn validate_exports(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
     let mut groups = BTreeMap::<&str, Vec<(usize, &ExportV1)>>::new();
-    for (index, (name, export)) in exports.iter().enumerate() {
+    for (index, (name, export)) in result.exports.iter().enumerate() {
         if !is_identifier(name) {
             return Err(ResultMetadataError);
         }
+        let source = result.export_sources.get(name);
         let carrier_path = match export {
             ExportV1::Available {
                 kind,
@@ -1204,8 +1453,11 @@ fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMe
                 path,
                 size_bytes: _,
                 digest,
+                provenance,
+                producer,
             } => {
-                if !valid_export_kind(kind, media_type)
+                if !valid_export_origin(result, source, provenance.as_ref(), producer.as_ref())
+                    || !valid_export_kind(kind, media_type)
                     || !valid_digest(digest)
                     || parse_carrier_ordinal(path).is_none()
                 {
@@ -1220,8 +1472,11 @@ fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMe
                 head_oid,
                 tree_oid,
                 carrier,
+                provenance,
+                producer,
             } => {
-                if *artifact_version != 1
+                if !valid_export_origin(result, source, provenance.as_ref(), producer.as_ref())
+                    || *artifact_version != 1
                     || object_format != "sha1"
                     || !is_lowercase_hex(base_oid, 40)
                     || !is_lowercase_hex(head_oid, 40)
@@ -1242,7 +1497,12 @@ fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMe
                     None => None,
                 }
             }
-            ExportV1::Unavailable { .. } => None,
+            ExportV1::Unavailable { reason } => {
+                if !valid_unavailable_export_source(result, source, *reason) {
+                    return Err(ResultMetadataError);
+                }
+                None
+            }
         };
         if let Some(path) = carrier_path {
             groups.entry(path).or_default().push((index + 1, export));
@@ -1267,6 +1527,172 @@ fn validate_exports(exports: &BTreeMap<String, ExportV1>) -> Result<(), ResultMe
         }
     }
     Ok(())
+}
+
+fn result_export_source_step<'a>(
+    result: &'a WorkflowResultV1,
+    source: &ExportSourceV1,
+) -> Option<&'a WorkflowStepV1> {
+    let steps = match source.node.role {
+        WorkflowNodeRoleV1::Step => Some(result.steps.as_slice()),
+        WorkflowNodeRoleV1::Finalizer => result
+            .finalization
+            .as_ref()
+            .map(|finalization| finalization.finalizers.as_slice()),
+    }?;
+    steps.iter().find(|step| step.id == source.node.id)
+}
+
+fn continuation_export_source_step<'a>(
+    result: &'a WorkflowResultV1,
+    source: Option<&'a ExportSourceV1>,
+) -> Option<(&'a ExportSourceV1, &'a WorkflowStepV1)> {
+    let source = source?;
+    Some((source, result_export_source_step(result, source)?))
+}
+
+fn valid_export_origin(
+    result: &WorkflowResultV1,
+    source: Option<&ExportSourceV1>,
+    provenance: Option<&ExportProvenanceV1>,
+    producer: Option<&super::runtime::OutputProducer>,
+) -> bool {
+    if result.continuation.is_none() {
+        return source.is_none() && provenance.is_none() && producer.is_none();
+    }
+    let Some((source, step)) = continuation_export_source_step(result, source) else {
+        return false;
+    };
+    export_origin_matches(
+        &result.output_producers,
+        source,
+        step.state,
+        provenance,
+        producer,
+    )
+}
+
+fn valid_unavailable_export_source(
+    result: &WorkflowResultV1,
+    source: Option<&ExportSourceV1>,
+    reason: ExportUnavailableReasonV1,
+) -> bool {
+    if result.continuation.is_none() {
+        return source.is_none();
+    }
+    let Some((source, step)) = continuation_export_source_step(result, source) else {
+        return false;
+    };
+    unavailable_export_source_matches(
+        &result.output_producers,
+        source,
+        step.state,
+        inherited_prior_state(step),
+        reason,
+    )
+}
+
+fn inherited_prior_state(step: &WorkflowStepV1) -> Option<super::evidence::InheritedPriorState> {
+    match step.detail.as_ref() {
+        Some(NodeDetail::Inherited(detail)) => Some(detail.prior_state),
+        _ => None,
+    }
+}
+
+pub(super) fn unavailable_export_source_matches(
+    output_producers: &BTreeMap<String, BTreeMap<String, super::runtime::OutputProducer>>,
+    source: &ExportSourceV1,
+    source_state: WorkflowStepStateV1,
+    inherited_prior_state: Option<super::evidence::InheritedPriorState>,
+    reason: ExportUnavailableReasonV1,
+) -> bool {
+    if !is_identifier(&source.node.id)
+        || !is_identifier(&source.output)
+        || output_producers
+            .get(&source.node.id)
+            .is_some_and(|outputs| outputs.contains_key(&source.output))
+    {
+        return false;
+    }
+    let inherited_source_skipped = source_state == WorkflowStepStateV1::Inherited
+        && match inherited_prior_state {
+            Some(super::evidence::InheritedPriorState::Skipped) => true,
+            Some(super::evidence::InheritedPriorState::Inherited) => {
+                !output_producers.contains_key(&source.node.id)
+            }
+            Some(super::evidence::InheritedPriorState::Succeeded) | None => false,
+        };
+    inherited_source_skipped && reason == ExportUnavailableReasonV1::Skipped
+        || matches!(
+            (source_state, source.node.role, reason),
+            (
+                WorkflowStepStateV1::Skipped,
+                _,
+                ExportUnavailableReasonV1::Skipped
+            ) | (
+                WorkflowStepStateV1::Failed,
+                _,
+                ExportUnavailableReasonV1::Failed
+            ) | (
+                WorkflowStepStateV1::Blocked,
+                WorkflowNodeRoleV1::Step,
+                ExportUnavailableReasonV1::Blocked
+            ) | (
+                WorkflowStepStateV1::Blocked,
+                WorkflowNodeRoleV1::Finalizer,
+                ExportUnavailableReasonV1::InputUnavailable
+            ) | (
+                WorkflowStepStateV1::NotRun,
+                WorkflowNodeRoleV1::Step,
+                ExportUnavailableReasonV1::NotRun
+            ) | (
+                WorkflowStepStateV1::NotRun,
+                WorkflowNodeRoleV1::Finalizer,
+                ExportUnavailableReasonV1::TriggerNotSelected
+            ) | (
+                WorkflowStepStateV1::Cancelled,
+                _,
+                ExportUnavailableReasonV1::Cancelled
+            )
+        )
+}
+
+pub(super) fn export_origin_matches(
+    output_producers: &BTreeMap<String, BTreeMap<String, super::runtime::OutputProducer>>,
+    source: &ExportSourceV1,
+    source_state: WorkflowStepStateV1,
+    provenance: Option<&ExportProvenanceV1>,
+    producer: Option<&super::runtime::OutputProducer>,
+) -> bool {
+    if !is_identifier(&source.node.id) || !is_identifier(&source.output) {
+        return false;
+    }
+    let expected_producer = output_producers
+        .get(&source.node.id)
+        .and_then(|outputs| outputs.get(&source.output));
+    match source_state {
+        WorkflowStepStateV1::Inherited => {
+            provenance == Some(&ExportProvenanceV1::Inherited)
+                && producer.is_some()
+                && producer == expected_producer
+                && producer.is_some_and(valid_output_producer)
+        }
+        WorkflowStepStateV1::Succeeded => {
+            provenance.is_none() && producer.is_none() && expected_producer.is_none()
+        }
+        WorkflowStepStateV1::Failed
+        | WorkflowStepStateV1::Blocked
+        | WorkflowStepStateV1::Skipped
+        | WorkflowStepStateV1::NotRun
+        | WorkflowStepStateV1::Cancelled => false,
+    }
+}
+
+fn valid_output_producer(producer: &super::runtime::OutputProducer) -> bool {
+    producer.attempt_number > 0
+        && super::local_run::is_canonical_uuid(&producer.attempt_id)
+        && is_identifier(&producer.node)
+        && is_identifier(&producer.output)
 }
 
 fn valid_digest(digest: &super::publication::DigestV1) -> bool {

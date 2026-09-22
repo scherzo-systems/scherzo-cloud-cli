@@ -33,9 +33,10 @@ use super::local_run::{
 };
 use super::presentation_feed::WorkflowPresentationDefinition;
 use super::publication::{
-    CancellationReasonV1, CommandOutputV1, DiagnosticStreamV1, ExportUnavailableReasonV1, ExportV1,
-    FinalizationTriggerV1, ForceAbortPhaseV1, WorkflowNodeRoleV1, WorkflowOutcomeV1,
-    WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    CancellationReasonV1, CommandOutputV1, DiagnosticStreamV1, ExportProvenanceV1,
+    ExportUnavailableReasonV1, ExportV1, FinalizationTriggerV1, ForceAbortPhaseV1,
+    WorkflowNodeRoleV1, WorkflowOutcomeV1, WorkflowProvenanceV1, WorkflowResultV1,
+    WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::resolution::WorkflowContentDigest;
 use super::result_metadata;
@@ -117,6 +118,7 @@ pub(crate) enum ArchivedWorkflowOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchivedStepState {
     Succeeded,
+    Inherited,
     Failed,
     Blocked,
     Skipped,
@@ -190,6 +192,7 @@ pub(crate) struct ArchivedStep {
     pub(crate) role: WorkflowNodeRole,
     pub(crate) failure_policy: FailurePolicy,
     pub(crate) state: ArchivedStepState,
+    pub(crate) inherited_data_available: bool,
     pub(crate) started_at: Option<OffsetDateTime>,
     pub(crate) duration: Option<Duration>,
     pub(crate) detail: ArchivedStepDetail,
@@ -232,6 +235,8 @@ pub struct LocalArchivedAttempt {
     pub(crate) current_attempt_number: u64,
     pub(crate) attempt_number: u64,
     pub(crate) prior_attempt_number: Option<u64>,
+    pub(crate) continuation: Option<super::publication::ContinuationRecordV1>,
+    pub(crate) workspace_modified: super::publication::WorkspaceModifiedV1,
     pub(crate) result_directory: PathBuf,
     pub(crate) trigger: ArchivedAttemptTrigger,
     pub(crate) state: ArchivedAttemptState,
@@ -410,6 +415,15 @@ fn load_local_archived_attempt_with(
         current_attempt_number: snapshot.state.current_attempt_number,
         attempt_number: attempt.attempt_number,
         prior_attempt_number: attempt.prior_attempt_number,
+        continuation: attempt.continuation.clone(),
+        workspace_modified: attempt.continuation.as_ref().map_or_else(
+            || {
+                super::publication::WorkspaceModifiedV1::Unknown(
+                    super::publication::WorkspaceModifiedUnknownV1::Unknown,
+                )
+            },
+            |continuation| continuation.workspace.modified.clone(),
+        ),
         result_directory,
         trigger: match attempt.trigger {
             AttemptTriggerV1::Initial => ArchivedAttemptTrigger::Initial,
@@ -649,6 +663,7 @@ fn validate_and_project_result(
         return Err(());
     };
     if result.attempt_number != attempt.attempt_number
+        || result.continuation != attempt.continuation
         || result.workflow.path != workflow.source.workflow_path
         || Path::new(source_root) != workflow.source.source_root
         || result.workflow.digest.algorithm != SHA256_ALGORITHM
@@ -707,6 +722,7 @@ fn validate_and_project_result(
             WorkflowOutcomeV1::Failed => FinalizationTriggerV1::Failed,
             WorkflowOutcomeV1::Cancelled => FinalizationTriggerV1::Cancelled,
         });
+    validate_output_producers(attempt, result, workflow)?;
     let ordinary_steps = project_steps(&snapshot.root, attempt, result, workflow)?;
     validate_terminal_step_facts(ordinary_trigger, &ordinary_steps, workflow)?;
     let (finalization, finalizers) = project_finalization(attempt, result, workflow)?;
@@ -766,6 +782,40 @@ fn validate_and_project_result(
     })
 }
 
+fn validate_output_producers(
+    attempt: &LocalAttemptV1,
+    result: &WorkflowResultV1,
+    workflow: &super::resolution::ResolvedWorkflow,
+) -> Result<(), ()> {
+    let required =
+        super::local_run::required_inherited_outputs(attempt, workflow).map_err(|_| ())?;
+    let mut expected = BTreeMap::<String, BTreeMap<String, super::runtime::OutputProducer>>::new();
+    for step in &attempt.progress.steps {
+        if step.state != AttemptStepStateV1::Inherited {
+            continue;
+        }
+        let producers = step
+            .outputs
+            .iter()
+            .flatten()
+            .filter(|output| required.contains(&(step.id.clone(), output.name().to_owned())))
+            .map(|output| {
+                output
+                    .producer()
+                    .cloned()
+                    .map(|producer| (output.name().to_owned(), producer))
+                    .ok_or(())
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        if !producers.is_empty() {
+            expected.insert(step.id.clone(), producers);
+        }
+    }
+    (expected == result.output_producers)
+        .then_some(())
+        .ok_or(())
+}
+
 fn project_steps(
     root: &OwnedFd,
     attempt: &LocalAttemptV1,
@@ -805,6 +855,10 @@ fn project_steps(
                 definition,
                 WorkflowNodeRole::Step,
                 maximum_stream_bytes,
+                result
+                    .output_producers
+                    .get(&step.id)
+                    .is_some_and(|outputs| !outputs.is_empty()),
             )
         })
         .collect()
@@ -886,6 +940,7 @@ fn project_finalization(
                 definition,
                 WorkflowNodeRole::Finalizer,
                 maximum_stream_bytes,
+                false,
             )
         })
         .collect::<Result<Vec<_>, ()>>()?;
@@ -930,7 +985,7 @@ fn finalizer_disposition_matches_definition(
 
     let unavailable = consumed_output_sources(&declared.body)
         .into_iter()
-        .filter(|source| !result_node_succeeded(result, &source.node.id))
+        .filter(|source| !result_node_output_available(result, source))
         .map(super::validated::ResolvedOutputSource::reference)
         .collect::<BTreeSet<_>>();
     match finalizer.state {
@@ -948,7 +1003,7 @@ fn finalizer_disposition_matches_definition(
         | WorkflowStepStateV1::Failed
         | WorkflowStepStateV1::Cancelled => unavailable.is_empty(),
         WorkflowStepStateV1::Skipped => true,
-        WorkflowStepStateV1::NotRun => false,
+        WorkflowStepStateV1::Inherited | WorkflowStepStateV1::NotRun => false,
     }
 }
 
@@ -984,7 +1039,10 @@ fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::Resol
     }
 }
 
-fn result_node_succeeded(result: &WorkflowResultV1, id: &str) -> bool {
+fn result_node_output_available(
+    result: &WorkflowResultV1,
+    source: &super::validated::ResolvedOutputSource,
+) -> bool {
     result
         .steps
         .iter()
@@ -994,8 +1052,15 @@ fn result_node_succeeded(result: &WorkflowResultV1, id: &str) -> bool {
                 .iter()
                 .flat_map(|summary| &summary.finalizers),
         )
-        .find(|node| node.id == id)
-        .is_some_and(|node| node.state == WorkflowStepStateV1::Succeeded)
+        .find(|node| node.id == source.node.id)
+        .is_some_and(|node| {
+            node.state == WorkflowStepStateV1::Succeeded
+                || (node.state == WorkflowStepStateV1::Inherited
+                    && result
+                        .output_producers
+                        .get(&source.node.id)
+                        .is_some_and(|outputs| outputs.contains_key(&source.output)))
+        })
 }
 
 fn parse_optional_timestamp(value: Option<&str>) -> Result<Option<OffsetDateTime>, ()> {
@@ -1198,7 +1263,9 @@ fn validate_terminal_step_facts(
                             .is_some_and(|source| {
                                 !steps.iter().any(|producer| {
                                     producer.id == source.node.id
-                                        && producer.state == ArchivedStepState::Succeeded
+                                        && (producer.state == ArchivedStepState::Succeeded
+                                            || (producer.state == ArchivedStepState::Inherited
+                                                && producer.inherited_data_available))
                                 })
                             }),
                         Prerequisite::Condition { .. } => false,
@@ -1219,7 +1286,10 @@ fn validate_terminal_step_facts(
             }
             ArchivedStepDetail::Succeeded
             | ArchivedStepDetail::Evidence(
-                NodeDetail::Failed(_) | NodeDetail::Skipped(_) | NodeDetail::Cancellation(_),
+                NodeDetail::Failed(_)
+                | NodeDetail::Skipped(_)
+                | NodeDetail::Cancellation(_)
+                | NodeDetail::Inherited(_),
             ) => {}
         }
     }
@@ -1243,6 +1313,7 @@ fn project_step(
     definition: &ValidatedStep,
     role: WorkflowNodeRole,
     maximum_stream_bytes: u64,
+    inherited_data_available: bool,
 ) -> Result<ArchivedStep, ()> {
     let (started_at, duration) = match (&step.started_at, step.duration_milliseconds) {
         (Some(started_at), Some(duration)) => (
@@ -1255,6 +1326,14 @@ fn project_step(
     let (state, detail) = match (step.state, step.detail.as_ref()) {
         (WorkflowStepStateV1::Succeeded, None) => {
             (ArchivedStepState::Succeeded, ArchivedStepDetail::Succeeded)
+        }
+        (WorkflowStepStateV1::Inherited, Some(NodeDetail::Inherited(inherited)))
+            if role == WorkflowNodeRole::Step =>
+        {
+            (
+                ArchivedStepState::Inherited,
+                ArchivedStepDetail::Evidence(NodeDetail::Inherited(inherited.clone())),
+            )
         }
         (WorkflowStepStateV1::Failed, Some(NodeDetail::Failed(failure))) => {
             validate_failure_binding(failure, definition)?;
@@ -1311,9 +1390,10 @@ fn project_step(
             }
             _ => false,
         },
-        ArchivedStepState::Blocked | ArchivedStepState::Skipped | ArchivedStepState::NotRun => {
-            !timing_present
-        }
+        ArchivedStepState::Inherited
+        | ArchivedStepState::Blocked
+        | ArchivedStepState::Skipped
+        | ArchivedStepState::NotRun => !timing_present,
         ArchivedStepState::Cancelled => !output_present || timing_present,
     };
     let valid_output = match (definition, &detail) {
@@ -1329,7 +1409,10 @@ fn project_step(
         (
             ValidatedStep::Command(_),
             ArchivedStepDetail::Evidence(
-                NodeDetail::Blocked(_) | NodeDetail::Skipped(_) | NodeDetail::NotRun(_),
+                NodeDetail::Blocked(_)
+                | NodeDetail::Skipped(_)
+                | NodeDetail::NotRun(_)
+                | NodeDetail::Inherited(_),
             ),
         ) => !output_present,
         (ValidatedStep::Command(_), ArchivedStepDetail::Evidence(NodeDetail::Cancellation(_))) => {
@@ -1344,6 +1427,7 @@ fn project_step(
         role,
         failure_policy: step.failure_policy,
         state,
+        inherited_data_available,
         started_at,
         duration,
         detail,
@@ -1563,7 +1647,22 @@ fn validate_exports(
     attempt: &LocalAttemptV1,
     steps: &[ArchivedStep],
 ) -> Result<(), ()> {
-    if !result.exports.keys().eq(workflow.definition.exports.keys()) {
+    if !result.exports.keys().eq(workflow.definition.exports.keys())
+        || (result.continuation.is_none() && !result.export_sources.is_empty())
+        || result.continuation.is_some()
+            && (!result.export_sources.keys().eq(result.exports.keys())
+                || result.export_sources.iter().any(|(name, recorded)| {
+                    workflow.definition.exports.get(name).is_none_or(|source| {
+                        recorded.node.id != source.node.id
+                            || recorded.node.role
+                                != match source.node.role {
+                                    WorkflowNodeRole::Step => WorkflowNodeRoleV1::Step,
+                                    WorkflowNodeRole::Finalizer => WorkflowNodeRoleV1::Finalizer,
+                                }
+                            || recorded.output != source.output
+                    })
+                }))
+    {
         return Err(());
     }
 
@@ -1573,7 +1672,7 @@ fn validate_exports(
             .iter()
             .find(|step| step.id == source.node.id)
             .ok_or(())?;
-        if source_step.state == ArchivedStepState::Succeeded {
+        if archived_step_data_available(source_step) {
             owner_ordinals
                 .entry((source.node.id.clone(), source.output.clone()))
                 .or_insert(index.checked_add(1).ok_or(())?);
@@ -1596,7 +1695,8 @@ fn validate_exports(
             WorkflowNodeRole::Step => AttemptNodeRoleV1::Step,
             WorkflowNodeRole::Finalizer => AttemptNodeRoleV1::Finalizer,
         };
-        if source_step.state == ArchivedStepState::Succeeded
+        let source_available = archived_step_data_available(source_step);
+        if source_available
             && attempt.definition.is_some()
             && !retained_output_matches_export(
                 attempt,
@@ -1608,6 +1708,19 @@ fn validate_exports(
         {
             return Err(());
         }
+        let provenance_matches =
+            |provenance: Option<&ExportProvenanceV1>,
+             producer: Option<&super::runtime::OutputProducer>| {
+                export_provenance_matches_source(
+                    source_step.state,
+                    provenance,
+                    producer,
+                    result
+                        .output_producers
+                        .get(&source.node.id)
+                        .and_then(|outputs| outputs.get(&source.output)),
+                )
+            };
         match export {
             ExportV1::Available {
                 kind,
@@ -1615,10 +1728,13 @@ fn validate_exports(
                 path,
                 size_bytes: _,
                 digest,
+                provenance,
+                producer,
             } => {
                 let identity = (source.node.id.clone(), source.output.clone());
                 let owner = *owner_ordinals.get(&identity).ok_or(())?;
-                if source_step.state != ArchivedStepState::Succeeded
+                if !source_available
+                    || !provenance_matches(provenance.as_ref(), producer.as_ref())
                     || kind != export_kind(source.value_type)
                     || media_type != export_media_type(workflow, source)?
                     || *path != format!("exports/{owner:04}")
@@ -1633,10 +1749,16 @@ fn validate_exports(
                     return Err(());
                 }
             }
-            ExportV1::GitBranch { carrier, .. } => {
+            ExportV1::GitBranch {
+                carrier,
+                provenance,
+                producer,
+                ..
+            } => {
                 let identity = (source.node.id.clone(), source.output.clone());
                 let owner = *owner_ordinals.get(&identity).ok_or(())?;
-                if source_step.state != ArchivedStepState::Succeeded
+                if !source_available
+                    || !provenance_matches(provenance.as_ref(), producer.as_ref())
                     || source.value_type != WorkflowValueType::GitBranch
                 {
                     return Err(());
@@ -1655,46 +1777,79 @@ fn validate_exports(
                 }
             }
             ExportV1::Unavailable { reason } => {
-                let expected = match (&source_step.detail, source_step.role) {
-                    (ArchivedStepDetail::Evidence(NodeDetail::Failed(_)), _) => {
-                        ExportUnavailableReasonV1::Failed
-                    }
-                    (
-                        ArchivedStepDetail::Evidence(NodeDetail::Blocked(_)),
-                        WorkflowNodeRole::Step,
-                    ) => ExportUnavailableReasonV1::Blocked,
-                    (
-                        ArchivedStepDetail::Evidence(NodeDetail::Blocked(_)),
-                        WorkflowNodeRole::Finalizer,
-                    ) => ExportUnavailableReasonV1::InputUnavailable,
-                    (
-                        ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)),
-                        WorkflowNodeRole::Step,
-                    ) if detail.code == NonExecutionCode::FailureStop => {
-                        ExportUnavailableReasonV1::NotRun
-                    }
-                    (
-                        ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)),
-                        WorkflowNodeRole::Finalizer,
-                    ) if detail.code == NonExecutionCode::FinalizerTriggerNotSelected => {
-                        ExportUnavailableReasonV1::TriggerNotSelected
-                    }
-                    (ArchivedStepDetail::Evidence(NodeDetail::Skipped(_)), _) => {
-                        ExportUnavailableReasonV1::Skipped
-                    }
-                    (ArchivedStepDetail::Evidence(NodeDetail::Cancellation(_)), _) => {
-                        ExportUnavailableReasonV1::Cancelled
-                    }
-                    (ArchivedStepDetail::Succeeded, _) => return Err(()),
-                    _ => return Err(()),
-                };
-                if *reason != expected {
+                if Some(*reason) != archived_export_unavailable_reason(source_step) {
                     return Err(());
                 }
             }
         }
     }
     Ok(())
+}
+
+fn archived_step_data_available(step: &ArchivedStep) -> bool {
+    step.state == ArchivedStepState::Succeeded
+        || (step.state == ArchivedStepState::Inherited && step.inherited_data_available)
+}
+
+fn archived_export_unavailable_reason(step: &ArchivedStep) -> Option<ExportUnavailableReasonV1> {
+    match (&step.detail, step.role) {
+        (ArchivedStepDetail::Evidence(NodeDetail::Failed(_)), _) => {
+            Some(ExportUnavailableReasonV1::Failed)
+        }
+        (ArchivedStepDetail::Evidence(NodeDetail::Blocked(_)), WorkflowNodeRole::Step) => {
+            Some(ExportUnavailableReasonV1::Blocked)
+        }
+        (ArchivedStepDetail::Evidence(NodeDetail::Blocked(_)), WorkflowNodeRole::Finalizer) => {
+            Some(ExportUnavailableReasonV1::InputUnavailable)
+        }
+        (ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)), WorkflowNodeRole::Step)
+            if detail.code == NonExecutionCode::FailureStop =>
+        {
+            Some(ExportUnavailableReasonV1::NotRun)
+        }
+        (ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)), WorkflowNodeRole::Finalizer)
+            if detail.code == NonExecutionCode::FinalizerTriggerNotSelected =>
+        {
+            Some(ExportUnavailableReasonV1::TriggerNotSelected)
+        }
+        (ArchivedStepDetail::Evidence(NodeDetail::Skipped(_)), _) => {
+            Some(ExportUnavailableReasonV1::Skipped)
+        }
+        (ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)), _)
+            if !step.inherited_data_available =>
+        {
+            Some(ExportUnavailableReasonV1::Skipped)
+        }
+        (ArchivedStepDetail::Evidence(NodeDetail::Cancellation(_)), _) => {
+            Some(ExportUnavailableReasonV1::Cancelled)
+        }
+        (ArchivedStepDetail::Succeeded, _)
+        | (ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)), _) => None,
+        (ArchivedStepDetail::Evidence(NodeDetail::NotRun(_)), _) => None,
+    }
+}
+
+fn export_provenance_matches_source(
+    state: ArchivedStepState,
+    provenance: Option<&super::publication::ExportProvenanceV1>,
+    producer: Option<&super::runtime::OutputProducer>,
+    expected_producer: Option<&super::runtime::OutputProducer>,
+) -> bool {
+    match state {
+        ArchivedStepState::Inherited => {
+            provenance == Some(&super::publication::ExportProvenanceV1::Inherited)
+                && producer.is_some()
+                && producer == expected_producer
+        }
+        ArchivedStepState::Succeeded => {
+            provenance.is_none() && producer.is_none() && expected_producer.is_none()
+        }
+        ArchivedStepState::Failed
+        | ArchivedStepState::Blocked
+        | ArchivedStepState::Skipped
+        | ArchivedStepState::NotRun
+        | ArchivedStepState::Cancelled => false,
+    }
 }
 
 fn export_kind(value_type: WorkflowValueType) -> &'static str {
@@ -1749,6 +1904,9 @@ fn step_state_matches(result: WorkflowStepStateV1, durable: AttemptStepStateV1) 
         (
             WorkflowStepStateV1::Succeeded,
             AttemptStepStateV1::Succeeded
+        ) | (
+            WorkflowStepStateV1::Inherited,
+            AttemptStepStateV1::Inherited
         ) | (WorkflowStepStateV1::Failed, AttemptStepStateV1::Failed)
             | (WorkflowStepStateV1::Blocked, AttemptStepStateV1::Blocked)
             | (WorkflowStepStateV1::NotRun, AttemptStepStateV1::NotRun)
@@ -1783,9 +1941,13 @@ fn prerequisite_satisfied(
     else {
         return false;
     };
-    let succeeded = producer.state == ArchivedStepState::Succeeded;
+    let succeeded = producer.state == ArchivedStepState::Succeeded
+        || (producer.state == ArchivedStepState::Inherited && producer.inherited_data_available);
     let control_satisfied = succeeded
-        || producer.state == ArchivedStepState::Skipped
+        || matches!(
+            producer.state,
+            ArchivedStepState::Inherited | ArchivedStepState::Skipped
+        )
         || (producer.failure_policy == FailurePolicy::Advisory
             && matches!(
                 producer.state,
@@ -1797,7 +1959,7 @@ fn prerequisite_satisfied(
 fn step_succeeds_workflow(step: &ArchivedStep) -> bool {
     matches!(
         step.state,
-        ArchivedStepState::Succeeded | ArchivedStepState::Skipped
+        ArchivedStepState::Succeeded | ArchivedStepState::Inherited | ArchivedStepState::Skipped
     ) || (step.failure_policy == FailurePolicy::Advisory
         && matches!(
             step.state,
@@ -1807,4 +1969,46 @@ fn step_succeeds_workflow(step: &ArchivedStep) -> bool {
 
 fn valid_digest(algorithm: &str, value: &str) -> bool {
     algorithm == SHA256_ALGORITHM && is_lowercase_hex(value, 64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inherited_step(data_available: bool) -> ArchivedStep {
+        ArchivedStep {
+            id: "produce".to_owned(),
+            role: WorkflowNodeRole::Step,
+            failure_policy: FailurePolicy::Required,
+            state: ArchivedStepState::Inherited,
+            inherited_data_available: data_available,
+            started_at: None,
+            duration: None,
+            detail: ArchivedStepDetail::Evidence(NodeDetail::Inherited(
+                super::super::evidence::InheritedDetail {
+                    prior_attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+                    prior_attempt_number: 1,
+                    prior_state: super::super::evidence::InheritedPriorState::Succeeded,
+                    definition_changed: false,
+                },
+            )),
+            command_output: None,
+            recovery: None,
+            invocations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn inherited_export_availability_uses_the_resolved_disposition() {
+        let available = inherited_step(true);
+        assert!(archived_step_data_available(&available));
+        assert_eq!(archived_export_unavailable_reason(&available), None);
+
+        let unavailable = inherited_step(false);
+        assert!(!archived_step_data_available(&unavailable));
+        assert_eq!(
+            archived_export_unavailable_reason(&unavailable),
+            Some(ExportUnavailableReasonV1::Skipped)
+        );
+    }
 }

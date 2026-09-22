@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::File;
@@ -34,12 +35,12 @@ use scherzo_cloud_execution::{
     ResolvedJsonInput, ResolvedWorkflow, RunOutcome, RunTimingObservation, RunTimingSnapshot,
     StepDiagnosticLog, SystemObservationClock, TerminalCapabilities, TerminalHostExit,
     TransitionSequence, ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep,
-    WorkflowExecutionResult, WorkflowNodeRole, WorkflowRunCancellation, WorkflowRunCleanupResult,
-    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunOutput,
-    WorkflowRunPresentation, WorkflowRunPresentationResult, WorkflowRunPublicationResult,
-    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1,
-    WorkflowRunTiming, WorkflowRunViewModel, WorkflowStepTiming, WorkflowTerminalHost,
-    admit_local_workflow, command_output_v1, default_execution_policy_limits,
+    WorkflowExecutionResult, WorkflowExecutionStart, WorkflowNodeRole, WorkflowRunCancellation,
+    WorkflowRunCleanupResult, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
+    WorkflowRunId, WorkflowRunOutput, WorkflowRunPresentation, WorkflowRunPresentationResult,
+    WorkflowRunPublicationResult, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
+    WorkflowRunTerminalResultV1, WorkflowRunTiming, WorkflowRunViewModel, WorkflowStepTiming,
+    WorkflowTerminalHost, admit_local_workflow, command_output_v1, default_execution_policy_limits,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation, execute_workflow, prepare_attempt_result_destination,
     production_agent_dispatcher, publish_prepared_workflow_result, resolve_workflow_file,
@@ -549,6 +550,25 @@ pub(super) async fn execute_owned_attempt(
             return diagnose("prepare local agent diagnostic retention");
         }
     };
+    let seed = match owned_run
+        .execution_seed(admitted.clone(), artifacts.clone())
+        .await
+    {
+        Ok(seed) => seed,
+        // Each pre-execution failure owns its diagnostic and terminal shutdown, while sharing
+        // the required settle-before-cleanup ordering with the adjacent preparation failures.
+        // jscpd:ignore-start
+        Err(error) => {
+            signal_task.abort();
+            settle_before_execution_failure(&owned_run).await;
+            let cleanup_failed =
+                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
+            record_private_cleanup_failure(&owned_run, cleanup_failed);
+            host.stop_terminal().await;
+            return diagnose(format_args!("load retained workflow values: {error}"));
+        } // jscpd:ignore-end
+    };
+    let execution_start = WorkflowExecutionStart::seeded(owned_run.process_guard_registry(), seed);
     let execution = execute_workflow(
         admitted.clone(),
         &artifacts,
@@ -558,7 +578,7 @@ pub(super) async fn execute_owned_attempt(
         SystemExecutionClock,
         owned_run.commit_port(diagnostics.clone(), accounting, artifacts.clone()),
         observer.clone(),
-        owned_run.process_guard_registry(),
+        execution_start,
     )
     .await;
     signal_task.abort();
@@ -1777,6 +1797,9 @@ fn build_run_result(
 ) -> anyhow::Result<WorkflowRunResult> {
     let diagnostics = evidence.diagnostics;
     let durable_invocations = evidence.durable_invocations;
+    let continuation = local_run
+        .continuation_record()
+        .map_err(|_| invalid_terminal_result_error())?;
     let timing = &evidence.timing;
     let cancellation = match timing.cancellation {
         None => None,
@@ -1930,6 +1953,14 @@ fn build_run_result(
     Ok(WorkflowRunResult {
         run_directory: local_run.run_directory().to_owned(),
         attempt_number: local_run.attempt_number(),
+        continuation,
+        output_producers: execution.output_producers.into_iter().fold(
+            BTreeMap::new(),
+            |mut producers, ((node, output), producer)| {
+                producers.entry(node).or_default().insert(output, producer);
+                producers
+            },
+        ),
         workflow_path: execution.provenance.workflow_path,
         source_root: execution.provenance.source_root,
         content_digest: execution.content_digest,

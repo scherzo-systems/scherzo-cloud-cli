@@ -605,6 +605,23 @@ impl<'de> Deserialize<'de> for ConditionFalseDetail {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InheritedPriorState {
+    Succeeded,
+    Skipped,
+    Inherited,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InheritedDetail {
+    pub(crate) prior_attempt_id: String,
+    pub(crate) prior_attempt_number: u64,
+    pub(crate) prior_state: InheritedPriorState,
+    pub(crate) definition_changed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum NodeDetail {
@@ -613,6 +630,7 @@ pub enum NodeDetail {
     Skipped(ConditionFalseDetail),
     NotRun(NonExecutionDetail),
     Cancellation(CancellationDetail),
+    Inherited(InheritedDetail),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -426,6 +426,7 @@ impl StepProjection for ArchivedTerminalStepView {
                         .map(|_| self.with_recovery_detail(String::new())),
                 }
             }
+            ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)) => None,
             ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
                 Some(self.with_recovery_detail(issue_detail_for_step(
                     archived_failure_detail(failure),
@@ -479,6 +480,7 @@ impl StepProjection for ArchivedTerminalStepView {
                 output_count_detail(self.definition.outputs().len()),
                 Tone::Success,
             )),
+            ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)) => None,
             ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => Some(InspectorField::new(
                 "failure",
                 archived_failure_detail(failure),
@@ -716,7 +718,7 @@ fn archived_outcome_status(outcome: ArchivedWorkflowOutcome) -> (&'static str, T
 
 fn archived_step_state(state: ArchivedStepState) -> StepStateKind {
     match state {
-        ArchivedStepState::Succeeded => StepStateKind::Succeeded,
+        ArchivedStepState::Succeeded | ArchivedStepState::Inherited => StepStateKind::Succeeded,
         ArchivedStepState::Failed => StepStateKind::Failed,
         ArchivedStepState::Blocked => StepStateKind::Blocked,
         ArchivedStepState::Skipped => StepStateKind::Skipped,
@@ -1900,6 +1902,10 @@ mod tests {
             current_attempt_number: 3,
             attempt_number: 2,
             prior_attempt_number: Some(1),
+            continuation: None,
+            workspace_modified: crate::workflow::publication::WorkspaceModifiedV1::Unknown(
+                crate::workflow::publication::WorkspaceModifiedUnknownV1::Unknown,
+            ),
             result_directory: PathBuf::from("/tmp/archive-run/attempts/0002/result"),
             trigger: ArchivedAttemptTrigger::ExplicitRetry,
             state: ArchivedAttemptState::WorkflowFailed,
@@ -1949,6 +1955,7 @@ mod tests {
                     role: WorkflowNodeRole::Step,
                     failure_policy: FailurePolicy::Required,
                     state: ArchivedStepState::Succeeded,
+                    inherited_data_available: false,
                     started_at: Some(started),
                     duration: Some(Duration::from_secs(1)),
                     detail: ArchivedStepDetail::Succeeded,
@@ -1961,6 +1968,7 @@ mod tests {
                     role: WorkflowNodeRole::Step,
                     failure_policy: FailurePolicy::Required,
                     state: ArchivedStepState::Failed,
+                    inherited_data_available: false,
                     started_at: Some(started + Duration::from_secs(1)),
                     duration: Some(Duration::from_secs(2)),
                     detail: ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)),

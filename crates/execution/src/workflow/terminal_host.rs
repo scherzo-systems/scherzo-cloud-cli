@@ -3469,6 +3469,7 @@ fn empty_log_message(state: StepStateKind) -> &'static str {
         | StepStateKind::Recovering
         | StepStateKind::Cancelling => "Waiting for output…",
         StepStateKind::Succeeded
+        | StepStateKind::Inherited
         | StepStateKind::Failed
         | StepStateKind::Blocked
         | StepStateKind::Skipped
@@ -4296,7 +4297,7 @@ fn step_counts(snapshot: &WorkflowRunViewSnapshot) -> StepCounts {
             | StepStateKind::CapturingOutputs
             | StepStateKind::Recovering
             | StepStateKind::Cancelling => counts.active += 1,
-            StepStateKind::Succeeded => counts.succeeded += 1,
+            StepStateKind::Succeeded | StepStateKind::Inherited => counts.succeeded += 1,
             StepStateKind::Failed => counts.failed += 1,
             StepStateKind::Blocked => counts.blocked += 1,
             StepStateKind::Skipped => counts.skipped += 1,
@@ -4404,7 +4405,7 @@ fn step_state_glyph<Step: StepProjection>(step: &Step) -> &'static str {
         StepStateKind::CapturingOutputs => "◕",
         StepStateKind::Recovering => "◑",
         StepStateKind::Cancelling => "◒",
-        StepStateKind::Succeeded => "✓",
+        StepStateKind::Succeeded | StepStateKind::Inherited => "✓",
         StepStateKind::Failed => "×",
         StepStateKind::Blocked => "◐",
         StepStateKind::Skipped => "↷",
@@ -4421,7 +4422,7 @@ fn step_state_label(state: StepStateKind) -> &'static str {
         StepStateKind::CapturingOutputs => "capturing",
         StepStateKind::Recovering => "recovering",
         StepStateKind::Cancelling => "cancelling",
-        StepStateKind::Succeeded => "succeeded",
+        StepStateKind::Succeeded | StepStateKind::Inherited => "succeeded",
         StepStateKind::Failed => "failed",
         StepStateKind::Blocked => "blocked",
         StepStateKind::Skipped => "skipped",
@@ -4440,7 +4441,7 @@ fn step_state_tone(state: StepStateKind) -> Tone {
         | StepStateKind::Running
         | StepStateKind::CapturingOutputs
         | StepStateKind::Recovering => Tone::Active,
-        StepStateKind::Succeeded => Tone::Success,
+        StepStateKind::Succeeded | StepStateKind::Inherited => Tone::Success,
         StepStateKind::Failed => Tone::Failure,
         StepStateKind::Cancelling | StepStateKind::Blocked | StepStateKind::Cancelled => {
             Tone::Blocked
@@ -7316,6 +7317,8 @@ finalizers:
         let run = WorkflowRunResult {
             run_directory: workflow.source.source_root.clone(),
             attempt_number: 1,
+            continuation: None,
+            output_producers: BTreeMap::new(),
             workflow_path: workflow.source.workflow_path.clone(),
             source_root: workflow.source.source_root.clone(),
             content_digest: workflow.content_digest.clone(),

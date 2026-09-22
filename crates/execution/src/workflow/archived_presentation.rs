@@ -323,6 +323,7 @@ fn archived_step_detail(step: &ArchivedStep, definition: &WorkflowPresentationSt
                 count => format!("{count} outputs committed"),
             },
         },
+        ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)) => String::new(),
         ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
             archived_failure_detail(failure)
         }
@@ -353,7 +354,7 @@ fn terminal_counts(steps: &[ArchivedStep]) -> TerminalCounts {
     let mut counts = TerminalCounts::default();
     for step in steps {
         match step.state {
-            ArchivedStepState::Succeeded => counts.succeeded += 1,
+            ArchivedStepState::Succeeded | ArchivedStepState::Inherited => counts.succeeded += 1,
             ArchivedStepState::Failed => counts.failed += 1,
             ArchivedStepState::Blocked => counts.blocked += 1,
             ArchivedStepState::Skipped => counts.skipped += 1,
@@ -589,7 +590,7 @@ pub(crate) const fn archived_role(role: WorkflowNodeRole) -> &'static str {
 
 pub(crate) const fn archived_step_state(state: ArchivedStepState) -> &'static str {
     match state {
-        ArchivedStepState::Succeeded => "succeeded",
+        ArchivedStepState::Succeeded | ArchivedStepState::Inherited => "succeeded",
         ArchivedStepState::Failed => "failed",
         ArchivedStepState::Blocked => "blocked",
         ArchivedStepState::Skipped => "skipped",
@@ -695,7 +696,7 @@ const fn outcome_style(outcome: ArchivedWorkflowOutcome) -> &'static str {
 
 const fn step_state_style(state: ArchivedStepState) -> &'static str {
     match state {
-        ArchivedStepState::Succeeded => STYLE_SUCCESS,
+        ArchivedStepState::Succeeded | ArchivedStepState::Inherited => STYLE_SUCCESS,
         ArchivedStepState::Failed => STYLE_FAILURE,
         ArchivedStepState::Blocked | ArchivedStepState::Cancelled => STYLE_BLOCKED,
         ArchivedStepState::Skipped | ArchivedStepState::NotRun => STYLE_MUTED,
@@ -762,6 +763,7 @@ mod tests {
             role: WorkflowNodeRole::Step,
             failure_policy: FailurePolicy::Required,
             state: ArchivedStepState::Succeeded,
+            inherited_data_available: false,
             started_at: None,
             duration: None,
             detail: ArchivedStepDetail::Succeeded,
@@ -948,6 +950,10 @@ mod tests {
             current_attempt_number: 1,
             attempt_number: 1,
             prior_attempt_number: None,
+            continuation: None,
+            workspace_modified: super::super::publication::WorkspaceModifiedV1::Unknown(
+                super::super::publication::WorkspaceModifiedUnknownV1::Unknown,
+            ),
             result_directory: PathBuf::from("/tmp/archive-run/attempts/000001/result"),
             trigger: ArchivedAttemptTrigger::Initial,
             state: ArchivedAttemptState::Succeeded,
@@ -985,6 +991,7 @@ mod tests {
                 role: WorkflowNodeRole::Step,
                 failure_policy: FailurePolicy::Required,
                 state: ArchivedStepState::Succeeded,
+                inherited_data_available: false,
                 started_at: Some(started),
                 duration: Some(Duration::from_secs(1)),
                 detail: ArchivedStepDetail::Succeeded,

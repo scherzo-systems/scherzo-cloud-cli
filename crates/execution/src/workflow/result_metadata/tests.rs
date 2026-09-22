@@ -115,6 +115,87 @@ fn cloud_metadata_only_result_fixture() -> Value {
     result
 }
 
+fn continuation_result_fixture() -> Value {
+    let mut result = result_fixture();
+    result["attemptNumber"] = json!(2);
+    result["steps"] = json!([
+        {
+            "id": "produce",
+            "role": "step",
+            "kind": "agent",
+            "failurePolicy": "required",
+            "state": "inherited",
+            "detail": {
+                "priorAttemptId": "00000000-0000-0000-0000-000000000001",
+                "priorAttemptNumber": 1,
+                "priorState": "succeeded",
+                "definitionChanged": false
+            }
+        },
+        {
+            "id": "rerun",
+            "role": "step",
+            "kind": "agent",
+            "failurePolicy": "required",
+            "state": "succeeded",
+            "startedAt": "2026-08-02T12:01:44Z",
+            "durationMilliseconds": 1000
+        }
+    ]);
+    result["outputProducers"] = json!({
+        "produce": {
+            "message": {
+                "attemptId": "00000000-0000-0000-0000-000000000001",
+                "attemptNumber": 1,
+                "node": "produce",
+                "output": "message"
+            }
+        }
+    });
+    result["continuation"] = json!({
+        "request": {
+            "fromSteps": ["rerun"],
+            "definition": "inherited"
+        },
+        "fromSteps": ["rerun"],
+        "reexecutedSteps": ["rerun"],
+        "inheritedSteps": [{
+            "id": "produce",
+            "priorState": "succeeded",
+            "definitionChanged": false
+        }],
+        "definitionSource": {
+            "kind": "inherited",
+            "manifestDigest": {"algorithm": "sha256", "value": "2".repeat(64)},
+            "priorManifestDigest": {"algorithm": "sha256", "value": "2".repeat(64)}
+        },
+        "workspace": {
+            "executionRoot": "/tmp/execution",
+            "priorExecutionRoot": "/tmp/execution",
+            "startSnapshot": {
+                "algorithm": "git_worktree_sha256_v1",
+                "value": "3".repeat(64),
+                "takenAt": "2026-08-02T12:01:43Z"
+            },
+            "priorSettlementSnapshot": {
+                "algorithm": "git_worktree_sha256_v1",
+                "value": "3".repeat(64),
+                "takenAt": "2026-08-02T12:01:40Z",
+                "settledBy": "engine"
+            },
+            "modified": false,
+            "quiescence": {
+                "groupsRecorded": 2,
+                "groupsTerminated": 1,
+                "groupsAbsent": 1,
+                "provenAt": "2026-08-02T12:01:42Z"
+            }
+        }
+    });
+    result["exports"] = json!({});
+    result
+}
+
 fn failed_result_fixture(phase: &str, cause: Value) -> Value {
     let mut result = result_fixture();
     let mut detail = cause;
@@ -134,6 +215,196 @@ fn encode(value: &Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+#[test]
+fn inherited_result_metadata_validates_producers_and_workspace_comparison() {
+    let valid: WorkflowResultV1 = serde_json::from_value(continuation_result_fixture()).unwrap();
+    assert_eq!(validate_with_invariant(&valid), Ok(()));
+
+    let mut invalid_producer = valid.clone();
+    invalid_producer
+        .output_producers
+        .get_mut("produce")
+        .unwrap()
+        .get_mut("message")
+        .unwrap()
+        .attempt_number = 2;
+    assert_eq!(
+        validate_with_invariant(&invalid_producer),
+        Err(RunResultInvariant::Continuation)
+    );
+
+    let mut invalid_comparison = valid;
+    invalid_comparison
+        .continuation
+        .as_mut()
+        .unwrap()
+        .workspace
+        .modified = super::super::publication::WorkspaceModifiedV1::Known(true);
+    assert_eq!(
+        validate_with_invariant(&invalid_comparison),
+        Err(RunResultInvariant::Continuation)
+    );
+
+    let mut stale_direct_producer = continuation_result_fixture();
+    stale_direct_producer["attemptNumber"] = json!(3);
+    stale_direct_producer["steps"][0]["detail"]["priorAttemptId"] =
+        json!("00000000-0000-0000-0000-000000000002");
+    stale_direct_producer["steps"][0]["detail"]["priorAttemptNumber"] = json!(2);
+    let stale_direct_result: WorkflowResultV1 =
+        serde_json::from_value(stale_direct_producer.clone()).unwrap();
+    assert_eq!(
+        validate_with_invariant(&stale_direct_result),
+        Err(RunResultInvariant::Continuation)
+    );
+
+    let mut valid_chain = stale_direct_producer;
+    valid_chain["steps"][0]["detail"]["priorState"] = json!("inherited");
+    valid_chain["continuation"]["inheritedSteps"][0]["priorState"] = json!("inherited");
+    let valid_chain_result: WorkflowResultV1 = serde_json::from_value(valid_chain.clone()).unwrap();
+    assert_eq!(validate_with_invariant(&valid_chain_result), Ok(()));
+
+    let mut unflattened_chain = valid_chain;
+    unflattened_chain["outputProducers"]["produce"]["message"]["attemptId"] =
+        json!("00000000-0000-0000-0000-000000000002");
+    unflattened_chain["outputProducers"]["produce"]["message"]["attemptNumber"] = json!(2);
+    let unflattened_chain: WorkflowResultV1 = serde_json::from_value(unflattened_chain).unwrap();
+    assert_eq!(
+        validate_with_invariant(&unflattened_chain),
+        Err(RunResultInvariant::Continuation)
+    );
+}
+
+#[test]
+fn unavailable_inherited_exports_require_a_resolved_skipped_source() {
+    let mut document = continuation_result_fixture();
+    document["outputProducers"] = json!({});
+    document["exportSources"] = json!({
+        "message": {
+            "node": {"id": "produce", "role": "step"},
+            "output": "message"
+        }
+    });
+    document["exports"] = json!({
+        "message": {
+            "state": "unavailable",
+            "reason": "source_skipped"
+        }
+    });
+    let direct_succeeded: WorkflowResultV1 = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(
+        validate_with_invariant(&direct_succeeded),
+        Err(RunResultInvariant::ExportMetadata)
+    );
+
+    document["steps"][0]["detail"]["priorState"] = json!("skipped");
+    document["continuation"]["inheritedSteps"][0]["priorState"] = json!("skipped");
+    assert!(decode(&encode(&document)).is_ok());
+
+    let mut chained_skipped = document.clone();
+    chained_skipped["attemptNumber"] = json!(3);
+    chained_skipped["steps"][0]["detail"]["priorAttemptId"] =
+        json!("00000000-0000-0000-0000-000000000002");
+    chained_skipped["steps"][0]["detail"]["priorAttemptNumber"] = json!(2);
+    chained_skipped["steps"][0]["detail"]["priorState"] = json!("inherited");
+    chained_skipped["continuation"]["inheritedSteps"][0]["priorState"] = json!("inherited");
+    assert!(decode(&encode(&chained_skipped)).is_ok());
+
+    chained_skipped["outputProducers"] = json!({
+        "produce": {
+            "other": {
+                "attemptId": "00000000-0000-0000-0000-000000000001",
+                "attemptNumber": 1,
+                "node": "produce",
+                "output": "other"
+            }
+        }
+    });
+    let resolved_succeeded: WorkflowResultV1 = serde_json::from_value(chained_skipped).unwrap();
+    assert_eq!(
+        validate_with_invariant(&resolved_succeeded),
+        Err(RunResultInvariant::ExportMetadata)
+    );
+
+    let producer = json!({
+        "attemptId": "00000000-0000-0000-0000-000000000001",
+        "attemptNumber": 1,
+        "node": "produce",
+        "output": "message"
+    });
+    document["outputProducers"] = json!({
+        "produce": { "message": producer.clone() }
+    });
+    document["exports"]["message"] = json!({
+        "state": "available",
+        "kind": "text",
+        "mediaType": "text/plain; charset=utf-8",
+        "path": "exports/0001",
+        "sizeBytes": 4,
+        "digest": {"algorithm": "sha256", "value": "0".repeat(64)},
+        "provenance": "inherited",
+        "producer": producer
+    });
+    let invalid: WorkflowResultV1 = serde_json::from_value(document).unwrap();
+    assert_eq!(
+        validate_with_invariant(&invalid),
+        Err(RunResultInvariant::Continuation)
+    );
+}
+
+#[test]
+fn inherited_export_provenance_requires_its_direct_producer() {
+    let mut document = continuation_result_fixture();
+    document["exportSources"] = json!({
+        "message": {
+            "node": {"id": "produce", "role": "step"},
+            "output": "message"
+        }
+    });
+    document["exports"] = json!({
+        "message": {
+            "state": "available",
+            "kind": "text",
+            "mediaType": "text/plain; charset=utf-8",
+            "path": "exports/0001",
+            "sizeBytes": 4,
+            "digest": {"algorithm": "sha256", "value": "0".repeat(64)},
+            "provenance": "inherited",
+            "producer": document["outputProducers"]["produce"]["message"].clone()
+        }
+    });
+    let valid: WorkflowResultV1 = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(validate_with_invariant(&valid), Ok(()));
+
+    let mut mismatched = document.clone();
+    mismatched["exports"]["message"]["producer"]["attemptId"] =
+        json!("00000000-0000-0000-0000-000000000002");
+    let mismatched: WorkflowResultV1 = serde_json::from_value(mismatched).unwrap();
+    assert_eq!(
+        validate_with_invariant(&mismatched),
+        Err(RunResultInvariant::ExportMetadata)
+    );
+
+    document["exports"]["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("producer");
+    let invalid: WorkflowResultV1 = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(
+        validate_with_invariant(&invalid),
+        Err(RunResultInvariant::ExportMetadata)
+    );
+
+    document["exports"]["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("provenance");
+    let stripped: WorkflowResultV1 = serde_json::from_value(document).unwrap();
+    assert_eq!(
+        validate_with_invariant(&stripped),
+        Err(RunResultInvariant::ExportMetadata)
+    );
 }
 
 #[test]

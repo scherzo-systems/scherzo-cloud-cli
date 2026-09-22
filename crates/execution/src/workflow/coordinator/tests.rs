@@ -18,7 +18,8 @@ use crate::workflow::admission::{
 };
 use crate::workflow::resolution;
 use crate::workflow::runtime::{
-    Action, RecoveryDecision, RecoveryTerminalDisposition, StepState, TargetExecutionNumber,
+    Action, ExecutionSeed, InheritedDisposition, InheritedStepSeed, RecoveryDecision,
+    RecoveryTerminalDisposition, StepState, TargetExecutionNumber,
 };
 
 const WORKFLOW: &str = r#"schemaVersion: 1
@@ -912,6 +913,67 @@ async fn execution_start_applies_an_already_admitted_force_abort_before_releasin
     assert_eq!(timeline.len(), 2);
     assert_eq!(timeline[0], TimelineEntry::Commit(OccurrenceOrdinal(1)));
     assert!(matches!(timeline[1], TimelineEntry::Action(_)));
+}
+
+#[tokio::test]
+async fn inherited_seed_is_committed_before_any_action_is_released() {
+    let fixture = admitted_fixture(CancellationSource::new(), Duration::from_secs(7));
+    let seed = ExecutionSeed::new(
+        &fixture.admitted,
+        BTreeMap::from([(
+            "task".to_owned(),
+            InheritedStepSeed {
+                detail: crate::workflow::evidence::InheritedDetail {
+                    prior_attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+                    prior_attempt_number: 1,
+                    prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+                    definition_changed: false,
+                },
+                disposition: InheritedDisposition::Succeeded,
+                outputs: BTreeMap::new(),
+                producers: BTreeMap::new(),
+            },
+        )]),
+    )
+    .unwrap();
+    let (_sender, receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+    let (commit_sender, mut commits) = mpsc::unbounded_channel();
+    let (action_sender, mut actions) = mpsc::unbounded_channel();
+    let coordinator = Coordinator::new_seeded(
+        fixture.admitted,
+        receiver,
+        TestClock {
+            instant: TestInstant(Duration::ZERO),
+            reads: Arc::new(AtomicUsize::new(0)),
+        },
+        ControlledCommitPort {
+            commits: commit_sender,
+        },
+        ControlledActionPort::<String> {
+            actions: action_sender,
+            timeline: Arc::new(Mutex::new(Vec::new())),
+        },
+        seed,
+    );
+
+    let driver = async {
+        let initialized = commits.recv().await.unwrap();
+        assert!(matches!(
+            initialized.commit.state.steps["task"].state,
+            StepState::Inherited { .. }
+        ));
+        assert!(matches!(
+            actions.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        initialized.resume.send(()).unwrap();
+        let finish = actions.recv().await.unwrap();
+        assert!(matches!(finish.action.action, Action::FinishRun { .. }));
+        finish.resume.send(()).unwrap();
+    };
+
+    let (result, ()) = tokio::join!(coordinator.run(), driver);
+    assert!(result.is_ok());
 }
 
 #[tokio::test]

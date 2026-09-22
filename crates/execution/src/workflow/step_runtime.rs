@@ -3243,6 +3243,33 @@ where
     }
 }
 
+pub struct WorkflowExecutionStart {
+    process_guards: ProcessGuardRegistry,
+    seed: super::runtime::ExecutionSeed<CapturedValue>,
+}
+
+impl WorkflowExecutionStart {
+    pub fn initial(process_guards: ProcessGuardRegistry) -> Self {
+        Self::seeded(process_guards, super::runtime::ExecutionSeed::empty())
+    }
+
+    pub fn seeded(
+        process_guards: ProcessGuardRegistry,
+        seed: super::runtime::ExecutionSeed<CapturedValue>,
+    ) -> Self {
+        Self {
+            process_guards,
+            seed,
+        }
+    }
+}
+
+impl From<ProcessGuardRegistry> for WorkflowExecutionStart {
+    fn from(process_guards: ProcessGuardRegistry) -> Self {
+        Self::initial(process_guards)
+    }
+}
+
 pub trait WorkflowCommitPort<Clock>:
     CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Clock::Instant>>
 where
@@ -3280,7 +3307,7 @@ where
         commits,
         NoopExecutionObserver,
         AgentExecution::disabled(),
-        ProcessGuardRegistry::default(),
+        WorkflowExecutionStart::initial(ProcessGuardRegistry::default()),
     )
     .await
 }
@@ -3298,7 +3325,7 @@ pub(super) async fn execute_workflow_observed<Clock, Commits, Observer, Dispatch
     commits: Commits,
     observer: Observer,
     agents: AgentExecution<Dispatcher>,
-    process_guards: ProcessGuardRegistry,
+    start: impl Into<WorkflowExecutionStart>,
 ) -> Result<CoordinationResult<StepFailureCause, CapturedValue, Clock::Instant>, CoordinationError>
 where
     Clock: CoordinatorClock,
@@ -3307,6 +3334,10 @@ where
     Observer: ExecutionObserver<Clock::Instant>,
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
 {
+    let WorkflowExecutionStart {
+        process_guards,
+        seed,
+    } = start.into();
     if !artifacts.is_bound_to(admitted.execution()) {
         return Err(CoordinationError::ArtifactStagingMismatch);
     }
@@ -3338,7 +3369,7 @@ where
         process_guards,
     );
     let lifecycle = actions.clone();
-    let result = Coordinator::new(admitted, receiver, clock, commits, actions)
+    let result = Coordinator::new_seeded(admitted, receiver, clock, commits, actions, seed)
         .run()
         .await;
     if matches!(

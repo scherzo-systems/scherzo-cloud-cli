@@ -108,6 +108,44 @@ fn initialize_test(definition: RuntimeDefinition) -> TestReduction {
     })
 }
 
+fn inherited_seed(
+    step: &str,
+    prior_state: crate::workflow::evidence::InheritedPriorState,
+    disposition: InheritedDisposition,
+    outputs: OutputSet<String>,
+) -> ExecutionSeed<String> {
+    let producers = outputs
+        .keys()
+        .map(|output| {
+            (
+                output.clone(),
+                OutputProducer {
+                    attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+                    attempt_number: 1,
+                    node: step.to_owned(),
+                    output: output.clone(),
+                },
+            )
+        })
+        .collect();
+    ExecutionSeed {
+        steps: BTreeMap::from([(
+            step.to_owned(),
+            InheritedStepSeed {
+                detail: InheritedDetail {
+                    prior_attempt_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+                    prior_attempt_number: 2,
+                    prior_state,
+                    definition_changed: false,
+                },
+                disposition,
+                outputs,
+                producers,
+            },
+        )]),
+    }
+}
+
 fn step_event(
     value: u64,
     step: &str,
@@ -418,6 +456,186 @@ fn finalizer_definition(
         text_inputs: BTreeMap::new(),
         json_inputs: BTreeMap::new(),
     }
+}
+
+#[test]
+fn disposition_conditions_observe_the_inherited_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(
+        source_root.join("workflow.yaml"),
+        "schemaVersion: 1\nsteps:\n  cached:\n    kind: cmd\n    command: {argv: [\"true\"]}\n  consumer:\n    kind: cmd\n    condition:\n      disposition:\n        node: cached\n        is: inherited\n    command: {argv: [\"true\"]}\n",
+    )
+    .unwrap();
+    let admitted = admit_workflow(
+        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedInputs::default(),
+        ExecutionContext::new(
+            execution_root,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        ),
+    )
+    .unwrap();
+    let seed = inherited_seed(
+        "cached",
+        crate::workflow::evidence::InheritedPriorState::Succeeded,
+        InheritedDisposition::Succeeded,
+        BTreeMap::new(),
+    );
+
+    let reduction: TestReduction = initialize_seeded_with_operation(&admitted, seed, None);
+
+    assert_step(&reduction.state, "cached", StepStateKind::Inherited);
+    assert_step(&reduction.state, "consumer", StepStateKind::Starting);
+    assert!(matches!(
+        reduction.actions.as_slice(),
+        [RequestedAction {
+            action: Action::StartStep { step, .. },
+            ..
+        }] if step == "consumer"
+    ));
+}
+
+#[test]
+fn execution_seed_allows_prior_outputs_to_be_a_subset_of_replacement_declarations() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&source_root).unwrap();
+    fs::create_dir(&execution_root).unwrap();
+    fs::write(
+        source_root.join("workflow.yaml"),
+        "schemaVersion: 1\nsteps:\n  cached:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      prior:\n        kind: text\n        from: path\n        path: prior.txt\n      added:\n        kind: text\n        from: path\n        path: added.txt\n",
+    )
+    .unwrap();
+    let admitted = admit_workflow(
+        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedInputs::default(),
+        ExecutionContext::new(
+            execution_root,
+            ExecutionPolicyLimits::new(
+                1,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        ),
+    )
+    .unwrap();
+    let seed = inherited_seed(
+        "cached",
+        crate::workflow::evidence::InheritedPriorState::Succeeded,
+        InheritedDisposition::Succeeded,
+        output_set(&[("prior", "retained")]),
+    );
+
+    assert!(ExecutionSeed::new(&admitted, seed.steps).is_ok());
+}
+
+#[test]
+fn inherited_success_resolves_exports_without_authorizing_the_source() {
+    let mut runtime_definition = definition(
+        &[("cached", &[], &["result"])],
+        &[("published", "cached", "result")],
+        1,
+    );
+    runtime_definition.steps.get_mut("cached").unwrap().recovery = Some(RuntimeRecovery {
+        retries: 3,
+        handler_kind: Some(RecoveryHandlerKind::Command),
+    });
+    let seed = inherited_seed(
+        "cached",
+        crate::workflow::evidence::InheritedPriorState::Succeeded,
+        InheritedDisposition::Succeeded,
+        output_set(&[("result", "retained")]),
+    );
+
+    let reduction = initialize_seeded_definition::<String, String, String, TestDeadline>(
+        ExecutionStart {
+            definition: runtime_definition,
+            initial_cancellation: None,
+        },
+        seed,
+    );
+
+    assert_step(&reduction.state, "cached", StepStateKind::Inherited);
+    assert!(reduction.state.steps["cached"].recovery.is_none());
+    assert_eq!(
+        reduction.state.output_producers[&("cached".to_owned(), "result".to_owned())]
+            .attempt_number,
+        1
+    );
+    assert!(matches!(
+        reduction.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun { outcome: RunOutcome::Succeeded, exports },
+            ..
+        }] if exports == &available_exports(&[("published", "retained")])
+    ));
+}
+
+#[test]
+fn finalizers_receive_inherited_values_and_skipped_values_remain_unavailable() {
+    let runtime_definition = finalizer_definition(
+        &[("cached", FailurePolicy::Required, &[], &[], &["resource"])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Succeeded],
+            &[("resource", "outputs.cached.resource")],
+            &[],
+        )],
+        1,
+    );
+    let succeeded = inherited_seed(
+        "cached",
+        crate::workflow::evidence::InheritedPriorState::Succeeded,
+        InheritedDisposition::Succeeded,
+        output_set(&[("resource", "retained")]),
+    );
+    let reduction = initialize_seeded_definition::<String, String, String, TestDeadline>(
+        ExecutionStart {
+            definition: runtime_definition.clone(),
+            initial_cancellation: None,
+        },
+        succeeded,
+    );
+    assert!(matches!(
+        reduction.actions.as_slice(),
+        [RequestedAction {
+            action: Action::StartStep { step, inputs, .. },
+            ..
+        }] if step == "release"
+            && inputs.get("resource") == Some(&ActionInput::Output("retained".to_owned()))
+    ));
+
+    let skipped = inherited_seed(
+        "cached",
+        crate::workflow::evidence::InheritedPriorState::Skipped,
+        InheritedDisposition::Skipped,
+        BTreeMap::new(),
+    );
+    let reduction = initialize_seeded_definition::<String, String, String, TestDeadline>(
+        ExecutionStart {
+            definition: runtime_definition,
+            initial_cancellation: None,
+        },
+        skipped,
+    );
+    assert_step(&reduction.state, "cached", StepStateKind::Inherited);
+    assert_step(&reduction.state, "release", StepStateKind::Blocked);
 }
 
 fn output_set(entries: &[(&str, &str)]) -> OutputSet<String> {

@@ -102,7 +102,7 @@
       "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
     },
     "TerminalDisposition": {
-      "enum": ["succeeded", "failed", "skipped", "blocked", "not_run", "cancelled"]
+      "enum": ["succeeded", "failed", "skipped", "blocked", "not_run", "cancelled", "inherited"]
     },
     "OrdinaryConditionReferenceString": {
       "type": "string",

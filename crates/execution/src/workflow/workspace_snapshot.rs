@@ -25,14 +25,14 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum WorkspaceSnapshotSettlementV1 {
+pub(crate) enum WorkspaceSnapshotSettlementV1 {
     Engine,
     AbandonmentRecovery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum WorkspaceSnapshotUnavailableReasonV1 {
+pub(crate) enum WorkspaceSnapshotUnavailableReasonV1 {
     GitUnavailable,
     GitOutputLimitExceeded,
     NotWorkTree,
@@ -47,7 +47,7 @@ pub(super) enum WorkspaceSnapshotUnavailableReasonV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct WorkspaceSnapshotV1 {
+pub(crate) struct WorkspaceSnapshotV1 {
     pub(super) algorithm: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) value: Option<String>,

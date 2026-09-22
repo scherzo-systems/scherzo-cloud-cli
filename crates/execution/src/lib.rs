@@ -66,7 +66,9 @@ pub use workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 pub use workflow::document::FailurePolicy;
 pub use workflow::document::FinalizationTrigger;
 pub use workflow::evidence::{BlockedDetail, Prerequisite};
-pub use workflow::evidence::{FailureDetail, NodeDetail, PrimaryIssue};
+pub use workflow::evidence::{
+    FailureDetail, InheritedDetail, InheritedPriorState, NodeDetail, PrimaryIssue,
+};
 pub use workflow::execution::{NoopCommitPort, WorkflowExecutionResult, execute_workflow};
 pub use workflow::git_capture::CloudGitCaptureProjection;
 pub use workflow::input::InputStaging;
@@ -98,7 +100,7 @@ pub use workflow::process_group::{
     SystemProcessIdentityInspector, terminate_authenticated_process_group,
 };
 pub use workflow::publication::{
-    CloudCarrierBody, CloudExecutionCapacityV1, CloudResultCarrier, DigestV1,
+    CloudCarrierBody, CloudExecutionCapacityV1, CloudResultCarrier, ContinuationRecordV1, DigestV1,
     LocalPublicationError, LocalPublicationPhase, PreparedCloudWorkflowResult,
     RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1,
     RecoveryInvocationStateV1, RecoveryInvocationUsageV1, RecoveryInvocationV1, WorkflowResultV1,
@@ -123,14 +125,15 @@ pub use workflow::run_view_model::{
 };
 pub use workflow::runtime::ExportValue;
 pub use workflow::runtime::{
-    ActionId, ActiveStepInvocation, FinalizationGate, FinalizationSummary, FinalizerResult,
-    ForceAbortEvidence, RecoveryDecisionKind, RecoveryHandlerActivity, RecoveryHandlerKind,
-    RunOutcome, SchedulingGate, StepRecoveryState, StepState, StepStateKind, TransitionEvent,
-    TransitionSequence, WorkflowState,
+    ActionId, ActiveStepInvocation, ExecutionSeed, FinalizationGate, FinalizationSummary,
+    FinalizerResult, ForceAbortEvidence, InheritedDisposition, OutputProducer,
+    RecoveryDecisionKind, RecoveryHandlerActivity, RecoveryHandlerKind, RunOutcome, SchedulingGate,
+    StepRecoveryState, StepState, StepStateKind, TransitionEvent, TransitionSequence,
+    WorkflowState,
 };
 pub use workflow::runtime::{RecoveryRoundNumber, TargetExecutionNumber};
 pub use workflow::step_runtime::spawn_isolated_command_launch;
-pub use workflow::step_runtime::{AgentExecution, StepFailureCause};
+pub use workflow::step_runtime::{AgentExecution, StepFailureCause, WorkflowExecutionStart};
 pub use workflow::terminal_host::archived::{
     ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
 };

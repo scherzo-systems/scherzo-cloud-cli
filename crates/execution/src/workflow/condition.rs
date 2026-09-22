@@ -200,6 +200,7 @@ pub(crate) enum TerminalDisposition {
     Blocked,
     NotRun,
     Cancelled,
+    Inherited,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

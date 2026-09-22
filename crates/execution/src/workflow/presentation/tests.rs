@@ -251,6 +251,8 @@ impl Fixture {
         WorkflowRunResult {
             run_directory: self.result_parent.clone(),
             attempt_number: 1,
+            continuation: None,
+            output_producers: BTreeMap::new(),
             workflow_path: "workflow.yaml".to_owned(),
             source_root: self.source_root.clone(),
             content_digest: self.digest.clone(),

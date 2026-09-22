@@ -935,14 +935,94 @@ fn inspect_metadata(bytes: &[u8], diagnostics: &mut Diagnostics) -> MetadataInsp
         diagnostics.result(ArtifactDiagnosticCode::ResultSchemaInvalid, None);
     }
 
+    let continuation = document.get("continuation").is_some();
+    let output_producers = document.get("outputProducers").map_or_else(
+        || Some(BTreeMap::new()),
+        |producers| serde_json::from_value(producers.clone()).ok(),
+    );
+    let export_sources = document.get("exportSources").map_or_else(
+        || Some(BTreeMap::new()),
+        |sources| serde_json::from_value(sources.clone()).ok(),
+    );
+    let source_states = portable_source_states(&document);
     let Some(exports) = document.get_mut("exports").and_then(Value::as_object_mut) else {
         return MetadataInspection::default();
     };
-    inspect_exports(exports, diagnostics)
+    let sources_match = export_sources.as_ref().is_some_and(|sources| {
+        if continuation {
+            sources.keys().eq(exports.keys())
+        } else {
+            sources.is_empty()
+        }
+    });
+    if !sources_match || source_states.is_none() {
+        diagnostics.result(
+            ArtifactDiagnosticCode::ResultSchemaInvalid,
+            Some("/exportSources"),
+        );
+    }
+    inspect_exports(
+        exports,
+        continuation,
+        output_producers.as_ref(),
+        export_sources.as_ref(),
+        source_states.as_ref(),
+        diagnostics,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PortableSourceState {
+    role: super::publication::WorkflowNodeRoleV1,
+    state: super::publication::WorkflowStepStateV1,
+    inherited_prior_state: Option<super::evidence::InheritedPriorState>,
+}
+
+type PortableSourceStates = BTreeMap<String, PortableSourceState>;
+
+fn portable_source_states(document: &Value) -> Option<PortableSourceStates> {
+    let mut steps = serde_json::from_value::<Vec<super::publication::WorkflowStepV1>>(
+        document.get("steps")?.clone(),
+    )
+    .ok()?;
+    if let Some(finalizers) = document
+        .get("finalization")
+        .and_then(|finalization| finalization.get("finalizers"))
+    {
+        steps.extend(
+            serde_json::from_value::<Vec<super::publication::WorkflowStepV1>>(finalizers.clone())
+                .ok()?,
+        );
+    }
+    let mut states = BTreeMap::new();
+    for step in steps {
+        let inherited_prior_state = match step.detail {
+            Some(super::evidence::NodeDetail::Inherited(detail)) => Some(detail.prior_state),
+            _ => None,
+        };
+        if states
+            .insert(
+                step.id,
+                PortableSourceState {
+                    role: step.role,
+                    state: step.state,
+                    inherited_prior_state,
+                },
+            )
+            .is_some()
+        {
+            return None;
+        }
+    }
+    Some(states)
 }
 
 fn inspect_exports(
     exports: &mut Map<String, Value>,
+    continuation: bool,
+    output_producers: Option<&BTreeMap<String, BTreeMap<String, super::runtime::OutputProducer>>>,
+    export_sources: Option<&BTreeMap<String, super::publication::ExportSourceV1>>,
+    source_states: Option<&PortableSourceStates>,
     diagnostics: &mut Diagnostics,
 ) -> MetadataInspection {
     let mut inspection = MetadataInspection {
@@ -1000,15 +1080,29 @@ fn inspect_exports(
             descriptor.base_oid == descriptor.head_oid && nested_carrier.is_some()
         });
 
+        let source = export_sources.and_then(|sources| sources.get(name));
+        let source_state = source.and_then(|source| {
+            source_states
+                .and_then(|states| states.get(&source.node.id))
+                .filter(|state| state.role == source.node.role)
+        });
+        let origin = PortableExportOrigin {
+            continuation,
+            output_producers,
+            source,
+            source_state: source_state.map(|state| state.state),
+            source_inherited_prior_state: source_state
+                .and_then(|state| state.inherited_prior_state),
+        };
         let shape_valid = if !is_identifier(name) {
             false
         } else {
             match state {
-                Some("unavailable") => valid_unavailable_entry(entry),
+                Some("unavailable") => valid_unavailable_entry(entry, origin),
                 Some("available") if kind == Some(CarrierKind::GitBranch) => {
-                    valid_git_branch_entry(entry, descriptor.as_ref(), invalid_zero_delta)
+                    valid_git_branch_entry(entry, descriptor.as_ref(), invalid_zero_delta, origin)
                 }
-                Some("available") if kind.is_some() => valid_available_entry(entry, kind),
+                Some("available") if kind.is_some() => valid_available_entry(entry, kind, origin),
                 _ => false,
             }
         };
@@ -1107,32 +1201,58 @@ fn record_carrier_reference(
     }
 }
 
-fn valid_unavailable_entry(entry: &Value) -> bool {
-    let Some(object) = entry.as_object() else {
-        return false;
-    };
-    exact_keys(object, &["state", "reason"])
-        && matches!(
-            object.get("reason").and_then(Value::as_str),
-            Some(
-                "source_failed"
-                    | "source_blocked"
-                    | "source_input_unavailable"
-                    | "source_skipped"
-                    | "source_not_run"
-                    | "source_trigger_not_selected"
-                    | "source_cancelled"
-            )
-        )
+#[derive(Clone, Copy)]
+struct PortableExportOrigin<'a> {
+    continuation: bool,
+    output_producers:
+        Option<&'a BTreeMap<String, BTreeMap<String, super::runtime::OutputProducer>>>,
+    source: Option<&'a super::publication::ExportSourceV1>,
+    source_state: Option<super::publication::WorkflowStepStateV1>,
+    source_inherited_prior_state: Option<super::evidence::InheritedPriorState>,
 }
 
-fn valid_available_entry(entry: &Value, kind: Option<CarrierKind>) -> bool {
+fn valid_unavailable_entry(entry: &Value, origin: PortableExportOrigin<'_>) -> bool {
     let Some(object) = entry.as_object() else {
         return false;
     };
-    exact_keys(
+    let Some(reason) = object
+        .get("reason")
+        .and_then(|reason| serde_json::from_value(reason.clone()).ok())
+    else {
+        return false;
+    };
+    if !exact_keys(object, &["state", "reason"]) {
+        return false;
+    }
+    if !origin.continuation {
+        return origin.source.is_none();
+    }
+    let (Some(source), Some(source_state), Some(output_producers)) =
+        (origin.source, origin.source_state, origin.output_producers)
+    else {
+        return false;
+    };
+    result_metadata::unavailable_export_source_matches(
+        output_producers,
+        source,
+        source_state,
+        origin.source_inherited_prior_state,
+        reason,
+    )
+}
+
+fn valid_available_entry(
+    entry: &Value,
+    kind: Option<CarrierKind>,
+    origin: PortableExportOrigin<'_>,
+) -> bool {
+    let Some(object) = entry.as_object() else {
+        return false;
+    };
+    exact_export_keys(
         object,
         &["state", "kind", "mediaType", "path", "sizeBytes", "digest"],
+        origin,
     ) && kind.is_some()
         && object.get("mediaType").and_then(Value::as_str).is_some()
         && object.get("path").and_then(Value::as_str).is_some()
@@ -1167,12 +1287,13 @@ fn valid_git_branch_entry(
     entry: &Value,
     descriptor: Option<&GitDescriptor>,
     invalid_zero_delta: bool,
+    origin: PortableExportOrigin<'_>,
 ) -> bool {
     let (Some(object), Some(descriptor)) = (entry.as_object(), descriptor) else {
         return false;
     };
     if descriptor.base_oid == descriptor.head_oid && !invalid_zero_delta {
-        exact_keys(
+        exact_export_keys(
             object,
             &[
                 "state",
@@ -1183,9 +1304,10 @@ fn valid_git_branch_entry(
                 "headOid",
                 "treeOid",
             ],
+            origin,
         )
     } else {
-        exact_keys(
+        exact_export_keys(
             object,
             &[
                 "state",
@@ -1197,11 +1319,45 @@ fn valid_git_branch_entry(
                 "treeOid",
                 "carrier",
             ],
+            origin,
         ) && object
             .get("carrier")
             .and_then(Value::as_object)
             .is_some_and(valid_git_carrier)
     }
+}
+
+fn exact_export_keys(
+    object: &Map<String, Value>,
+    base: &[&str],
+    origin: PortableExportOrigin<'_>,
+) -> bool {
+    let provenance = object
+        .get("provenance")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let producer = object
+        .get("producer")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let origin_valid = if origin.continuation {
+        let (Some(output_producers), Some(source), Some(source_state)) =
+            (origin.output_producers, origin.source, origin.source_state)
+        else {
+            return false;
+        };
+        result_metadata::export_origin_matches(
+            output_producers,
+            source,
+            source_state,
+            provenance.as_ref(),
+            producer.as_ref(),
+        )
+    } else {
+        origin.source.is_none() && provenance.is_none() && producer.is_none()
+    };
+    let origin_fields = usize::from(provenance.is_some()) + usize::from(producer.is_some());
+    origin_valid
+        && object.len() == base.len() + origin_fields
+        && base.iter().all(|key| object.contains_key(*key))
 }
 
 fn valid_git_carrier(carrier: &Map<String, Value>) -> bool {
@@ -1789,6 +1945,121 @@ impl<Reader: Seek> Seek for CancellableReader<'_, Reader> {
 mod tests {
     use super::*;
     use crate::workflow::git_artifact::tests::{BundleMutation, RealBundleFixture};
+
+    #[test]
+    fn inherited_export_shape_requires_a_typed_recorded_producer() {
+        let recorded = super::super::runtime::OutputProducer {
+            attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            attempt_number: 1,
+            node: "produce".to_owned(),
+            output: "message".to_owned(),
+        };
+        let output_producers = BTreeMap::from([(
+            "produce".to_owned(),
+            BTreeMap::from([("message".to_owned(), recorded.clone())]),
+        )]);
+        let source = super::super::publication::ExportSourceV1 {
+            node: super::super::publication::WorkflowNodeV1 {
+                id: "produce".to_owned(),
+                role: super::super::publication::WorkflowNodeRoleV1::Step,
+            },
+            output: "message".to_owned(),
+        };
+        let base = ["state", "kind", "mediaType", "path", "sizeBytes", "digest"];
+        let mut entry = serde_json::json!({
+            "state": "available",
+            "kind": "text",
+            "mediaType": "text/plain; charset=utf-8",
+            "path": "exports/0001",
+            "sizeBytes": 4,
+            "digest": {"algorithm": "sha256", "value": "0".repeat(64)},
+            "provenance": "inherited",
+            "producer": recorded
+        });
+        let origin = PortableExportOrigin {
+            continuation: true,
+            output_producers: Some(&output_producers),
+            source: Some(&source),
+            source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),
+            source_inherited_prior_state: Some(
+                super::super::evidence::InheritedPriorState::Succeeded,
+            ),
+        };
+        let valid = |entry: &Value| exact_export_keys(entry.as_object().unwrap(), &base, origin);
+        assert!(valid(&entry));
+
+        entry["producer"]["attemptId"] = Value::Null;
+        assert!(!valid(&entry));
+        entry["producer"] = serde_json::json!({
+            "attemptId": "00000000-0000-0000-0000-000000000002",
+            "attemptNumber": 1,
+            "node": "produce",
+            "output": "message"
+        });
+        assert!(!valid(&entry));
+        entry.as_object_mut().unwrap().remove("producer");
+        entry.as_object_mut().unwrap().remove("provenance");
+        assert!(!valid(&entry));
+    }
+
+    #[test]
+    fn inherited_unavailable_shape_requires_a_resolved_skipped_source() {
+        let source = super::super::publication::ExportSourceV1 {
+            node: super::super::publication::WorkflowNodeV1 {
+                id: "produce".to_owned(),
+                role: super::super::publication::WorkflowNodeRoleV1::Step,
+            },
+            output: "message".to_owned(),
+        };
+        let entry = serde_json::json!({
+            "state": "unavailable",
+            "reason": "source_skipped"
+        });
+        let output_producers = BTreeMap::new();
+        let origin = |prior_state| PortableExportOrigin {
+            continuation: true,
+            output_producers: Some(&output_producers),
+            source: Some(&source),
+            source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),
+            source_inherited_prior_state: Some(prior_state),
+        };
+
+        assert!(!valid_unavailable_entry(
+            &entry,
+            origin(super::super::evidence::InheritedPriorState::Succeeded)
+        ));
+        assert!(valid_unavailable_entry(
+            &entry,
+            origin(super::super::evidence::InheritedPriorState::Skipped)
+        ));
+        assert!(valid_unavailable_entry(
+            &entry,
+            origin(super::super::evidence::InheritedPriorState::Inherited)
+        ));
+
+        let resolved_producer = super::super::runtime::OutputProducer {
+            attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            attempt_number: 1,
+            node: "produce".to_owned(),
+            output: "other".to_owned(),
+        };
+        let succeeded_producers = BTreeMap::from([(
+            "produce".to_owned(),
+            BTreeMap::from([("other".to_owned(), resolved_producer)]),
+        )]);
+        assert!(!valid_unavailable_entry(
+            &entry,
+            PortableExportOrigin {
+                continuation: true,
+                output_producers: Some(&succeeded_producers),
+                source: Some(&source),
+                source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),
+                source_inherited_prior_state: Some(
+                    super::super::evidence::InheritedPriorState::Inherited,
+                ),
+            }
+        ));
+    }
 
     #[test]
     fn real_bundle_failures_emit_their_portable_diagnostic_codes() {

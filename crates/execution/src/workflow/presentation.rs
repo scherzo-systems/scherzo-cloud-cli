@@ -1188,6 +1188,7 @@ where
                     )
                 }
                 StepStateKind::Pending
+                | StepStateKind::Inherited
                 | StepStateKind::Running
                 | StepStateKind::CapturingOutputs => Ok(()),
             },
@@ -2087,6 +2088,7 @@ fn summary_step(
             success_detail(success, outputs.len()),
             TokenRole::Success,
         )),
+        StepState::Inherited { .. } => None,
         StepState::Failed { detail } => Some((
             "failed",
             issue_detail(canonical_failure_detail(detail), step.failure_policy),
@@ -2232,7 +2234,7 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 7] {
             .flat_map(|finalization| &finalization.finalizers),
     ) {
         let index = match step.state {
-            StepState::Succeeded { .. } => Some(0),
+            StepState::Succeeded { .. } | StepState::Inherited { .. } => Some(0),
             StepState::Failed { .. } => Some(1),
             StepState::Blocked { .. } => Some(2),
             StepState::Skipped { .. } => Some(3),

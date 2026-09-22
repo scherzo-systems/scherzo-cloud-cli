@@ -1165,6 +1165,14 @@ impl ExecutionJob {
         Some(WorkflowRunResult {
             run_directory: self.accepted.root.private.path().to_owned(),
             attempt_number: self.accepted.attempt_number,
+            continuation: None,
+            output_producers: execution.output_producers.into_iter().fold(
+                BTreeMap::new(),
+                |mut producers, ((node, output), producer)| {
+                    producers.entry(node).or_default().insert(output, producer);
+                    producers
+                },
+            ),
             workflow_path: execution.provenance.workflow_path,
             source_root: execution.provenance.source_root,
             content_digest: execution.content_digest,
@@ -2688,6 +2696,7 @@ fn finalizer_result(result: &FinalizerResult) -> Value {
             object.insert("detail".to_owned(), json!(detail));
         }
         StepState::Pending
+        | StepState::Inherited { .. }
         | StepState::Starting
         | StepState::Running
         | StepState::CapturingOutputs
@@ -3023,20 +3032,7 @@ fn terminal_result_agrees(terminal: Option<&WorkflowState>, outcome: &RunOutcome
 }
 
 fn step_state_name(state: StepStateKind) -> &'static str {
-    match state {
-        StepStateKind::Pending => "pending",
-        StepStateKind::Starting => "starting",
-        StepStateKind::Running => "running",
-        StepStateKind::CapturingOutputs => "capturing_outputs",
-        StepStateKind::Recovering => "recovering",
-        StepStateKind::Cancelling => "cancelling",
-        StepStateKind::Succeeded => "succeeded",
-        StepStateKind::Failed => "failed",
-        StepStateKind::Blocked => "blocked",
-        StepStateKind::Skipped => "skipped",
-        StepStateKind::NotRun => "not_run",
-        StepStateKind::Cancelled => "cancelled",
-    }
+    state.as_str()
 }
 
 fn cancellation_reason(reason: CancellationReason) -> &'static str {

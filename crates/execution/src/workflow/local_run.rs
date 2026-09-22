@@ -12,7 +12,7 @@ use std::time::Duration;
 use ring::digest::{Context as DigestContext, SHA256, digest};
 use rustix::fs::{
     AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, fcntl_lock, fstat,
-    mkdirat, openat, renameat_with, statat, unlinkat,
+    linkat, mkdirat, openat, renameat_with, statat, unlinkat,
 };
 use rustix::io::{Errno, dup};
 use rustix::process::{Flock, FlockOffsetType, FlockType, fcntl_getlk};
@@ -28,7 +28,11 @@ use super::admission::{
 };
 use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
-use super::artifact::{ArtifactStaging, GitObjectFormat};
+use super::artifact::{
+    ArtifactStaging, CaptureCancellation, CaptureCandidateDeclaration, CarrierDestination,
+    CarrierProducer, GitBranchCaptureDeclaration, GitBranchMetadata, GitObjectFormat,
+    RetainedFileCaptureDeclaration,
+};
 use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
 use super::coordinator::{
     CommitPort, CommittedActionKind, CommittedReduction, CoordinationDiagnostic,
@@ -57,13 +61,15 @@ use super::publication::{
 };
 use super::resolution::{ResolvedWorkflow, resolve_retained};
 use super::runtime::{
-    ActiveStepInvocation, FinalizationSummary, StepState, TargetExecutionNumber, WorkflowState,
+    ActiveStepInvocation, ExecutionSeed, FinalizationSummary, InheritedDisposition,
+    InheritedStepSeed, StepState, TargetExecutionNumber, WorkflowState,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_lowercase_hex, lowercase_hex,
     utc_timestamp,
 };
 use super::step_runtime::StepFailureCause;
+use super::value::CapturedValue;
 use super::workspace_snapshot::{
     WorkspaceSnapshotSettlementV1, WorkspaceSnapshotV1, capture_settlement_snapshot,
 };
@@ -296,6 +302,8 @@ pub(super) struct LocalAttemptV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) definition: Option<AttemptDefinitionV1>,
     pub(super) state: AttemptStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) continuation: Option<super::publication::ContinuationRecordV1>,
     pub(super) execution_root: String,
     pub(super) created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -459,20 +467,28 @@ pub(super) struct RetainedCarrierV1 {
 pub(super) enum RetainedOutputV1 {
     Text {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer: Option<super::runtime::OutputProducer>,
         carrier: RetainedCarrierV1,
     },
     Json {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer: Option<super::runtime::OutputProducer>,
         carrier: RetainedCarrierV1,
     },
     File {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer: Option<super::runtime::OutputProducer>,
         #[serde(rename = "mediaType")]
         media_type: String,
         carrier: RetainedCarrierV1,
     },
     GitBranch {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer: Option<super::runtime::OutputProducer>,
         #[serde(rename = "artifactVersion")]
         artifact_version: u8,
         #[serde(rename = "objectFormat")]
@@ -489,12 +505,30 @@ pub(super) enum RetainedOutputV1 {
 }
 
 impl RetainedOutputV1 {
-    fn name(&self) -> &str {
+    pub(super) fn name(&self) -> &str {
         match self {
             Self::Text { name, .. }
             | Self::Json { name, .. }
             | Self::File { name, .. }
             | Self::GitBranch { name, .. } => name,
+        }
+    }
+
+    pub(super) fn producer(&self) -> Option<&super::runtime::OutputProducer> {
+        match self {
+            Self::Text { producer, .. }
+            | Self::Json { producer, .. }
+            | Self::File { producer, .. }
+            | Self::GitBranch { producer, .. } => producer.as_ref(),
+        }
+    }
+
+    fn set_producer(&mut self, value: super::runtime::OutputProducer) {
+        match self {
+            Self::Text { producer, .. }
+            | Self::Json { producer, .. }
+            | Self::File { producer, .. }
+            | Self::GitBranch { producer, .. } => *producer = Some(value),
         }
     }
 
@@ -546,6 +580,7 @@ impl RetainedOutputV1 {
                     head_oid: export_head_oid,
                     tree_oid: export_tree_oid,
                     carrier: export_carrier,
+                    ..
                 },
             ) => {
                 artifact_version == export_artifact_version
@@ -792,6 +827,7 @@ pub(super) enum AttemptStepStateV1 {
     CapturingOutputs,
     Cancelling,
     Succeeded,
+    Inherited,
     Failed,
     Blocked,
     Skipped,
@@ -1246,6 +1282,18 @@ impl LocalAttemptOwner {
         self.attempt_number
     }
 
+    pub fn continuation_record(
+        &self,
+    ) -> Result<Option<super::publication::ContinuationRecordV1>, LocalRunDirectoryError> {
+        let state = lock_state(&self.state.current)?;
+        let attempt = state
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_number == self.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        Ok(attempt.continuation.clone())
+    }
+
     pub fn release(mut self) -> LocalAttemptOwnershipReleased {
         self.release_lock();
         LocalAttemptOwnershipReleased { _private: () }
@@ -1279,6 +1327,26 @@ impl LocalAttemptOwner {
     pub fn process_guard_registry(&self) -> ProcessGuardRegistry {
         let state: Arc<dyn DurableProcessGuardStore> = self.state.clone();
         ProcessGuardRegistry::durable(state)
+    }
+
+    pub async fn execution_seed(
+        &self,
+        admitted: AdmittedWorkflow,
+        artifacts: ArtifactStaging,
+    ) -> Result<ExecutionSeed<CapturedValue>, LocalRunDirectoryError> {
+        let state = Arc::clone(&self.state);
+        let attempt_number = self.attempt_number;
+        tokio::task::spawn_blocking(move || {
+            load_execution_seed(
+                &state.root,
+                &state.current,
+                attempt_number,
+                &admitted,
+                &artifacts,
+            )
+        })
+        .await
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?
     }
 
     pub fn record_result_published(&self) -> Result<(), LocalRunDirectoryError> {
@@ -2229,9 +2297,10 @@ impl StateStore {
         finalizers: &[AttemptStepV1],
         artifacts: &ArtifactStaging,
     ) -> Result<RetainedOutputSets, LocalRunDirectoryError> {
-        let attempt_number = {
+        let (attempt_number, durable_state) = {
             let state = lock_state(&self.current)?;
-            state.current_attempt_number
+            let attempt = current_attempt(&state)?;
+            (attempt.attempt_number, state.clone())
         };
         let attempts = open_directory_at(&self.root, ATTEMPTS_DIRECTORY)?;
         let attempt_name =
@@ -2239,26 +2308,50 @@ impl StateStore {
         let attempt = open_directory_at(&attempts, &attempt_name)?;
         let values = create_or_open_directory(&attempt, VALUES_DIRECTORY)?;
         let mut retained = BTreeMap::new();
-        for (node, runtime) in &runtime.steps {
-            let StepState::Succeeded { outputs } = &runtime.state else {
-                continue;
-            };
+        for (node, node_runtime) in &runtime.steps {
             let role = if finalizers.iter().any(|finalizer| finalizer.id == *node) {
                 AttemptNodeRoleV1::Finalizer
             } else {
                 AttemptNodeRoleV1::Step
             };
+            let outputs = match &node_runtime.state {
+                StepState::Succeeded { outputs } => outputs,
+                StepState::Inherited {
+                    disposition: super::runtime::InheritedDisposition::Succeeded,
+                    outputs,
+                    ..
+                } => {
+                    let descriptors = inherited_retained_outputs(
+                        &durable_state,
+                        attempt_number,
+                        node,
+                        outputs,
+                        &runtime.output_producers,
+                    )?;
+                    retained.insert((role, node.clone()), descriptors);
+                    continue;
+                }
+                StepState::Inherited {
+                    disposition: super::runtime::InheritedDisposition::Skipped,
+                    ..
+                } => {
+                    retained.insert((role, node.clone()), Vec::new());
+                    continue;
+                }
+                _ => continue,
+            };
             let role_directory = create_or_open_directory(&values, retained_role_name(role))?;
             let node_directory = create_or_open_directory(&role_directory, node)?;
             let mut descriptors = Vec::with_capacity(outputs.len());
             for (name, value) in outputs {
-                descriptors.push(retain_output_value(
+                descriptors.push(retain_output_value_with_producer(
                     artifacts,
                     &node_directory,
                     role,
                     node,
                     name,
                     value,
+                    None,
                 )?);
             }
             sync_directory(&node_directory)?;
@@ -2271,6 +2364,57 @@ impl StateStore {
     }
 }
 
+fn inherited_retained_outputs<Output>(
+    state: &LocalRunStateV1,
+    current_attempt_number: u64,
+    node: &str,
+    outputs: &super::runtime::OutputSet<Output>,
+    producers: &BTreeMap<(String, String), super::runtime::OutputProducer>,
+) -> Result<Vec<RetainedOutputV1>, LocalRunDirectoryError> {
+    let mut retained = Vec::with_capacity(outputs.len());
+    for name in outputs.keys() {
+        let producer = producers
+            .get(&(node.to_owned(), name.clone()))
+            .filter(|producer| {
+                producer.node == node
+                    && producer.output == *name
+                    && producer.attempt_number < current_attempt_number
+            })
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        let source_attempt = state
+            .attempts
+            .iter()
+            .find(|attempt| {
+                attempt.attempt_number == producer.attempt_number
+                    && attempt.attempt_id == producer.attempt_id
+            })
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        let source_step = source_attempt
+            .progress
+            .steps
+            .iter()
+            .find(|step| step.id == node && step.state == AttemptStepStateV1::Succeeded)
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        let mut descriptor = source_step
+            .outputs
+            .iter()
+            .flatten()
+            .find(|output| output.name() == name)
+            .cloned()
+            .ok_or(LocalRunDirectoryError::StateConflict)?;
+        if descriptor
+            .producer()
+            .is_some_and(|retained_producer| retained_producer != producer)
+        {
+            return Err(LocalRunDirectoryError::StateConflict);
+        }
+        descriptor.set_producer(producer.clone());
+        retained.push(descriptor);
+    }
+    Ok(retained)
+}
+
+#[cfg(test)]
 fn retain_output_value(
     artifacts: &ArtifactStaging,
     directory: &OwnedFd,
@@ -2278,6 +2422,18 @@ fn retain_output_value(
     node: &str,
     name: &str,
     value: &super::value::CapturedValue,
+) -> Result<RetainedOutputV1, LocalRunDirectoryError> {
+    retain_output_value_with_producer(artifacts, directory, role, node, name, value, None)
+}
+
+fn retain_output_value_with_producer(
+    artifacts: &ArtifactStaging,
+    directory: &OwnedFd,
+    role: AttemptNodeRoleV1,
+    node: &str,
+    name: &str,
+    value: &super::value::CapturedValue,
+    producer: Option<super::runtime::OutputProducer>,
 ) -> Result<RetainedOutputV1, LocalRunDirectoryError> {
     let relative_path = retained_value_relative_path(role, node, name);
     match value {
@@ -2291,6 +2447,7 @@ fn retain_output_value(
             )?;
             Ok(RetainedOutputV1::Text {
                 name: name.to_owned(),
+                producer,
                 carrier,
             })
         }
@@ -2304,6 +2461,7 @@ fn retain_output_value(
             )?;
             Ok(RetainedOutputV1::Json {
                 name: name.to_owned(),
+                producer,
                 carrier,
             })
         }
@@ -2315,6 +2473,7 @@ fn retain_output_value(
                 retain_staged_carrier(artifacts, directory, name, &relative_path, file.carrier())?;
             Ok(RetainedOutputV1::File {
                 name: name.to_owned(),
+                producer,
                 media_type: file.media_type().to_owned(),
                 carrier,
             })
@@ -2338,6 +2497,7 @@ fn retain_output_value(
                 .transpose()?;
             Ok(RetainedOutputV1::GitBranch {
                 name: name.to_owned(),
+                producer,
                 artifact_version: metadata.artifact_version(),
                 object_format: metadata.object_format().as_str().to_owned(),
                 base_oid: metadata.base_oid().to_owned(),
@@ -2991,11 +3151,29 @@ fn update_progress_nodes<Cause, Output>(
         let runtime = runtime_steps
             .get(&node.id)
             .ok_or(LocalRunDirectoryError::StateConflict)?;
-        node.state = attempt_step_state(&runtime.state);
-        node.outputs = retained_outputs
-            .get(&(node.role, node.id.clone()))
-            .cloned()
-            .or_else(|| (node.state != AttemptStepStateV1::Succeeded).then(Vec::new));
+        let next_state = attempt_step_state(&runtime.state);
+        let retained = retained_outputs.get(&(node.role, node.id.clone()));
+        node.outputs = match &runtime.state {
+            StepState::Inherited { disposition, .. } => {
+                let durable = node
+                    .outputs
+                    .as_deref()
+                    .ok_or(LocalRunDirectoryError::StateConflict)?;
+                let loaded = retained.ok_or(LocalRunDirectoryError::StateConflict)?;
+                if node.state != AttemptStepStateV1::Inherited
+                    || (*disposition == InheritedDisposition::Skipped
+                        && (!durable.is_empty() || !loaded.is_empty()))
+                    || loaded.iter().any(|output| !durable.contains(output))
+                {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
+                Some(durable.to_vec())
+            }
+            _ => retained
+                .cloned()
+                .or_else(|| (next_state != AttemptStepStateV1::Succeeded).then(Vec::new)),
+        };
+        node.state = next_state;
         if node.outputs.is_none() {
             return Err(LocalRunDirectoryError::StateConflict);
         }
@@ -3129,6 +3307,7 @@ fn attempt_step_state<Output>(state: &StepState<Output>) -> AttemptStepStateV1 {
         StepState::Recovering { .. } => AttemptStepStateV1::Running,
         StepState::Cancelling { .. } => AttemptStepStateV1::Cancelling,
         StepState::Succeeded { .. } => AttemptStepStateV1::Succeeded,
+        StepState::Inherited { .. } => AttemptStepStateV1::Inherited,
         StepState::Failed { .. } => AttemptStepStateV1::Failed,
         StepState::Blocked { .. } => AttemptStepStateV1::Blocked,
         StepState::Skipped { .. } => AttemptStepStateV1::Skipped,
@@ -3142,6 +3321,7 @@ fn attempt_step_state<Output>(state: &StepState<Output>) -> AttemptStepStateV1 {
 // jscpd:ignore-start
 fn attempt_step_detail<Output>(state: &StepState<Output>) -> Option<NodeDetail> {
     match state {
+        StepState::Inherited { detail, .. } => Some(NodeDetail::Inherited(detail.clone())),
         StepState::Failed { detail } => Some(NodeDetail::Failed(detail.clone())),
         StepState::Blocked { detail } => Some(NodeDetail::Blocked(detail.clone())),
         StepState::Skipped { detail } => Some(NodeDetail::Skipped(detail.clone())),
@@ -3171,6 +3351,9 @@ where
         .map(|finalizer| {
             let (state, detail) = match &finalizer.disposition {
                 StepState::Succeeded { .. } => (AttemptStepStateV1::Succeeded, None),
+                StepState::Inherited { .. } => {
+                    return Err(LocalRunDirectoryError::StateConflict);
+                }
                 StepState::Failed { detail } => (
                     AttemptStepStateV1::Failed,
                     Some(NodeDetail::Failed(detail.clone())),
@@ -3285,6 +3468,7 @@ fn outstanding_actions<Cause, Output>(
                 StepState::CapturingOutputs => OutstandingActionKindV1::CaptureOutputs,
                 StepState::Cancelling { .. } => OutstandingActionKindV1::CancelStep,
                 StepState::Pending
+                | StepState::Inherited { .. }
                 | StepState::Succeeded { .. }
                 | StepState::Failed { .. }
                 | StepState::Blocked { .. }
@@ -3805,6 +3989,12 @@ fn cleanup_unreferenced_retained_values(
         found = true;
         let expected = attempt_retained_outputs(attempt)
             .into_iter()
+            .filter(|output| {
+                output.producer().is_none_or(|producer| {
+                    producer.attempt_id == attempt.attempt_id
+                        && producer.attempt_number == attempt.attempt_number
+                })
+            })
             .filter_map(RetainedOutputV1::carrier)
             .map(|carrier| carrier.relative_path.clone())
             .collect::<BTreeSet<_>>();
@@ -3879,6 +4069,477 @@ fn cleanup_unreferenced_tree(
     Ok(())
 }
 
+pub(super) fn required_inherited_outputs(
+    attempt: &LocalAttemptV1,
+    workflow: &ResolvedWorkflow,
+) -> Result<BTreeSet<(String, String)>, LocalRunDirectoryError> {
+    let inherited = attempt
+        .progress
+        .steps
+        .iter()
+        .filter(|step| step.state == AttemptStepStateV1::Inherited)
+        .map(|step| step.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut required = BTreeSet::new();
+    for step in attempt
+        .progress
+        .steps
+        .iter()
+        .filter(|step| step.state != AttemptStepStateV1::Inherited)
+    {
+        let definition = workflow
+            .definition
+            .steps
+            .get(&step.id)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        collect_output_references(definition, &mut required);
+    }
+    for finalizer in workflow.definition.finalizers.values() {
+        collect_output_references(&finalizer.body, &mut required);
+    }
+    required.extend(
+        workflow
+            .definition
+            .exports
+            .values()
+            .map(|source| (source.node.id.clone(), source.output.clone())),
+    );
+    required.retain(|(node, _)| inherited.contains(node.as_str()));
+    Ok(required)
+}
+
+fn collect_output_references(
+    step: &super::validated::ValidatedStep,
+    references: &mut BTreeSet<(String, String)>,
+) {
+    let common = match step {
+        super::validated::ValidatedStep::Command(command) => &command.common,
+        super::validated::ValidatedStep::Agent(agent) => &agent.common,
+    };
+    insert_output_references(common.condition_values.values(), references);
+    match step {
+        super::validated::ValidatedStep::Command(command) => {
+            insert_output_references(
+                command.inputs.values().map(|input| &input.source),
+                references,
+            );
+        }
+        super::validated::ValidatedStep::Agent(agent) => {
+            let sources = agent
+                .agent
+                .message
+                .text
+                .iter()
+                .chain(&agent.agent.message.attachments)
+                .filter_map(|source| match source {
+                    super::validated::ValidatedMessageSource::Reference { source, .. } => {
+                        Some(source)
+                    }
+                    super::validated::ValidatedMessageSource::File { .. } => None,
+                });
+            insert_output_references(sources, references);
+        }
+    }
+}
+
+fn insert_output_references<'a>(
+    sources: impl IntoIterator<Item = &'a super::validated::ResolvedValueSource>,
+    references: &mut BTreeSet<(String, String)>,
+) {
+    for source in sources {
+        insert_output_reference(source, references);
+    }
+}
+
+fn insert_output_reference(
+    source: &super::validated::ResolvedValueSource,
+    references: &mut BTreeSet<(String, String)>,
+) {
+    if let super::validated::ResolvedValueSource::Output(output) = source {
+        references.insert((output.node.id.clone(), output.output.clone()));
+    }
+}
+
+fn load_execution_seed(
+    root: &OwnedFd,
+    current: &Mutex<LocalRunStateV1>,
+    attempt_number: u64,
+    admitted: &AdmittedWorkflow,
+    artifacts: &ArtifactStaging,
+) -> Result<ExecutionSeed<CapturedValue>, LocalRunDirectoryError> {
+    let state = lock_state(current)?;
+    let attempt = state
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number == attempt_number)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    validate_retained_outputs_against_definition(attempt, admitted.workflow())?;
+    verify_retained_output_evidence(root, &state, attempt_number)?;
+    let required_outputs = required_inherited_outputs(attempt, admitted.workflow())?;
+    let mut inherited_steps = BTreeMap::new();
+    for step in &attempt.progress.steps {
+        if step.state != AttemptStepStateV1::Inherited {
+            continue;
+        }
+        let Some(NodeDetail::Inherited(detail)) = &step.detail else {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        };
+        let disposition = inherited_disposition(&state, attempt_number, &step.id)?;
+        let retained_outputs = step.outputs.iter().flatten().collect::<Vec<_>>();
+        if disposition == InheritedDisposition::Skipped && !retained_outputs.is_empty() {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        let mut outputs = BTreeMap::new();
+        let mut producers = BTreeMap::new();
+        for retained in retained_outputs.into_iter().filter(|retained| {
+            required_outputs.contains(&(step.id.clone(), retained.name().to_owned()))
+        }) {
+            let declaration =
+                step_output_declaration(admitted.workflow(), &step.id, retained.name())
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            if !retained_output_matches_declaration(retained, declaration) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            let producer = retained
+                .producer()
+                .cloned()
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            let name = retained.name().to_owned();
+            let value = load_retained_value(root, &state, admitted, artifacts, &step.id, retained)?;
+            if outputs.insert(name.clone(), value).is_some()
+                || producers.insert(name, producer).is_some()
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+        if disposition == InheritedDisposition::Succeeded
+            && required_outputs
+                .iter()
+                .any(|(node, output)| node == &step.id && !outputs.contains_key(output))
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        inherited_steps.insert(
+            step.id.clone(),
+            InheritedStepSeed {
+                detail: detail.clone(),
+                disposition,
+                outputs,
+                producers,
+            },
+        );
+    }
+    ExecutionSeed::new(admitted, inherited_steps).map_err(|_| LocalRunDirectoryError::StateInvalid)
+}
+
+fn step_output_declaration<'a>(
+    workflow: &'a ResolvedWorkflow,
+    node: &str,
+    output: &str,
+) -> Option<&'a super::document::Output> {
+    let step = workflow.definition.steps.get(node)?;
+    let outputs = match step {
+        super::validated::ValidatedStep::Command(command) => &command.common.outputs,
+        super::validated::ValidatedStep::Agent(agent) => &agent.common.outputs,
+    };
+    outputs.get(output).map(|output| &output.definition)
+}
+
+fn inherited_disposition(
+    state: &LocalRunStateV1,
+    mut attempt_number: u64,
+    node: &str,
+) -> Result<InheritedDisposition, LocalRunDirectoryError> {
+    for _ in 0..state.attempts.len() {
+        let attempt = state
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_number == attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let step = attempt
+            .progress
+            .steps
+            .iter()
+            .find(|step| step.id == node)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        match step.state {
+            AttemptStepStateV1::Succeeded => return Ok(InheritedDisposition::Succeeded),
+            AttemptStepStateV1::Skipped => return Ok(InheritedDisposition::Skipped),
+            AttemptStepStateV1::Inherited => {
+                let Some(NodeDetail::Inherited(detail)) = &step.detail else {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                };
+                if detail.prior_attempt_number == 0 || detail.prior_attempt_number >= attempt_number
+                {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                }
+                attempt_number = detail.prior_attempt_number;
+            }
+            AttemptStepStateV1::Pending
+            | AttemptStepStateV1::Starting
+            | AttemptStepStateV1::Running
+            | AttemptStepStateV1::CapturingOutputs
+            | AttemptStepStateV1::Cancelling
+            | AttemptStepStateV1::Failed
+            | AttemptStepStateV1::Blocked
+            | AttemptStepStateV1::NotRun
+            | AttemptStepStateV1::Cancelled => {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+    }
+    Err(LocalRunDirectoryError::StateInvalid)
+}
+
+fn load_retained_value(
+    root: &OwnedFd,
+    state: &LocalRunStateV1,
+    admitted: &AdmittedWorkflow,
+    artifacts: &ArtifactStaging,
+    node: &str,
+    retained: &RetainedOutputV1,
+) -> Result<CapturedValue, LocalRunDirectoryError> {
+    match retained {
+        RetainedOutputV1::Text { carrier, .. } => {
+            let mut producer = open_retained_carrier(root, state, retained)?;
+            let value = capture_retained_candidate(
+                artifacts,
+                retained.name(),
+                CaptureCandidateDeclaration::RetainedFile(RetainedFileCaptureDeclaration::text(
+                    retained.name(),
+                    &mut producer,
+                )),
+            )?;
+            let CapturedValue::Text(text) = &value else {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            };
+            retained_semantic_carrier_matches(text.carrier(), carrier)?;
+            Ok(value)
+        }
+        RetainedOutputV1::Json { carrier, .. } => {
+            let schema = admitted
+                .workflow()
+                .json_schema(node, retained.name())
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            let mut producer = open_retained_carrier(root, state, retained)?;
+            let value = capture_retained_candidate(
+                artifacts,
+                retained.name(),
+                CaptureCandidateDeclaration::RetainedFile(RetainedFileCaptureDeclaration::json(
+                    retained.name(),
+                    schema,
+                    &mut producer,
+                )),
+            )?;
+            let CapturedValue::Json(json) = &value else {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            };
+            retained_semantic_carrier_matches(json.carrier(), carrier)?;
+            Ok(value)
+        }
+        RetainedOutputV1::File {
+            media_type,
+            carrier,
+            ..
+        } => {
+            let mut producer = open_retained_carrier(root, state, retained)?;
+            let value = capture_retained_candidate(
+                artifacts,
+                retained.name(),
+                CaptureCandidateDeclaration::RetainedFile(RetainedFileCaptureDeclaration::new(
+                    retained.name(),
+                    media_type,
+                    &mut producer,
+                )),
+            )?;
+            let CapturedValue::File(file) = &value else {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            };
+            if file.size() != carrier.size_bytes || file.sha256() != carrier.digest.value {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            Ok(value)
+        }
+        RetainedOutputV1::GitBranch {
+            artifact_version,
+            object_format,
+            base_oid,
+            head_oid,
+            tree_oid,
+            carrier,
+            ..
+        } => {
+            if *artifact_version != 1 || object_format != "sha1" {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            let metadata = GitBranchMetadata::new(
+                Arc::from(base_oid.as_str()),
+                Arc::from(head_oid.as_str()),
+                Arc::from(tree_oid.as_str()),
+            );
+            let branch = match carrier {
+                None => super::artifact::CapturedGitBranch::from_retained(
+                    Arc::from(retained.name()),
+                    metadata,
+                    None,
+                ),
+                Some(carrier) => {
+                    let mut producer = open_retained_carrier(root, state, retained)?;
+                    let mut declarations = [CaptureCandidateDeclaration::GitBranch(
+                        GitBranchCaptureDeclaration::new(
+                            retained.name(),
+                            metadata,
+                            Some(&mut producer),
+                        ),
+                    )];
+                    let mut captured = artifacts
+                        .capture_candidates(&mut declarations, &CaptureCancellation::default())
+                        .map_err(|_| LocalRunDirectoryError::StateInvalid)?
+                        .commit();
+                    let value = captured
+                        .remove(retained.name())
+                        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                    let CapturedValue::GitBranch(branch) = &value else {
+                        return Err(LocalRunDirectoryError::StateInvalid);
+                    };
+                    let staged = branch
+                        .carrier()
+                        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                    if staged.size() != carrier.size_bytes
+                        || staged.sha256() != carrier.digest.value
+                    {
+                        return Err(LocalRunDirectoryError::StateInvalid);
+                    }
+                    return Ok(value);
+                }
+            };
+            Ok(CapturedValue::GitBranch(branch))
+        }
+    }
+}
+
+struct RetainedCarrierProducer {
+    source: File,
+    parent: OwnedFd,
+    name: OsString,
+}
+
+impl CarrierProducer for RetainedCarrierProducer {
+    fn stream_to(&mut self, destination: &mut CarrierDestination<'_>) -> io::Result<()> {
+        io::copy(&mut self.source, destination).map(|_| ())
+    }
+
+    fn supports_hard_links(&self) -> bool {
+        true
+    }
+
+    fn hard_link_to(&mut self, destination: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+        linkat(
+            &self.parent,
+            &self.name,
+            destination,
+            name,
+            AtFlags::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let identity_matches = fstat(&self.source)
+            .and_then(|source| {
+                statat(destination, name, AtFlags::SYMLINK_NOFOLLOW).map(|linked| {
+                    FileType::from_raw_mode(linked.st_mode) == FileType::RegularFile
+                        && source.st_dev == linked.st_dev
+                        && source.st_ino == linked.st_ino
+                })
+            })
+            .unwrap_or(false);
+        if identity_matches {
+            Ok(())
+        } else {
+            let _ = unlinkat(destination, name, AtFlags::empty());
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained carrier identity changed",
+            ))
+        }
+    }
+}
+
+fn capture_retained_candidate(
+    artifacts: &ArtifactStaging,
+    name: &str,
+    declaration: CaptureCandidateDeclaration<'_>,
+) -> Result<CapturedValue, LocalRunDirectoryError> {
+    let mut declarations = [declaration];
+    artifacts
+        .capture_candidates(&mut declarations, &CaptureCancellation::default())
+        .map_err(|_| LocalRunDirectoryError::StateInvalid)?
+        .commit()
+        .remove(name)
+        .ok_or(LocalRunDirectoryError::StateInvalid)
+}
+
+fn retained_semantic_carrier_matches(
+    bytes: &[u8],
+    carrier: &RetainedCarrierV1,
+) -> Result<(), LocalRunDirectoryError> {
+    (u64::try_from(bytes.len()) == Ok(carrier.size_bytes)
+        && lowercase_hex(digest(&SHA256, bytes).as_ref()) == carrier.digest.value)
+        .then_some(())
+        .ok_or(LocalRunDirectoryError::StateInvalid)
+}
+
+fn open_retained_carrier(
+    root: &OwnedFd,
+    state: &LocalRunStateV1,
+    output: &RetainedOutputV1,
+) -> Result<RetainedCarrierProducer, LocalRunDirectoryError> {
+    let producer = output
+        .producer()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let owner = state
+        .attempts
+        .iter()
+        .find(|attempt| {
+            attempt.attempt_number == producer.attempt_number
+                && attempt.attempt_id == producer.attempt_id
+        })
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let carrier = output
+        .carrier()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let attempts = open_directory_at(root, ATTEMPTS_DIRECTORY)?;
+    let owner_name =
+        attempt_directory_name(owner.attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let owner = open_directory_at(&attempts, &owner_name)?;
+    let path = Path::new(&carrier.relative_path);
+    let name = path
+        .file_name()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let mut parent = owner;
+    for component in path
+        .parent()
+        .ok_or(LocalRunDirectoryError::StateInvalid)?
+        .components()
+    {
+        let std::path::Component::Normal(component) = component else {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        };
+        parent = open_directory_at(&parent, component)?;
+    }
+    let source = openat(
+        &parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    Ok(RetainedCarrierProducer {
+        source,
+        parent,
+        name: name.to_owned(),
+    })
+}
+
 pub(super) fn verify_retained_output_evidence(
     root: &OwnedFd,
     state: &LocalRunStateV1,
@@ -3894,9 +4555,6 @@ pub(super) fn verify_retained_output_evidence(
         .filter(|attempt| attempt.attempt_number == attempt_number)
     {
         found = true;
-        let attempt_name = attempt_directory_name(attempt.attempt_number)
-            .ok_or(LocalRunDirectoryError::StateInvalid)?;
-        let attempt_directory = open_directory_at(&attempts, &attempt_name)?;
         for output in attempt_retained_outputs(attempt) {
             output_count = output_count
                 .checked_add(1)
@@ -3908,7 +4566,21 @@ pub(super) fn verify_retained_output_evidence(
                     .filter(|bytes| *bytes <= MAXIMUM_RETAINED_OUTPUT_BYTES)
                     .ok_or(LocalRunDirectoryError::StateInvalid)?;
             }
-            verify_retained_output(&attempt_directory, output)?;
+            let owner = match output.producer() {
+                Some(producer) => state
+                    .attempts
+                    .iter()
+                    .find(|candidate| {
+                        candidate.attempt_number == producer.attempt_number
+                            && candidate.attempt_id == producer.attempt_id
+                    })
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?,
+                None => attempt,
+            };
+            let owner_name = attempt_directory_name(owner.attempt_number)
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            let owner_directory = open_directory_at(&attempts, &owner_name)?;
+            verify_retained_output(&owner_directory, output)?;
         }
     }
     if !found {
@@ -4759,6 +5431,7 @@ fn fresh_attempt(
         prior_attempt_number,
         definition: Some(definition),
         state: AttemptStateV1::Created,
+        continuation: None,
         execution_root,
         created_at,
         started_at: None,
@@ -5435,7 +6108,7 @@ fn validate_state(state: &LocalRunStateV1) -> Result<(), LocalRunDirectoryError>
             .ok()
             .and_then(|index| index.checked_add(1))
             .ok_or(LocalRunDirectoryError::StateInvalid)?;
-        validate_attempt(attempt, number)?;
+        validate_attempt(state, attempt, number)?;
     }
     let mut prior_sequence = 0;
     for diagnostic in &state.diagnostics {
@@ -5457,6 +6130,7 @@ fn validate_state(state: &LocalRunStateV1) -> Result<(), LocalRunDirectoryError>
 }
 
 fn validate_attempt(
+    state: &LocalRunStateV1,
     attempt: &LocalAttemptV1,
     expected_number: u64,
 ) -> Result<(), LocalRunDirectoryError> {
@@ -5589,6 +6263,7 @@ fn validate_attempt(
                 step.outputs.as_deref(),
                 attempt.definition.is_some(),
             )
+            || (step.state == AttemptStepStateV1::Inherited && step.recovery.is_some())
             || step.detail.as_ref().is_some_and(|detail| {
                 let NodeDetail::Cancellation(detail) = detail else {
                     return false;
@@ -5604,6 +6279,7 @@ fn validate_attempt(
             return Err(LocalRunDirectoryError::StateInvalid);
         }
     }
+    validate_attempt_continuation(state, attempt)?;
     validate_attempt_recovery(attempt, &step_ids)?;
     validate_attempt_finalization(attempt, &mut step_ids)?;
     let mut action_ids = BTreeSet::new();
@@ -5651,6 +6327,200 @@ fn validate_attempt(
         }
     }
     validate_attempt_result(attempt)
+}
+
+fn validate_attempt_continuation(
+    state: &LocalRunStateV1,
+    attempt: &LocalAttemptV1,
+) -> Result<(), LocalRunDirectoryError> {
+    let inherited = attempt
+        .progress
+        .steps
+        .iter()
+        .filter(|step| step.state == AttemptStepStateV1::Inherited)
+        .collect::<Vec<_>>();
+    let Some(continuation) = &attempt.continuation else {
+        return (attempt.trigger != AttemptTriggerV1::Continuation && inherited.is_empty())
+            .then_some(())
+            .ok_or(LocalRunDirectoryError::StateInvalid);
+    };
+    let reexecuted = attempt
+        .progress
+        .steps
+        .iter()
+        .filter(|step| step.state != AttemptStepStateV1::Inherited)
+        .map(|step| step.id.as_str())
+        .collect::<Vec<_>>();
+    if attempt.trigger != AttemptTriggerV1::Continuation
+        || !super::result_metadata::validate_continuation_record(continuation)
+        || continuation.workspace.execution_root != attempt.execution_root
+        || reexecuted
+            != continuation
+                .reexecuted_steps
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        || continuation.inherited_steps.len() != inherited.len()
+        || continuation
+            .inherited_steps
+            .iter()
+            .zip(&inherited)
+            .any(|(record, step)| record.id != step.id)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let prior = state
+        .attempts
+        .iter()
+        .find(|candidate| Some(candidate.attempt_number) == attempt.prior_attempt_number)
+        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+    let requested_execution_root = continuation
+        .request
+        .execution_root
+        .as_deref()
+        .unwrap_or(&prior.execution_root);
+    if requested_execution_root != continuation.workspace.execution_root
+        || continuation.workspace.prior_execution_root != prior.execution_root
+        || continuation.workspace.prior_settlement_snapshot != prior.settlement_snapshot
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    for (record, step) in continuation.inherited_steps.iter().zip(inherited) {
+        let Some(NodeDetail::Inherited(detail)) = &step.detail else {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        };
+        let disposition = inherited_disposition(state, attempt.attempt_number, &step.id)?;
+        let prior_step = prior
+            .progress
+            .steps
+            .iter()
+            .find(|prior_step| prior_step.id == step.id)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let prior_state = match prior_step.state {
+            AttemptStepStateV1::Succeeded => super::evidence::InheritedPriorState::Succeeded,
+            AttemptStepStateV1::Skipped => super::evidence::InheritedPriorState::Skipped,
+            AttemptStepStateV1::Inherited => super::evidence::InheritedPriorState::Inherited,
+            AttemptStepStateV1::Pending
+            | AttemptStepStateV1::Starting
+            | AttemptStepStateV1::Running
+            | AttemptStepStateV1::CapturingOutputs
+            | AttemptStepStateV1::Failed
+            | AttemptStepStateV1::Blocked
+            | AttemptStepStateV1::NotRun
+            | AttemptStepStateV1::Cancelling
+            | AttemptStepStateV1::Cancelled => {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        };
+        let outputs = step
+            .outputs
+            .as_deref()
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        let prior_outputs = prior_step
+            .outputs
+            .as_deref()
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        if detail.prior_attempt_id != prior.attempt_id
+            || detail.prior_attempt_number != prior.attempt_number
+            || detail.prior_state != prior_state
+            || detail.prior_state != record.prior_state
+            || detail.definition_changed != record.definition_changed
+            || outputs.len() != prior_outputs.len()
+            || (disposition == InheritedDisposition::Skipped && !outputs.is_empty())
+        {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        for output in outputs {
+            let prior_output = prior_outputs
+                .iter()
+                .find(|candidate| candidate.name() == output.name())
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            let expected_producer = match prior_step.state {
+                AttemptStepStateV1::Succeeded => super::runtime::OutputProducer {
+                    attempt_id: prior.attempt_id.clone(),
+                    attempt_number: prior.attempt_number,
+                    node: step.id.clone(),
+                    output: output.name().to_owned(),
+                },
+                AttemptStepStateV1::Inherited => prior_output
+                    .producer()
+                    .cloned()
+                    .ok_or(LocalRunDirectoryError::StateInvalid)?,
+                AttemptStepStateV1::Skipped
+                | AttemptStepStateV1::Pending
+                | AttemptStepStateV1::Starting
+                | AttemptStepStateV1::Running
+                | AttemptStepStateV1::CapturingOutputs
+                | AttemptStepStateV1::Failed
+                | AttemptStepStateV1::Blocked
+                | AttemptStepStateV1::NotRun
+                | AttemptStepStateV1::Cancelling
+                | AttemptStepStateV1::Cancelled => {
+                    return Err(LocalRunDirectoryError::StateInvalid);
+                }
+            };
+            if output.producer() != Some(&expected_producer)
+                || !retained_output_payload_matches(prior_output, output, &expected_producer)
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            let producer_attempt = state
+                .attempts
+                .iter()
+                .find(|candidate| {
+                    candidate.attempt_number == expected_producer.attempt_number
+                        && candidate.attempt_id == expected_producer.attempt_id
+                })
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            let source = producer_attempt
+                .progress
+                .steps
+                .iter()
+                .find(|candidate| {
+                    candidate.id == step.id && candidate.state == AttemptStepStateV1::Succeeded
+                })
+                .and_then(|source| source.outputs.as_deref())
+                .and_then(|outputs| {
+                    outputs
+                        .iter()
+                        .find(|candidate| candidate.name() == output.name())
+                })
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            if !retained_output_payload_matches(source, output, &expected_producer) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+        }
+    }
+    for step in attempt
+        .progress
+        .steps
+        .iter()
+        .filter(|step| step.state == AttemptStepStateV1::Succeeded)
+    {
+        if step.outputs.iter().flatten().any(|output| {
+            output.producer().is_some_and(|producer| {
+                producer.attempt_id != attempt.attempt_id
+                    || producer.attempt_number != attempt.attempt_number
+                    || producer.node != step.id
+                    || producer.output != output.name()
+            })
+        }) {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn retained_output_payload_matches(
+    source: &RetainedOutputV1,
+    inherited: &RetainedOutputV1,
+    producer: &super::runtime::OutputProducer,
+) -> bool {
+    let mut source = source.clone();
+    let mut inherited = inherited.clone();
+    source.set_producer(producer.clone());
+    inherited.set_producer(producer.clone());
+    source == inherited
 }
 
 fn validate_attempt_recovery(
@@ -6040,6 +6910,9 @@ fn retained_outputs_match_declarations(
     let Some(retained) = retained else {
         return false;
     };
+    if state == AttemptStepStateV1::Inherited {
+        return true;
+    }
     if state != AttemptStepStateV1::Succeeded {
         return retained.is_empty();
     }
@@ -6132,7 +7005,11 @@ fn retained_output_set_valid(
     let Some(outputs) = outputs else {
         return !required;
     };
-    if state != AttemptStepStateV1::Succeeded && !outputs.is_empty() {
+    if !matches!(
+        state,
+        AttemptStepStateV1::Succeeded | AttemptStepStateV1::Inherited
+    ) && !outputs.is_empty()
+    {
         return false;
     }
     let mut names = BTreeSet::new();
@@ -6146,6 +7023,14 @@ fn retained_output_set_valid(
 
 fn retained_output_valid(role: AttemptNodeRoleV1, node: &str, output: &RetainedOutputV1) -> bool {
     let expected_path = retained_value_relative_path(role, node, output.name());
+    if output.producer().is_some_and(|producer| {
+        !is_canonical_uuid(&producer.attempt_id)
+            || producer.attempt_number == 0
+            || producer.node != node
+            || producer.output != output.name()
+    }) {
+        return false;
+    }
     let carrier_valid = |carrier: &RetainedCarrierV1, media_type: &str| {
         carrier.relative_path == expected_path
             && carrier.media_type == media_type
@@ -6221,6 +7106,11 @@ fn attempt_step_detail_valid(
             | AttemptStepStateV1::Succeeded,
             None,
         ) => true,
+        (
+            AttemptNodeRoleV1::Step,
+            AttemptStepStateV1::Inherited,
+            Some(NodeDetail::Inherited(detail)),
+        ) => detail.prior_attempt_number > 0 && is_canonical_uuid(&detail.prior_attempt_id),
         (_, AttemptStepStateV1::Failed, Some(NodeDetail::Failed(_))) => true,
         (_, AttemptStepStateV1::Blocked, Some(NodeDetail::Blocked(_))) => true,
         (_, AttemptStepStateV1::Skipped, Some(NodeDetail::Skipped(_))) => true,
@@ -6445,7 +7335,7 @@ fn generate_uuid() -> Result<String, LocalRunDirectoryError> {
     super::identity::random_uuid_v4().map_err(|()| LocalRunDirectoryError::IdentityUnavailable)
 }
 
-fn is_canonical_uuid(value: &str) -> bool {
+pub(super) fn is_canonical_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',

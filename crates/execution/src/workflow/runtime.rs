@@ -13,8 +13,8 @@ use super::document::{FailurePolicy, FinalizationTrigger};
 pub(crate) use super::evidence::FailurePhase;
 use super::evidence::{
     BlockedDetail, CancellationDetail, ConditionFalseDetail, EvaluatedPredicateEvidence,
-    FailureDetail, NodeFailureSource, NonExecutionCode, NonExecutionDetail, Prerequisite,
-    PrimaryIssue,
+    FailureDetail, InheritedDetail, NodeFailureSource, NonExecutionCode, NonExecutionDetail,
+    Prerequisite, PrimaryIssue,
 };
 use super::finalization_context::{
     self, FinalizationContext, OrdinaryIssue, OrdinaryIssueDisposition,
@@ -376,6 +376,107 @@ impl<Deadline> WorkflowState<Deadline> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InheritedDisposition {
+    Succeeded,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutputProducer {
+    pub(crate) attempt_id: String,
+    pub(crate) attempt_number: u64,
+    pub(crate) node: String,
+    pub(crate) output: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InheritedStepSeed<Output> {
+    pub(crate) detail: InheritedDetail,
+    pub(crate) disposition: InheritedDisposition,
+    pub(crate) outputs: OutputSet<Output>,
+    pub(crate) producers: BTreeMap<String, OutputProducer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionSeed<Output> {
+    steps: BTreeMap<String, InheritedStepSeed<Output>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionSeedError {
+    UnknownStep,
+    Finalizer,
+    InvalidDetail,
+    InvalidOutputs,
+    InvalidProducer,
+}
+
+impl<Output> ExecutionSeed<Output> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            steps: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn new(
+        admitted: &AdmittedWorkflow,
+        steps: BTreeMap<String, InheritedStepSeed<Output>>,
+    ) -> Result<Self, ExecutionSeedError> {
+        for (id, seed) in &steps {
+            let disposition = match seed.detail.prior_state {
+                super::evidence::InheritedPriorState::Succeeded => InheritedDisposition::Succeeded,
+                super::evidence::InheritedPriorState::Skipped => InheritedDisposition::Skipped,
+                super::evidence::InheritedPriorState::Inherited => seed.disposition,
+            };
+            if disposition != seed.disposition {
+                return Err(ExecutionSeedError::InvalidDetail);
+            }
+            if !admitted.workflow().definition.steps.contains_key(id) {
+                return Err(
+                    if admitted.workflow().definition.finalizers.contains_key(id) {
+                        ExecutionSeedError::Finalizer
+                    } else {
+                        ExecutionSeedError::UnknownStep
+                    },
+                );
+            }
+            if seed.detail.prior_attempt_id.is_empty() || seed.detail.prior_attempt_number == 0 {
+                return Err(ExecutionSeedError::InvalidDetail);
+            }
+            if (disposition == InheritedDisposition::Skipped && !seed.outputs.is_empty())
+                || seed.producers.keys().ne(seed.outputs.keys())
+            {
+                return Err(ExecutionSeedError::InvalidOutputs);
+            }
+            if seed.producers.iter().any(|(output, producer)| {
+                producer.attempt_id.is_empty()
+                    || producer.attempt_number == 0
+                    || producer.attempt_number > seed.detail.prior_attempt_number
+                    || producer.node != *id
+                    || producer.output != *output
+            }) {
+                return Err(ExecutionSeedError::InvalidProducer);
+            }
+        }
+        Ok(Self { steps })
+    }
+}
+
+#[cfg(test)]
+impl<Output> ExecutionSeed<Output> {
+    pub(crate) fn inherited_step(&self, id: &str) -> Option<&InheritedStepSeed<Output>> {
+        self.steps.get(id)
+    }
+}
+
+impl<Output> Default for ExecutionSeed<Output> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StepState<Output> {
     Pending,
@@ -390,6 +491,11 @@ pub enum StepState<Output> {
         detail: CancellationDetail,
     },
     Succeeded {
+        outputs: OutputSet<Output>,
+    },
+    Inherited {
+        detail: InheritedDetail,
+        disposition: InheritedDisposition,
         outputs: OutputSet<Output>,
     },
     Failed {
@@ -419,6 +525,7 @@ impl<Output> StepState<Output> {
             Self::Recovering { .. } => StepStateKind::Recovering,
             Self::Cancelling { .. } => StepStateKind::Cancelling,
             Self::Succeeded { .. } => StepStateKind::Succeeded,
+            Self::Inherited { .. } => StepStateKind::Inherited,
             Self::Failed { .. } => StepStateKind::Failed,
             Self::Blocked { .. } => StepStateKind::Blocked,
             Self::Skipped { .. } => StepStateKind::Skipped,
@@ -442,6 +549,7 @@ impl<Output> StepState<Output> {
         matches!(
             self,
             Self::Succeeded { .. }
+                | Self::Inherited { .. }
                 | Self::Failed { .. }
                 | Self::Blocked { .. }
                 | Self::Skipped { .. }
@@ -460,11 +568,32 @@ pub enum StepStateKind {
     Recovering,
     Cancelling,
     Succeeded,
+    Inherited,
     Failed,
     Blocked,
     Skipped,
     NotRun,
     Cancelled,
+}
+
+impl StepStateKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::CapturingOutputs => "capturing_outputs",
+            Self::Recovering => "recovering",
+            Self::Cancelling => "cancelling",
+            Self::Succeeded => "succeeded",
+            Self::Inherited => "inherited",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Skipped => "skipped",
+            Self::NotRun => "not_run",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -761,6 +890,7 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     pub(crate) workflow: WorkflowState<Deadline>,
     // One namespace and one reducer map; role is retained in the definition and events.
     pub(crate) steps: BTreeMap<String, StepRuntimeState<Cause, Output>>,
+    pub(crate) output_producers: BTreeMap<(String, String), OutputProducer>,
     pub(crate) exports: Option<ExportSet<Output>>,
     pub(crate) finalization_summary: Option<FinalizationSummary<Deadline>>,
     finalization: Option<FinalizationRuntime<Deadline>>,
@@ -986,8 +1116,9 @@ where
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
-    initialize_with_operation(
+    initialize_seeded_with_operation(
         admitted,
+        ExecutionSeed::empty(),
         initial_cancellation.map(|request| InitialCancellation::Graceful {
             request,
             operation: None,
@@ -1006,8 +1137,9 @@ pub(super) enum InitialCancellation<Deadline> {
     },
 }
 
-pub(super) fn initialize_with_operation<Provisional, Cause, Output, Deadline>(
+pub(super) fn initialize_seeded_with_operation<Provisional, Cause, Output, Deadline>(
     admitted: &AdmittedWorkflow,
+    seed: ExecutionSeed<Output>,
     initial_cancellation: Option<InitialCancellation<Deadline>>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
@@ -1015,10 +1147,13 @@ where
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
-    initialize_definition(ExecutionStart {
-        definition: RuntimeDefinition::from_admitted(admitted),
-        initial_cancellation,
-    })
+    initialize_seeded_definition(
+        ExecutionStart {
+            definition: RuntimeDefinition::from_admitted(admitted),
+            initial_cancellation,
+        },
+        seed,
+    )
 }
 
 struct ExecutionStart<Deadline> {
@@ -1026,6 +1161,7 @@ struct ExecutionStart<Deadline> {
     initial_cancellation: Option<InitialCancellation<Deadline>>,
 }
 
+#[cfg(test)]
 fn initialize_definition<Provisional, Cause, Output, Deadline>(
     start: ExecutionStart<Deadline>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>
@@ -1034,25 +1170,55 @@ where
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
+    initialize_seeded_definition(start, ExecutionSeed::empty())
+}
+
+fn initialize_seeded_definition<Provisional, Cause, Output, Deadline>(
+    start: ExecutionStart<Deadline>,
+    seed: ExecutionSeed<Output>,
+) -> Reduction<Provisional, Cause, Output, Deadline>
+where
+    Cause: Clone,
+    Output: Clone + ConditionOutput,
+    Deadline: Clone,
+{
+    let output_producers = seed
+        .steps
+        .iter()
+        .flat_map(|(step, seed)| {
+            seed.producers
+                .iter()
+                .map(move |(output, producer)| ((step.clone(), output.clone()), producer.clone()))
+        })
+        .collect();
     let steps = start
         .definition
         .steps
         .iter()
         .map(|(step, definition)| {
+            let inherited = seed.steps.get(step);
             (
                 step.clone(),
                 StepRuntimeState {
-                    state: StepState::Pending,
+                    state: inherited.map_or(StepState::Pending, |seed| StepState::Inherited {
+                        detail: seed.detail.clone(),
+                        disposition: seed.disposition,
+                        outputs: seed.outputs.clone(),
+                    }),
                     current_action: None,
                     target_execution: None,
                     target_invocation: None,
                     active_invocation: None,
-                    recovery: definition.recovery.map(|recovery| StepRecoveryState {
-                        configured_rounds: recovery.retries,
-                        handler_kind: recovery.handler_kind,
-                        rounds: Vec::with_capacity(usize::from(recovery.retries)),
-                        terminal_disposition: None,
-                    }),
+                    recovery: inherited
+                        .is_none()
+                        .then_some(definition.recovery)
+                        .flatten()
+                        .map(|recovery| StepRecoveryState {
+                            configured_rounds: recovery.retries,
+                            handler_kind: recovery.handler_kind,
+                            rounds: Vec::with_capacity(usize::from(recovery.retries)),
+                            terminal_disposition: None,
+                        }),
                     condition_passed: false,
                 },
             )
@@ -1065,6 +1231,7 @@ where
                 gate: SchedulingGate::Open,
             },
             steps,
+            output_producers,
             exports: None,
             finalization_summary: None,
             finalization: None,
@@ -1853,6 +2020,7 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
             }
             StepStateKind::Cancelling
             | StepStateKind::Succeeded
+            | StepStateKind::Inherited
             | StepStateKind::Failed
             | StepStateKind::Blocked
             | StepStateKind::Skipped
@@ -2520,7 +2688,7 @@ fn condition_gate_ready<Cause, Output, Deadline>(
             return false;
         };
         let terminal = producer.state.is_terminal();
-        let succeeded = matches!(producer.state, StepState::Succeeded { .. });
+        let succeeded = step_data_available(&producer.state);
         match definition.role {
             WorkflowNodeRole::Step => {
                 (!prerequisite.control || ordinary_control_satisfied(state, prerequisite))
@@ -2575,7 +2743,7 @@ fn condition_sources_available<Cause, Output, Deadline>(
             ResolvedValueSource::Output(source) => state
                 .steps
                 .get(&source.node.id)
-                .is_some_and(|runtime| matches!(runtime.state, StepState::Succeeded { .. })),
+                .is_some_and(|runtime| step_data_available(&runtime.state)),
         })
 }
 
@@ -2606,14 +2774,11 @@ where
                 }
             }
             ResolvedValueSource::Output(source) => {
-                let Some(output) =
-                    state
-                        .steps
-                        .get(&source.node.id)
-                        .and_then(|runtime| match &runtime.state {
-                            StepState::Succeeded { outputs } => outputs.get(&source.output),
-                            _ => None,
-                        })
+                let Some(output) = state
+                    .steps
+                    .get(&source.node.id)
+                    .and_then(|runtime| step_outputs(&runtime.state))
+                    .and_then(|outputs| outputs.get(&source.output))
                 else {
                     continue;
                 };
@@ -2645,9 +2810,47 @@ where
     condition::evaluate(predicate, &values, &dispositions)
 }
 
+fn step_data_available<Output>(state: &StepState<Output>) -> bool {
+    matches!(state, StepState::Succeeded { .. })
+        || matches!(
+            state,
+            StepState::Inherited {
+                disposition: InheritedDisposition::Succeeded,
+                ..
+            }
+        )
+}
+
+fn step_outputs<Output>(state: &StepState<Output>) -> Option<&OutputSet<Output>> {
+    match state {
+        StepState::Succeeded { outputs }
+        | StepState::Inherited {
+            disposition: InheritedDisposition::Succeeded,
+            outputs,
+            ..
+        } => Some(outputs),
+        StepState::Inherited {
+            disposition: InheritedDisposition::Skipped,
+            ..
+        }
+        | StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
+        | StepState::Cancelling { .. }
+        | StepState::Failed { .. }
+        | StepState::Blocked { .. }
+        | StepState::Skipped { .. }
+        | StepState::NotRun { .. }
+        | StepState::Cancelled { .. } => None,
+    }
+}
+
 fn terminal_disposition<Output>(state: &StepState<Output>) -> Option<TerminalDisposition> {
     match state {
         StepState::Succeeded { .. } => Some(TerminalDisposition::Succeeded),
+        StepState::Inherited { .. } => Some(TerminalDisposition::Inherited),
         StepState::Failed { .. } => Some(TerminalDisposition::Failed),
         StepState::Skipped { .. } => Some(TerminalDisposition::Skipped),
         StepState::Blocked { .. } => Some(TerminalDisposition::Blocked),
@@ -2776,7 +2979,7 @@ fn condition_blockers<Cause, Output, Deadline>(
         {
             blockers.push(blocker);
         }
-        if prerequisite.condition_data && !matches!(producer.state, StepState::Succeeded { .. }) {
+        if prerequisite.condition_data && !step_data_available(&producer.state) {
             blockers.extend(
                 definition
                     .evidence_prerequisites
@@ -2795,7 +2998,7 @@ fn condition_blockers<Cause, Output, Deadline>(
             continue;
         };
         if state.steps.get(&source.node.id).is_some_and(|producer| {
-            producer.state.is_terminal() && !matches!(producer.state, StepState::Succeeded { .. })
+            producer.state.is_terminal() && !step_data_available(&producer.state)
         }) && let Ok(blocker) = Prerequisite::condition(source.reference())
         {
             blockers.push(blocker);
@@ -2828,7 +3031,7 @@ fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
         if !producer.state.is_terminal() {
             continue;
         }
-        let succeeded = matches!(producer.state, StepState::Succeeded { .. });
+        let succeeded = step_data_available(&producer.state);
         let control_satisfied = ordinary_control_satisfied(state, prerequisite);
         if prerequisite.control
             && !control_satisfied
@@ -2873,7 +3076,7 @@ fn ordinary_prerequisite_satisfied<Cause, Output, Deadline>(
     let Some(producer) = state.steps.get(&prerequisite.producer) else {
         return false;
     };
-    let succeeded = matches!(producer.state, StepState::Succeeded { .. });
+    let succeeded = step_data_available(&producer.state);
     (!prerequisite.control || ordinary_control_satisfied(state, prerequisite))
         && (!prerequisite.data || succeeded)
         && (!prerequisite.disposition_control || producer.state.is_terminal())
@@ -2889,7 +3092,9 @@ fn ordinary_control_satisfied<Cause, Output, Deadline>(
         .is_some_and(|producer| {
             matches!(
                 producer.state,
-                StepState::Succeeded { .. } | StepState::Skipped { .. }
+                StepState::Succeeded { .. }
+                    | StepState::Skipped { .. }
+                    | StepState::Inherited { .. }
             ) || (state
                 .definition
                 .steps
@@ -3020,7 +3225,7 @@ fn unavailable_references<Cause, Output, Deadline>(
                     !state
                         .steps
                         .get(producer)
-                        .is_some_and(|runtime| matches!(runtime.state, StepState::Succeeded { .. }))
+                        .is_some_and(|runtime| step_data_available(&runtime.state))
                 }) =>
             {
                 Some(r#ref.clone())
@@ -3148,10 +3353,8 @@ where
                 ResolvedValueSource::Output(source) => state
                     .steps
                     .get(&source.node.id)
-                    .and_then(|producer| match &producer.state {
-                        StepState::Succeeded { outputs } => outputs.get(&source.output),
-                        _ => None,
-                    })
+                    .and_then(|producer| step_outputs(&producer.state))
+                    .and_then(|outputs| outputs.get(&source.output))
                     .cloned()
                     .map_or(ActionInput::Unavailable, ActionInput::Output),
             };
@@ -3421,6 +3624,7 @@ fn erase_outputs<Output>(state: &StepState<Output>) -> Option<StepState<()>> {
         StepState::Succeeded { .. } => StepState::Succeeded {
             outputs: BTreeMap::new(),
         },
+        StepState::Inherited { .. } => return None,
         StepState::Failed { detail } => StepState::Failed {
             detail: detail.clone(),
         },
@@ -3544,8 +3748,19 @@ where
         .map(|(name, source)| {
             let step = state.steps.get(&source.step)?;
             let value = match &step.state {
-                StepState::Succeeded { outputs } => ExportValue::Available {
+                StepState::Succeeded { outputs }
+                | StepState::Inherited {
+                    disposition: InheritedDisposition::Succeeded,
+                    outputs,
+                    ..
+                } => ExportValue::Available {
                     output: outputs.get(&source.output)?.clone(),
+                },
+                StepState::Inherited {
+                    disposition: InheritedDisposition::Skipped,
+                    ..
+                } => ExportValue::Unavailable {
+                    reason: ExportUnavailableReason::Skipped,
                 },
                 StepState::Failed { .. } => ExportValue::Unavailable {
                     reason: ExportUnavailableReason::Failed,

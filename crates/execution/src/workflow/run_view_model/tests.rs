@@ -840,10 +840,90 @@ async fn terminal_result_and_local_lifecycle_do_not_enable_quit() {
     assert!(view.snapshot().quit_eligible);
 }
 
+#[test]
+fn terminal_reconciliation_accepts_referenced_inherited_output_subset() {
+    let (_temporary, workflow) = resolve_workflow(
+        "schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: [\"prepare\"]
+    outputs:
+      report:
+        kind: text
+        from: path
+        path: report.txt
+      unused:
+        kind: text
+        from: path
+        path: unused.txt
+  consume:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv: [\"consume\"]
+    outputs:
+      receipt:
+        kind: text
+        from: path
+        path: receipt.txt
+",
+    );
+    let base = scherzo_cloud_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let mut run = succeeded_run_result(&workflow, base);
+    run.attempt_number = 2;
+    run.steps[0].state = StepState::Inherited {
+        detail: crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            prior_attempt_number: 1,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+            definition_changed: true,
+        },
+        disposition: crate::workflow::runtime::InheritedDisposition::Succeeded,
+        outputs: BTreeMap::from([(
+            "report".to_owned(),
+            CapturedValue::text(Arc::from("captured")),
+        )]),
+    };
+    run.steps[0].timing = None;
+
+    let view = model(&workflow, clock.clone());
+    view.reconcile_terminal_result(&run).unwrap();
+    let snapshot = view.snapshot();
+    assert!(snapshot.authoritative_result);
+    assert_eq!(snapshot.steps[0].state, StepStateKind::Succeeded);
+    assert_eq!(
+        snapshot.steps[0].outputs["report"],
+        WorkflowRunOutputDisposition::Committed
+    );
+    assert_eq!(
+        snapshot.steps[0].outputs["unused"],
+        WorkflowRunOutputDisposition::Pending
+    );
+
+    let mut invalid = run;
+    let StepState::Inherited { outputs, .. } = &mut invalid.steps[0].state else {
+        panic!("fixture must remain inherited");
+    };
+    outputs.insert(
+        "undeclared".to_owned(),
+        CapturedValue::text(Arc::from("invalid")),
+    );
+    let invalid_view = model(&workflow, clock);
+    assert_eq!(
+        invalid_view.reconcile_terminal_result(&invalid),
+        Err(WorkflowRunViewModelError::InvalidTerminalResult)
+    );
+}
+
 fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowRunResult {
     WorkflowRunResult {
         run_directory: workflow.source.source_root.clone(),
         attempt_number: 1,
+        continuation: None,
+        output_producers: BTreeMap::new(),
         workflow_path: workflow.source.workflow_path.clone(),
         source_root: workflow.source.source_root.clone(),
         content_digest: workflow.content_digest.clone(),

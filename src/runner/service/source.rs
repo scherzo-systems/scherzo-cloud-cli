@@ -2761,6 +2761,8 @@ mod tests {
             let run = WorkflowRunResult {
                 run_directory: assignment.path().to_owned(),
                 attempt_number: 1,
+                continuation: None,
+                output_producers: BTreeMap::new(),
                 workflow_path: admitted.workflow().source.workflow_path.clone(),
                 source_root: admitted.execution().root().to_owned(),
                 content_digest: admitted.workflow().content_digest.clone(),

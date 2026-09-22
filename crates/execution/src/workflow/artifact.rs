@@ -485,6 +485,18 @@ pub struct CapturedGitBranch {
 }
 
 impl CapturedGitBranch {
+    pub(crate) fn from_retained(
+        output_identity: Arc<str>,
+        metadata: GitBranchMetadata,
+        carrier: Option<GitBranchCarrier>,
+    ) -> Self {
+        Self {
+            output_identity,
+            metadata,
+            carrier,
+        }
+    }
+
     pub(crate) fn output_identity(&self) -> &str {
         &self.output_identity
     }
@@ -740,6 +752,17 @@ impl<'a> CaptureDeclaration<'a> {
 
 pub(crate) trait CarrierProducer: Send {
     fn stream_to(&mut self, destination: &mut CarrierDestination<'_>) -> io::Result<()>;
+
+    fn supports_hard_links(&self) -> bool {
+        false
+    }
+
+    fn hard_link_to(&mut self, _destination: &OwnedFd, _name: &OsStr) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "carrier producer does not support hard links",
+        ))
+    }
 }
 
 pub(crate) struct GitBranchCaptureDeclaration<'a> {
@@ -762,9 +785,50 @@ impl<'a> GitBranchCaptureDeclaration<'a> {
     }
 }
 
+pub(crate) struct RetainedFileCaptureDeclaration<'a> {
+    output_identity: &'a str,
+    profile: PathCaptureProfile<'a>,
+    producer: &'a mut dyn CarrierProducer,
+}
+
+impl<'a> RetainedFileCaptureDeclaration<'a> {
+    pub(crate) fn new(
+        output_identity: &'a str,
+        media_type: &'a str,
+        producer: &'a mut dyn CarrierProducer,
+    ) -> Self {
+        Self {
+            output_identity,
+            profile: PathCaptureProfile::File { media_type },
+            producer,
+        }
+    }
+
+    pub(crate) fn text(output_identity: &'a str, producer: &'a mut dyn CarrierProducer) -> Self {
+        Self {
+            output_identity,
+            profile: PathCaptureProfile::Text,
+            producer,
+        }
+    }
+
+    pub(crate) fn json(
+        output_identity: &'a str,
+        schema: &'a RetainedJsonSchema,
+        producer: &'a mut dyn CarrierProducer,
+    ) -> Self {
+        Self {
+            output_identity,
+            profile: PathCaptureProfile::Json { schema },
+            producer,
+        }
+    }
+}
+
 pub(crate) enum CaptureCandidateDeclaration<'a> {
     File(CaptureDeclaration<'a>),
     GitBranch(GitBranchCaptureDeclaration<'a>),
+    RetainedFile(RetainedFileCaptureDeclaration<'a>),
 }
 
 impl CaptureCandidateDeclaration<'_> {
@@ -772,12 +836,13 @@ impl CaptureCandidateDeclaration<'_> {
         match self {
             Self::File(declaration) => declaration.output_identity,
             Self::GitBranch(declaration) => declaration.output_identity,
+            Self::RetainedFile(declaration) => declaration.output_identity,
         }
     }
 
     fn budget_class(&self) -> Option<CarrierBudgetClass> {
         match self {
-            Self::File(_) => Some(CarrierBudgetClass::File),
+            Self::File(_) | Self::RetainedFile(_) => Some(CarrierBudgetClass::File),
             Self::GitBranch(declaration) => declaration
                 .producer
                 .is_some()
@@ -787,7 +852,7 @@ impl CaptureCandidateDeclaration<'_> {
 
     fn carrier_presence_matches_delta(&self) -> bool {
         match self {
-            Self::File(_) => true,
+            Self::File(_) | Self::RetainedFile(_) => true,
             Self::GitBranch(declaration) => {
                 let has_delta = declaration.metadata.base_oid != declaration.metadata.head_oid;
                 has_delta == declaration.producer.is_some()
@@ -1172,6 +1237,27 @@ impl ArtifactStaging {
                             self.semantic_path_value(
                                 &output_identity,
                                 file,
+                                declaration.profile,
+                                bounds,
+                            )
+                        })
+                    })
+                    .map(|value| (value, Some(CarrierBudgetClass::File))),
+                CaptureCandidateDeclaration::RetainedFile(declaration) => self
+                    .capture_bounds(CarrierBudgetClass::File, &output_identity)
+                    .and_then(|bounds| {
+                        self.stage_produced_carrier(
+                            Arc::clone(&output_identity),
+                            declaration.producer,
+                            Arc::from(declaration.profile.media_type()),
+                            CarrierBudgetClass::File,
+                            bounds,
+                            cancellation,
+                        )
+                        .and_then(|carrier| {
+                            self.semantic_path_value(
+                                &output_identity,
+                                CapturedArtifact { carrier },
                                 declaration.profile,
                                 bounds,
                             )
@@ -1692,6 +1778,36 @@ impl ArtifactStaging {
         bounds: CaptureBounds,
         cancellation: &CaptureCancellation,
     ) -> Result<GitBranchCarrier, CaptureAttemptFailure> {
+        self.stage_produced_carrier(
+            output_identity,
+            producer,
+            Arc::from("application/vnd.git.bundle"),
+            CarrierBudgetClass::Git,
+            bounds,
+            cancellation,
+        )
+        .map(|staged| GitBranchCarrier { staged })
+    }
+
+    fn stage_produced_carrier(
+        &self,
+        output_identity: Arc<str>,
+        producer: &mut dyn CarrierProducer,
+        media_type: Arc<str>,
+        budget_class: CarrierBudgetClass,
+        bounds: CaptureBounds,
+        cancellation: &CaptureCancellation,
+    ) -> Result<StagedCarrier, CaptureAttemptFailure> {
+        if producer.supports_hard_links() {
+            return self.stage_linked_carrier(
+                output_identity,
+                producer,
+                media_type,
+                budget_class,
+                bounds,
+                cancellation,
+            );
+        }
         cancellation.check()?;
         let lifecycle = self.active_lifecycle(&output_identity)?;
         let (artifact_identity, mut destination) = self.create_destination().map_err(|kind| {
@@ -1720,13 +1836,118 @@ impl ArtifactStaging {
                 output_identity,
                 destination,
                 capture_result,
-                profile: (
-                    Arc::from("application/vnd.git.bundle"),
-                    CarrierBudgetClass::Git,
-                ),
+                profile: (media_type, budget_class),
             },
         )
-        .map(|staged| GitBranchCarrier { staged })
+    }
+
+    // Hard-link and streaming capture intentionally have parallel typed entry points while
+    // differing in identity acquisition, rollback, and byte transfer.
+    // jscpd:ignore-start
+    fn stage_linked_carrier(
+        &self,
+        output_identity: Arc<str>,
+        producer: &mut dyn CarrierProducer,
+        media_type: Arc<str>,
+        budget_class: CarrierBudgetClass,
+        bounds: CaptureBounds,
+        cancellation: &CaptureCancellation,
+    ) -> Result<StagedCarrier, CaptureAttemptFailure> {
+        // jscpd:ignore-end
+        let unavailable = || {
+            CaptureAttemptFailure::Capture(CaptureFailure::new(
+                Arc::clone(&output_identity),
+                CaptureFailureKind::CarrierProducerUnavailable,
+            ))
+        };
+        cancellation.check()?;
+        let lifecycle = self.active_lifecycle(&output_identity)?;
+        let artifact_identity = (0..IDENTITY_ATTEMPTS)
+            .find_map(|_| {
+                let identity = Arc::<str>::from(format!(
+                    "art_{}",
+                    ulid::Ulid::generate().to_string().to_ascii_lowercase()
+                ));
+                match producer.hard_link_to(&self.inner.staging_root, OsStr::new(&*identity)) {
+                    Ok(()) => Some(Ok(identity)),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                    Err(_) => Some(Err(unavailable())),
+                }
+            })
+            .transpose()?
+            .ok_or_else(unavailable)?;
+        let registered = self.inner.artifacts.lock().map(|mut artifacts| {
+            artifacts.insert(Arc::clone(&artifact_identity));
+        });
+        if registered.is_err() {
+            let _ = unlinkat(
+                &self.inner.staging_root,
+                artifact_identity.as_ref(),
+                AtFlags::empty(),
+            );
+            return Err(unavailable());
+        }
+        let mut destination = match openat(
+            &self.inner.staging_root,
+            artifact_identity.as_ref(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(destination) => File::from(destination),
+            Err(_) => {
+                drop(lifecycle);
+                self.inner.remove_artifact_while_active(&artifact_identity);
+                return Err(unavailable());
+            }
+        };
+        let capture_result = (|| {
+            let metadata = fstat(&destination).map_err(|_| unavailable())?;
+            if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+                return Err(unavailable());
+            }
+            let size = u64::try_from(metadata.st_size).map_err(|_| unavailable())?;
+            if size > bounds.maximum_bytes {
+                return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                    Arc::clone(&output_identity),
+                    bounds.overflow_kind,
+                )));
+            }
+            let mut observed = 0_u64;
+            let mut digest = DigestContext::new(&SHA256);
+            let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+            loop {
+                cancellation.check()?;
+                let read = destination.read(&mut buffer).map_err(|_| unavailable())?;
+                if read == 0 {
+                    break;
+                }
+                observed = observed
+                    .checked_add(u64::try_from(read).map_err(|_| unavailable())?)
+                    .ok_or_else(unavailable)?;
+                if observed > bounds.maximum_bytes {
+                    return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
+                        Arc::clone(&output_identity),
+                        bounds.overflow_kind,
+                    )));
+                }
+                digest.update(&buffer[..read]);
+            }
+            if observed != size {
+                return Err(unavailable());
+            }
+            Ok((observed, Arc::from(lowercase_hex(digest.finish().as_ref()))))
+        })();
+        self.finish_staged_carrier(
+            lifecycle,
+            cancellation,
+            PendingStagedCarrier {
+                artifact_identity,
+                output_identity,
+                destination,
+                capture_result,
+                profile: (media_type, budget_class),
+            },
+        )
     }
 
     fn active_lifecycle(

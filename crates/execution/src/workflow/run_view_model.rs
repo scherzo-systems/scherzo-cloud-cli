@@ -733,6 +733,7 @@ impl WorkflowRunStepViewState {
                     }
                 }
             }
+            StepStateKind::Inherited => {}
             StepStateKind::Failed => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Failed);
             }
@@ -770,6 +771,24 @@ impl WorkflowRunStepViewState {
                     };
                 }
             }
+            StepState::Inherited {
+                disposition,
+                outputs,
+                ..
+            } => match disposition {
+                super::runtime::InheritedDisposition::Succeeded => {
+                    for (name, output_disposition) in &mut self.outputs {
+                        *output_disposition = if outputs.contains_key(name) {
+                            WorkflowRunOutputDisposition::Committed
+                        } else {
+                            WorkflowRunOutputDisposition::Pending
+                        };
+                    }
+                }
+                super::runtime::InheritedDisposition::Skipped => {
+                    self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Skipped);
+                }
+            },
             StepState::Failed { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Failed);
             }
@@ -982,7 +1001,18 @@ fn terminal_step_is_valid(
 ) -> bool {
     match &terminal.state {
         StepState::Succeeded { outputs } => outputs.keys().eq(view.outputs.keys()),
-        StepState::Failed { .. }
+        StepState::Inherited {
+            disposition: super::runtime::InheritedDisposition::Succeeded,
+            outputs,
+            ..
+        } => outputs
+            .keys()
+            .all(|output| view.outputs.contains_key(output)),
+        StepState::Inherited {
+            disposition: super::runtime::InheritedDisposition::Skipped,
+            ..
+        }
+        | StepState::Failed { .. }
         | StepState::Blocked { .. }
         | StepState::Skipped { .. }
         | StepState::NotRun { .. }
@@ -1004,7 +1034,7 @@ fn terminal_state_kind(state: &StepState<super::value::CapturedValue>) -> StepSt
         StepState::CapturingOutputs => StepStateKind::CapturingOutputs,
         StepState::Recovering { .. } => StepStateKind::Recovering,
         StepState::Cancelling { .. } => StepStateKind::Cancelling,
-        StepState::Succeeded { .. } => StepStateKind::Succeeded,
+        StepState::Succeeded { .. } | StepState::Inherited { .. } => StepStateKind::Succeeded,
         StepState::Failed { .. } => StepStateKind::Failed,
         StepState::Blocked { .. } => StepStateKind::Blocked,
         StepState::Skipped { .. } => StepStateKind::Skipped,
@@ -1017,6 +1047,7 @@ fn terminal_step_fact(
     state: &StepState<super::value::CapturedValue>,
 ) -> Option<ObservedStepTransition> {
     match state {
+        StepState::Inherited { .. } => None,
         StepState::Failed { detail } => Some(ObservedStepTransition::Failed {
             detail: detail.clone(),
         }),

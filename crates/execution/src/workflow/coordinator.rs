@@ -950,6 +950,7 @@ where
     clock: Clock,
     commits: Commits,
     actions: Actions,
+    seed: runtime::ExecutionSeed<Output>,
     state: Option<RuntimeState<Cause, Output, Clock::Instant>>,
 }
 
@@ -963,6 +964,7 @@ where
     Commits: CommitPort<CommittedReduction<Cause, Output, Clock::Instant>>,
     Actions: ActionPort<RequestedAction<Provisional, Cause, Output, Clock::Instant>>,
 {
+    #[cfg(test)]
     pub(crate) fn new(
         admitted: AdmittedWorkflow,
         occurrences: OccurrenceReceiver<Provisional, Cause, Output>,
@@ -970,12 +972,31 @@ where
         commits: Commits,
         actions: Actions,
     ) -> Self {
+        Self::new_seeded(
+            admitted,
+            occurrences,
+            clock,
+            commits,
+            actions,
+            runtime::ExecutionSeed::empty(),
+        )
+    }
+
+    pub(crate) fn new_seeded(
+        admitted: AdmittedWorkflow,
+        occurrences: OccurrenceReceiver<Provisional, Cause, Output>,
+        clock: Clock,
+        commits: Commits,
+        actions: Actions,
+        seed: runtime::ExecutionSeed<Output>,
+    ) -> Self {
         Self {
             admitted,
             occurrences,
             clock,
             commits,
             actions,
+            seed,
             state: None,
         }
     }
@@ -1013,11 +1034,12 @@ where
             DriverOccurrenceContentDigest,
         > = BTreeMap::new();
         let occurrence_identity_capacity = self.admitted.capacity().maximum_transitions;
-        let initialization =
-            runtime::initialize_with_operation::<Provisional, Cause, Output, Clock::Instant>(
-                &self.admitted,
-                initial_cancellation,
-            );
+        let initialization = runtime::initialize_seeded_with_operation::<
+            Provisional,
+            Cause,
+            Output,
+            Clock::Instant,
+        >(&self.admitted, self.seed.clone(), initial_cancellation);
         if initialization.state.transition_capacity_exceeded() {
             self.commit_coordination_diagnostic(
                 ordinal,

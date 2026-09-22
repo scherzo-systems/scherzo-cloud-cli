@@ -18,7 +18,7 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 use serde::de::Error as _;
-use serde::ser::SerializeStruct as _;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -40,7 +40,7 @@ use super::resolution::WorkflowContentDigest;
 use super::result_metadata;
 use super::runtime::{
     ActiveStepInvocation, ExportSet, ExportUnavailableReason, ExportValue, FailurePhase,
-    RecoveryHandlerFailurePhase, RecoveryHandlerKind, RecoveryHandlerOutcome,
+    OutputProducer, RecoveryHandlerFailurePhase, RecoveryHandlerKind, RecoveryHandlerOutcome,
     RecoveryTerminalDisposition, RunOutcome, StepRecoveryState, StepState,
 };
 use super::schema_common::{lowercase_hex, utc_timestamp};
@@ -51,6 +51,7 @@ use super::step_runtime::{
 use super::validated::WorkflowNodeRole;
 use super::validated::{ResolvedOutputSource, WorkflowValueType};
 use super::value::CapturedValue;
+use super::workspace_snapshot::WorkspaceSnapshotV1;
 
 const COMMAND: &str = "scherzo-cloud workflow run";
 const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
@@ -110,10 +111,128 @@ pub struct WorkflowRunFinalizationCancellation {
     pub force_stop_deadline: Option<OffsetDateTime>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinuationRecordV1 {
+    pub(crate) request: ContinuationRequestV1,
+    pub(crate) from_steps: Vec<String>,
+    pub(crate) reexecuted_steps: Vec<String>,
+    pub(crate) inherited_steps: Vec<ContinuationInheritedStepV1>,
+    pub(crate) definition_source: ContinuationDefinitionSourceV1,
+    pub(crate) workspace: ContinuationWorkspaceV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContinuationRequestV1 {
+    pub(crate) from_steps: Vec<String>,
+    pub(crate) definition: ContinuationRequestedDefinitionV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_run_version: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ContinuationRequestedDefinitionV1 {
+    Inherited(ContinuationInheritedDefinitionV1),
+    Replaced {
+        replaced: ContinuationReplacementDefinitionSourceV1,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContinuationInheritedDefinitionV1 {
+    Inherited,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ContinuationReplacementDefinitionSourceV1 {
+    Local(ContinuationLocalDefinitionSourceV1),
+    Cloud(ContinuationCloudDefinitionSourceV1),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContinuationLocalDefinitionSourceV1 {
+    pub(crate) path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContinuationCloudDefinitionSourceV1 {
+    pub(crate) commit_oid: String,
+    pub(crate) workflow_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContinuationInheritedStepV1 {
+    pub(crate) id: String,
+    pub(crate) prior_state: super::evidence::InheritedPriorState,
+    pub(crate) definition_changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ContinuationDefinitionSourceV1 {
+    Inherited {
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: DigestV1,
+        #[serde(rename = "priorManifestDigest")]
+        prior_manifest_digest: DigestV1,
+    },
+    Replaced {
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: DigestV1,
+        #[serde(rename = "priorManifestDigest")]
+        prior_manifest_digest: DigestV1,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContinuationWorkspaceV1 {
+    pub(crate) execution_root: String,
+    pub(crate) prior_execution_root: String,
+    pub(crate) start_snapshot: WorkspaceSnapshotV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prior_settlement_snapshot: Option<WorkspaceSnapshotV1>,
+    pub(crate) modified: WorkspaceModifiedV1,
+    pub(crate) quiescence: ContinuationQuiescenceV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum WorkspaceModifiedV1 {
+    Known(bool),
+    Unknown(WorkspaceModifiedUnknownV1),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceModifiedUnknownV1 {
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContinuationQuiescenceV1 {
+    pub(crate) groups_recorded: u64,
+    pub(crate) groups_terminated: u64,
+    pub(crate) groups_absent: u64,
+    pub(crate) proven_at: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkflowRunResult {
     pub run_directory: PathBuf,
     pub attempt_number: u64,
+    pub continuation: Option<ContinuationRecordV1>,
+    pub output_producers: BTreeMap<String, BTreeMap<String, OutputProducer>>,
     pub workflow_path: String,
     pub source_root: PathBuf,
     pub content_digest: WorkflowContentDigest,
@@ -158,6 +277,18 @@ pub fn summary_disposition_matches(
 ) -> bool {
     match (summarized, state) {
         (StepState::Succeeded { .. }, StepState::Succeeded { .. }) => true,
+        (
+            StepState::Inherited {
+                detail: left_detail,
+                disposition: left_disposition,
+                ..
+            },
+            StepState::Inherited {
+                detail: right_detail,
+                disposition: right_disposition,
+                ..
+            },
+        ) => left_detail == right_detail && left_disposition == right_disposition,
         (StepState::Failed { detail: left }, StepState::Failed { detail: right }) => left == right,
         (StepState::Blocked { detail: left }, StepState::Blocked { detail: right }) => {
             left == right
@@ -204,6 +335,7 @@ pub(crate) enum LocalPublicationFailureKind {
 #[serde(rename_all = "snake_case")]
 pub enum RunResultInvariant {
     AttemptMetadata,
+    Continuation,
     WorkflowMetadata,
     ExecutionMetadata,
     ResultStructure,
@@ -225,6 +357,7 @@ impl RunResultInvariant {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::AttemptMetadata => "attempt_metadata",
+            Self::Continuation => "continuation",
             Self::WorkflowMetadata => "workflow_metadata",
             Self::ExecutionMetadata => "execution_metadata",
             Self::ResultStructure => "result_structure",
@@ -371,6 +504,16 @@ impl WorkflowRunTerminalResultV1 {
 pub struct WorkflowResultV1 {
     pub(crate) schema_version: u8,
     pub(crate) attempt_number: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) continuation: Option<ContinuationRecordV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) output_producers: BTreeMap<String, BTreeMap<String, OutputProducer>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) export_sources: BTreeMap<String, ExportSourceV1>,
     pub(crate) workflow: WorkflowIdentityV1,
     pub(crate) execution: WorkflowExecutionV1,
     pub(crate) command_output_policy: CommandOutputPolicyV1,
@@ -523,6 +666,7 @@ pub(crate) enum CancellationReasonV1 {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkflowStepStateV1 {
     Succeeded,
+    Inherited,
     Failed,
     Blocked,
     Skipped,
@@ -543,6 +687,13 @@ pub(crate) enum WorkflowNodeRoleV1 {
 pub(crate) struct WorkflowNodeV1 {
     pub(crate) id: String,
     pub(crate) role: WorkflowNodeRoleV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ExportSourceV1 {
+    pub(crate) node: WorkflowNodeV1,
+    pub(crate) output: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1095,6 +1246,8 @@ pub(crate) enum ExportV1 {
         path: String,
         size_bytes: u64,
         digest: DigestV1,
+        provenance: Option<ExportProvenanceV1>,
+        producer: Option<OutputProducer>,
     },
     GitBranch {
         artifact_version: u8,
@@ -1103,10 +1256,18 @@ pub(crate) enum ExportV1 {
         head_oid: String,
         tree_oid: String,
         carrier: Option<GitBranchCarrierV1>,
+        provenance: Option<ExportProvenanceV1>,
+        producer: Option<OutputProducer>,
     },
     Unavailable {
         reason: ExportUnavailableReasonV1,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) enum ExportProvenanceV1 {
+    Inherited,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1116,6 +1277,23 @@ pub(crate) struct GitBranchCarrierV1 {
     pub(crate) media_type: String,
     pub(crate) size_bytes: u64,
     pub(crate) digest: DigestV1,
+}
+
+fn serialize_export_origin<State>(
+    state: &mut State,
+    provenance: Option<&ExportProvenanceV1>,
+    producer: Option<&OutputProducer>,
+) -> Result<(), State::Error>
+where
+    State: SerializeStruct,
+{
+    if let Some(provenance) = provenance {
+        state.serialize_field("provenance", provenance)?;
+    }
+    if let Some(producer) = producer {
+        state.serialize_field("producer", producer)?;
+    }
+    Ok(())
 }
 
 impl Serialize for ExportV1 {
@@ -1130,14 +1308,20 @@ impl Serialize for ExportV1 {
                 path,
                 size_bytes,
                 digest,
+                provenance,
+                producer,
             } => {
-                let mut state = serializer.serialize_struct("AvailableExportV1", 6)?;
+                let mut state = serializer.serialize_struct(
+                    "AvailableExportV1",
+                    6 + usize::from(provenance.is_some()) + usize::from(producer.is_some()),
+                )?;
                 state.serialize_field("state", "available")?;
                 state.serialize_field("kind", kind)?;
                 state.serialize_field("mediaType", media_type)?;
                 state.serialize_field("path", path)?;
                 state.serialize_field("sizeBytes", size_bytes)?;
                 state.serialize_field("digest", digest)?;
+                serialize_export_origin(&mut state, provenance.as_ref(), producer.as_ref())?;
                 state.end()
             }
             Self::GitBranch {
@@ -1147,9 +1331,15 @@ impl Serialize for ExportV1 {
                 head_oid,
                 tree_oid,
                 carrier,
+                provenance,
+                producer,
             } => {
-                let mut state = serializer
-                    .serialize_struct("GitBranchExportV1", if carrier.is_some() { 8 } else { 7 })?;
+                let mut state = serializer.serialize_struct(
+                    "GitBranchExportV1",
+                    7 + usize::from(carrier.is_some())
+                        + usize::from(provenance.is_some())
+                        + usize::from(producer.is_some()),
+                )?;
                 state.serialize_field("state", "available")?;
                 state.serialize_field("kind", "git_branch")?;
                 state.serialize_field("artifactVersion", artifact_version)?;
@@ -1160,6 +1350,7 @@ impl Serialize for ExportV1 {
                 if let Some(carrier) = carrier {
                     state.serialize_field("carrier", carrier)?;
                 }
+                serialize_export_origin(&mut state, provenance.as_ref(), producer.as_ref())?;
                 state.end()
             }
             Self::Unavailable { reason } => {
@@ -1194,6 +1385,8 @@ impl<'de> Deserialize<'de> for ExportV1 {
                     head_oid: wire.head_oid,
                     tree_oid: wire.tree_oid,
                     carrier: wire.carrier,
+                    provenance: wire.provenance,
+                    producer: wire.producer,
                 })
             }
             (Some("available"), Some(_)) => {
@@ -1208,6 +1401,8 @@ impl<'de> Deserialize<'de> for ExportV1 {
                     path: wire.path,
                     size_bytes: wire.size_bytes,
                     digest: wire.digest,
+                    provenance: wire.provenance,
+                    producer: wire.producer,
                 })
             }
             (Some("unavailable"), None) => {
@@ -1234,8 +1429,15 @@ struct AvailableExportWire {
     path: String,
     size_bytes: u64,
     digest: DigestV1,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    provenance: Option<ExportProvenanceV1>,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    producer: Option<OutputProducer>,
 }
 
+// Available file-like and Git exports intentionally keep separate closed wire structs;
+// flattening their shared optional origin fields would weaken unknown-field rejection.
+// jscpd:ignore-start
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GitBranchExportWire {
@@ -1248,7 +1450,12 @@ struct GitBranchExportWire {
     tree_oid: String,
     #[serde(default, deserialize_with = "deserialize_non_null_option")]
     carrier: Option<GitBranchCarrierV1>,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    provenance: Option<ExportProvenanceV1>,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    producer: Option<OutputProducer>,
 }
+// jscpd:ignore-end
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1443,6 +1650,8 @@ fn cloud_available_export(
                     algorithm: "sha256".to_owned(),
                     value: file.sha256().to_owned(),
                 },
+                provenance: None,
+                producer: None,
             },
             Some(CloudCarrierBody::Staged(file.carrier().clone())),
         ),
@@ -1485,6 +1694,8 @@ fn cloud_available_export(
                     head_oid: branch_metadata.head_oid().to_owned(),
                     tree_oid: branch_metadata.tree_oid().to_owned(),
                     carrier,
+                    provenance: None,
+                    producer: None,
                 },
                 body,
             )
@@ -1544,6 +1755,8 @@ fn byte_backed_cloud_export(
                 algorithm: "sha256".to_owned(),
                 value: sha256,
             },
+            provenance: None,
+            producer: None,
         },
         Some(CloudCarrierBody::Bytes(bytes)),
     ))
@@ -1805,25 +2018,43 @@ fn write_available_export(
     }
     let file_name = format!("{ordinal:04}");
     if let CapturedValue::File(file) = output {
-        expose_staged_carrier(
+        return expose_available_carrier(
             staging,
             observer,
             artifacts,
             name,
             &file_name,
-            file.carrier(),
-            file.output_identity(),
-        )?;
-        return Ok(ExportV1::Available {
-            kind: "file".to_owned(),
-            media_type: file.media_type().to_owned(),
-            path: format!("{EXPORT_DIRECTORY}/{file_name}"),
-            size_bytes: file.size(),
-            digest: DigestV1 {
-                algorithm: "sha256".to_owned(),
-                value: file.sha256().to_owned(),
+            AvailableCarrier {
+                kind: "file",
+                media_type: file.media_type(),
+                staged: file.carrier(),
             },
-        });
+        );
+    }
+
+    if let Some(carrier) = output
+        .private_capture_carrier()
+        .filter(|carrier| staged_carrier_matches_semantic_bytes(carrier, output))
+    {
+        let (kind, media_type) = match output {
+            CapturedValue::Text(_) => ("text", "text/plain; charset=utf-8"),
+            CapturedValue::Json(_) => ("json", "application/json"),
+            CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
+                return Err(unsupported_export_error(name));
+            }
+        };
+        return expose_available_carrier(
+            staging,
+            observer,
+            artifacts,
+            name,
+            &file_name,
+            AvailableCarrier {
+                kind,
+                media_type,
+                staged: carrier,
+            },
+        );
     }
 
     observe(
@@ -1847,11 +2078,7 @@ fn write_available_export(
             semantic_export_size(value.carrier(), name)?,
         ),
         CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
-            return Err(LocalPublicationError::for_export(
-                LocalPublicationPhase::ExportCopy,
-                LocalPublicationFailureKind::UnsupportedExport,
-                name,
-            ));
+            return Err(unsupported_export_error(name));
         }
     };
     let mut destination = staging.create_export(&file_name).map_err(|kind| {
@@ -1872,11 +2099,7 @@ fn write_available_export(
                 .write_all(value.carrier())
                 .map_err(|_| export_write_error(name))?,
             CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
-                return Err(LocalPublicationError::for_export(
-                    LocalPublicationPhase::ExportCopy,
-                    LocalPublicationFailureKind::UnsupportedExport,
-                    name,
-                ));
+                return Err(unsupported_export_error(name));
             }
         }
         hashing.flush().map_err(|_| export_write_error(name))?;
@@ -1909,6 +2132,8 @@ fn write_available_export(
             algorithm: "sha256".to_owned(),
             value: lowercase_hex(digest.finish().as_ref()),
         },
+        provenance: None,
+        producer: None,
     };
     observe(
         observer,
@@ -1966,6 +2191,8 @@ fn write_git_branch_export(
         head_oid: metadata.head_oid().to_owned(),
         tree_oid: metadata.tree_oid().to_owned(),
         carrier,
+        provenance: None,
+        producer: None,
     })
 }
 
@@ -2016,6 +2243,57 @@ fn expose_staged_carrier(
     )
 }
 
+struct AvailableCarrier<'a> {
+    kind: &'a str,
+    media_type: &'a str,
+    staged: &'a StagedCarrier,
+}
+
+fn expose_available_carrier(
+    staging: &mut StagingDirectory<'_>,
+    observer: &mut impl PublicationObserver,
+    artifacts: &ArtifactStaging,
+    export: &str,
+    file_name: &str,
+    carrier: AvailableCarrier<'_>,
+) -> Result<ExportV1, LocalPublicationError> {
+    expose_staged_carrier(
+        staging,
+        observer,
+        artifacts,
+        export,
+        file_name,
+        carrier.staged,
+        carrier.staged.output_identity(),
+    )?;
+    Ok(ExportV1::Available {
+        kind: carrier.kind.to_owned(),
+        media_type: carrier.media_type.to_owned(),
+        path: format!("{EXPORT_DIRECTORY}/{file_name}"),
+        size_bytes: carrier.staged.size(),
+        digest: DigestV1 {
+            algorithm: "sha256".to_owned(),
+            value: carrier.staged.sha256().to_owned(),
+        },
+        provenance: None,
+        producer: None,
+    })
+}
+
+fn staged_carrier_matches_semantic_bytes(carrier: &StagedCarrier, output: &CapturedValue) -> bool {
+    let bytes = match output {
+        CapturedValue::Text(text) => text.carrier(),
+        CapturedValue::Json(json) => json.carrier(),
+        CapturedValue::File(_) | CapturedValue::GitBranch(_) => return false,
+    };
+    let Ok(size) = u64::try_from(bytes.len()) else {
+        return false;
+    };
+    let mut digest = DigestContext::new(&SHA256);
+    digest.update(bytes);
+    carrier.size() == size && carrier.sha256() == lowercase_hex(digest.finish().as_ref())
+}
+
 fn semantic_export_size(carrier: &[u8], export: &str) -> Result<u64, LocalPublicationError> {
     u64::try_from(carrier.len()).map_err(|_| {
         LocalPublicationError::for_export(
@@ -2024,6 +2302,14 @@ fn semantic_export_size(carrier: &[u8], export: &str) -> Result<u64, LocalPublic
             export,
         )
     })
+}
+
+fn unsupported_export_error(export: &str) -> LocalPublicationError {
+    LocalPublicationError::for_export(
+        LocalPublicationPhase::ExportCopy,
+        LocalPublicationFailureKind::UnsupportedExport,
+        export,
+    )
 }
 
 fn export_write_error(export: &str) -> LocalPublicationError {
@@ -2059,7 +2345,7 @@ fn build_result(
 fn build_result_with_provenance(
     run: &WorkflowRunResult,
     provenance: WorkflowProvenanceV1,
-    exports: BTreeMap<String, ExportV1>,
+    mut exports: BTreeMap<String, ExportV1>,
 ) -> Result<WorkflowResultV1, LocalPublicationError> {
     let (outcome, primary_issue) = match &run.outcome {
         RunOutcome::Succeeded => (WorkflowOutcomeV1::Succeeded, None),
@@ -2091,6 +2377,56 @@ fn build_result_with_provenance(
         .map(step_v1)
         .collect::<Result<Vec<_>, _>>()?;
     let finalization = run.finalization.as_ref().map(finalization_v1).transpose()?;
+    let export_sources = run
+        .continuation
+        .as_ref()
+        .map(|_| {
+            run.export_sources
+                .iter()
+                .map(|(name, source)| {
+                    (
+                        name.clone(),
+                        ExportSourceV1 {
+                            node: WorkflowNodeV1 {
+                                id: source.node.id.clone(),
+                                role: workflow_node_role(source.node.role),
+                            },
+                            output: source.output.clone(),
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (name, export) in &mut exports {
+        let Some(source) = run.export_sources.get(name) else {
+            return Err(invalid_run_result(RunResultInvariant::ExportSources));
+        };
+        if let Some(producer) = run
+            .output_producers
+            .get(&source.node.id)
+            .and_then(|outputs| outputs.get(&source.output))
+        {
+            match export {
+                ExportV1::Available {
+                    provenance: export_provenance,
+                    producer: export_producer,
+                    ..
+                }
+                | ExportV1::GitBranch {
+                    provenance: export_provenance,
+                    producer: export_producer,
+                    ..
+                } => {
+                    *export_provenance = Some(ExportProvenanceV1::Inherited);
+                    *export_producer = Some(producer.clone());
+                }
+                ExportV1::Unavailable { .. } => {
+                    return Err(invalid_run_result(RunResultInvariant::ExportValues));
+                }
+            }
+        }
+    }
 
     if run.attempt_number == 0 {
         return Err(invalid_run_result(RunResultInvariant::AttemptMetadata));
@@ -2098,6 +2434,9 @@ fn build_result_with_provenance(
     Ok(WorkflowResultV1 {
         schema_version: 1,
         attempt_number: run.attempt_number,
+        continuation: run.continuation.clone(),
+        output_producers: run.output_producers.clone(),
+        export_sources,
         workflow: WorkflowIdentityV1 {
             path: run.workflow_path.clone(),
             provenance,
@@ -2190,6 +2529,10 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
     };
     let (state, detail) = match &step.state {
         StepState::Succeeded { .. } => (WorkflowStepStateV1::Succeeded, None),
+        StepState::Inherited { detail, .. } => (
+            WorkflowStepStateV1::Inherited,
+            Some(NodeDetail::Inherited(detail.clone())),
+        ),
         StepState::Failed { detail } => (
             WorkflowStepStateV1::Failed,
             Some(NodeDetail::Failed(detail.clone())),

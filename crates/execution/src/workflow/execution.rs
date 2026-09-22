@@ -10,14 +10,14 @@ use super::input::InputStaging;
 use super::observation::{
     ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
 };
-use super::process_group::ProcessGuardRegistry;
 use super::resolution::{WorkflowContentDigest, WorkflowSourceProvenance};
 use super::runtime::{
-    ExportSet, RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent, WorkflowState,
+    ExportSet, OutputProducer, RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent,
+    WorkflowState,
 };
 use super::step_runtime::{
     AgentExecution, StepFailureCause, WorkflowAgentDispatcher, WorkflowCommitPort,
-    execute_workflow_observed,
+    WorkflowExecutionStart, execute_workflow_observed,
 };
 use super::value::CapturedValue;
 
@@ -26,6 +26,7 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
     pub outcome: RunOutcome,
     pub steps: BTreeMap<String, StepState<CapturedValue>>,
     pub recoveries: BTreeMap<String, Option<super::runtime::StepRecoveryState<StepFailureCause>>>,
+    pub output_producers: BTreeMap<(String, String), OutputProducer>,
     pub finalization_summary: Option<super::runtime::FinalizationSummary<Deadline>>,
     pub force_abort: Option<super::runtime::ForceAbortEvidence>,
     pub exports: ExportSet<CapturedValue>,
@@ -195,7 +196,7 @@ pub async fn execute_workflow<Clock, Commits, Observer, Dispatcher>(
     clock: Clock,
     commits: Commits,
     observer: Observer,
-    process_guards: ProcessGuardRegistry,
+    start: impl Into<WorkflowExecutionStart>,
 ) -> Result<WorkflowExecutionResult<Clock::Instant>, CoordinationError>
 // This result projection intentionally repeats the shared runtime's generic port
 // constraints so it can preserve its distinct domain result.
@@ -210,6 +211,7 @@ where
 {
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();
+    let start = start.into();
     let coordinated = execute_workflow_observed(
         admitted,
         artifacts,
@@ -222,7 +224,7 @@ where
         },
         observer,
         agents,
-        process_guards,
+        start,
     )
     .await?;
     let outcome = match coordinated.state.workflow {
@@ -245,6 +247,7 @@ where
         .into_iter()
         .map(|(step, runtime)| ((step.clone(), runtime.state), (step, runtime.recovery)))
         .unzip();
+    let output_producers = coordinated.state.output_producers;
     let finalization_summary = coordinated.state.finalization_summary;
     let force_abort = coordinated.state.force_abort;
     let exports = coordinated
@@ -255,6 +258,7 @@ where
         outcome,
         steps,
         recoveries,
+        output_producers,
         finalization_summary,
         force_abort,
         exports,
