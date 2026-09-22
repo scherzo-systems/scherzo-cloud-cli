@@ -12,6 +12,40 @@ problems, and feature requests. Maintainers may incorporate a proposal and publi
 through the normal mirror process, but starting a Discussion does not guarantee that a
 patch will be adopted.
 
+## Adding a command
+
+Choose the path and verb before copying an existing command. The full rules and rationale
+are in [Command grammar](docs/output-style.md#command-grammar); use this decision table for
+the common choices:
+
+| Decision | Rule |
+|---|---|
+| Available leaf verb | Use only `create`, `issue`, `list`, `show`, `update`, `rename`, `set`, `remove`, `revoke`, `retire`, `validate`, `run`, `retry`, `view`, `wait`, `download`, `upload`, `enroll`, `serve`, `doctor`, or `status`. Amend the style guide before introducing another verb; an existing command is not precedent. |
+| Print one / print many / interact | Use `show` / `list` / `view`. Use `validate`, `run`, and `retry` for those literal operations. |
+| Mint an entity | Use `issue` when the immediate sibling family contains `revoke`; otherwise use `create`. |
+| Change attributes | Use `rename` only when the complete mutable set is `{name}`; use `update` when two or more attributes are mutable. Never offer both in one family. |
+| Sever a binding | Use `remove`, never `detach` or `disconnect`. |
+
+Compose recurring flags from the shared argument types in `src/cli.rs`: `HttpOptions` for
+`--allow-insecure-http`, `PrincipalAuthenticationArgs` or
+`RequiredServiceAuthenticationArgs` for `--service-api-key-file`, `PaginationArgs` for
+`--limit` plus `--cursor`, `WaitTimeoutArgs` for `--timeout`, and `NamedInputArgs` for
+named inputs. Reuse a family's options type for flags such as `--json`. If a flag will
+recur and has no shared type yet, introduce one rather than declaring the flag on each
+leaf.
+
+Require `--yes` exactly for leaves ending in `remove`, `revoke`, or `retire`; no other
+verb takes it. A command paginates when it returns one page and permits continuation: in
+that case expose `--limit` and `--cursor` together through `PaginationArgs` and include
+the exact `Pagination:` after-help from the style guide.
+
+Every new command path needs exactly one help snapshot under `tests/cmd/help/`;
+[`cli::tests::every_customer_command_has_one_help_snapshot`](src/cli.rs) is the topology
+conformance test, and [`tests/help_snapshots.rs`](tests/help_snapshots.rs) checks the
+rendered help. Adding a path is the only normal reason to add a `trycmd` case. Update an
+existing snapshot when help changes, and use focused integration tests rather than
+snapshots for command behavior.
+
 ## Development checks
 
 If you inspect or modify a local copy, run the canonical check from the repository root:
