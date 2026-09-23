@@ -17,20 +17,29 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CurrentPrincipalMembershipList {
-    #[serde(rename = "items")]
-    pub items: Vec<models::CurrentPrincipalMembershipEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+pub struct SourceDisplayRepository {
+    #[serde(rename = "providerKind")]
+    pub provider_kind: ProviderKind,
+    #[serde(rename = "fullName")]
+    pub full_name: String,
 }
 
-impl CurrentPrincipalMembershipList {
-    pub fn new(
-        items: Vec<models::CurrentPrincipalMembershipEntry>,
-    ) -> CurrentPrincipalMembershipList {
-        CurrentPrincipalMembershipList {
-            items,
-            next_cursor: None,
+impl SourceDisplayRepository {
+    pub fn new(provider_kind: ProviderKind, full_name: String) -> SourceDisplayRepository {
+        SourceDisplayRepository {
+            provider_kind,
+            full_name,
         }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum ProviderKind {
+    #[serde(rename = "github")]
+    Github,
+}
+
+impl Default for ProviderKind {
+    fn default() -> ProviderKind {
+        Self::Github
     }
 }

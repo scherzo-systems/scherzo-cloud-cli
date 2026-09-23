@@ -166,11 +166,18 @@ pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), R
             repository_connection_id,
             object_format,
             commit_oid,
+            source_display_snapshot,
         } => (
             valid_typed_id(project_id, "prj_")
                 && valid_typed_id(repository_connection_id, "rpc_")
                 && object_format == "sha1"
-                && is_lowercase_hex(commit_oid, 40),
+                && is_lowercase_hex(commit_oid, 40)
+                && source_display_snapshot.as_ref().is_none_or(|snapshot| {
+                    valid_organization_display_name(&snapshot.organization_display_name)
+                        && valid_project_name(&snapshot.project_name)
+                        && snapshot.repository.provider_kind == "github"
+                        && valid_github_repository_name(&snapshot.repository.full_name)
+                }),
             result.execution.execution_root.is_none()
                 && result.execution.capacity.as_ref().is_some_and(|capacity| {
                     valid_cloud_capacity(capacity, &result.workflow.digest)
@@ -612,6 +619,38 @@ fn validate_force_abort(result: &WorkflowResultV1) -> Result<(), ResultMetadataE
         return Err(ResultMetadataError);
     }
     Ok(())
+}
+
+fn valid_organization_display_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= 200
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_project_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let is_lowercase_or_digit = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes.first().is_some_and(is_lowercase_or_digit)
+        && bytes.last().is_some_and(is_lowercase_or_digit)
+        && bytes
+            .iter()
+            .all(|byte| is_lowercase_or_digit(byte) || *byte == b'-')
+}
+
+fn valid_github_repository_name(value: &str) -> bool {
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    };
+    value.len() <= 255
+        && value.split_once('/').is_some_and(|(owner, repository)| {
+            valid_part(owner) && valid_part(repository) && !repository.contains('/')
+        })
 }
 
 fn primary_role(primary: &super::evidence::PrimaryIssue) -> WorkflowNodeRoleV1 {

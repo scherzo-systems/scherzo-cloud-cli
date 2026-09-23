@@ -100,13 +100,14 @@ pub use workflow::process_group::{
     SystemProcessIdentityInspector, terminate_authenticated_process_group,
 };
 pub use workflow::publication::{
-    CloudCarrierBody, CloudExecutionCapacityV1, CloudResultCarrier, ContinuationRecordV1, DigestV1,
-    LocalPublicationError, LocalPublicationPhase, PreparedCloudWorkflowResult,
-    RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1,
-    RecoveryInvocationStateV1, RecoveryInvocationUsageV1, RecoveryInvocationV1, WorkflowResultV1,
-    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1,
-    WorkflowRunTiming, WorkflowStepTiming, command_output_v1, prepare_attempt_result_destination,
+    CloudCarrierBody, CloudExecutionCapacityV1, CloudResultCarrier, CloudSourceDisplayRepositoryV1,
+    CloudSourceDisplaySnapshotV1, ContinuationRecordV1, DigestV1, LocalPublicationError,
+    LocalPublicationPhase, PreparedCloudWorkflowResult, RecoveryDiagnosticKindV1,
+    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
+    RecoveryInvocationUsageV1, RecoveryInvocationV1, WorkflowResultV1, WorkflowRunCancellation,
+    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunResult,
+    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
+    WorkflowStepTiming, command_output_v1, prepare_attempt_result_destination,
     prepare_cloud_workflow_result, publish_prepared_workflow_result, step_recovery_summary_v1,
     summary_disposition_matches,
 };

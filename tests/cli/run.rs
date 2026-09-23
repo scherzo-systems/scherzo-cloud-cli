@@ -126,6 +126,14 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
             "commitOid": "0123456789abcdef0123456789abcdef01234567",
             "materializationContract": "git_full_clone_v1"
         },
+        "sourceDisplaySnapshot": {
+            "organizationDisplayName": "Example Organization",
+            "projectName": "example-project",
+            "repository": {
+                "providerKind": "github",
+                "fullName": "example/repository"
+            }
+        },
         "inputs": {
             "inputSetId": INPUT_SET_ID,
             "inputCount": 2,

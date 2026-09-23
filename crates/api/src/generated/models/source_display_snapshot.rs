@@ -17,20 +17,25 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CurrentPrincipalMembershipList {
-    #[serde(rename = "items")]
-    pub items: Vec<models::CurrentPrincipalMembershipEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+pub struct SourceDisplaySnapshot {
+    #[serde(rename = "organizationDisplayName")]
+    pub organization_display_name: String,
+    #[serde(rename = "projectName")]
+    pub project_name: String,
+    #[serde(rename = "repository")]
+    pub repository: Box<models::SourceDisplayRepository>,
 }
 
-impl CurrentPrincipalMembershipList {
+impl SourceDisplaySnapshot {
     pub fn new(
-        items: Vec<models::CurrentPrincipalMembershipEntry>,
-    ) -> CurrentPrincipalMembershipList {
-        CurrentPrincipalMembershipList {
-            items,
-            next_cursor: None,
+        organization_display_name: String,
+        project_name: String,
+        repository: models::SourceDisplayRepository,
+    ) -> SourceDisplaySnapshot {
+        SourceDisplaySnapshot {
+            organization_display_name,
+            project_name,
+            repository: Box::new(repository),
         }
     }
 }

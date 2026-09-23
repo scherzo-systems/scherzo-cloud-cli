@@ -1,0 +1,71 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abm",
+  "sentAt": "2026-07-23T00:00:02Z",
+  "type": "assignment_offer",
+  "payloadVersion": 1,
+  "payload": {
+    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
+    "executionSpec": {
+      "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abq",
+      "schemaVersion": 2,
+      "executionLimits": {
+        "maximumParallelSteps": 1,
+        "cancellationGraceSeconds": 1
+      },
+      "sourceBranch": "main",
+      "workflowDefinitionSource": {
+        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "objectFormat": "sha1",
+        "commitOid": "0123456789abcdef0123456789abcdef01234567",
+        "workflowPath": "workflows/build.yaml",
+        "workflowSourceClosureDigest": {
+          "algorithm": "sha256",
+          "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }
+      },
+      "primaryWorkspaceSource": {
+        "kind": "connected_repository",
+        "providerKind": "github",
+        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "objectFormat": "sha1",
+        "commitOid": "0123456789abcdef0123456789abcdef01234567",
+        "materializationContract": "git_full_clone_v1"
+      },
+      "capacity": {
+        "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
+        "sourceClosureDigest": {
+          "algorithm": "sha256",
+          "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 364277238,
+        "encodedOutboxBytes": 18189549
+      },
+      "runInputs": null,
+      "sourceDisplaySnapshot": {
+        "organizationDisplayName": "Example Organization",
+        "projectName": "example-project",
+        "repository": {
+          "providerKind": "github",
+          "fullName": "example/repository"
+        }
+      }
+    },
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "attemptNumber": 1
+  }
+}

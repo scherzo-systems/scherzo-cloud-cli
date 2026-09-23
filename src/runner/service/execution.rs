@@ -30,22 +30,22 @@ use super::workspace::{RetentionReason, WorkspaceDisposition};
 use scherzo_cloud_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
     AgentInputStaging, ArtifactStaging, AuthenticatedProcessGroup, CancellationReason,
-    CancellationSource, CloudCarrierBody, CloudExecutionCapacityV1, CoordinatorClock, DigestV1,
-    DurableProcessGuardStore, ExecutionObservation, ExecutionObserver, FailurePolicy,
-    FinalizationGate, FinalizationSummary, FinalizerResult, ForceAbortEvidence, InputStaging,
-    InvocationAccountingLog, NoopCommitPort, ObservedStepTransition, PreparedCloudWorkflowResult,
-    PrimaryIssue, ProcessGuardRegistry, ProcessGuardStoreError, ProcessIdentityInspector,
-    ProcessIdentityObservation, RecoveryDecisionKind, RecoveryDiagnosticKindV1,
-    RecoveryHandlerActivity, RecoveryHandlerKind, RecoveryInvocationDiagnosticV1,
-    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryInvocationUsageV1,
-    RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnosticLog, StepFailureCause,
-    StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector, TransitionEvent,
-    TransitionObservation, ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole,
-    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunId, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming,
-    WorkflowState, WorkflowStepTiming, command_output_v1, execute_workflow,
-    prepare_cloud_workflow_result, production_agent_dispatcher, step_recovery_summary_v1,
-    summary_disposition_matches, terminate_authenticated_process_group,
+    CancellationSource, CloudCarrierBody, CloudExecutionCapacityV1, CloudSourceDisplayRepositoryV1,
+    CloudSourceDisplaySnapshotV1, CoordinatorClock, DigestV1, DurableProcessGuardStore,
+    ExecutionObservation, ExecutionObserver, FailurePolicy, FinalizationGate, FinalizationSummary,
+    FinalizerResult, ForceAbortEvidence, InputStaging, InvocationAccountingLog, NoopCommitPort,
+    ObservedStepTransition, PreparedCloudWorkflowResult, PrimaryIssue, ProcessGuardRegistry,
+    ProcessGuardStoreError, ProcessIdentityInspector, ProcessIdentityObservation,
+    RecoveryDecisionKind, RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
+    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
+    RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnosticLog,
+    StepFailureCause, StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector,
+    TransitionEvent, TransitionObservation, ValidatedStep, WorkflowExecutionResult,
+    WorkflowNodeRole, WorkflowRunCancellation, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult, WorkflowRunStep,
+    WorkflowRunStepKind, WorkflowRunTiming, WorkflowState, WorkflowStepTiming, command_output_v1,
+    execute_workflow, prepare_cloud_workflow_result, production_agent_dispatcher,
+    step_recovery_summary_v1, summary_disposition_matches, terminate_authenticated_process_group,
 };
 #[cfg(test)]
 use scherzo_cloud_execution::{
@@ -913,6 +913,16 @@ impl ExecutionJob {
                     self.accepted.repository_connection_id().to_owned(),
                     self.accepted.source_object_format().to_owned(),
                     self.accepted.source_commit_oid().to_owned(),
+                    self.accepted.source_display_snapshot().map(|snapshot| {
+                        CloudSourceDisplaySnapshotV1 {
+                            organization_display_name: snapshot.organization_display_name.clone(),
+                            project_name: snapshot.project_name.clone(),
+                            repository: CloudSourceDisplayRepositoryV1 {
+                                provider_kind: snapshot.repository.provider_kind.clone(),
+                                full_name: snapshot.repository.full_name.clone(),
+                            },
+                        }
+                    }),
                 )
                 .ok()
             });

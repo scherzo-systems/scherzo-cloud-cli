@@ -39,8 +39,9 @@ use scherzo_cloud_runner_protocol::{
     ExecutionLeasePolicy, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection,
     MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES, MAXIMUM_ORDINARY_FRAME_BYTES,
     MAXIMUM_TERMINAL_FRAME_BYTES, PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope,
-    RunnerFrame, RunnerUnableReason, WorkflowDefinitionSourceV1RunnerProjection,
-    encode_runner_frame, is_condition_evidence_workflow_event,
+    RunnerFrame, RunnerUnableReason, SourceDisplaySnapshotV1RunnerProjection,
+    WorkflowDefinitionSourceV1RunnerProjection, encode_runner_frame,
+    is_condition_evidence_workflow_event,
 };
 
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
@@ -1099,6 +1100,7 @@ struct AssignmentIdentity {
     attempt_id: String,
     execution_spec_id: String,
     source_branch: String,
+    source_display_snapshot: Option<SourceDisplaySnapshotV1RunnerProjection>,
     repository_connection_id: String,
     source_object_format: String,
     source_commit_oid: String,
@@ -1113,6 +1115,7 @@ impl AssignmentIdentity {
             attempt_id: offer.attempt_id.clone(),
             execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
             source_branch: offer.execution_spec.source_branch.clone(),
+            source_display_snapshot: offer.execution_spec.source_display_snapshot.clone(),
             repository_connection_id: offer
                 .execution_spec
                 .primary_workspace_source
@@ -1171,6 +1174,12 @@ impl AcceptedAssignment {
 
     pub(super) fn source_commit_oid(&self) -> &str {
         &self.identity.source_commit_oid
+    }
+
+    pub(super) fn source_display_snapshot(
+        &self,
+    ) -> Option<&SourceDisplaySnapshotV1RunnerProjection> {
+        self.identity.source_display_snapshot.as_ref()
     }
 }
 
@@ -5595,6 +5604,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 source_branch: "main".to_owned(),
                 workflow_definition_source: production_workflow_definition_source(),
                 primary_workspace_source: production_primary_workspace_source(),
+                source_display_snapshot: None,
                 capacity: production_capacity(),
                 run_inputs: None,
             },

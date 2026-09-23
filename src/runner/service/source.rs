@@ -2811,6 +2811,7 @@ mod tests {
                 projection.repository_connection_id.clone(),
                 projection.object_format.clone(),
                 projection.commit_oid.clone(),
+                None,
             )
             .unwrap()
         };

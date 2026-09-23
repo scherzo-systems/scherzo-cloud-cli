@@ -390,11 +390,30 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
         "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         "sha1".to_owned(),
         "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        Some(CloudSourceDisplaySnapshotV1 {
+            organization_display_name: "Example Organization".to_owned(),
+            project_name: "example-project".to_owned(),
+            repository: CloudSourceDisplayRepositoryV1 {
+                provider_kind: "github".to_owned(),
+                full_name: "example/repository".to_owned(),
+            },
+        }),
     )
     .unwrap();
     assert_eq!(captured.carriers.len(), 4);
     let document: serde_json::Value = serde_json::from_slice(&captured.result_json).unwrap();
     assert_eq!(document["workflow"]["provenance"]["kind"], "cloud");
+    assert_eq!(
+        document["workflow"]["provenance"]["sourceDisplaySnapshot"],
+        serde_json::json!({
+            "organizationDisplayName": "Example Organization",
+            "projectName": "example-project",
+            "repository": {
+                "providerKind": "github",
+                "fullName": "example/repository"
+            }
+        })
+    );
     assert!(document["execution"].get("executionRoot").is_none());
 
     let mut metadata_only = run;
@@ -406,6 +425,7 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
         "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         "sha1".to_owned(),
         "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        None,
     )
     .unwrap();
     assert!(prepared.carriers.is_empty());

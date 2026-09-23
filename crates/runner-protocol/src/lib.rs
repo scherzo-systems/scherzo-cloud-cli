@@ -306,6 +306,19 @@ pub struct RunInputProjectionV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDisplayRepositoryV1RunnerProjection {
+    pub provider_kind: String,
+    pub full_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDisplaySnapshotV1RunnerProjection {
+    pub organization_display_name: String,
+    pub project_name: String,
+    pub repository: SourceDisplayRepositoryV1RunnerProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionSpecV1RunnerProjection {
     pub execution_spec_id: String,
     pub schema_version: u64,
@@ -313,6 +326,7 @@ pub struct ExecutionSpecV1RunnerProjection {
     pub source_branch: String,
     pub workflow_definition_source: WorkflowDefinitionSourceV1RunnerProjection,
     pub primary_workspace_source: PrimaryWorkspaceSourceV1RunnerProjection,
+    pub source_display_snapshot: Option<SourceDisplaySnapshotV1RunnerProjection>,
     pub capacity: ExecutionCapacityV1RunnerProjection,
     pub run_inputs: Option<RunInputProjectionV1>,
 }
@@ -1179,10 +1193,11 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         generated::RunnerProtocolVersion1::CloudAssignmentOffer(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
             let execution_spec = frame.payload.execution_spec;
-            let schema_version = execution_spec
-                .schema_version
-                .as_u64()
-                .ok_or(DecodeError::InvalidFrame("schemaVersion"))?;
+            let schema_version = if *execution_spec.schema_version == 1.0 {
+                1
+            } else {
+                2
+            };
             let maximum_parallel_steps =
                 u64::try_from(execution_spec.execution_limits.maximum_parallel_steps.0)
                     .map_err(|_| DecodeError::InvalidFrame("maximumParallelSteps"))?;
@@ -1267,6 +1282,29 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     ))?
                     .to_owned(),
             };
+            let source_display_snapshot = execution_spec.source_display_snapshot.map(|snapshot| {
+                SourceDisplaySnapshotV1RunnerProjection {
+                    organization_display_name: snapshot.organization_display_name.to_string(),
+                    project_name: snapshot.project_name.to_string(),
+                    repository: SourceDisplayRepositoryV1RunnerProjection {
+                        provider_kind: snapshot
+                            .repository
+                            .provider_kind
+                            .as_str()
+                            .unwrap_or("github")
+                            .to_owned(),
+                        full_name: snapshot.repository.full_name.to_string(),
+                    },
+                }
+            });
+            match (schema_version, source_display_snapshot.is_some()) {
+                (1, false) | (2, true) => {}
+                _ => {
+                    return Err(DecodeError::InvalidFrame(
+                        "executionSpec.sourceDisplaySnapshot",
+                    ));
+                }
+            }
             let run_inputs = execution_spec
                 .run_inputs
                 .map(|inputs| RunInputProjectionV1 {
@@ -1342,6 +1380,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     source_branch: execution_spec.source_branch.to_string(),
                     workflow_definition_source,
                     primary_workspace_source,
+                    source_display_snapshot,
                     capacity,
                     run_inputs,
                 }),
@@ -1986,6 +2025,10 @@ mod tests {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-fresh-hello.json"
         )),
         include_bytes!(concat!(
@@ -2166,6 +2209,10 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/runner-execution-finished-recovery-version.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/cloud-assignment-offer-v2-missing-source-display.json"
         )),
     ];
 

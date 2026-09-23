@@ -277,6 +277,50 @@
         "materializationContract"
       ]
     },
+    "SourceDisplayRepository": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "providerKind": {
+          "const": "github"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        }
+      },
+      "required": [
+        "providerKind",
+        "fullName"
+      ]
+    },
+    "SourceDisplaySnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "organizationDisplayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "projectName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "repository": {
+          "$ref": "#/$defs/SourceDisplayRepository"
+        }
+      },
+      "required": [
+        "organizationDisplayName",
+        "projectName",
+        "repository"
+      ]
+    },
     "ExecutionCapacity": {
       "type": "object",
       "additionalProperties": false,
@@ -373,7 +417,10 @@
           "$ref": "#/$defs/executionSpecId"
         },
         "schemaVersion": {
-          "const": 1
+          "enum": [
+            1,
+            2
+          ]
         },
         "executionLimits": {
           "$ref": "#/$defs/ExecutionLimits"
@@ -388,6 +435,9 @@
         },
         "primaryWorkspaceSource": {
           "$ref": "#/$defs/PrimaryWorkspaceSource"
+        },
+        "sourceDisplaySnapshot": {
+          "$ref": "#/$defs/SourceDisplaySnapshot"
         },
         "capacity": {
           "$ref": "#/$defs/ExecutionCapacity"
@@ -412,6 +462,22 @@
         "primaryWorkspaceSource",
         "capacity",
         "runInputs"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {"schemaVersion": {"const": 1}},
+            "required": ["schemaVersion"]
+          },
+          "then": {"not": {"required": ["sourceDisplaySnapshot"]}}
+        },
+        {
+          "if": {
+            "properties": {"schemaVersion": {"const": 2}},
+            "required": ["schemaVersion"]
+          },
+          "then": {"required": ["sourceDisplaySnapshot"]}
+        }
       ]
     },
     "RunInputProjection": {

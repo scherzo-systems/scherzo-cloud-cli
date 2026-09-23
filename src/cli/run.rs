@@ -1495,6 +1495,7 @@ mod tests {
                 "commitOid": "0123456789abcdef0123456789abcdef01234567",
                 "materializationContract": "git_full_clone_v1"
             },
+            "sourceDisplaySnapshot": null,
             "inputs": {
                 "inputSetId": null,
                 "inputCount": 0,
