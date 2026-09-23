@@ -43,6 +43,12 @@ pub(crate) mod attribute {
     pub(crate) const SERVER_PORT: &str = "server.port";
     pub(crate) const ASSIGNMENT_ID: &str = "scherzo.assignment.id";
     pub(crate) const ATTEMPT_ID: &str = "scherzo.attempt.id";
+    pub(crate) const ARTIFACT_DELIVERY_ID: &str = "scherzo.artifact.delivery_id";
+    pub(crate) const ARTIFACT_OPERATION: &str = "scherzo.artifact.operation";
+    pub(crate) const ARTIFACT_MEMBER: &str = "scherzo.artifact.member";
+    pub(crate) const ARTIFACT_FAILURE_ORIGIN: &str = "scherzo.artifact.failure_origin";
+    pub(crate) const ARTIFACT_FAILURE_CODE: &str = "scherzo.artifact.failure_code";
+    pub(crate) const PROTOCOL_REQUEST_MESSAGE_ID: &str = "scherzo.protocol.request_message_id";
     pub(crate) const ASSIGNMENT_PREPARATION_PHASE: &str = "scherzo.assignment.preparation_phase";
     pub(crate) const OWNED_PROCESSES_STOPPED: &str = "scherzo.teardown.owned_processes_stopped";
     pub(crate) const RETENTION_REASON: &str = "scherzo.workspace.retention_reason";

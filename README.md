@@ -1732,6 +1732,17 @@ no Scherzo-owned endpoint, ingestion credential, Honeycomb behavior, or collecto
 requirement. Human and JSON output contracts for help, version, authentication, account,
 and `runner doctor` remain unchanged and do not initialize runner telemetry.
 
+Cloud rejections and local enqueue failures during artifact registration and confirmation
+emit a local JSON diagnostic named `runner.artifact_delivery_failed`. Its assignment,
+attempt, and delivery IDs identify
+the affected transfer. `scherzo.artifact.failure_origin` distinguishes `runner` from
+`cloud`; `scherzo.artifact.operation` identifies `registration` or `confirmation`,
+independently of the public delivery phase. Local enqueue failures retain the closed
+codes `outbox_capacity`, `outbox_encoding`, and `outbox_sequence`. Cloud failures retain
+their closed response code and `scherzo.protocol.request_message_id` for correlation
+with protocol frame logs. These diagnostics exclude upload URLs, artifact contents,
+and raw errors.
+
 ## Release policy
 
 `release.toml` schema 2 contains only static policy: the initial release is `0.1.0`, the

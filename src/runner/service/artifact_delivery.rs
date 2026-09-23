@@ -3,7 +3,9 @@ use std::io::{self, Cursor, Read};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::runner::telemetry::{self, Recorder};
 use base64::Engine as _;
+use opentelemetry::KeyValue;
 use reqwest::StatusCode;
 use reqwest::blocking::Body;
 use reqwest::header::{
@@ -172,6 +174,28 @@ pub(super) enum ArtifactCloudResponse {
 }
 
 impl ArtifactCloudResponse {
+    fn failure(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::CarrierRegistration(ArtifactRegistrationResponse {
+                request_message_id,
+                outcome: ArtifactRegistrationOutcome::Failed { code },
+            })
+            | Self::CarrierConfirmation(ArtifactConfirmationResponse {
+                request_message_id,
+                outcome: ArtifactConfirmationOutcome::Failed { code, .. },
+            })
+            | Self::ResultRegistration(ArtifactResultRegistrationResponse {
+                request_message_id,
+                outcome: ArtifactResultRegistrationOutcome::Failed { code },
+            })
+            | Self::ResultConfirmation(ArtifactResultConfirmationResponse {
+                request_message_id,
+                outcome: ArtifactResultConfirmationOutcome::Failed { code, .. },
+            }) => Some((request_message_id, code)),
+            _ => None,
+        }
+    }
+
     pub(super) fn request_kind(&self) -> ArtifactRequestKind {
         match self {
             Self::CarrierRegistration(_) => ArtifactRequestKind::RegisterCarrier,
@@ -189,6 +213,7 @@ pub(super) struct ArtifactDeliveryBroker {
     uploads: mpsc::UnboundedSender<UploadCompleted>,
     sleeper: Arc<dyn Sleeper>,
     allow_insecure_loopback: bool,
+    recorder: Option<Arc<Recorder>>,
 }
 
 struct ArtifactDeliveryState {
@@ -246,6 +271,7 @@ impl ArtifactDeliveryBroker {
         outbox: ObservationOutbox,
         sleeper: Arc<dyn Sleeper>,
         allow_insecure_loopback: bool,
+        recorder: Option<Arc<Recorder>>,
     ) -> Self {
         let (uploads, upload_results) = mpsc::unbounded_channel();
         Self {
@@ -258,6 +284,7 @@ impl ArtifactDeliveryBroker {
             uploads,
             sleeper,
             allow_insecure_loopback,
+            recorder,
         }
     }
 
@@ -268,10 +295,17 @@ impl ArtifactDeliveryBroker {
         let (completion, receiver) = oneshot::channel();
         let mut state = self.lock();
         let id = state.next_id;
-        state.next_id = state
-            .next_id
-            .checked_add(1)
-            .ok_or(OutboxFailure::Sequence)?;
+        let Some(next_id) = state.next_id.checked_add(1) else {
+            self.record_outbox_failure(id, &spec, "registration", OutboxFailure::Sequence);
+            return Err(OutboxFailure::Sequence);
+        };
+        state.next_id = next_id;
+        // Keep the state lock until the delivery is installed so a fast response
+        // cannot overtake registration.
+        if let Err(failure) = self.outbox.enqueue(register_observation(id, &spec)) {
+            self.record_outbox_failure(id, &spec, "registration", failure);
+            return Err(failure);
+        }
         state.deliveries.insert(
             id,
             Delivery {
@@ -283,11 +317,6 @@ impl ArtifactDeliveryBroker {
                 backoff: Backoff::new(),
             },
         );
-        let request = register_observation(id, &state.deliveries[&id].spec);
-        if let Err(failure) = self.outbox.enqueue(request) {
-            state.deliveries.remove(&id);
-            return Err(failure);
-        }
         Ok(receiver)
     }
 
@@ -309,6 +338,30 @@ impl ArtifactDeliveryBroker {
         let mut upload = None;
         let mut retry = None;
         let mut completion = None;
+
+        if let Some((request_message_id, code)) = response.failure() {
+            let operation = match response.request_kind() {
+                ArtifactRequestKind::RegisterCarrier | ArtifactRequestKind::RegisterResult => {
+                    "registration"
+                }
+                ArtifactRequestKind::ConfirmCarrier | ArtifactRequestKind::ConfirmResult => {
+                    "confirmation"
+                }
+            };
+            self.record_failure(
+                delivery_id,
+                &delivery.spec,
+                operation,
+                [
+                    KeyValue::new(telemetry::attribute::ARTIFACT_FAILURE_ORIGIN, "cloud"),
+                    KeyValue::new(telemetry::attribute::ARTIFACT_FAILURE_CODE, code.to_owned()),
+                    KeyValue::new(
+                        telemetry::attribute::PROTOCOL_REQUEST_MESSAGE_ID,
+                        request_message_id.to_owned(),
+                    ),
+                ],
+            );
+        }
 
         match (&delivery.phase, response) {
             (
@@ -375,14 +428,18 @@ impl ArtifactDeliveryBroker {
                     outcome: ArtifactRegistrationOutcome::Failed { code },
                     ..
                 }),
-            ) if !delivery.spec.is_result() => completion = Some(failed_for_code(code)),
+            ) if !delivery.spec.is_result() => {
+                completion = Some(failed_for_code("registration", code))
+            }
             (
                 DeliveryPhase::Registering,
                 ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
                     outcome: ArtifactResultRegistrationOutcome::Failed { code },
                     ..
                 }),
-            ) if delivery.spec.is_result() => completion = Some(failed_for_code(code)),
+            ) if delivery.spec.is_result() => {
+                completion = Some(failed_for_code("registration", code))
+            }
             (
                 DeliveryPhase::Confirming {
                     artifact_set_id: expected_set,
@@ -466,7 +523,7 @@ impl ArtifactDeliveryBroker {
                     ..
                 }),
             ) if expected_set == &artifact_set_id && expected_carrier == &carrier_id => {
-                completion = Some(failed_for_code(code));
+                completion = Some(failed_for_code("upload", code));
             }
             (
                 DeliveryPhase::Confirming {
@@ -593,7 +650,7 @@ impl ArtifactDeliveryBroker {
                 complete(
                     &mut state,
                     completed.delivery_id,
-                    internal_failure("confirmation"),
+                    internal_failure("upload"),
                 );
                 continue;
             };
@@ -601,7 +658,13 @@ impl ArtifactDeliveryBroker {
                 artifact_set_id,
                 carrier_id,
             };
-            if self.outbox.enqueue(request).is_err() {
+            if let Err(failure) = self.outbox.enqueue(request) {
+                self.record_outbox_failure(
+                    completed.delivery_id,
+                    &delivery.spec,
+                    "confirmation",
+                    failure,
+                );
                 complete(
                     &mut state,
                     completed.delivery_id,
@@ -664,13 +727,24 @@ impl ArtifactDeliveryBroker {
         let mut upload = None;
         match retry.action {
             RetryAction::Request(request) => {
-                if self.outbox.enqueue(request).is_err() {
+                if let Err(failure) = self.outbox.enqueue(request) {
                     let phase = match delivery.phase {
                         DeliveryPhase::Registering => "registration",
                         DeliveryPhase::Uploading { .. } | DeliveryPhase::Confirming { .. } => {
                             "upload"
                         }
                     };
+                    let operation = if phase == "registration" {
+                        "registration"
+                    } else {
+                        "confirmation"
+                    };
+                    self.record_outbox_failure(
+                        retry.delivery_id,
+                        &delivery.spec,
+                        operation,
+                        failure,
+                    );
                     complete(&mut state, retry.delivery_id, internal_failure(phase));
                 }
             }
@@ -694,6 +768,65 @@ impl ArtifactDeliveryBroker {
         }
     }
 
+    fn record_outbox_failure(
+        &self,
+        id: u64,
+        spec: &ArtifactDeliverySpec,
+        operation: &'static str,
+        failure: OutboxFailure,
+    ) {
+        let code = match failure {
+            OutboxFailure::Capacity => "outbox_capacity",
+            OutboxFailure::Encoding => "outbox_encoding",
+            OutboxFailure::Sequence => "outbox_sequence",
+        };
+        self.record_failure(
+            id,
+            spec,
+            operation,
+            [
+                KeyValue::new(telemetry::attribute::ARTIFACT_FAILURE_ORIGIN, "runner"),
+                KeyValue::new(telemetry::attribute::ARTIFACT_FAILURE_CODE, code),
+            ],
+        );
+    }
+
+    fn record_failure(
+        &self,
+        id: u64,
+        spec: &ArtifactDeliverySpec,
+        operation: &'static str,
+        details: impl IntoIterator<Item = KeyValue>,
+    ) {
+        if let Some(recorder) = &self.recorder {
+            recorder.record(
+                "runner.artifact_delivery_failed",
+                [
+                    KeyValue::new(
+                        telemetry::attribute::ASSIGNMENT_ID,
+                        spec.assignment_id.clone(),
+                    ),
+                    KeyValue::new(telemetry::attribute::ATTEMPT_ID, spec.attempt_id.clone()),
+                    KeyValue::new(
+                        telemetry::attribute::ARTIFACT_DELIVERY_ID,
+                        telemetry::integer(id),
+                    ),
+                    KeyValue::new(telemetry::attribute::ARTIFACT_OPERATION, operation),
+                    KeyValue::new(
+                        telemetry::attribute::ARTIFACT_MEMBER,
+                        if spec.is_result() {
+                            "result"
+                        } else {
+                            "carrier"
+                        },
+                    ),
+                ]
+                .into_iter()
+                .chain(details),
+            );
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ArtifactDeliveryState> {
         self.state
             .lock()
@@ -701,10 +834,13 @@ impl ArtifactDeliveryBroker {
     }
 }
 
-fn failed_for_code(code: String) -> ArtifactDeliveryOutcome {
+fn failed_for_code(operation_phase: &str, code: String) -> ArtifactDeliveryOutcome {
     let phase = match code.as_str() {
         "stored_object_integrity_mismatch" => "upload",
-        _ => "registration",
+        // An identity conflict is a registration disposition in the wire contract,
+        // even when learned during confirmation. Diagnostics retain the operation.
+        "stored_object_conflict" => "registration",
+        _ => operation_phase,
     };
     ArtifactDeliveryOutcome::Failed(ClosedArtifactDeliveryFailure {
         phase: phase.to_owned(),
@@ -1090,6 +1226,138 @@ mod tests {
     use super::*;
     use crate::runner::service::test_support::{controlled_sleeper, with_watchdog};
 
+    fn result_spec() -> ArtifactDeliverySpec {
+        ArtifactDeliverySpec::result(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+            Arc::from(&b"{}"[..]),
+        )
+    }
+
+    #[tokio::test]
+    async fn delivery_start_failures_retain_the_local_cause_without_payloads() {
+        use super::super::assignment::MAXIMUM_SERVICE_OBSERVATIONS;
+        for (failure, code) in [
+            (OutboxFailure::Encoding, "outbox_encoding"),
+            (OutboxFailure::Capacity, "outbox_capacity"),
+            (OutboxFailure::Sequence, "outbox_sequence"),
+        ] {
+            let (recorder, capture) = telemetry::test_recorder("artifact-test");
+            let (sleeper, _) = controlled_sleeper();
+            let outbox = ObservationOutbox::new();
+            let broker = ArtifactDeliveryBroker::new(outbox.clone(), sleeper, true, Some(recorder));
+            let mut spec = result_spec();
+            match failure {
+                OutboxFailure::Encoding => spec.sha256 = "not-a-digest".to_owned(),
+                OutboxFailure::Sequence => broker.lock().next_id = u64::MAX,
+                OutboxFailure::Capacity => {
+                    for _ in 0..MAXIMUM_SERVICE_OBSERVATIONS {
+                        outbox.enqueue(register_observation(1, &spec)).unwrap();
+                    }
+                }
+            }
+            assert_eq!(broker.start(spec).unwrap_err(), failure);
+            assert!(broker.lock().deliveries.is_empty());
+            let records = capture.records();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(
+                record[telemetry::attribute::ARTIFACT_FAILURE_ORIGIN],
+                "runner"
+            );
+            assert_eq!(record[telemetry::attribute::ARTIFACT_FAILURE_CODE], code);
+            assert_eq!(
+                record[telemetry::attribute::ARTIFACT_OPERATION],
+                "registration"
+            );
+            assert_eq!(record[telemetry::attribute::ARTIFACT_MEMBER], "result");
+            assert_eq!(
+                record[telemetry::attribute::ASSIGNMENT_ID],
+                result_spec().assignment_id
+            );
+            assert_eq!(
+                record[telemetry::attribute::ATTEMPT_ID],
+                result_spec().attempt_id
+            );
+            assert!(
+                !serde_json::to_string(record)
+                    .unwrap()
+                    .contains("not-a-digest")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_confirmation_failures_keep_the_operation_and_closed_disposition() {
+        for (code, phase) in [
+            ("delivery_internal_failure", "upload"),
+            ("upload_authorization_failed", "upload"),
+            ("stored_object_integrity_mismatch", "upload"),
+            ("stored_object_conflict", "registration"),
+        ] {
+            let (recorder, capture) = telemetry::test_recorder("artifact-test");
+            let (sleeper, _) = controlled_sleeper();
+            let broker = ArtifactDeliveryBroker::new(
+                ObservationOutbox::new(),
+                sleeper,
+                true,
+                Some(recorder),
+            );
+            let mut spec = result_spec();
+            spec.member = ArtifactMember::Carrier {
+                portable_owner_path: "exports/0001".to_owned(),
+                idempotency_key: "a".repeat(64),
+            };
+            let mut completion = broker.start(spec).unwrap();
+            let artifact_set_id = "ats_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned();
+            let carrier_id = "acr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned();
+            broker.lock().deliveries.get_mut(&1).unwrap().phase = DeliveryPhase::Confirming {
+                artifact_set_id: artifact_set_id.clone(),
+                carrier_id: Some(carrier_id.clone()),
+            };
+            broker
+                .handle_response(
+                    1,
+                    ArtifactCloudResponse::CarrierConfirmation(ArtifactConfirmationResponse {
+                        request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+                        outcome: ArtifactConfirmationOutcome::Failed {
+                            artifact_set_id,
+                            carrier_id,
+                            code: code.to_owned(),
+                        },
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                completion.try_recv(),
+                Ok(ArtifactDeliveryOutcome::Failed(
+                    ClosedArtifactDeliveryFailure {
+                        phase: phase.to_owned(),
+                        code: code.to_owned(),
+                    }
+                ))
+            );
+            let records = capture.records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0][telemetry::attribute::ARTIFACT_FAILURE_ORIGIN],
+                "cloud"
+            );
+            assert_eq!(
+                records[0][telemetry::attribute::ARTIFACT_OPERATION],
+                "confirmation"
+            );
+            assert_eq!(
+                records[0][telemetry::attribute::ARTIFACT_FAILURE_CODE],
+                code
+            );
+            assert_eq!(
+                records[0][telemetry::attribute::PROTOCOL_REQUEST_MESSAGE_ID],
+                "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd"
+            );
+        }
+    }
+
     fn start_result_delivery(
         outbox: &ObservationOutbox,
         sleeper: Arc<dyn Sleeper>,
@@ -1097,14 +1365,8 @@ mod tests {
         ArtifactDeliveryBroker,
         oneshot::Receiver<ArtifactDeliveryOutcome>,
     ) {
-        let broker = ArtifactDeliveryBroker::new(outbox.clone(), sleeper, true);
-        let completion = broker
-            .start(ArtifactDeliverySpec::result(
-                "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
-                "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
-                Arc::from(&b"{}"[..]),
-            ))
-            .unwrap();
+        let broker = ArtifactDeliveryBroker::new(outbox.clone(), sleeper, true, None);
+        let completion = broker.start(result_spec()).unwrap();
         (broker, completion)
     }
 

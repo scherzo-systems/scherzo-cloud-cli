@@ -1657,6 +1657,7 @@ impl AssignmentManager {
             outbox.clone(),
             Arc::clone(&sleeper),
             allow_insecure_artifact_uploads,
+            recorder.clone(),
         );
         let root_preparation_worker = AssignmentRootPreparationWorker::new();
         Self {
@@ -4565,7 +4566,7 @@ fn nonnegative(value: i64) -> Result<u64, WelcomePolicyFailure> {
 fn validate_execution_spec(
     execution_spec: &ExecutionSpecV1RunnerProjection,
 ) -> Result<(), AssignmentDecline> {
-    if execution_spec.schema_version != 1 {
+    if !matches!(execution_spec.schema_version, 1 | 2) {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::UnsupportedSchemaVersion,
         ));
@@ -4931,6 +4932,7 @@ mod tests {
     };
 
     const NOW: &str = "2026-07-23T00:00:00Z";
+    mod artifact_delivery_tests;
     const COMMAND_FIXTURE_TEST_NAME: &str =
         "runner::service::assignment::tests::command_fixture_process";
     const FAILING_COMMAND_FIXTURE_TEST_NAME: &str =
@@ -6793,6 +6795,68 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         terminal_outcome
     }
 
+    fn decoded_source_display_offer() -> AssignmentOffer {
+        let CloudFrame::AssignmentOffer {
+            effect_id,
+            assignment_id,
+            run_id,
+            project_id,
+            attempt_id,
+            attempt_number,
+            execution_spec,
+            ..
+        } = decode_cloud_frame(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
+        )))
+        .unwrap()
+        else {
+            panic!("expected an assignment offer");
+        };
+        AssignmentOffer {
+            effect_id,
+            assignment_id,
+            run_id,
+            project_id,
+            attempt_id,
+            attempt_number,
+            execution_spec: *execution_spec,
+        }
+    }
+
+    #[test]
+    fn decoded_execution_spec_versions_retain_semantic_admission_guards() {
+        for mut spec in [
+            offer("bg").execution_spec,
+            decoded_source_display_offer().execution_spec,
+        ] {
+            assert_eq!(validate_execution_spec(&spec), Ok(()));
+            spec.execution_limits.maximum_parallel_steps = 0;
+            assert_eq!(
+                validate_execution_spec(&spec),
+                Err(invalid_execution_limits())
+            );
+            spec.execution_limits.maximum_parallel_steps = 1;
+            spec.primary_workspace_source.commit_oid = "0".repeat(40);
+            assert_eq!(
+                validate_execution_spec(&spec),
+                Err(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::InvalidSourceProjection,
+                ))
+            );
+        }
+        for version in [0, 3, u64::MAX] {
+            let mut spec = decoded_source_display_offer().execution_spec;
+            spec.schema_version = version;
+            assert_eq!(
+                validate_execution_spec(&spec),
+                Err(AssignmentDecline::ExecutionSpecInvalid(
+                    ExecutionSpecInvalidReason::UnsupportedSchemaVersion,
+                ))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn malformed_run_input_projection_has_the_closed_immutable_decline() {
         let mut execution_spec = offer("bg").execution_spec;
@@ -6966,8 +7030,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
-        manager.artifact_delivery =
-            ArtifactDeliveryBroker::new(manager.outbox.clone(), Arc::clone(&manager.sleeper), true);
+        manager.artifact_delivery = ArtifactDeliveryBroker::new(
+            manager.outbox.clone(),
+            Arc::clone(&manager.sleeper),
+            true,
+            None,
+        );
         let mut offered = offer("bg");
         offered.attempt_number = 2;
         offer_then_prepare(&mut manager, &offered).await;
