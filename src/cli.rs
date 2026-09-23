@@ -1713,6 +1713,10 @@ fn print_help(command_path: &[&str]) -> CommandResult {
 }
 
 #[cfg(test)]
+#[path = "cli/grammar_tests.rs"]
+mod grammar_tests;
+
+#[cfg(test)]
 mod tests {
     use std::ffi::OsString;
     use std::fs;
