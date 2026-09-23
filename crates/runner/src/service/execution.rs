@@ -3108,7 +3108,7 @@ pub(super) mod test_support {
 
     use super::*;
 
-    pub(in crate::runner::service) struct LiveLeaseExecution {
+    pub(in crate::service) struct LiveLeaseExecution {
         completion: tokio::sync::oneshot::Sender<&'static str>,
         task: tokio::task::JoinHandle<LeaseExecution<&'static str>>,
         cancellation: CancellationSource,
@@ -3119,7 +3119,7 @@ pub(super) mod test_support {
     }
 
     impl LiveLeaseExecution {
-        pub(in crate::runner::service) async fn complete(self) {
+        pub(in crate::service) async fn complete(self) {
             let Self {
                 completion,
                 task,
@@ -3133,7 +3133,7 @@ pub(super) mod test_support {
                 .send("completed-after-renewal")
                 .expect("live lease execution ended before completion");
             assert!(matches!(
-                crate::runner::service::test_support::with_watchdog(task)
+                crate::service::test_support::with_watchdog(task)
                     .await
                     .expect("live lease execution supervision timed out")
                     .expect("live lease execution supervision task failed"),
@@ -3150,7 +3150,7 @@ pub(super) mod test_support {
         }
     }
 
-    pub(in crate::runner::service) fn supervise_assignment_lease(
+    pub(in crate::service) fn supervise_assignment_lease(
         lease_clock: LeaseClock,
         authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
         causal_lease: CausalLease,
@@ -3210,8 +3210,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::runner::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
-    use crate::runner::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
+    use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
+    use crate::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
     use scherzo_cloud_runner_protocol::{
         MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame,
     };

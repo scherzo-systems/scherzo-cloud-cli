@@ -254,7 +254,7 @@ struct WorkflowGitAuthorityInner {
     alias_link_identity: PathIdentity,
     broker: Arc<dyn SourceCredentialBroker>,
     clock: Arc<dyn Sleeper>,
-    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
     stop: AtomicBool,
     state: Mutex<AuthorityState>,
     teardown_changed: Condvar,
@@ -310,7 +310,7 @@ pub(super) struct WorkflowGitInstall<'a> {
     pub(super) environment: &'a EnvironmentSnapshot,
     pub(super) helper_executable: &'a Path,
     pub(super) clock: Arc<dyn Sleeper>,
-    pub(super) recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    pub(super) recorder: Option<Arc<crate::telemetry::Recorder>>,
     pub(super) cancellation: &'a CaptureCancellation,
 }
 
@@ -1063,7 +1063,7 @@ fn wake_helper(socket: &Path) {
 }
 
 fn record_teardown(
-    recorder: Option<&Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<&Arc<crate::telemetry::Recorder>>,
     report: &WorkflowGitTeardownReport,
 ) {
     let Some(recorder) = recorder else {
@@ -1139,7 +1139,7 @@ fn record_teardown(
 pub(super) mod test_support {
     use super::*;
 
-    pub(in crate::runner::service) fn lease_authority_fixture(
+    pub(in crate::service) fn lease_authority_fixture(
         assignment_id: &str,
         broker: Arc<dyn SourceCredentialBroker>,
         clock: Arc<dyn Sleeper>,
@@ -1193,7 +1193,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::runner::service::source::{
+    use crate::service::source::{
         CommitAvailability, CredentialBrokerFailure, ProviderSecret, WorkflowGitRevocationOutcome,
     };
 
@@ -1465,11 +1465,7 @@ mod tests {
     }
 
     fn install(fixture: &Fixture, broker: Arc<FixtureBroker>) -> WorkflowGitAuthority {
-        install_with_clock(
-            fixture,
-            broker,
-            Arc::new(crate::runner::service::TokioSleeper),
-        )
+        install_with_clock(fixture, broker, Arc::new(crate::service::TokioSleeper))
     }
 
     fn install_with_clock(
@@ -1671,7 +1667,7 @@ mod tests {
     #[tokio::test]
     async fn expired_replacement_is_destroyed_without_a_gateway_revocation_call() {
         let fixture = fixture();
-        let (clock, mut waits) = crate::runner::service::test_support::controlled_sleeper();
+        let (clock, mut waits) = crate::service::test_support::controlled_sleeper();
         let now = clock.utc_now();
         let first_expiry = now + time::Duration::seconds(5);
         let second_expiry = now + time::Duration::hours(1);

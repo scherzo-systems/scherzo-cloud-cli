@@ -14,7 +14,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::assignment::AssignmentManager;
-use crate::runner::control_protocol::{
+use crate::control_protocol::{
     ConnectionFailure, ConnectionState, ControlError, Operation, ProcessState, Response,
     StatusSnapshot, decode_request, encode_response,
 };
@@ -162,7 +162,7 @@ impl LiveStatus {
 
     fn snapshot(
         &self,
-        assignment_counts: crate::runner::control_protocol::AssignmentCounts,
+        assignment_counts: crate::control_protocol::AssignmentCounts,
     ) -> StatusSnapshot {
         let state = self.lock();
         let uptime_milliseconds =
@@ -471,7 +471,7 @@ async fn read_request(stream: &mut UnixStream, io_timeout: Duration) -> Result<V
                 return Err(());
             }
             request.extend_from_slice(&chunk[..read]);
-            if request.len() > crate::runner::control_protocol::REQUEST_LIMIT {
+            if request.len() > crate::control_protocol::REQUEST_LIMIT {
                 return Err(());
             }
             if let Some(newline) = request.iter().position(|byte| *byte == b'\n') {
@@ -499,10 +499,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    use crate::runner::control_protocol::{AssignmentCounts, Response, decode_response};
-    use crate::runner::credential::test_credential;
-    use crate::runner::service::assignment::test_support::manager;
-    use crate::runner::service::test_support::{ConfigFixture, fixture_lease_clock};
+    use crate::control_protocol::{AssignmentCounts, Response, decode_response};
+    use crate::credential::test_credential;
+    use crate::service::assignment::test_support::manager;
+    use crate::service::test_support::{ConfigFixture, fixture_lease_clock};
 
     const TEST_TIMEOUTS: ControlTimeouts = ControlTimeouts {
         io: Duration::from_millis(50),
@@ -633,7 +633,7 @@ mod tests {
             b"not-json\n".to_vec(),
             b"{\"schemaVersion\":1,\"operation\":\"run_command\"}\n".to_vec(),
             {
-                let mut oversized = vec![b'x'; crate::runner::control_protocol::REQUEST_LIMIT];
+                let mut oversized = vec![b'x'; crate::control_protocol::REQUEST_LIMIT];
                 oversized.push(b'\n');
                 oversized
             },

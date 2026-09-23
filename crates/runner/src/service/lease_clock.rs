@@ -830,7 +830,7 @@ mod tests {
     use std::task::Poll;
 
     use super::*;
-    use crate::runner::service::test_support::with_watchdog;
+    use crate::service::test_support::with_watchdog;
 
     struct ControlledSource {
         state: Arc<Mutex<ControlledState>>,

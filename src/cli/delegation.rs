@@ -93,7 +93,7 @@ impl DelegationOptions {
     where
         O: super::HumanCredentialOutcome<Error = DelegationApiError>,
     {
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate delegation mutation request identity")?;
         self.execute(
             deployment,
@@ -221,7 +221,7 @@ impl ListCommand {
 
 impl ProposeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate delegation proposal request identity")?;
         let outcome = super::execute_with_human_credential(
             deployment,
@@ -267,7 +267,7 @@ impl ShowCommand {
 impl AcceptCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let api_key = self.options.authentication.api_key()?;
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate delegation acceptance request identity")?;
         let client = HttpClient::new(self.options.http.transport_policy())
             .map_err(|error| anyhow!(error))

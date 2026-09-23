@@ -160,7 +160,7 @@ impl CreateCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         let idempotency_key = match self.idempotency_key.clone() {
             Some(key) => key,
-            None => crate::idempotency::generate_idempotency_key()
+            None => scherzo_cloud_support::generate_idempotency_key()
                 .context("generate Cloud publication request identity")?,
         };
         if self.wait.wait {

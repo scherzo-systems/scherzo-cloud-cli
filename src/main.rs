@@ -13,8 +13,6 @@ mod cli;
 mod error;
 mod exit_code;
 mod human_auth;
-mod idempotency;
-mod runner;
 mod service_auth;
 
 use std::env;
@@ -28,8 +26,8 @@ fn main() -> ExitCode {
     if scherzo_cloud_execution::result_validation_worker_requested() {
         return scherzo_cloud_execution::run_result_validation_worker().into();
     }
-    if runner::service::workflow_git_helper_requested() {
-        return if runner::service::run_workflow_git_helper() {
+    if scherzo_cloud_runner::workflow_git_helper_requested() {
+        return if scherzo_cloud_runner::run_workflow_git_helper() {
             ExitCode::Success
         } else {
             ExitCode::GeneralFailure

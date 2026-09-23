@@ -68,6 +68,8 @@ required_files=(
   crates/api/Cargo.toml
   crates/api/src/lib.rs
   crates/api/src/generated/mod.rs
+  crates/runner/Cargo.toml
+  crates/runner/src/lib.rs
   crates/runner-protocol/Cargo.toml
   crates/runner-protocol/src/lib.rs
   crates/runner-protocol/src/generated.rs

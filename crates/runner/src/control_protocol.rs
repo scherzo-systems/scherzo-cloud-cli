@@ -7,14 +7,14 @@ pub(crate) const REQUEST_LIMIT: usize = 4_096;
 pub(crate) const RESPONSE_LIMIT: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Operation {
+pub enum Operation {
     Status,
     ReloadCredential,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ControlError {
+pub enum ControlError {
     InvalidRequest,
     UnsupportedVersion,
     NoPendingCredential,
@@ -27,14 +27,14 @@ pub(crate) enum ControlError {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ProcessState {
+pub enum ProcessState {
     Running,
     Stopping,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ConnectionState {
+pub enum ConnectionState {
     Connecting,
     Connected,
     BackingOff,
@@ -45,7 +45,7 @@ pub(crate) enum ConnectionState {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ConnectionFailure {
+pub enum ConnectionFailure {
     Network,
     RateLimited,
     CloudUnavailable,
@@ -55,16 +55,16 @@ pub(crate) enum ConnectionFailure {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct AssignmentCounts {
-    pub(crate) preparing: u64,
-    pub(crate) accepted: u64,
-    pub(crate) running: u64,
-    pub(crate) finishing: u64,
-    pub(crate) reporting: u64,
+pub struct AssignmentCounts {
+    pub preparing: u64,
+    pub accepted: u64,
+    pub running: u64,
+    pub finishing: u64,
+    pub reporting: u64,
 }
 
 impl AssignmentCounts {
-    pub(crate) fn total(self) -> Option<u64> {
+    pub fn total(self) -> Option<u64> {
         self.preparing
             .checked_add(self.accepted)?
             .checked_add(self.running)?
@@ -75,24 +75,24 @@ impl AssignmentCounts {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct StatusSnapshot {
-    pub(crate) process_state: ProcessState,
-    pub(crate) boot_id: String,
-    pub(crate) uptime_milliseconds: u64,
-    pub(crate) connection_state: ConnectionState,
+pub struct StatusSnapshot {
+    pub process_state: ProcessState,
+    pub boot_id: String,
+    pub uptime_milliseconds: u64,
+    pub connection_state: ConnectionState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) last_connected_at: Option<String>,
+    pub last_connected_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) current_credential_id: Option<String>,
+    pub current_credential_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) pending_credential_id: Option<String>,
-    pub(crate) assignment_counts: AssignmentCounts,
+    pub pending_credential_id: Option<String>,
+    pub assignment_counts: AssignmentCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) last_connection_failure: Option<ConnectionFailure>,
+    pub last_connection_failure: Option<ConnectionFailure>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Response {
+pub enum Response {
     Status(StatusSnapshot),
     Reloaded { credential_id: String },
     Error(ControlError),
@@ -136,7 +136,7 @@ struct DecodedResponse {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ProtocolFailure {
+pub enum ProtocolFailure {
     Invalid,
     Oversized,
 }
@@ -326,13 +326,13 @@ mod tests {
 
     #[test]
     fn canonical_schema_accepts_only_valid_control_fixtures() {
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cli_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let schema: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(manifest.join("schemas/runner-control-v1.schema.json")).unwrap(),
+            &std::fs::read(cli_root.join("schemas/runner-control-v1.schema.json")).unwrap(),
         )
         .unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
-        let fixtures = manifest.join("tests/fixtures/runner-control/v1");
+        let fixtures = cli_root.join("tests/fixtures/runner-control/v1");
         for (kind, expected) in [("valid", true), ("invalid", false)] {
             for entry in std::fs::read_dir(fixtures.join(kind)).unwrap() {
                 let path = entry.unwrap().path();

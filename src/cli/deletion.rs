@@ -160,7 +160,7 @@ impl OrganizationCommand {
 
 impl AccountRequestCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate account deletion request identity")?;
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -228,7 +228,7 @@ impl AccountRequestCommand {
 impl OrganizationRequestCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let organization_ref = self.organization_ref.into_string();
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate organization deletion request identity")?;
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -467,7 +467,7 @@ fn execute_cancellation(
         }
     };
 
-    let idempotency_key = crate::idempotency::generate_idempotency_key()
+    let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
         .context("generate deletion cancellation request identity")?;
     let result = match &target {
         DeletionTarget::Account => cancel_current_principal_deletion(

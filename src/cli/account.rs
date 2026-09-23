@@ -29,8 +29,8 @@ use anyhow::Context;
 use clap::{ArgGroup, Args, Subcommand};
 
 use crate::human_auth::deployment::Deployment;
-use crate::idempotency::generate_idempotency_key;
 use scherzo_cloud_api::{HttpClient, HttpTransportPolicy, signup_human, update_current_principal};
+use scherzo_cloud_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage your Scherzo Cloud account";
 const NAME: &str = "account";

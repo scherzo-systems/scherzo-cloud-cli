@@ -25,14 +25,14 @@ use std::sync::{Arc, Mutex};
 
 use opentelemetry::KeyValue;
 
+#[cfg(feature = "test-fixtures")]
+pub(crate) use assignment::run_nested_workflow_delivery_failure_scenario;
 #[cfg(test)]
 pub(crate) use config::AssignmentConfig;
-pub(crate) use config::Config;
-#[cfg(test)]
-pub(crate) use test_support::ConfigFixture;
+pub use config::{Config, ConfigError};
 
-use crate::runner::control_protocol::{ConnectionFailure, ControlError};
-use crate::runner::telemetry::{self, Event, Outcome, Recorder};
+use crate::control_protocol::{ConnectionFailure, ControlError};
+use crate::telemetry::{self, Event, Outcome, Recorder};
 use assignment::{AssignmentDependencies, AssignmentManager};
 use backoff::Backoff;
 use connection::{
@@ -194,7 +194,7 @@ enum ConnectedReloadResult {
 }
 
 struct PreparedReload {
-    state_access: crate::runner::enrollment::RunnerStateAccess,
+    state_access: crate::enrollment::RunnerStateAccess,
     expected_runner_id: String,
     expected_current_credential_id: String,
     candidate: PromotedAttempt,
@@ -1292,12 +1292,12 @@ fn respond_to_reload(request: &mut Option<ReloadRequest>, result: Result<String,
     }
 }
 
-const fn control_state_error(error: crate::runner::enrollment::ReloadStateError) -> ControlError {
+const fn control_state_error(error: crate::enrollment::ReloadStateError) -> ControlError {
     match error {
-        crate::runner::enrollment::ReloadStateError::RegistrationMismatch => {
+        crate::enrollment::ReloadStateError::RegistrationMismatch => {
             ControlError::PendingRegistrationMismatch
         }
-        crate::runner::enrollment::ReloadStateError::StateUpdate => ControlError::StateUpdateFailed,
+        crate::enrollment::ReloadStateError::StateUpdate => ControlError::StateUpdateFailed,
     }
 }
 
@@ -1500,12 +1500,24 @@ mod tests {
         Sleeper, TokioSleeper, record_startup_retention, run_connection_loop_with_work_root,
         run_until_cancelled_with_dependencies,
     };
-    use crate::runner::control_protocol::{ConnectionState, ControlError, Operation, Response};
-    use crate::runner::credential::test_credential;
-    use crate::runner::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
-    use crate::runner::service::config::RepositoryUrlPolicy;
-    use crate::runner::telemetry::{TestCapture, test_recorder};
+    use crate::control_protocol::{ConnectionState, ControlError, Operation, Response};
+    use crate::credential::test_credential;
+    use crate::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
+    use crate::service::config::RepositoryUrlPolicy;
+    use crate::telemetry::{TestCapture, test_recorder};
     use scherzo_cloud_execution::resolve;
+
+    #[test]
+    fn recovery_required_failures_are_closed_to_work_root_ownership() {
+        for error in [
+            ServiceError::WorkRootInUse,
+            ServiceError::WorkRootIsolation,
+            ServiceError::WorkspaceCleanupFailed,
+        ] {
+            assert!(error.requires_operator_recovery());
+        }
+        assert!(!ServiceError::BuildRuntime.requires_operator_recovery());
+    }
 
     #[test]
     fn shutdown_timeout_accommodates_maximum_cancellation_grace() {
@@ -1801,7 +1813,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            crate::runner::enrollment::load_runner_service_configuration(&config_path).unwrap();
+            crate::enrollment::load_runner_service_configuration(&config_path).unwrap();
             let config = Config::load(&config_path).unwrap();
             Self {
                 _root: root,
@@ -1895,12 +1907,10 @@ mod tests {
     }
 
     async fn request_control(socket_path: PathBuf, operation: Operation) -> Response {
-        tokio::task::spawn_blocking(move || {
-            crate::runner::control_client::request(&socket_path, operation)
-        })
-        .await
-        .unwrap()
-        .unwrap()
+        tokio::task::spawn_blocking(move || crate::control_client::request(&socket_path, operation))
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     async fn request_staged_reload(fixture: &RotationFixture, socket_path: PathBuf) -> Response {
@@ -3028,7 +3038,7 @@ mod tests {
             assert_eq!(first_hello["sentAt"], "2026-07-23T00:00:00Z");
             assert_eq!(
                 first_hello["payload"]["runnerVersion"],
-                crate::runner::telemetry::TEST_SERVICE_VERSION
+                crate::telemetry::TEST_SERVICE_VERSION
             );
             let first_sequence = first_hello["sequence"]
                 .as_u64()
@@ -3074,7 +3084,7 @@ mod tests {
             assert_eq!(second_hello["sentAt"], "2026-07-23T00:00:00Z");
             assert_eq!(
                 second_hello["payload"]["runnerVersion"],
-                crate::runner::telemetry::TEST_SERVICE_VERSION
+                crate::telemetry::TEST_SERVICE_VERSION
             );
         });
 
@@ -3087,10 +3097,10 @@ mod tests {
         let (backoff_delay, release_sleep) = backoff_request(&mut sleep_requests).await;
         let records = capture.records();
         assert!(records.iter().all(|record| {
-            record["service.version"] == crate::runner::telemetry::TEST_SERVICE_VERSION
+            record["service.version"] == crate::telemetry::TEST_SERVICE_VERSION
                 && record
                     .get("scherzo.runner.version")
-                    .is_none_or(|version| version == crate::runner::telemetry::TEST_SERVICE_VERSION)
+                    .is_none_or(|version| version == crate::telemetry::TEST_SERVICE_VERSION)
         }));
         let events = capture.events();
         let connection_events: Vec<_> = events
@@ -3102,7 +3112,7 @@ mod tests {
         assert_eq!(event["scherzo.connection.failure_kind"], "retryable");
         assert_eq!(
             event["scherzo.runner.version"],
-            crate::runner::telemetry::TEST_SERVICE_VERSION
+            crate::telemetry::TEST_SERVICE_VERSION
         );
         assert_eq!(event["error.type"], "read_gateway_frame");
         assert_eq!(event["scherzo.outcome"], "disconnected");

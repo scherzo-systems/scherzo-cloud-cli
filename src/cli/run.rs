@@ -390,7 +390,7 @@ impl CreateCommand {
                 }
             }
         };
-        let run_idempotency_key = crate::idempotency::generate_idempotency_key()
+        let run_idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate Cloud run request identity")?;
         if control.is_cancelled() {
             return Ok(ExitCode::GeneralFailure);

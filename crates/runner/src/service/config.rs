@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
-use crate::runner::credential::Credential;
-use crate::runner::enrollment::{PendingCredential, RunnerStateAccess};
+use crate::credential::Credential;
+use crate::enrollment::{PendingCredential, RunnerStateAccess};
 use scherzo_cloud_execution::{
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
 };
@@ -47,7 +47,7 @@ impl AssignmentConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct Config {
+pub struct Config {
     endpoint: Url,
     credential: Credential,
     startup_pending: Option<PendingCredential>,
@@ -77,7 +77,7 @@ impl fmt::Debug for Config {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ConfigError {
+pub enum ConfigError {
     InvalidOperatorConfiguration,
     InvalidGatewayUrl,
     InsecureGatewayUrl,
@@ -104,8 +104,8 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
-    pub(crate) fn load(path: &Path) -> Result<Self, ConfigError> {
-        let enrolled = crate::runner::enrollment::load_runner_service_configuration(path)
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let enrolled = crate::enrollment::load_runner_service_configuration(path)
             .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
         let credential = Credential::from_enrolled_state(
             &enrolled.runner_id,
@@ -150,7 +150,7 @@ impl Config {
         }
         match endpoint.scheme() {
             "wss" => {}
-            "ws" if allow_insecure_http && crate::runner::is_loopback(&endpoint) => {}
+            "ws" if allow_insecure_http && crate::is_loopback(&endpoint) => {}
             "ws" => return Err(ConfigError::InsecureGatewayUrl),
             _ => return Err(ConfigError::InvalidGatewayUrl),
         }
@@ -208,11 +208,11 @@ impl Config {
         self.repository_url_policy
     }
 
-    pub(crate) fn pi_installation(&self) -> Option<&ValidatedPiInstallation> {
+    pub fn pi_installation(&self) -> Option<&ValidatedPiInstallation> {
         self.pi_installation.as_ref()
     }
 
-    pub(crate) fn with_pi_installation(mut self, installation: ValidatedPiInstallation) -> Self {
+    pub fn with_pi_installation(mut self, installation: ValidatedPiInstallation) -> Self {
         self.pi_installation = Some(installation);
         self
     }
@@ -220,11 +220,11 @@ impl Config {
     // Runner service configuration snapshots and workflow admission intentionally retain
     // parallel typed builders; sharing their containers would merge separate lifecycle layers.
     // jscpd:ignore-start
-    pub(crate) fn claude_code_installation(&self) -> Option<&ValidatedClaudeCodeInstallation> {
+    pub fn claude_code_installation(&self) -> Option<&ValidatedClaudeCodeInstallation> {
         self.claude_code_installation.as_ref()
     }
 
-    pub(crate) fn with_claude_code_installation(
+    pub fn with_claude_code_installation(
         mut self,
         installation: ValidatedClaudeCodeInstallation,
     ) -> Self {
@@ -232,18 +232,35 @@ impl Config {
         self
     }
 
-    pub(crate) fn codex_installation(&self) -> Option<&ValidatedCodexInstallation> {
+    pub fn codex_installation(&self) -> Option<&ValidatedCodexInstallation> {
         self.codex_installation.as_ref()
     }
 
-    pub(crate) fn with_codex_installation(
-        mut self,
-        installation: ValidatedCodexInstallation,
-    ) -> Self {
+    pub fn with_codex_installation(mut self, installation: ValidatedCodexInstallation) -> Self {
         self.codex_installation = Some(installation);
         self
     }
     // jscpd:ignore-end
+
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_for_command_tests(
+        gateway_url: &str,
+        work_root: &Path,
+    ) -> Result<Self, ConfigError> {
+        let credential = Credential::from_enrolled_state(
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "rrc_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+        Self::new(
+            gateway_url,
+            credential,
+            true,
+            AssignmentConfig::new(work_root)?,
+            RepositoryUrlPolicy::production(),
+        )
+    }
 }
 
 fn validate_pending_credential(
@@ -274,7 +291,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
-    use crate::runner::credential::test_credential;
+    use crate::credential::test_credential;
 
     fn assignment_fixture(temporary: &TempDir) -> AssignmentConfig {
         let work = temporary.path().join("work");

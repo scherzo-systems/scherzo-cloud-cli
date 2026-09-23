@@ -17,11 +17,11 @@ use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
-use crate::runner::credential::Credential;
-use crate::runner::service::config::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
-use crate::runner::service::connection::{ConnectionError, FrameSource, run_established_shared};
-pub(crate) use crate::runner::service::lease_clock::fixture_lease_clock;
-use crate::runner::service::{
+use crate::credential::Credential;
+use crate::service::config::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
+use crate::service::connection::{ConnectionError, FrameSource, run_established_shared};
+pub(crate) use crate::service::lease_clock::fixture_lease_clock;
+use crate::service::{
     ConnectionAttempt, ConnectionFuture, Connector, Shutdown, ShutdownFuture, Sleeper,
 };
 
@@ -40,8 +40,9 @@ impl ConfigFixture {
         credential: Credential,
         allow_insecure_http: bool,
     ) -> Result<Self, ConfigError> {
-        let manifest = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
-            .map_err(|_| ConfigError::WorkRootUnavailable)?;
+        let manifest =
+            std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                .map_err(|_| ConfigError::WorkRootUnavailable)?;
         // The test boundary preserves TMPDIR, which may be inside this checkout.
         // Runner fixtures must not follow it back into the source tree.
         let work_root =

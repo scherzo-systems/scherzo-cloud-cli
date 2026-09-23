@@ -195,7 +195,7 @@ impl CreateCommand {
     ) -> super::CommandResult {
         let mut destination = ApiKeyDestination::prepare(&self.api_key_file)
             .context("prepare initial service API-key destination")?;
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate service-principal creation request identity")?;
         let attempt = super::execute_with_human_credential(
             deployment,
@@ -297,7 +297,7 @@ impl IssueCommand {
     ) -> super::CommandResult {
         let mut destination = ApiKeyDestination::prepare(&self.api_key_file)
             .context("prepare issued service API-key destination")?;
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate service-credential issuance request identity")?;
         let client = service_client(deployment, &self.options)?;
         if !control.begin_bounded_dispatch() {
@@ -344,7 +344,7 @@ impl IssueCommand {
 impl RevokeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let api_key = self.options.authentication.api_key()?;
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate service-credential revocation request identity")?;
         let client = service_client(deployment, &self.options)?;
         let outcome = revoke_service_credential(

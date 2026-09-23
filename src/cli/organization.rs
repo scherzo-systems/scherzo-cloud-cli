@@ -102,7 +102,7 @@ impl LeafOptions {
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate organization mutation request identity")?;
         self.execute(
             deployment,

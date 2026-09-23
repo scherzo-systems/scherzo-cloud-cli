@@ -3,7 +3,7 @@ use std::io::{self, Cursor, Read};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::runner::telemetry::{self, Recorder};
+use crate::telemetry::{self, Recorder};
 use base64::Engine as _;
 use opentelemetry::KeyValue;
 use reqwest::StatusCode;
@@ -1124,7 +1124,7 @@ fn validate_capability(
 ) -> Result<(), ()> {
     let url = url::Url::parse(&capability.url).map_err(|_| ())?;
     let secure = url.scheme() == "https"
-        || (allow_insecure_loopback && url.scheme() == "http" && crate::runner::is_loopback(&url));
+        || (allow_insecure_loopback && url.scheme() == "http" && crate::is_loopback(&url));
     if !secure
         || capability.content_length != size_bytes.to_string()
         || capability.content_type != media_type
@@ -1224,7 +1224,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::runner::service::test_support::{controlled_sleeper, with_watchdog};
+    use crate::service::test_support::{controlled_sleeper, with_watchdog};
 
     fn result_spec() -> ArtifactDeliverySpec {
         ArtifactDeliverySpec::result(

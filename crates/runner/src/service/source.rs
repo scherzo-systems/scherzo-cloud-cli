@@ -18,8 +18,8 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 use zeroize::Zeroize as _;
 
-use crate::runner::credential::Credential;
-use crate::runner::service::config::RepositoryUrlPolicy;
+use crate::credential::Credential;
+use crate::service::config::RepositoryUrlPolicy;
 use scherzo_cloud_execution::ManagedProcessGroup;
 use scherzo_cloud_execution::{
     CaptureCancellation, CloudGitCaptureProjection, EnvironmentSnapshot, ResolvedWorkflow, resolve,
@@ -135,7 +135,7 @@ pub(super) struct HttpSourceCredentialBroker {
     runner_credential: Credential,
     boot_id: Arc<str>,
     repository_url_policy: RepositoryUrlPolicy,
-    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
     retry_waiter: Arc<dyn ProviderRetryWaiter>,
 }
 
@@ -180,10 +180,7 @@ impl HttpSourceCredentialBroker {
         })
     }
 
-    pub(super) fn with_recorder(
-        mut self,
-        recorder: Arc<crate::runner::telemetry::Recorder>,
-    ) -> Self {
+    pub(super) fn with_recorder(mut self, recorder: Arc<crate::telemetry::Recorder>) -> Self {
         self.recorder = Some(recorder);
         self
     }
@@ -193,7 +190,7 @@ impl HttpSourceCredentialBroker {
             recorder.record(
                 "runner.source_authority",
                 [KeyValue::new(
-                    crate::runner::telemetry::attribute::ERROR_TYPE,
+                    crate::telemetry::attribute::ERROR_TYPE,
                     "source_repository_unavailable",
                 )],
             );
@@ -1573,7 +1570,7 @@ pub(super) mod test_support {
 
     use super::*;
 
-    pub(in crate::runner::service) fn fixture_credential(
+    pub(in crate::service) fn fixture_credential(
         repository_url: String,
         token: &str,
     ) -> ProviderCredential {
@@ -1633,7 +1630,7 @@ pub(super) mod test_support {
         // jscpd:ignore-end
     }
 
-    pub(in crate::runner::service) fn fixture_source_broker(
+    pub(in crate::service) fn fixture_source_broker(
         repository: &Path,
     ) -> Arc<dyn SourceCredentialBroker> {
         Arc::new(FixtureSourceBroker {
@@ -1641,8 +1638,7 @@ pub(super) mod test_support {
         })
     }
 
-    pub(in crate::runner::service) fn unavailable_source_broker() -> Arc<dyn SourceCredentialBroker>
-    {
+    pub(in crate::service) fn unavailable_source_broker() -> Arc<dyn SourceCredentialBroker> {
         Arc::new(FixtureSourceBroker {
             repository_url: None,
         })
@@ -1698,7 +1694,7 @@ pub(super) mod test_support {
         // jscpd:ignore-end
     }
 
-    pub(in crate::runner::service) fn gated_unavailable_source_broker() -> (
+    pub(in crate::service) fn gated_unavailable_source_broker() -> (
         Arc<dyn SourceCredentialBroker>,
         std::sync::mpsc::SyncSender<()>,
     ) {
@@ -1711,7 +1707,7 @@ pub(super) mod test_support {
         )
     }
 
-    pub(in crate::runner::service) fn materialize(
+    pub(in crate::service) fn materialize(
         broker: Arc<dyn SourceCredentialBroker>,
         environment: &EnvironmentSnapshot,
         assignment_id: &str,
@@ -1750,8 +1746,8 @@ mod tests {
     use nix::unistd::mkfifo;
 
     use super::*;
-    use crate::runner::credential::test_credential;
-    use crate::runner::telemetry::test_recorder;
+    use crate::credential::test_credential;
+    use crate::telemetry::test_recorder;
     use scherzo_cloud_execution::{
         ArtifactStaging, CancellationPolicy, CancellationSource, CapturedDiagnosticStream,
         CapturedValue, CloudCarrierBody, ExecutionContext, ExportValue, FailurePolicy,
@@ -2773,7 +2769,7 @@ mod tests {
                     .limits()
                     .maximum_step_log_bytes()
                     .get(),
-                cloud_capacity: Some(crate::runner::service::execution::cloud_execution_capacity(
+                cloud_capacity: Some(crate::service::execution::cloud_execution_capacity(
                     &admitted,
                 )),
                 timing: WorkflowRunTiming {
@@ -3427,7 +3423,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["event.name"], "runner.source_authority");
         assert_eq!(
-            records[0][crate::runner::telemetry::attribute::ERROR_TYPE],
+            records[0][crate::telemetry::attribute::ERROR_TYPE],
             "source_repository_unavailable"
         );
     }

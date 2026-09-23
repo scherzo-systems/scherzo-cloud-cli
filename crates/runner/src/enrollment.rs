@@ -14,7 +14,7 @@ use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 
-use crate::idempotency::generate_idempotency_key;
+use scherzo_cloud_support::generate_idempotency_key;
 
 use super::validation::{valid_secret_syntax, valid_typed_id};
 
@@ -38,7 +38,7 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct ActivationArtifact {
+pub struct ActivationArtifact {
     schema_version: u8,
     activation_url: String,
     #[serde(skip_serializing)]
@@ -50,15 +50,15 @@ pub(crate) struct ActivationArtifact {
 /// Owned activation fields supplied by the caller that received the Cloud
 /// response. Translation from API DTOs happens at that boundary so the
 /// runner component never references the human API client.
-pub(crate) struct ActivationArtifactParts {
-    pub(crate) activation_url: String,
-    pub(crate) activation_token: String,
-    pub(crate) runner_id: String,
-    pub(crate) expires_at: String,
+pub struct ActivationArtifactParts {
+    pub activation_url: String,
+    pub activation_token: String,
+    pub runner_id: String,
+    pub expires_at: String,
 }
 
 impl ActivationArtifact {
-    pub(crate) fn from_parts(parts: ActivationArtifactParts) -> Self {
+    pub fn from_parts(parts: ActivationArtifactParts) -> Self {
         Self {
             schema_version: 1,
             activation_url: parts.activation_url,
@@ -68,7 +68,7 @@ impl ActivationArtifact {
         }
     }
 
-    pub(crate) fn write_json(&self, output: &mut impl Write) -> Result<(), EnrollmentError> {
+    pub fn write_json(&self, output: &mut impl Write) -> Result<(), EnrollmentError> {
         let transferable = TransferableActivationArtifact::from(self);
         serde_json::to_writer_pretty(&mut *output, &transferable)
             .map_err(|_| EnrollmentError::ArtifactWrite)?;
@@ -77,7 +77,7 @@ impl ActivationArtifact {
             .map_err(|_| EnrollmentError::ArtifactWrite)
     }
 
-    pub(crate) fn runner_id(&self) -> &str {
+    pub fn runner_id(&self) -> &str {
         &self.runner_id
     }
 }
@@ -295,7 +295,7 @@ impl<'a> From<&'a RunnerState> for PersistedRunnerState<'a> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct EnrollmentResponse {
+pub struct EnrollmentResponse {
     schema_version: u8,
     runner_id: String,
     runner_name: String,
@@ -320,25 +320,25 @@ struct EnrollmentPool {
 }
 
 impl EnrollmentResponse {
-    pub(crate) fn runner_id(&self) -> &str {
+    pub fn runner_id(&self) -> &str {
         &self.runner_id
     }
 
-    pub(crate) fn credential_id(&self) -> &str {
+    pub fn credential_id(&self) -> &str {
         &self.credential_id
     }
 
-    pub(crate) fn runner_name(&self) -> &str {
+    pub fn runner_name(&self) -> &str {
         &self.runner_name
     }
 
-    pub(crate) fn pool_name(&self) -> &str {
+    pub fn pool_name(&self) -> &str {
         &self.runner_pool.name
     }
 }
 
 #[derive(Debug)]
-pub(crate) enum EnrollmentOutcome {
+pub enum EnrollmentOutcome {
     Enrolled {
         response: EnrollmentResponse,
         replacement: bool,
@@ -353,13 +353,13 @@ pub(crate) enum EnrollmentOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReplacementDisposition {
+pub enum ReplacementDisposition {
     Current,
     Pending,
     Missing,
 }
 
-pub(crate) fn write_activation_file(
+pub fn write_activation_file(
     destination: &str,
     artifact: &ActivationArtifact,
 ) -> Result<(), EnrollmentError> {
@@ -383,7 +383,7 @@ pub(crate) fn write_activation_file(
         .map_err(|_| EnrollmentError::ArtifactWrite)
 }
 
-pub(crate) fn enroll(
+pub fn enroll(
     activation_file: Option<&Path>,
     config_path: &Path,
     replace_credential: bool,
@@ -588,11 +588,11 @@ pub(crate) fn load_runner_service_configuration(
     })
 }
 
-pub(crate) fn load_control_socket_path(path: &Path) -> Result<PathBuf, EnrollmentError> {
+pub fn load_control_socket_path(path: &Path) -> Result<PathBuf, EnrollmentError> {
     Ok(load_operator_config(path)?.control_socket_path)
 }
 
-pub(crate) fn replacement_disposition(
+pub fn replacement_disposition(
     config_path: &Path,
     expected_runner_id: &str,
     expected_credential_id: &str,
@@ -1375,7 +1375,7 @@ fn now_rfc3339() -> Result<String, EnrollmentError> {
 }
 
 #[derive(Debug)]
-pub(crate) enum EnrollmentError {
+pub enum EnrollmentError {
     InvalidCommand,
     TerminalStdin,
     InvalidConfig,

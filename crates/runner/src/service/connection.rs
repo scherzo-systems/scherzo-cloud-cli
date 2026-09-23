@@ -17,17 +17,17 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
-use crate::runner::service::artifact_delivery::ArtifactCloudResponse;
-use crate::runner::service::assignment::{
+use crate::service::artifact_delivery::ArtifactCloudResponse;
+use crate::service::assignment::{
     ArtifactRequestKind, AssignmentCancel, AssignmentManager, AssignmentManagerFailure,
     AssignmentOffer, AssignmentPrepare, AssignmentRelease, AssignmentRenewal, AssignmentStart,
     AssignmentStartAuthorization, PendingAssignmentObservation, RetainedObservationFrame,
     WelcomePolicyFailure,
 };
-use crate::runner::service::config::Config;
-use crate::runner::service::control::LiveStatus;
-use crate::runner::service::{Sequence, Sleeper};
-use crate::runner::telemetry::{self, Event, Outcome, Recorder};
+use crate::service::config::Config;
+use crate::service::control::LiveStatus;
+use crate::service::{Sequence, Sleeper};
+use crate::telemetry::{self, Event, Outcome, Recorder};
 use scherzo_cloud_runner_protocol::{
     CloudFrame, MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES, RunnerEnvelope,
     RunnerFrame, decode_cloud_frame, encode_runner_frame,
@@ -2810,11 +2810,11 @@ mod tests {
         close_locally, close_outcome, handle_artifact_cloud_response, opening_hello, run,
         run_established,
     };
-    use crate::runner::credential::test_credential;
-    use crate::runner::service::artifact_delivery::{
+    use crate::credential::test_credential;
+    use crate::service::artifact_delivery::{
         ArtifactCloudResponse, ArtifactDeliverySpec, ArtifactUploadBody,
     };
-    use crate::runner::service::assignment::{
+    use crate::service::assignment::{
         ArtifactRequestKind, AssignmentManager, AssignmentOffer, AssignmentRootPreparer,
         test_support::{
             artifact_delivery, enqueue_finalization_terminal, enqueue_lease_clock_failure_report,
@@ -2822,12 +2822,12 @@ mod tests {
             manager as manager_fixture, manager_with_dependencies, observation_retained,
         },
     };
-    use crate::runner::service::config::Config;
-    use crate::runner::service::source::{
+    use crate::service::config::Config;
+    use crate::service::source::{
         SourceCredentialBroker,
         test_support::{gated_unavailable_source_broker, unavailable_source_broker},
     };
-    use crate::runner::service::test_support::{
+    use crate::service::test_support::{
         ConfigFixture, DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
         accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, expect_close_frame,
@@ -2835,9 +2835,9 @@ mod tests {
         observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
         sleep_request, welcome, with_watchdog,
     };
-    use crate::runner::service::workspace::{AssignmentRoot, AssignmentRootCreationError};
-    use crate::runner::service::{Sequence, Sleeper};
-    use crate::runner::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
+    use crate::service::workspace::{AssignmentRoot, AssignmentRootCreationError};
+    use crate::service::{Sequence, Sleeper};
+    use crate::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
     use scherzo_cloud_runner_protocol::{
         AssignmentDecline, CloudFrame, ExecutionSpecInvalidReason, RunnerEnvelope, RunnerFrame,
         RunnerUnableReason, decode_cloud_frame,
@@ -3034,7 +3034,7 @@ mod tests {
         Message::Text(
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-cancel.json"
+                "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-cancel.json"
             ))
             .into(),
         )
@@ -3678,7 +3678,7 @@ mod tests {
             inbound.send(Message::Text(
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-lease-renewed.json"
+                    "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-lease-renewed.json"
                 ))
                 .into(),
             ));
@@ -4087,7 +4087,7 @@ mod tests {
         broker.cancel_assignment("asn_01k0z6r1w8f4jy2m7q9v3x5abh");
         assert_eq!(
             completion.try_recv(),
-            Ok(crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome::AuthorityLost)
+            Ok(crate::service::artifact_delivery::ArtifactDeliveryOutcome::AuthorityLost)
         );
         let response = |request_message_id: &str| {
             ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
@@ -4252,7 +4252,7 @@ mod tests {
             if cancel_registration {
                 assert_eq!(
                     completion.await.unwrap(),
-                    crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome::AuthorityLost
+                    crate::service::artifact_delivery::ArtifactDeliveryOutcome::AuthorityLost
                 );
                 inbound.send(Message::Close(None));
                 return;
@@ -4292,7 +4292,7 @@ mod tests {
                 confirmation_message_id,
                 confirmation_sequence,
             ));
-            use crate::runner::service::artifact_delivery::ArtifactDeliveryOutcome;
+            use crate::service::artifact_delivery::ArtifactDeliveryOutcome;
             let outcome = completion.await.unwrap();
             if cancel_at.is_some() {
                 assert_eq!(outcome, ArtifactDeliveryOutcome::AuthorityLost);
@@ -5020,7 +5020,7 @@ mod tests {
         assert_eq!(protocol[6]["scherzo.runner.sequence"], 2);
         assert_eq!(
             protocol[0]["scherzo.runner.version"],
-            crate::runner::telemetry::TEST_SERVICE_VERSION
+            crate::telemetry::TEST_SERVICE_VERSION
         );
         let protocol_json = serde_json::to_string(&protocol).expect("encode protocol records");
         for forbidden in [
@@ -5601,7 +5601,7 @@ mod tests {
             BOOT_ID,
             OPENING_MESSAGE_ID.to_owned(),
             1,
-            crate::runner::telemetry::TEST_SERVICE_VERSION,
+            crate::telemetry::TEST_SERVICE_VERSION,
         )
         .expect("encode opening hello")
     }

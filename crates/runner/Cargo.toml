@@ -1,0 +1,48 @@
+[package]
+name = "scherzo-cloud-runner"
+version = "0.0.0-dev"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+test-fixtures = []
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+fs4.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+nix.workspace = true
+opentelemetry.workspace = true
+opentelemetry-proto.workspace = true
+opentelemetry_sdk.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rustix.workspace = true
+scherzo-cloud-execution.workspace = true
+scherzo-cloud-runner-protocol.workspace = true
+scherzo-cloud-support.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+ulid.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+rustix = { workspace = true, features = ["event", "pty"] }
+scherzo-cloud-execution = { workspace = true, features = ["test-fixtures"] }
+scherzo-cloud-test-support.workspace = true

@@ -14,7 +14,7 @@ use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
 use crate::human_auth::deployment::Deployment;
-use crate::idempotency::generate_idempotency_key;
+use scherzo_cloud_support::generate_idempotency_key;
 
 use super::{OrganizationArg, PaginationArgs, PoolArg};
 
@@ -400,21 +400,21 @@ fn validate_activation_destination(destination: &str, json: bool) -> anyhow::Res
 fn write_activation_issuance(
     destination: &str,
     issuance: &scherzo_cloud_api::RunnerActivationIssuance,
-) -> anyhow::Result<crate::runner::enrollment::ActivationArtifact> {
+) -> anyhow::Result<scherzo_cloud_runner::ActivationArtifact> {
     let api_artifact = issuance.artifact.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "activation issuance replay omitted its secret; issue a replacement activation with a new command"
         )
     })?;
-    let artifact = crate::runner::enrollment::ActivationArtifact::from_parts(
-        crate::runner::enrollment::ActivationArtifactParts {
+    let artifact = scherzo_cloud_runner::ActivationArtifact::from_parts(
+        scherzo_cloud_runner::ActivationArtifactParts {
             activation_url: api_artifact.activation_url.clone(),
             activation_token: api_artifact.activation_token.clone(),
             runner_id: api_artifact.runner_id.clone(),
             expires_at: api_artifact.expires_at.clone(),
         },
     );
-    crate::runner::enrollment::write_activation_file(destination, &artifact)
+    scherzo_cloud_runner::write_activation_file(destination, &artifact)
         .map_err(|error| anyhow::anyhow!(error))?;
     Ok(artifact)
 }

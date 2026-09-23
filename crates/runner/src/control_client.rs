@@ -12,7 +12,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const RELOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum RequestFailure {
+pub enum RequestFailure {
     NotReachable,
     Protocol(ProtocolFailure),
 }
@@ -35,10 +35,7 @@ impl std::error::Error for RequestFailure {
     }
 }
 
-pub(crate) fn request(
-    socket_path: &Path,
-    operation: Operation,
-) -> Result<Response, RequestFailure> {
+pub fn request(socket_path: &Path, operation: Operation) -> Result<Response, RequestFailure> {
     let mut stream = UnixStream::connect(socket_path).map_err(|_| RequestFailure::NotReachable)?;
     let response_timeout = match operation {
         Operation::Status => IO_TIMEOUT,

@@ -376,7 +376,7 @@ impl CreateCommand {
             },
             None => None,
         };
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project creation request identity")?;
         let result = with_api(
             deployment,
@@ -454,7 +454,7 @@ impl ShowCommand {
 
 impl RenameCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project rename request identity")?;
         let result = with_api(
             deployment,
@@ -534,7 +534,7 @@ impl RepositoryShowCommand {
 
 impl RepositorySetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project repository request identity")?;
         let result = with_api(
             deployment,
@@ -564,7 +564,7 @@ impl RepositorySetCommand {
 
 impl RepositoryUpdateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project repository update request identity")?;
         let result = with_api(
             deployment,
@@ -592,7 +592,7 @@ impl RepositoryUpdateCommand {
 
 impl RepositoryDetachCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project repository detachment request identity")?;
         let result = with_api(
             deployment,
@@ -631,7 +631,7 @@ impl RunnerPoolSetCommand {
                 );
             }
         };
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project runner pool request identity")?;
         let result = with_api(
             deployment,
@@ -659,7 +659,7 @@ impl RunnerPoolSetCommand {
 
 impl RunnerPoolRemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project runner pool removal request identity")?;
         let result = with_api(
             deployment,

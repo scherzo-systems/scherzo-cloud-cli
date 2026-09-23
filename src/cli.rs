@@ -1799,21 +1799,27 @@ mod tests {
     }
 
     #[test]
-    fn controlled_completion_preserves_output_failures() {
-        let mutation = super::OperationControl::new(());
-        let result = super::complete_operation(&mutation, || {
-            mutation.recovery();
-            Err(anyhow::anyhow!("fixture mutation output failure").into())
-        });
-        assert!(result.is_err());
-        assert!(mutation.claim_signal().is_none());
-
-        let read_only = super::OperationControl::new(());
-        let result = super::complete_read_only_output(&read_only, || {
-            Err(anyhow::anyhow!("fixture read-only output failure").into())
-        });
-        assert!(result.is_err());
-        assert!(read_only.claim_signal().is_none());
+    fn nested_workflow_result_and_staging_survive_delivery_failure() {
+        let fixture_arguments = std::iter::once(
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .chain(
+            [
+                "--ignored",
+                "--exact",
+                "cli::tests::nested_workflow_fixture_process",
+                "--nocapture",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .collect::<Vec<_>>();
+        scherzo_cloud_runner::run_nested_workflow_delivery_failure_fixture(&fixture_arguments)
+            .unwrap();
     }
 
     #[test]
@@ -1877,6 +1883,24 @@ mod tests {
                 0o500
             );
         }
+    }
+
+    #[test]
+    fn controlled_completion_preserves_output_failures() {
+        let mutation = super::OperationControl::new(());
+        let result = super::complete_operation(&mutation, || {
+            mutation.recovery();
+            Err(anyhow::anyhow!("fixture mutation output failure").into())
+        });
+        assert!(result.is_err());
+        assert!(mutation.claim_signal().is_none());
+
+        let read_only = super::OperationControl::new(());
+        let result = super::complete_read_only_output(&read_only, || {
+            Err(anyhow::anyhow!("fixture read-only output failure").into())
+        });
+        assert!(result.is_err());
+        assert!(read_only.claim_signal().is_none());
     }
 
     fn collect_command_paths(command: &clap::Command, prefix: &str, paths: &mut Vec<String>) {

@@ -268,7 +268,7 @@ fn export_endpoint(value: &str, signal_specific: bool) -> Option<Url> {
     }
     match endpoint.scheme() {
         "https" => {}
-        "http" if crate::runner::is_loopback(&endpoint) => {}
+        "http" if crate::is_loopback(&endpoint) => {}
         _ => return None,
     }
     if !signal_specific {
@@ -612,7 +612,7 @@ mod tests {
     use prost::Message as _;
 
     use super::*;
-    use crate::runner::telemetry::{Outcome, Recorder, TestCapture, runner_resource};
+    use crate::telemetry::{Outcome, Recorder, TestCapture, runner_resource};
 
     fn outcome(values: &[(&str, &str)]) -> SettingsOutcome {
         let values = values
@@ -844,10 +844,7 @@ mod tests {
     }
 
     fn resource() -> Resource {
-        runner_resource(
-            crate::runner::telemetry::TEST_SERVICE_VERSION,
-            "rbt_fixture",
-        )
+        runner_resource(crate::telemetry::TEST_SERVICE_VERSION, "rbt_fixture")
     }
 
     fn recorder_with_exporter(
@@ -866,7 +863,7 @@ mod tests {
         Arc::new(Recorder::new(
             provider,
             writer,
-            crate::runner::telemetry::TEST_SERVICE_VERSION,
+            crate::telemetry::TEST_SERVICE_VERSION,
             "rbt_fixture",
         ))
     }
@@ -962,7 +959,7 @@ mod tests {
                 ),
                 (
                     "service.version".to_owned(),
-                    serde_json::json!(crate::runner::telemetry::TEST_SERVICE_VERSION)
+                    serde_json::json!(crate::telemetry::TEST_SERVICE_VERSION)
                 ),
                 (
                     "service.instance.id".to_owned(),

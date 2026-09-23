@@ -4,13 +4,13 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use crate::runner::service::Config;
 use scherzo_cloud_execution::{
     ClaudeCodeInstallationFailure, CodexInstallationFailure, PiInstallationFailure,
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation,
 };
+use scherzo_cloud_runner::Config;
 
 pub(super) const ABOUT: &str = "Connect to Scherzo Cloud and serve run assignments";
 
@@ -42,10 +42,10 @@ impl Command {
             claude_code_installation,
             codex_installation,
         );
-        match crate::runner::service::run(config, crate::build_info::VERSION) {
+        match scherzo_cloud_runner::run(config, crate::build_info::VERSION) {
             Ok(()) => Ok(ExitCode::Success),
             Err(error) => {
-                let exit_code = service_exit_code(&error);
+                let exit_code = service_exit_code(error.requires_operator_recovery());
                 Err(super::super::CommandFailure::with_exit_code(
                     anyhow::Error::new(error).context("serve enrolled runner assignments"),
                     exit_code,
@@ -55,8 +55,8 @@ impl Command {
     }
 }
 
-const fn service_exit_code(error: &crate::runner::service::ServiceError) -> ExitCode {
-    if error.requires_operator_recovery() {
+const fn service_exit_code(requires_operator_recovery: bool) -> ExitCode {
+    if requires_operator_recovery {
         ExitCode::RunnerRecoveryRequired
     } else {
         ExitCode::GeneralFailure
@@ -111,8 +111,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::runner::credential::test_credential;
-    use crate::runner::service::ConfigFixture;
     use scherzo_cloud_execution::ClaudeCodeIncompatibility;
 
     #[test]
@@ -134,13 +132,12 @@ mod tests {
             let claude_code =
                 ValidatedClaudeCodeInstallation::fixture(PathBuf::from("/validated/claude"));
             let codex = ValidatedCodexInstallation::fixture(PathBuf::from("/validated/codex"));
-            let fixture = ConfigFixture::new(
+            let work_root = tempfile::tempdir().unwrap();
+            let config = Config::fixture_for_command_tests(
                 "ws://127.0.0.1:8081/v1/runner/connect",
-                test_credential(),
-                true,
+                work_root.path(),
             )
             .unwrap();
-            let config = fixture.cloned_config();
 
             let (pi_installation, claude_code_installation, codex_installation) =
                 discover_harness_installations_with(
@@ -186,30 +183,20 @@ mod tests {
     }
 
     #[test]
-    fn recovery_required_service_failures_have_a_supervisor_stopping_exit_code() {
-        for error in [
-            crate::runner::service::ServiceError::WorkRootInUse,
-            crate::runner::service::ServiceError::WorkRootIsolation,
-            crate::runner::service::ServiceError::WorkspaceCleanupFailed,
-        ] {
-            assert_eq!(service_exit_code(&error), ExitCode::RunnerRecoveryRequired);
-        }
-        assert_eq!(
-            service_exit_code(&crate::runner::service::ServiceError::BuildRuntime),
-            ExitCode::GeneralFailure
-        );
+    fn recovery_requirement_selects_the_supervisor_stopping_exit_code() {
+        assert_eq!(service_exit_code(true), ExitCode::RunnerRecoveryRequired);
+        assert_eq!(service_exit_code(false), ExitCode::GeneralFailure);
     }
 
     #[test]
     fn incompatible_claude_code_and_missing_codex_do_not_remove_compatible_pi() {
         let pi = ValidatedPiInstallation::fixture(PathBuf::from("/validated/pi"));
-        let fixture = ConfigFixture::new(
+        let work_root = tempfile::tempdir().unwrap();
+        let config = Config::fixture_for_command_tests(
             "ws://127.0.0.1:8081/v1/runner/connect",
-            test_credential(),
-            true,
+            work_root.path(),
         )
         .unwrap();
-        let config = fixture.cloned_config();
 
         let (pi_installation, claude_code_installation, codex_installation) =
             discover_harness_installations_with(

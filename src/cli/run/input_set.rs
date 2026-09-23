@@ -300,7 +300,7 @@ fn create_input_set(
     acquired: &AcquiredInputs,
     begin_dispatch: impl Fn() -> bool,
 ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
-    let create_key = crate::idempotency::generate_idempotency_key()
+    let create_key = scherzo_cloud_support::generate_idempotency_key()
         .context("generate Run Input Set request identity")?;
     super::with_api(deployment, transport_policy, authentication, |api| {
         api.create_input_set(
@@ -364,7 +364,7 @@ pub(super) fn stage_and_seal(
     acquired: &AcquiredInputs,
     control: &super::super::OperationControl<super::CreateRecoveryState>,
 ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
-    let seal_key = crate::idempotency::generate_idempotency_key()
+    let seal_key = scherzo_cloud_support::generate_idempotency_key()
         .context("generate Run Input Set seal identity")?;
     let input_set = match create_input_set(
         deployment,
@@ -563,7 +563,7 @@ fn seal(
         command.options.http.transport_policy(),
         &command.options.authentication,
     )?);
-    let key = crate::idempotency::generate_idempotency_key()
+    let key = scherzo_cloud_support::generate_idempotency_key()
         .context("generate Run Input Set seal identity")?;
     super::with_api(
         deployment,
@@ -580,7 +580,7 @@ fn seal(
 impl DeleteCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
         let _confirmation = self.yes;
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate Run Input Set deletion identity")?;
         let signal_deployment = deployment.clone();
         let signal_input_set = self.input_set.clone();

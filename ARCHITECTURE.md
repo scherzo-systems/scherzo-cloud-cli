@@ -65,17 +65,18 @@ Input manifests live in the private `scherzo-cloud-support` package beneath
 on its explicit facade for duplicate-aware strict JSON decoding, input identifiers,
 diagnostic display names, media types, and hexadecimal digests; the leaf owns no
 transport, credentials, acquisition bytes, or execution state. The same package owns
-the shared clock, TLS-provider, and public-ID leaves and has no internal package edge.
+the shared clock, TLS-provider, public-ID, and opaque idempotency-key leaves and has no
+internal package edge.
 
 ## Runner diagnostics
 
 `src/cli/runner/doctor.rs` is a typed Clap adapter: it parses runner-doctor arguments
 and renders human or JSON output. Its machine behavior lives separately in
-`src/runner/doctor/`. That internal module owns the pass/fail report model, ordered
-registry, selection rules, bounded process probe, and built-in Git check. The registry
-is crate-private and accepts boxed checks from components assembled into this executable;
-it is not a dynamic plugin API, does not discover libraries or scripts, and is not a
-third-party extension contract.
+`crates/runner/src/doctor/`. That runner-package module owns the pass/fail report model,
+ordered registry, selection rules, bounded process probe, and built-in Git check. The
+unpublished runner facade exposes only the report and registry inventory consumed by the
+command adapter; it is not a dynamic plugin API, does not discover libraries or scripts,
+and is not a third-party extension contract.
 
 The first registry entry is `environment.command.git` and is the sole default. The
 operator-selected entries `execution.harness.pi-json-v1`,
@@ -115,7 +116,7 @@ exposes none through the runner protocol.
 
 ## Runner service observability
 
-Long-running runner machine behavior owns a recorder beneath `src/runner/`. One recorder
+Long-running runner machine behavior owns a recorder beneath `crates/runner/src/`. One recorder
 projects each completed unit of work to a newline-delimited JSON object on standard
 error and to an OpenTelemetry span through a process-local SDK provider. JSON records
 enter a bounded queue without waiting; a dedicated local thread owns standard error,
@@ -155,10 +156,12 @@ or arbitrary errors into either projection. Local or export queue saturation, JS
 failures, malformed export configuration, receiver failures, and export shutdown timeout
 do not change connection, acknowledgement, retry, terminal result, or shutdown behavior.
 
-API, runner protocol, support, and execution are unpublished workspace packages; runner,
-human authentication, and command composition remain root modules. A second runner
-binary should be introduced only if platform dependencies, privilege isolation,
-artifact size, or independent release cadence creates a demonstrated need.
+API, runner protocol, support, execution, and runner are unpublished workspace packages;
+human authentication and command composition remain root modules. Runner depends only
+on support, runner protocol, and execution in production, and on test-support for tests;
+it has no API, human-authentication, command, or root-package edge. A second runner binary
+should be introduced only if platform dependencies, privilege isolation, artifact size,
+or independent release cadence creates a demonstrated need.
 
 ## Credential separation
 
@@ -355,7 +358,7 @@ second ID policy inside the API boundary.
 
 ## Rust source shape
 
-`cli/Cargo.toml` is both the workspace root and the sole binary package. Five unpublished
+`cli/Cargo.toml` is both the workspace root and the sole binary package. Six unpublished
 library members now occupy their final roots:
 
 - `scherzo-cloud-support` owns shared public-ID, timing, TLS-provider, and Workflow
@@ -369,15 +372,17 @@ library members now occupy their final roots:
 - `scherzo-cloud-execution` owns execution, harness adapters, process containment,
   workflow assets, and their tests, depends on support in production, and uses
   test-support only for tests. Its test-only internal-worker example keeps package
-  suites independent of a previously built root executable.
+  suites independent of a previously built root executable; and
+- `scherzo-cloud-runner` owns Runner Serve, enrollment, doctor, local control,
+  assignment execution, artifact delivery, and telemetry. It depends only on support,
+  runner-protocol, and execution in production and uses test-support only for tests.
 
-The binary depends on support, API, runner-protocol, and execution in production and on
-test-support for tests. Its dev dependency on execution enables only the `test-fixtures`
-feature used by root integration tests; the production dependency does not expose those
-fixture constructors. Commands, runner service, human authentication, service
-credential files, build identity, and exit policy remain rooted in `src/`. There is one
-`scherzo-cloud` executable, Cargo continues to provide `CARGO_BIN_EXE_scherzo-cloud`, and
-the archive shape is unchanged.
+The binary depends on support, API, execution, and runner in production and on
+test-support for tests. Its dev dependencies enable only the `test-fixtures` seams used
+by root tests; production dependencies do not expose fixture constructors. Commands,
+human authentication, service credential files, build identity, and exit policy remain
+rooted in `src/`. There is one `scherzo-cloud` executable, Cargo continues to provide
+`CARGO_BIN_EXE_scherzo-cloud`, and the archive shape is unchanged.
 
 The remaining seams have this closed ownership matrix:
 
@@ -385,13 +390,15 @@ The remaining seams have this closed ownership matrix:
 | --- | --- | --- |
 | Execution implementation | Private modules beneath `crates/execution/src/` | Non-execution code uses only the explicit flat facade in `crates/execution/src/lib.rs`; implementation modules are not public. |
 | Process implementation | Private `crates/execution/src/process.rs` module | Execution uses it internally and its facade exports exactly `ManagedProcessGroup`, `CommandRunner`, `CommandRequest`, `CommandOutput`, `CommandProbeError`, and `SystemCommandRunner` for runner consumers. |
+| Runner implementation | Private modules beneath `crates/runner/src/` | Root commands and the binary helper dispatch use only the explicit flat facade; the runner package receives the root-resolved version when Runner Serve starts. |
 | Build identity | `src/build_info.rs` and the crate root | Root CLI dispatch injects the resolved version into local agent dispatch and Runner Serve. Execution and runner code do not read build environment or root build policy. |
 | Exit policy | `src/exit_code.rs` and the crate root | Execution returns the closed `ExecutionOutcome` domain value. Root command dispatch maps that value to the unchanged process exit statuses. |
 
 `tests/architecture.rs` enforces the exact member and internal-edge inventories, each
 member's inherited lint policy, the residual root-module graph, private generated API,
-the final execution and process ownership, and confinement of command parsing, HTTP,
-WebSocket, telemetry, and terminal dependencies to their owning packages. The dev-only
+the final execution, process, runner, and idempotency ownership, and confinement of
+command parsing, HTTP, WebSocket, telemetry, and terminal dependencies to their owning
+packages. The dev-only
 `scherzo-cloud-test-support` facade supplies the Git fixture to execution and runner tests
 without entering the production graph. The `src/service_auth.rs` boundary depends only
 on support's public-ID syntax and remains a root-owned policy for caller-managed service

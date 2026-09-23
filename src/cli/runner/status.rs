@@ -5,8 +5,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::runner::control_client::RequestFailure;
-use crate::runner::control_protocol::{AssignmentCounts, Operation, Response, StatusSnapshot};
+use scherzo_cloud_runner::RequestFailure;
+use scherzo_cloud_runner::{AssignmentCounts, Operation, Response, StatusSnapshot};
 
 pub(super) const ABOUT: &str = "Show live Runner Serve status";
 
@@ -20,15 +20,15 @@ pub(super) struct Command {
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         let config_path = super::operator_config_path(&self.config)?;
-        let socket_path = crate::runner::enrollment::load_control_socket_path(&config_path)
+        let socket_path = scherzo_cloud_runner::load_control_socket_path(&config_path)
             .with_context(|| {
                 format!(
                     "load runner operator configuration {}",
                     config_path.display()
                 )
             })?;
-        let response = crate::runner::control_client::request(&socket_path, Operation::Status)
-            .map_err(|error| {
+        let response =
+            scherzo_cloud_runner::request(&socket_path, Operation::Status).map_err(|error| {
                 let outcome = match error {
                     RequestFailure::NotReachable => OutcomeClass::Unreachable,
                     RequestFailure::Protocol(_) => OutcomeClass::Protocol,
@@ -130,7 +130,7 @@ fn format_assignments(counts: AssignmentCounts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::control_protocol::{ConnectionState, ProcessState};
+    use scherzo_cloud_runner::{ConnectionState, ProcessState};
 
     #[test]
     fn renders_idle_and_nonzero_assignment_counts() {

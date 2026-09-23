@@ -5,7 +5,7 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use crate::runner::doctor::{CheckResult, Report, Status, built_in_registry};
+use scherzo_cloud_runner::{CheckResult, Report, Status, built_in_registry};
 
 pub(super) const ABOUT: &str = "Check local runner prerequisites";
 const COMMAND_NAME: &str = "scherzo-cloud runner doctor";
@@ -55,7 +55,7 @@ impl Command {
     }
 }
 
-fn write_check_list(descriptors: &[crate::runner::doctor::CheckDescriptor]) -> anyhow::Result<()> {
+fn write_check_list(descriptors: &[scherzo_cloud_runner::CheckDescriptor]) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     for descriptor in descriptors {
@@ -185,7 +185,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::write_human_report_to;
-    use crate::runner::doctor::{CheckDescriptor, CheckResult, Outcome, Report, Status};
+    use scherzo_cloud_runner::{CheckDescriptor, CheckResult, Outcome, Report, Status};
 
     fn result(
         id: &'static str,

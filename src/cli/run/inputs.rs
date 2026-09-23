@@ -494,7 +494,7 @@ fn sync_tree(root: &Path) -> io::Result<()> {
 impl DeleteCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
         let _confirmation = self.yes;
-        let key = crate::idempotency::generate_idempotency_key()
+        let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate retained input deletion identity")?;
         let signal_deployment = deployment.clone();
         let signal_organization = self.run.organization.clone();

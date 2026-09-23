@@ -22,8 +22,8 @@ use super::source::{
 use super::test_support::{
     ConfigFixture, DeterminismTranscript, fixture_lease_clock, scripted_duplex, with_watchdog,
 };
-use crate::runner::credential::test_credential;
-use crate::runner::telemetry::test_recorder;
+use crate::credential::test_credential;
+use crate::telemetry::test_recorder;
 use scherzo_cloud_execution::CaptureCancellation;
 
 const REPLAY_BOOT_ID: &str = "rbt_00000000000000000000000001";
@@ -377,7 +377,7 @@ fn gateway_acknowledgement_mut(
 
 fn bundled_conversation_path(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/runner-conversations/v1")
+        .join("../../tests/fixtures/runner-conversations/v1")
         .join(format!("{name}.json"))
 }
 
@@ -385,8 +385,8 @@ fn load_conversations() -> Vec<Conversation> {
     let mut paths: Vec<_> = if let Some(path) = std::env::var_os(REPLAY_OVERRIDE) {
         vec![Path::new(&path).to_path_buf()]
     } else {
-        let directory =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner-conversations/v1");
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/runner-conversations/v1");
         fs::read_dir(&directory)
             .unwrap_or_else(|error| panic!("read conversation fixture directory: {error}"))
             .map(|entry| entry.expect("read conversation fixture entry").path())

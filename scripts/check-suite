@@ -153,6 +153,10 @@ export TMPDIR=$tmp_alias
 
 cd "$public_root"
 export CARGO_TERM_COLOR=never
+# This complete check reuses ordinary Cargo artifacts across invocations, but
+# retaining per-revision incremental state makes repeated exact-base checks grow
+# without a useful bound. Keep the shared target reusable without that state.
+export CARGO_INCREMENTAL=0
 cargo fmt --all -- --check
 "$public_root/scripts/check-msrv"
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

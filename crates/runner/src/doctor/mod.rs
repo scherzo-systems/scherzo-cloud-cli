@@ -12,10 +12,10 @@ use git::GitCheck;
 use pi::PiCheck;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CheckDescriptor {
-    pub(crate) id: &'static str,
-    pub(crate) title: &'static str,
-    pub(crate) default: bool,
+pub struct CheckDescriptor {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub default: bool,
 }
 
 pub(crate) trait DoctorCheck: Send + Sync {
@@ -24,13 +24,13 @@ pub(crate) trait DoctorCheck: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Status {
+pub enum Status {
     Pass,
     Fail,
 }
 
 impl Status {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pass => "pass",
             Self::Fail => "fail",
@@ -39,11 +39,11 @@ impl Status {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Outcome {
-    pub(crate) status: Status,
-    pub(crate) code: &'static str,
-    pub(crate) message: String,
-    pub(crate) details: std::collections::BTreeMap<String, String>,
+pub struct Outcome {
+    pub status: Status,
+    pub code: &'static str,
+    pub message: String,
+    pub details: std::collections::BTreeMap<String, String>,
 }
 
 impl Outcome {
@@ -97,24 +97,24 @@ fn compatible_harness_outcome(
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct CheckResult {
-    pub(crate) descriptor: CheckDescriptor,
-    pub(crate) outcome: Outcome,
+pub struct CheckResult {
+    pub descriptor: CheckDescriptor,
+    pub outcome: Outcome,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Summary {
-    pub(crate) passed: usize,
-    pub(crate) failed: usize,
+pub struct Summary {
+    pub passed: usize,
+    pub failed: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Report {
-    pub(crate) results: Vec<CheckResult>,
+pub struct Report {
+    pub results: Vec<CheckResult>,
 }
 
 impl Report {
-    pub(crate) fn summary(&self) -> Summary {
+    pub fn summary(&self) -> Summary {
         self.results.iter().fold(
             Summary {
                 passed: 0,
@@ -130,14 +130,14 @@ impl Report {
         )
     }
 
-    pub(crate) fn has_failures(&self) -> bool {
+    pub fn has_failures(&self) -> bool {
         self.results
             .iter()
             .any(|result| result.outcome.status == Status::Fail)
     }
 }
 
-pub(crate) struct Registry {
+pub struct Registry {
     checks: Vec<Box<dyn DoctorCheck>>,
 }
 
@@ -160,11 +160,11 @@ impl Registry {
         Ok(())
     }
 
-    pub(crate) fn descriptors(&self) -> Vec<CheckDescriptor> {
+    pub fn descriptors(&self) -> Vec<CheckDescriptor> {
         self.checks.iter().map(|check| check.descriptor()).collect()
     }
 
-    pub(crate) fn run(&self, requested: &[String]) -> Result<Report, SelectionError> {
+    pub fn run(&self, requested: &[String]) -> Result<Report, SelectionError> {
         for id in requested {
             if !self.checks.iter().any(|check| check.descriptor().id == id) {
                 return Err(SelectionError::UnknownId(id.clone()));
@@ -198,7 +198,7 @@ impl Registry {
     }
 }
 
-pub(crate) fn built_in_registry() -> Result<Registry, RegistryError> {
+pub fn built_in_registry() -> Result<Registry, RegistryError> {
     let mut registry = Registry::new();
     registry.register(Box::new(GitCheck::system()))?;
     registry.register(Box::new(PiCheck))?;
@@ -208,7 +208,7 @@ pub(crate) fn built_in_registry() -> Result<Registry, RegistryError> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegistryError {
+pub enum RegistryError {
     InvalidId(&'static str),
     EmptyTitle(&'static str),
     DuplicateId(&'static str),
@@ -227,7 +227,7 @@ impl fmt::Display for RegistryError {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum SelectionError {
+pub enum SelectionError {
     UnknownId(String),
 }
 

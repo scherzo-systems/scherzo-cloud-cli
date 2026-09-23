@@ -138,7 +138,7 @@ impl Command {
             }
         };
 
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate identity-link request identity")?;
         let outcome =
             with_bound_human_session(&client, deployment, &acting_session, |access_token| {
@@ -206,7 +206,7 @@ impl Command {
         let client = scherzo_cloud_api::HttpClient::new(self.common.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare identity networking")?;
-        let idempotency_key = crate::idempotency::generate_idempotency_key()
+        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate identity-link request identity")?;
         // This ownership claim is the authorization boundary for dispatch. The network send
         // cannot be atomic with an OS signal, so a claim that wins preserves bounded completion.

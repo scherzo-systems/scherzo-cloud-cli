@@ -1,7 +1,7 @@
 const RANDOM_KEY_BYTES: usize = 32;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-pub(crate) fn generate_idempotency_key() -> Result<String, getrandom::Error> {
+pub fn generate_idempotency_key() -> Result<String, getrandom::Error> {
     let mut random = [0_u8; RANDOM_KEY_BYTES];
     getrandom::fill(&mut random)?;
     let mut key = String::with_capacity(RANDOM_KEY_BYTES * 2);
@@ -13,6 +13,11 @@ pub(crate) fn generate_idempotency_key() -> Result<String, getrandom::Error> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::expect_used,
+    reason = "idempotency unit tests use Rust assertions and require operating-system randomness"
+)]
 mod tests {
     use super::generate_idempotency_key;
 

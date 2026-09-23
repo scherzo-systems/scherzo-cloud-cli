@@ -23,8 +23,8 @@ use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, RetentionReason,
     WorkRootLease, WorkspaceDisposition,
 };
-use crate::runner::control_protocol::AssignmentCounts;
-use crate::runner::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
+use crate::control_protocol::AssignmentCounts;
+use crate::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 use scherzo_cloud_execution::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationReason, CancellationSource, CaptureCancellation, CloudGitCaptureProjection,
@@ -76,7 +76,7 @@ pub(super) trait AssignmentRootPreparer: Send + Sync {
     fn prepare(
         &self,
         offer: &AssignmentOffer,
-        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+        recorder: Option<Arc<crate::telemetry::Recorder>>,
     ) -> Result<AssignmentRoot, AssignmentRootCreationError>;
 }
 
@@ -84,7 +84,7 @@ impl AssignmentRootPreparer for WorkRootLease {
     fn prepare(
         &self,
         offer: &AssignmentOffer,
-        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+        recorder: Option<Arc<crate::telemetry::Recorder>>,
     ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
         self.create_assignment_for_attempt(
             &offer.assignment_id,
@@ -135,7 +135,7 @@ impl AssignmentRootPreparationHandoff {
 
 struct AssignmentRootPreparation {
     offer: AssignmentOffer,
-    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
     root_preparer: Arc<dyn AssignmentRootPreparer>,
     handoff: Arc<AssignmentRootPreparationHandoff>,
     event_sender: mpsc::UnboundedSender<ManagerEvent>,
@@ -383,7 +383,7 @@ impl RenewalDecision {
     }
 
     pub(super) fn record(&self, event: &TelemetryEvent) {
-        use crate::runner::telemetry::attribute;
+        use crate::telemetry::attribute;
         event.set(opentelemetry::KeyValue::new(
             attribute::LEASE_DISPOSITION,
             self.disposition.as_str(),
@@ -1435,7 +1435,7 @@ struct AdmissionRuntime {
     execution_version: Arc<str>,
     outbox: ObservationOutbox,
     guard_processes: bool,
-    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
     preparation_event: Option<TelemetryEvent>,
 }
 
@@ -1448,7 +1448,7 @@ impl AdmissionRuntime {
     ) -> Result<(), AssignmentDecline> {
         if let Some(event) = &self.preparation_event {
             event.set(opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::ASSIGNMENT_PREPARATION_PHASE,
+                crate::telemetry::attribute::ASSIGNMENT_PREPARATION_PHASE,
                 phase.to_owned(),
             ));
         }
@@ -1527,7 +1527,7 @@ pub(super) struct AssignmentDependencies {
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
     execution_version: Arc<str>,
-    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
     guard_processes: bool,
 }
 
@@ -1538,7 +1538,7 @@ impl AssignmentDependencies {
         source_broker: Option<Arc<dyn SourceCredentialBroker>>,
         input_broker: Option<Arc<dyn RunInputBroker>>,
         execution_version: Arc<str>,
-        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+        recorder: Option<Arc<crate::telemetry::Recorder>>,
         guard_processes: bool,
     ) -> Self {
         let root_preparer: Arc<dyn AssignmentRootPreparer> = work_root.clone();
@@ -1559,7 +1559,7 @@ impl AssignmentDependencies {
         boot_id: &str,
         sleeper: Arc<dyn Sleeper>,
         work_root: Arc<WorkRootLease>,
-        recorder: Arc<crate::runner::telemetry::Recorder>,
+        recorder: Arc<crate::telemetry::Recorder>,
     ) -> Self {
         let source_broker = HttpSourceCredentialBroker::new(
             config.endpoint(),
@@ -1613,7 +1613,7 @@ pub(super) struct AssignmentManager {
     sleeper: Arc<dyn Sleeper>,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
-    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
     lease_policy: Option<ExecutionLeasePolicy>,
     slot: Option<LocalSlot>,
     reporting: Option<AssignmentIdentity>,
@@ -1652,7 +1652,7 @@ impl AssignmentManager {
         let (event_sender, events) = mpsc::unbounded_channel();
         let outbox = ObservationOutbox::new();
         let allow_insecure_artifact_uploads =
-            config.endpoint().scheme() == "ws" && crate::runner::is_loopback(config.endpoint());
+            config.endpoint().scheme() == "ws" && crate::is_loopback(config.endpoint());
         let artifact_delivery = ArtifactDeliveryBroker::new(
             outbox.clone(),
             Arc::clone(&sleeper),
@@ -1905,15 +1905,15 @@ impl AssignmentManager {
                 "runner.assignment_preparation",
                 [
                     opentelemetry::KeyValue::new(
-                        crate::runner::telemetry::attribute::ASSIGNMENT_ID,
+                        crate::telemetry::attribute::ASSIGNMENT_ID,
                         offer.assignment_id.clone(),
                     ),
                     opentelemetry::KeyValue::new(
-                        crate::runner::telemetry::attribute::RUN_ID,
+                        crate::telemetry::attribute::RUN_ID,
                         offer.run_id.clone(),
                     ),
                     opentelemetry::KeyValue::new(
-                        crate::runner::telemetry::attribute::ASSIGNMENT_PREPARATION_PHASE,
+                        crate::telemetry::attribute::ASSIGNMENT_PREPARATION_PHASE,
                         "source_materialization",
                     ),
                 ],
@@ -2748,7 +2748,7 @@ impl AssignmentManager {
         // These local monotonic durations diagnose queueing and deadline pressure;
         // unavailable telemetry must not alter the authority decision.
         let milliseconds =
-            |duration: Duration| crate::runner::telemetry::integer_u128(duration.as_millis());
+            |duration: Duration| crate::telemetry::integer_u128(duration.as_millis());
         let cancellation_headroom_ms = match cancellation_order {
             std::cmp::Ordering::Less | std::cmp::Ordering::Equal => authority
                 .cancellation_start
@@ -4015,7 +4015,7 @@ impl AssignmentManager {
 pub(super) mod test_support {
     use super::*;
 
-    pub(in crate::runner::service) fn manager(
+    pub(in crate::service) fn manager(
         config: &Config,
         boot_id: String,
         lease_clock: LeaseClock,
@@ -4031,12 +4031,12 @@ pub(super) mod test_support {
         )
     }
 
-    pub(in crate::runner::service) fn manager_with_dependencies(
+    pub(in crate::service) fn manager_with_dependencies(
         config: &Config,
         boot_id: String,
         lease_clock: LeaseClock,
         sleeper: Arc<dyn Sleeper>,
-        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+        recorder: Option<Arc<crate::telemetry::Recorder>>,
         source_broker: Option<Arc<dyn SourceCredentialBroker>>,
         guard_processes: bool,
     ) -> AssignmentManager {
@@ -4063,14 +4063,14 @@ pub(super) mod test_support {
             sleeper,
             source_broker.or(default_source_broker),
             input_broker,
-            Arc::from(crate::runner::telemetry::TEST_SERVICE_VERSION),
+            Arc::from(crate::telemetry::TEST_SERVICE_VERSION),
             recorder,
             guard_processes,
         );
         AssignmentManager::new(config, lease_clock, dependencies)
     }
 
-    pub(in crate::runner::service) struct RenewalTimingFixture {
+    pub(in crate::service) struct RenewalTimingFixture {
         clock: LeaseClock,
         control: super::super::lease_clock::ControlledLeaseClock,
         waits: tokio::sync::mpsc::UnboundedReceiver<(
@@ -4085,7 +4085,7 @@ pub(super) mod test_support {
     }
 
     impl RenewalTimingFixture {
-        pub(in crate::runner::service) async fn start_execution_supervisor(
+        pub(in crate::service) async fn start_execution_supervisor(
             &mut self,
         ) -> super::super::execution::test_support::LiveLeaseExecution {
             let execution = super::super::execution::test_support::supervise_assignment_lease(
@@ -4112,7 +4112,7 @@ pub(super) mod test_support {
             execution
         }
 
-        pub(in crate::runner::service) async fn wait_until_execution_observes_renewal(&mut self) {
+        pub(in crate::service) async fn wait_until_execution_observes_renewal(&mut self) {
             let expected = self
                 .authority
                 .borrow()
@@ -4127,15 +4127,15 @@ pub(super) mod test_support {
             assert_eq!(renewal_wait, expected);
         }
 
-        pub(in crate::runner::service) fn advance(&self, duration: Duration) {
+        pub(in crate::service) fn advance(&self, duration: Duration) {
             self.control.advance(duration);
         }
 
-        pub(in crate::runner::service) fn authority_sequence(&self) -> u64 {
+        pub(in crate::service) fn authority_sequence(&self) -> u64 {
             self.authority.borrow().sequence
         }
 
-        pub(in crate::runner::service) fn cancellation_headroom(&self) -> Option<Duration> {
+        pub(in crate::service) fn cancellation_headroom(&self) -> Option<Duration> {
             self.authority
                 .borrow()
                 .cancellation_start
@@ -4143,12 +4143,12 @@ pub(super) mod test_support {
                 .ok()
         }
 
-        pub(in crate::runner::service) fn cancellation_started(&self) -> bool {
+        pub(in crate::service) fn cancellation_started(&self) -> bool {
             self.cancellation.cancellation_reason().is_some()
         }
     }
 
-    pub(in crate::runner::service) fn install_running_renewal_fixture(
+    pub(in crate::service) fn install_running_renewal_fixture(
         manager: &mut AssignmentManager,
         offer: AssignmentOffer,
     ) -> RenewalTimingFixture {
@@ -4268,34 +4268,29 @@ pub(super) mod test_support {
         }
     }
 
-    pub(in crate::runner::service) fn install_root_preparer(
+    pub(in crate::service) fn install_root_preparer(
         manager: &mut AssignmentManager,
         root_preparer: Arc<dyn AssignmentRootPreparer>,
     ) {
         manager.root_preparer = root_preparer;
     }
 
-    pub(in crate::runner::service) fn observation_retained(
-        manager: &AssignmentManager,
-        id: u64,
-    ) -> bool {
+    pub(in crate::service) fn observation_retained(manager: &AssignmentManager, id: u64) -> bool {
         manager.outbox.contains(id)
     }
 
-    pub(in crate::runner::service) fn artifact_delivery(
+    pub(in crate::service) fn artifact_delivery(
         manager: &AssignmentManager,
     ) -> ArtifactDeliveryBroker {
         manager.artifact_delivery.clone()
     }
 
-    pub(in crate::runner::service) fn cleanup_complete(manager: &mut AssignmentManager) -> bool {
+    pub(in crate::service) fn cleanup_complete(manager: &mut AssignmentManager) -> bool {
         manager.drain_events();
         !matches!(manager.slot, Some(LocalSlot::Releasing(_)))
     }
 
-    pub(in crate::runner::service) fn enqueue_lease_clock_failure_report(
-        manager: &mut AssignmentManager,
-    ) {
+    pub(in crate::service) fn enqueue_lease_clock_failure_report(manager: &mut AssignmentManager) {
         let final_observation_id = manager
             .outbox
             .enqueue(AssignmentObservation::Execution {
@@ -4310,7 +4305,7 @@ pub(super) mod test_support {
         manager.begin_lease_clock_failure_reporting(final_observation_id);
     }
 
-    pub(in crate::runner::service) fn enqueue_transitions(manager: &AssignmentManager, count: u64) {
+    pub(in crate::service) fn enqueue_transitions(manager: &AssignmentManager, count: u64) {
         for sequence in 1..=count {
             manager
                 .outbox
@@ -4335,7 +4330,7 @@ pub(super) mod test_support {
         }
     }
 
-    pub(in crate::runner::service) fn enqueue_finalization_terminal(manager: &AssignmentManager) {
+    pub(in crate::service) fn enqueue_finalization_terminal(manager: &AssignmentManager) {
         manager
             .outbox
             .enqueue(AssignmentObservation::Execution {
@@ -4367,9 +4362,7 @@ pub(super) mod test_support {
             .unwrap();
     }
 
-    pub(in crate::runner::service) fn active_step_count(
-        manager: &AssignmentManager,
-    ) -> Option<usize> {
+    pub(in crate::service) fn active_step_count(manager: &AssignmentManager) -> Option<usize> {
         match &manager.slot {
             Some(LocalSlot::Accepted(accepted)) => {
                 Some(accepted.admitted.workflow().definition.steps.len())
@@ -4379,7 +4372,7 @@ pub(super) mod test_support {
     }
 
     // jscpd:ignore-start -- Test offers and production result metadata use distinct protocol projections.
-    pub(in crate::runner::service) fn align_fixture_capacity(
+    pub(in crate::service) fn align_fixture_capacity(
         execution_spec: &mut ExecutionSpecV1RunnerProjection,
         workflow: &ResolvedWorkflow,
     ) {
@@ -4882,6 +4875,12 @@ fn start_matches_offer(start: &AssignmentStart, offer: &AssignmentOffer) -> bool
         && start.execution_spec_id == offer.execution_spec.execution_spec_id
 }
 
+#[cfg(feature = "test-fixtures")]
+#[path = "../../tests/support/nested_workflow_scenario.rs"]
+mod nested_workflow_scenario;
+#[cfg(feature = "test-fixtures")]
+pub(crate) use nested_workflow_scenario::run_nested_workflow_delivery_failure_scenario;
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -4900,22 +4899,18 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::runner::credential::test_credential;
-    use crate::runner::service::assignment::test_support::{
-        active_step_count, align_fixture_capacity,
-    };
-    use crate::runner::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
-    use crate::runner::service::lease_clock::{
+    use crate::credential::test_credential;
+    use crate::service::assignment::test_support::{active_step_count, align_fixture_capacity};
+    use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
+    use crate::service::lease_clock::{
         ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
     };
-    use crate::runner::service::source::{
+    use crate::service::source::{
         CommitAvailability, CredentialBrokerFailure, ProviderCredential, WorkflowGitRevocation,
         test_support::{fixture_source_broker, unavailable_source_broker},
     };
-    use crate::runner::service::test_support::{
-        controlled_sleeper, fixture_lease_clock, with_watchdog,
-    };
-    use crate::runner::service::workspace::{
+    use crate::service::test_support::{controlled_sleeper, fixture_lease_clock, with_watchdog};
+    use crate::service::workspace::{
         CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook,
         WorkspaceFilesystem,
     };
@@ -4933,11 +4928,9 @@ mod tests {
 
     const NOW: &str = "2026-07-23T00:00:00Z";
     mod artifact_delivery_tests;
-    const COMMAND_FIXTURE_TEST_NAME: &str =
-        "runner::service::assignment::tests::command_fixture_process";
+    const COMMAND_FIXTURE_TEST_NAME: &str = "service::assignment::tests::command_fixture_process";
     const FAILING_COMMAND_FIXTURE_TEST_NAME: &str =
-        "runner::service::assignment::tests::failing_command_fixture_process";
-    const NESTED_WORKFLOW_FIXTURE_TEST_NAME: &str = "cli::tests::nested_workflow_fixture_process";
+        "service::assignment::tests::failing_command_fixture_process";
     // SCHERZO_* variables are intentionally removed from admitted command environments.
     const COMMAND_FIXTURE_SOCKET: &str = "WORKFLOW_ASSIGNMENT_COMMAND_FIXTURE_SOCKET";
 
@@ -4945,7 +4938,7 @@ mod tests {
     fn final_acknowledgement_grace_matches_runner_timing_contract() {
         let fixture: Value = serde_json::from_slice(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/runner-protocol/v1/timing.json"
+            "/../../tests/fixtures/runner-protocol/v1/timing.json"
         )))
         .unwrap();
         let duration = |field| Duration::from_secs(fixture[field].as_u64().unwrap());
@@ -5082,7 +5075,7 @@ for argument in "$@"; do
   esac
 done
 exec "$CODEX_FIXTURE_HELPER" \
-  --exact runner::service::assignment::tests::codex_process_fixture \
+  --exact service::assignment::tests::codex_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null
 "#;
@@ -5126,7 +5119,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         fn prepare(
             &self,
             offer: &AssignmentOffer,
-            recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+            recorder: Option<Arc<crate::telemetry::Recorder>>,
         ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
             let _ = self.started.send(());
             self.release
@@ -5918,10 +5911,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     ) -> AssignmentManager {
         let dependencies = AssignmentDependencies::new(
             work_root,
-            Arc::new(crate::runner::service::TokioSleeper),
+            Arc::new(crate::service::TokioSleeper),
             Some(fixture_source_broker(source)),
             None,
-            Arc::from(crate::runner::telemetry::TEST_SERVICE_VERSION),
+            Arc::from(crate::telemetry::TEST_SERVICE_VERSION),
             None,
             false,
         );
@@ -6807,7 +6800,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             ..
         } = decode_cloud_frame(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
         )))
         .unwrap()
         else {
@@ -7257,75 +7250,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert_eq!(fs::read(workspace.join("value.txt")).unwrap(), b"staged");
         assert!(private.exists());
         assert!(!helper.exists());
-    }
-
-    #[tokio::test]
-    async fn nested_workflow_result_and_staging_survive_delivery_failure() {
-        let nested_arguments = serde_json::to_string(&command_fixture_arguments_for(
-            NESTED_WORKFLOW_FIXTURE_TEST_NAME,
-        ))
-        .unwrap();
-        let workflow = format!(
-            "schemaVersion: 1\nsteps:\n  nested:\n    kind: cmd\n    command:\n      argv: {nested_arguments}\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: delivery-rounds/0001/nested-result.txt\n        mediaType: text/plain\nexports:\n  nestedResult:\n    ref: outputs.nested.result\n"
-        );
-        let (_temporary, mut manager) = manager_fixture(&workflow);
-        let source = source_fixture_path(&manager);
-        fs::write(
-            source.join("nested.yaml"),
-            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"printf 'nested portable result' > nested.txt\"]\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: nested.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      payload:\n        ref: outputs.produce.result\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"mkdir -p ../run/.private/workflow-retained/.inputs-retained; cp -a \\\"$SCHERZO_STEP_INPUTS\\\" ../run/.private/workflow-retained/.inputs-retained/view-retained\"]\nexports:\n  portable:\n    ref: outputs.produce.result\n",
-        )
-        .unwrap();
-        run_fixture_git(&source, &["add", "nested.yaml"]);
-        run_fixture_git(&source, &["commit", "--quiet", "-m", "nested fixture"]);
-        let offered = offer("bg");
-        let assignment_path = manager.work_root.boot_path().join(&offered.assignment_id);
-        offer_then_prepare(&mut manager, &offered).await;
-        spawn_execution(&mut manager, &offered);
-
-        let pending = with_watchdog(wait_for_carrier_registration(&mut manager))
-            .await
-            .expect("nested result carrier registration was not reached");
-        let expected = b"nested portable result";
-        let expected_sha256 = ring::digest::digest(&ring::digest::SHA256, expected)
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert!(pending.iter().any(|entry| matches!(
-            &entry.observation,
-            AssignmentObservation::Artifact {
-                request: ArtifactRequest::RegisterCarrier {
-                    portable_owner_path,
-                    media_type,
-                    size_bytes,
-                    sha256,
-                    ..
-                },
-                ..
-            } if portable_owner_path == "exports/0001"
-                && media_type == "text/plain"
-                && *size_bytes == u64::try_from(expected.len()).unwrap()
-                && sha256 == &expected_sha256
-        )));
-        assert!(assignment_path.join("workspace").exists());
-        assert!(fail_pending_artifact_registrations(&mut manager, &pending));
-
-        let reports = with_watchdog(wait_for_terminal(&mut manager))
-            .await
-            .expect("nested workflow terminal report was not selected");
-        assert_succeeded(&reports);
-        acknowledge_terminal_and_settle(&mut manager).await;
-        assert!(!manager.cleanup_failed);
-        assert!(manager.slot.is_none());
-        assert!(assignment_path.exists());
-        assert!(
-            assignment_path
-                .join("private")
-                .read_dir()
-                .unwrap()
-                .next()
-                .is_some()
-        );
     }
 
     #[tokio::test]
@@ -8392,12 +8316,9 @@ steps:
         let notification = manager.notification();
         let elapsed = notification.notified();
         tokio::pin!(elapsed);
-        lease_wait_request(
-            &mut waits,
-            crate::runner::service::SHUTDOWN_CLEANUP_START_TIMEOUT,
-        )
-        .await
-        .release();
+        lease_wait_request(&mut waits, crate::service::SHUTDOWN_CLEANUP_START_TIMEOUT)
+            .await
+            .release();
         elapsed.await;
         manager.pending_observations(&BTreeSet::new(), 10);
         settle_cleanup(&mut manager).await;
@@ -8925,7 +8846,7 @@ steps:
             manager.handle_renewal(renewal).unwrap().disposition,
             RenewalDisposition::ReplayApplied
         );
-        let (recorder, capture) = crate::runner::telemetry::test_recorder("renewal-test");
+        let (recorder, capture) = crate::telemetry::test_recorder("renewal-test");
         let event = recorder.start("runner.effect_acknowledgement", []);
         decision.record(&event);
         event.finish(TelemetryOutcome::Success);
@@ -10056,7 +9977,7 @@ steps:
     async fn runner_reservation_consumes_carried_capacity_without_node_arithmetic() {
         let frame_fixture: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/runner-protocol/v1/maximal-recovery-frame-size.json"
+            "/../../tests/fixtures/runner-protocol/v1/maximal-recovery-frame-size.json"
         )))
         .unwrap();
         assert_eq!(

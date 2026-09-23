@@ -16,7 +16,7 @@ use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 
-use crate::runner::credential::Credential;
+use crate::credential::Credential;
 use scherzo_cloud_execution::{
     CaptureCancellation, ResolvedAttachment, ResolvedFile, ResolvedInput, ResolvedInputs,
     ResolvedJsonInput,
@@ -1473,7 +1473,7 @@ mod tests {
     #[test]
     fn canonical_encoder_matches_shared_digest_vectors() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/run-inputs/v1/manifest-digests.json"
+            "../../../../tests/fixtures/run-inputs/v1/manifest-digests.json"
         ))
         .unwrap();
         for vector in fixture["vectors"].as_array().unwrap() {
@@ -1974,7 +1974,7 @@ mod tests {
         let endpoint = Url::parse("ws://127.0.0.1:1/v1/runner/connect").unwrap();
         let broker = HttpRunInputBroker::new(
             &endpoint,
-            &crate::runner::credential::test_credential(),
+            &crate::credential::test_credential(),
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
         )
         .unwrap();

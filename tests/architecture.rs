@@ -1,8 +1,8 @@
 //! Cargo-workspace and source-boundary architecture tests.
 //!
-//! Slice 2B gives execution, process abstractions, assets, and owner tests one
-//! final package. These tests keep Cargo's package graph, residual root modules,
-//! the execution facade, generated-source privacy, and external-crate ownership
+//! Slice 3 gives runner behavior and idempotency their final package owners.
+//! These tests keep Cargo's package graph, residual root modules, explicit
+//! component facades, generated-source privacy, and external-crate ownership
 //! aligned with `ARCHITECTURE.md`.
 
 #![allow(
@@ -26,17 +26,18 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const INTERNAL_PACKAGES: [&str; 6] = [
+const INTERNAL_PACKAGES: [&str; 7] = [
     "scherzo-cloud",
     "scherzo-cloud-api",
     "scherzo-cloud-execution",
+    "scherzo-cloud-runner",
     "scherzo-cloud-runner-protocol",
     "scherzo-cloud-support",
     "scherzo-cloud-test-support",
 ];
 
 #[test]
-fn workspace_members_and_edges_match_slice_two_b() {
+fn workspace_members_and_edges_match_slice_three() {
     let root = cli_root();
     let metadata = cargo_metadata(&root);
     let packages = metadata["packages"]
@@ -53,6 +54,7 @@ fn workspace_members_and_edges_match_slice_two_b() {
         ("scherzo-cloud", "Cargo.toml"),
         ("scherzo-cloud-api", "crates/api/Cargo.toml"),
         ("scherzo-cloud-execution", "crates/execution/Cargo.toml"),
+        ("scherzo-cloud-runner", "crates/runner/Cargo.toml"),
         (
             "scherzo-cloud-runner-protocol",
             "crates/runner-protocol/Cargo.toml",
@@ -85,7 +87,7 @@ fn workspace_members_and_edges_match_slice_two_b() {
     assert_eq!(
         workspace_packages.keys().copied().collect::<BTreeSet<_>>(),
         INTERNAL_PACKAGES.into_iter().collect(),
-        "Slice 2B must contain the root package and five final component members"
+        "Slice 3 must contain the root package and six final component members"
     );
 
     for (name, relative_manifest) in expected_manifests {
@@ -100,7 +102,7 @@ fn workspace_members_and_edges_match_slice_two_b() {
         assert_eq!(
             manifest,
             root.join(relative_manifest),
-            "{name} is not rooted at its final Slice 1 path"
+            "{name} is not rooted at its final package path"
         );
         assert_eq!(
             package["publish"].as_array().map(Vec::len),
@@ -135,7 +137,8 @@ fn workspace_members_and_edges_match_slice_two_b() {
         ("scherzo-cloud", "scherzo-cloud-api", "normal"),
         ("scherzo-cloud", "scherzo-cloud-execution", "normal"),
         ("scherzo-cloud", "scherzo-cloud-execution", "dev"),
-        ("scherzo-cloud", "scherzo-cloud-runner-protocol", "normal"),
+        ("scherzo-cloud", "scherzo-cloud-runner", "normal"),
+        ("scherzo-cloud", "scherzo-cloud-runner", "dev"),
         ("scherzo-cloud", "scherzo-cloud-support", "normal"),
         ("scherzo-cloud", "scherzo-cloud-test-support", "dev"),
         ("scherzo-cloud-api", "scherzo-cloud-support", "normal"),
@@ -146,6 +149,15 @@ fn workspace_members_and_edges_match_slice_two_b() {
             "scherzo-cloud-test-support",
             "dev",
         ),
+        ("scherzo-cloud-runner", "scherzo-cloud-execution", "normal"),
+        ("scherzo-cloud-runner", "scherzo-cloud-execution", "dev"),
+        (
+            "scherzo-cloud-runner",
+            "scherzo-cloud-runner-protocol",
+            "normal",
+        ),
+        ("scherzo-cloud-runner", "scherzo-cloud-support", "normal"),
+        ("scherzo-cloud-runner", "scherzo-cloud-test-support", "dev"),
     ]);
     assert_eq!(
         actual_edges, expected_edges,
@@ -166,6 +178,8 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
         "src/workflow_contract",
         "src/execution",
         "src/process.rs",
+        "src/runner",
+        "src/idempotency.rs",
         "src/test_support.rs",
         "tests/liv_2331_remediation_repro.rs",
         "tests/fixtures/codex-app-server-v1-schema",
@@ -195,9 +209,42 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
     assert!(api_facade.contains("mod generated;"));
     assert!(!api_facade.contains("pub mod generated;"));
 
+    let support_facade = read_source(&root.join("crates/support/src/lib.rs"));
+    assert!(support_facade.contains("mod idempotency;"));
+    assert!(support_facade.contains("pub use idempotency::generate_idempotency_key;"));
+
+    let runner_facade = read_source(&root.join("crates/runner/src/lib.rs"));
+    for implementation in [
+        "control_client",
+        "control_protocol",
+        "credential",
+        "doctor",
+        "enrollment",
+        "service",
+        "telemetry",
+        "validation",
+    ] {
+        assert!(
+            runner_facade.contains(&format!("mod {implementation};")),
+            "runner facade does not privately own {implementation}"
+        );
+    }
+    for consumed in [
+        "pub use control_client::{RequestFailure, request};",
+        "pub use service::{Config, ConfigError};",
+        "pub struct ServiceError",
+        "pub fn run(config: Config, service_version: &str)",
+    ] {
+        assert!(
+            runner_facade.contains(consumed),
+            "runner facade is missing command/helper seam `{consumed}`"
+        );
+    }
+
     for facade in [
         "crates/api/src/lib.rs",
         "crates/execution/src/lib.rs",
+        "crates/runner/src/lib.rs",
         "crates/runner-protocol/src/lib.rs",
         "crates/support/src/lib.rs",
     ] {
@@ -241,20 +288,11 @@ fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("build_info", &[]),
         (
             "cli",
-            &[
-                "build_info",
-                "exit_code",
-                "human_auth",
-                "idempotency",
-                "runner",
-                "service_auth",
-            ],
+            &["build_info", "exit_code", "human_auth", "service_auth"],
         ),
         ("error", &["exit_code"]),
         ("exit_code", &[]),
         ("human_auth", &[]),
-        ("idempotency", &[]),
-        ("runner", &["idempotency"]),
         ("service_auth", &[]),
     ];
     entries
@@ -425,7 +463,7 @@ fn execution_boundary_policy_rejects_public_modules() {
 fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
     let root = cli_root();
     let mut violations = Vec::new();
-    for owner in ["crates/execution/src", "src/runner"] {
+    for owner in ["crates/execution/src", "crates/runner/src"] {
         for source in rust_sources(&root.join(owner)) {
             let relative = source.strip_prefix(&root).unwrap();
             let text = read_source(&source);
@@ -635,12 +673,15 @@ fn external_crate_containment() -> Vec<(&'static str, Vec<&'static str>)> {
         ("clap", vec!["src/cli.rs", "src/cli/"]),
         (
             "reqwest",
-            vec!["crates/api/src/", "src/human_auth/", "src/runner/"],
+            vec!["crates/api/src/", "src/human_auth/", "crates/runner/src/"],
         ),
-        ("tokio_tungstenite", vec!["src/runner/service/"]),
-        ("opentelemetry", vec!["src/runner/"]),
-        ("opentelemetry_sdk", vec!["src/runner/"]),
-        ("opentelemetry_proto", vec!["src/runner/"]),
+        (
+            "tokio_tungstenite",
+            vec!["crates/runner/src/service/", "tests/cli/runner_status.rs"],
+        ),
+        ("opentelemetry", vec!["crates/runner/src/"]),
+        ("opentelemetry_sdk", vec!["crates/runner/src/"]),
+        ("opentelemetry_proto", vec!["crates/runner/src/"]),
         ("ratatui", vec!["crates/execution/src/workflow/"]),
         ("crossterm", vec!["crates/execution/src/workflow/"]),
     ]

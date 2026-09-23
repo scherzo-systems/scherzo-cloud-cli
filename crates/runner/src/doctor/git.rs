@@ -151,7 +151,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{GitCheck, GitVersion, MINIMUM_VERSION, parse_version};
-    use crate::runner::doctor::{DoctorCheck, Outcome, Status};
+    use crate::doctor::{DoctorCheck, Outcome, Status};
     use scherzo_cloud_execution::{
         CommandOutput, CommandProbeError, CommandRequest, CommandRunner,
     };

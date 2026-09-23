@@ -12,19 +12,19 @@ const REPLACEMENT_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abd";
 const ACTIVATION_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const RUNNER_STATE_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/schemas/runner-state-v1.schema.json"
+    "/../../schemas/runner-state-v1.schema.json"
 ));
 const OPERATOR_CONFIG_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/schemas/runner-operator-config-v1.schema.json"
+    "/../../schemas/runner-operator-config-v1.schema.json"
 ));
 const ENROLLMENT_JOURNAL_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/schemas/runner-enrollment-journal-v1.schema.json"
+    "/../../schemas/runner-enrollment-journal-v1.schema.json"
 ));
 const TERMINAL_RECEIPT_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/schemas/runner-enrollment-terminal-receipt-v1.schema.json"
+    "/../../schemas/runner-enrollment-terminal-receipt-v1.schema.json"
 ));
 
 fn assert_json_matches_schema(format: &str, schema_source: &str, bytes: &[u8]) {

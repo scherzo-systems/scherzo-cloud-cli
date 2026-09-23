@@ -32,8 +32,8 @@ use super::{
     Config, ConnectionLoopDependencies, Connector, ServiceError, Shutdown, Sleeper,
     run_connection_loop_with_work_root,
 };
-use crate::runner::credential::test_credential;
-use crate::runner::telemetry::test_recorder;
+use crate::credential::test_credential;
+use crate::telemetry::test_recorder;
 
 const ESTABLISHED_REPETITIONS: usize = 2;
 const RECONNECT_REPETITIONS: usize = 2;

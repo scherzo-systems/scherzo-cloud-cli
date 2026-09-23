@@ -1,8 +1,10 @@
+mod idempotency;
 mod public_id;
 mod timing;
 mod tls;
 mod workflow_contract;
 
+pub use idempotency::generate_idempotency_key;
 pub use public_id::{
     valid_lowercase_hyphenated, valid_organization_ref, valid_typed_id, valid_url_safe_name,
 };

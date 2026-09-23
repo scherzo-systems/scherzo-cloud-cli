@@ -298,10 +298,10 @@ impl CleanupIdentityStore for ExtendedAttributeCleanupIdentityStore {
 // Unit tests exercise cleanup state transitions on filesystems such as the Nix
 // build sandbox that intentionally reject extended attributes. Device and inode
 // identity preserves replacement detection without weakening the system store.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 struct MetadataCleanupIdentityStore;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 impl CleanupIdentityStore for MetadataCleanupIdentityStore {
     fn read(&self, directory: &OwnedFd) -> Result<Option<[u8; CLEANUP_IDENTITY_BYTES]>, ()> {
         let metadata = fstat(directory).map_err(|_| ())?;
@@ -343,7 +343,7 @@ impl WorkspaceFilesystem {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(super) fn testing() -> Self {
         Self {
             remover: Arc::new(SystemTreeRemover),
@@ -1384,7 +1384,7 @@ impl WorkRootLease {
         assignment_id: &str,
         run_id: &str,
         attempt_id: &str,
-        recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+        recorder: Option<Arc<crate::telemetry::Recorder>>,
     ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
         let attempt_record = AttemptRecord::new(assignment_id, run_id, attempt_id)
             .map_err(|()| AssignmentRootCreationError::CleanupFailed)?;
@@ -1894,7 +1894,7 @@ pub(super) struct AssignmentRoot {
     pub(super) workspace: WorkspaceLease,
     workflow_git: Option<WorkflowGitAuthority>,
     attempt_record: AttemptRecord,
-    recorder: Option<Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
     retained: Arc<AtomicBool>,
     engine: CleanupEngine,
     workspace_release_spawner: Arc<dyn WorkspaceReleaseSpawner>,
@@ -2053,7 +2053,7 @@ fn effective_disposition(
 }
 
 fn record_retention(
-    recorder: Option<&Arc<crate::runner::telemetry::Recorder>>,
+    recorder: Option<&Arc<crate::telemetry::Recorder>>,
     attempt: &AttemptRecord,
     path: PathBuf,
     reason: RetentionReason,
@@ -2068,39 +2068,39 @@ fn record_retention(
         "runner.workspace_retained",
         [
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::ASSIGNMENT_ID,
+                crate::telemetry::attribute::ASSIGNMENT_ID,
                 attempt.assignment_id.clone(),
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::RUN_ID,
+                crate::telemetry::attribute::RUN_ID,
                 attempt.run_id.clone(),
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::ATTEMPT_ID,
+                crate::telemetry::attribute::ATTEMPT_ID,
                 attempt.attempt_id.clone(),
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::WORKSPACE_PATH,
+                crate::telemetry::attribute::WORKSPACE_PATH,
                 path.to_string_lossy().into_owned(),
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::RETENTION_REASON,
+                crate::telemetry::attribute::RETENTION_REASON,
                 reason.as_str(),
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::OWNED_PROCESSES_STOPPED,
+                crate::telemetry::attribute::OWNED_PROCESSES_STOPPED,
                 quiescence == ProcessQuiescence::Proven,
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::RUNNER_CREDENTIALS_REMOVED,
+                crate::telemetry::attribute::RUNNER_CREDENTIALS_REMOVED,
                 credentials.local_state_destroyed,
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::RUNNER_CREDENTIALS_REVOKED,
+                crate::telemetry::attribute::RUNNER_CREDENTIALS_REVOKED,
                 credentials.revocation_succeeded(),
             ),
             opentelemetry::KeyValue::new(
-                crate::runner::telemetry::attribute::RETENTION_RECORDED,
+                crate::telemetry::attribute::RETENTION_RECORDED,
                 disposition_recorded,
             ),
         ],
@@ -2753,7 +2753,7 @@ mod tests {
         let filesystem = WorkspaceFilesystem::testing()
             .with_workspace_release_spawner(Arc::new(RejectingWorkspaceReleaseSpawner));
         let owner = WorkRootLease::acquire_with(root.path(), BOOT_A, filesystem).unwrap();
-        let (recorder, capture) = crate::runner::telemetry::test_recorder(BOOT_A);
+        let (recorder, capture) = crate::telemetry::test_recorder(BOOT_A);
         let mut assignment = owner
             .create_assignment_for_attempt(
                 ASSIGNMENT,
@@ -2852,7 +2852,7 @@ mod tests {
         let root = private_work_root();
         let remover = ScriptedRemover::new([]);
         let owner = owner_with_remover(root.path(), remover.clone());
-        let (recorder, capture) = crate::runner::telemetry::test_recorder(BOOT_A);
+        let (recorder, capture) = crate::telemetry::test_recorder(BOOT_A);
         let assignment = owner
             .create_assignment_for_attempt(
                 ASSIGNMENT,
