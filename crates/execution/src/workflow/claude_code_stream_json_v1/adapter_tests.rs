@@ -88,7 +88,7 @@ printf '%s\n' "$PWD" > "$CLAUDE_FIXTURE_CWD"
 } > "$CLAUDE_FIXTURE_ENVIRONMENT"
 printf 'fixture diagnostic\n' >&2
 output=$(
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.263"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.280"}\n' "$PWD" "$session" "$model"
 printf '{"type":"system","subtype":"status","status":"requesting","session_id":"%s"}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-driver","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -485,7 +485,7 @@ for argument in "$@"; do
 done
 IFS= read -r _initial
 session='{session}'
-printf '{{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.263"}}\n' "$PWD" "$session" "$model"
+printf '{{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.280"}}\n' "$PWD" "$session" "$model"
 {output}exit {exit_status}
 "#
     )
@@ -774,7 +774,7 @@ fn result_exchange_transcript(
         "session_id": SESSION,
         "model": MODEL,
         "permissionMode": "bypassPermissions",
-        "claude_code_version": "2.1.263",
+        "claude_code_version": "2.1.280",
     })];
     if let Some(candidate) = &fixture.candidate {
         values.push(stream_event(json!({
@@ -1072,7 +1072,7 @@ fn write_fixture_initialization(
         "session_id": session,
         "model": MODEL,
         "permissionMode": "bypassPermissions",
-        "claude_code_version": "2.1.263",
+        "claude_code_version": "2.1.280",
     });
     if let Some(padding) = padding {
         initialization["padding"] = Value::String(padding);

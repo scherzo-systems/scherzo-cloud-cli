@@ -506,13 +506,19 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
                 "data": "JVBERi1uYXRpdmU="
             })
         ));
-        assert!(contains_exact_string(
-            request.body(),
-            &format!(
-                "Scherzo attachment 000003 has media type application/octet-stream and is available to runner tools at {unsupported_sealed_path}."
-            )
-        ));
-        assert!(!contains_exact_string(
+        // The pinned native release appends one LF to this separate user text block.
+        // Check the whole block: substring matching could hide a merged instruction.
+        let sealed_reference = format!(
+            "Scherzo attachment 000003 has media type application/octet-stream and is available to runner tools at {unsupported_sealed_path}.\n"
+        );
+        assert_eq!(request.body()["messages"][0]["role"], "user");
+        let user_content = request.body()["messages"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert!(user_content.iter().any(|block| {
+            block["type"] == "text" && block["text"].as_str() == Some(sealed_reference.as_str())
+        }));
+        assert!(!contains_string_fragment(
             request.body(),
             "caller-controlled-name"
         ));
@@ -901,7 +907,7 @@ async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_befor
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.263 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.280 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.
