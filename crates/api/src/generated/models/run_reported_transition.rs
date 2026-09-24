@@ -17,29 +17,56 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunInputAttachmentsEntry {
-    #[serde(skip)]
+pub struct RunReportedTransition {
+    #[serde(rename = "attemptId")]
+    pub attempt_id: String,
+    #[serde(rename = "eventSequence")]
+    pub event_sequence: i64,
+    #[serde(rename = "transitionSequence")]
+    pub transition_sequence: i64,
+    #[serde(rename = "recordedAt")]
+    pub recorded_at: String,
+    #[serde(rename = "kind")]
     pub kind: Kind,
-    #[serde(rename = "items")]
-    pub items: Vec<models::RunInputAttachmentMember>,
+    #[serde(rename = "stepId", deserialize_with = "Option::deserialize")]
+    pub step_id: Option<String>,
+    #[serde(rename = "targetState", deserialize_with = "Option::deserialize")]
+    pub target_state: Option<String>,
 }
 
-impl RunInputAttachmentsEntry {
+impl RunReportedTransition {
     pub fn new(
+        attempt_id: String,
+        event_sequence: i64,
+        transition_sequence: i64,
+        recorded_at: String,
         kind: Kind,
-        items: Vec<models::RunInputAttachmentMember>,
-    ) -> RunInputAttachmentsEntry {
-        RunInputAttachmentsEntry { kind, items }
+        step_id: Option<String>,
+        target_state: Option<String>,
+    ) -> RunReportedTransition {
+        RunReportedTransition {
+            attempt_id,
+            event_sequence,
+            transition_sequence,
+            recorded_at,
+            kind,
+            step_id,
+            target_state,
+        }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Kind {
-    #[serde(rename = "attachments")]
-    Attachments,
+    #[serde(rename = "workflow_state_changed")]
+    WorkflowStateChanged,
+    #[serde(rename = "step_state_changed")]
+    StepStateChanged,
+    #[serde(rename = "other")]
+    Other,
 }
 
 impl Default for Kind {
     fn default() -> Kind {
-        Self::Attachments
+        Self::WorkflowStateChanged
     }
 }

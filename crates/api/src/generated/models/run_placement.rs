@@ -17,15 +17,29 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PublicationPullRequestMetadata {
-    #[serde(rename = "title")]
-    pub title: String,
-    #[serde(rename = "body")]
-    pub body: String,
+pub struct RunPlacement {
+    #[serde(rename = "runnerId")]
+    pub runner_id: String,
+    #[serde(rename = "runnerName")]
+    pub runner_name: String,
+    #[serde(rename = "poolId")]
+    pub pool_id: String,
+    #[serde(rename = "poolName")]
+    pub pool_name: String,
 }
 
-impl PublicationPullRequestMetadata {
-    pub fn new(title: String, body: String) -> PublicationPullRequestMetadata {
-        PublicationPullRequestMetadata { title, body }
+impl RunPlacement {
+    pub fn new(
+        runner_id: String,
+        runner_name: String,
+        pool_id: String,
+        pool_name: String,
+    ) -> RunPlacement {
+        RunPlacement {
+            runner_id,
+            runner_name,
+            pool_id,
+            pool_name,
+        }
     }
 }

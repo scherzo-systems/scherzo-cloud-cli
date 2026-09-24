@@ -21,6 +21,7 @@ const PRIVATE_CACHE_CONTROL: &str = "private, no-store";
 const RUN_CREATION_REJECTED: &str = "https://api.scherzo.dev/problems/run-creation-rejected";
 
 pub type Run = models::Run;
+pub type RunObservation = models::RunObservation;
 pub type RunState = models::run::State;
 pub type RunCreationAcceptance = models::RunCreationAcceptance;
 pub type RunCreationPending = models::RunCreationPending;

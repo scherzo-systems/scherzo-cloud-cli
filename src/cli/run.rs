@@ -11,8 +11,8 @@ use crate::human_auth::deployment::Deployment;
 #[cfg(test)]
 use scherzo_cloud_api::HttpClient;
 use scherzo_cloud_api::{
-    CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunFailure, RunRead,
-    RunState,
+    CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunFailure,
+    RunObservation, RunRead, RunState,
 };
 use scherzo_cloud_execution::visible_text;
 
@@ -863,6 +863,87 @@ fn write_wait_terminal(
     Ok(state.exit_code())
 }
 
+fn write_observation_human(
+    out: &mut impl io::Write,
+    observation: &RunObservation,
+) -> anyhow::Result<()> {
+    writeln!(out, "\nobserved at: {}", observation.observed_at)?;
+    writeln!(out, "placement (current attempt):")?;
+    if let Some(place) = observation.placement.as_deref() {
+        writeln!(out, "  runner: {} ({})", place.runner_name, place.runner_id)?;
+        writeln!(out, "  pool: {} ({})", place.pool_name, place.pool_id)?;
+    } else {
+        writeln!(out, "  none")?;
+    }
+    writeln!(out, "Cloud assignment and runner connection:")?;
+    if let Some(assignment) = observation.assignment.as_deref() {
+        writeln!(
+            out,
+            "  assignment: {} ({})",
+            assignment.id,
+            enum_text(&assignment.state)?
+        )?;
+        writeln!(
+            out,
+            "  target: {} / {} / generation {}",
+            assignment.runner_id, assignment.boot_id, assignment.presence_generation
+        )?;
+        writeln!(
+            out,
+            "  Cloud lease: sequence {}, expires {} ({})",
+            assignment
+                .lease_sequence
+                .map_or_else(|| "none".to_owned(), |n| n.to_string()),
+            assignment.lease_expires_at.as_deref().unwrap_or("none"),
+            if assignment.lease_valid {
+                "valid"
+            } else {
+                "not valid"
+            }
+        )?;
+        writeln!(
+            out,
+            "  matching runner connected: {}",
+            assignment.runner_connected
+        )?;
+        writeln!(
+            out,
+            "  matching runner last seen: {}",
+            assignment.runner_last_seen_at.as_deref().unwrap_or("none")
+        )?;
+    } else {
+        writeln!(out, "  no current assignment")?;
+    }
+    writeln!(out, "last coordinator-accepted workflow transition:")?;
+    if let Some(progress) = observation.last_transition.as_deref() {
+        writeln!(
+            out,
+            "  recorded: {} (attempt {})",
+            progress.recorded_at, progress.attempt_id
+        )?;
+        writeln!(
+            out,
+            "  kind: {} (transition {}, event {})",
+            enum_text(&progress.kind)?,
+            progress.transition_sequence,
+            progress.event_sequence
+        )?;
+        writeln!(
+            out,
+            "  step: {}",
+            progress.step_id.as_deref().unwrap_or("none")
+        )?;
+        writeln!(
+            out,
+            "  target state: {}",
+            progress.target_state.as_deref().unwrap_or("unavailable")
+        )?;
+    } else {
+        writeln!(out, "  none reported")?;
+    }
+    Ok(())
+}
+
 fn write_wait_timeout(
     deployment: &str,
     organization: &str,
@@ -1073,6 +1154,11 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     }
     writeln!(stdout, "\ncreated: {}", run.created_at)?;
     writeln!(stdout, "updated: {}", run.updated_at)?;
+    if let Some(observation) = run.observation.as_deref() {
+        write_observation_human(&mut stdout, observation)?;
+    } else {
+        writeln!(stdout, "\nassignment and reported progress: unavailable")?;
+    }
     writeln!(stdout, "deployment: {deployment}")?;
     Ok(())
 }
@@ -1407,6 +1493,50 @@ mod tests {
         HttpTransportPolicy, InputScalarMetadata, NamedInputMetadata, RunCreationAcceptance,
         RunInputManifest, UnreachableCategory,
     };
+
+    #[test]
+    fn run_show_keeps_placement_and_reported_progress_separate() {
+        let observation: RunObservation = serde_json::from_value(serde_json::json!({
+            "observedAt": "2026-08-03T12:00:00Z",
+            "placement": {"runnerId": "runner-b", "runnerName": "second",
+                "poolId": "pool-b", "poolName": "work"},
+            "assignment": {"id": "assignment-b", "state": "active", "runnerId": "runner-b",
+                "bootId": "boot-b", "presenceGeneration": 2, "leaseSequence": 9,
+                "leaseExpiresAt": "2026-08-03T13:00:00Z", "leaseValid": false,
+                "runnerConnected": true, "runnerLastSeenAt": null},
+            "lastTransition": {"attemptId": "attempt-a", "eventSequence": 3,
+                "transitionSequence": 2, "recordedAt": "2026-08-03T11:00:00Z",
+                "kind": "step_state_changed", "stepId": "build", "targetState": "running"}
+        }))
+        .expect("valid run observation");
+        let mut output = Vec::new();
+        write_observation_human(&mut output, &observation).expect("render observation");
+        let output = String::from_utf8(output).expect("human report is UTF-8");
+        for identifier in ["runner-b", "pool-b", "assignment-b", "attempt-a", "build"] {
+            assert!(output.contains(identifier), "missing {identifier}");
+        }
+        let mut run = run(RunState::Running);
+        run.observation = Some(Box::new(observation));
+        let document = serde_json::to_value(ShowResult {
+            schema_version: 1,
+            deployment: "test",
+            outcome: "found",
+            run: &run,
+        })
+        .expect("serialize run show");
+        assert_eq!(
+            document["run"]["observation"]["assignment"]["runnerConnected"],
+            true
+        );
+        assert_eq!(
+            document["run"]["observation"]["assignment"]["leaseValid"],
+            false
+        );
+        assert_eq!(
+            document["run"]["observation"]["lastTransition"]["attemptId"],
+            "attempt-a"
+        );
+    }
 
     struct ScriptedObservationApi {
         responses: RefCell<VecDeque<Result<RunRead, RunFailure>>>,

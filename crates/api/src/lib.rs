@@ -147,7 +147,8 @@ pub use runners::{
 };
 pub use runs::{
     CreateRunInput, Run, RunApi, RunArtifactDelivery, RunCancellation, RunCreationAcceptance,
-    RunCreationPending, RunFailure, RunInterruption, RunRead, RunState, valid_integration_context,
+    RunCreationPending, RunFailure, RunInterruption, RunObservation, RunRead, RunState,
+    valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,
