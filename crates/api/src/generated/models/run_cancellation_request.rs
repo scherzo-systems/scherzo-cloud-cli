@@ -17,33 +17,26 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ArtifactDownloadCapabilityMember {
-    #[serde(rename = "path")]
-    pub path: String,
-    #[serde(rename = "mediaType")]
-    pub media_type: String,
-    #[serde(rename = "sizeBytes")]
-    pub size_bytes: i64,
-    #[serde(rename = "digest")]
-    pub digest: Box<models::ArtifactDigest>,
-    #[serde(rename = "url")]
-    pub url: String,
+pub struct RunCancellationRequest {
+    #[serde(rename = "mode")]
+    pub mode: Mode,
 }
 
-impl ArtifactDownloadCapabilityMember {
-    pub fn new(
-        path: String,
-        media_type: String,
-        size_bytes: i64,
-        digest: models::ArtifactDigest,
-        url: String,
-    ) -> ArtifactDownloadCapabilityMember {
-        ArtifactDownloadCapabilityMember {
-            path,
-            media_type,
-            size_bytes,
-            digest: Box::new(digest),
-            url,
-        }
+impl RunCancellationRequest {
+    pub fn new(mode: Mode) -> RunCancellationRequest {
+        RunCancellationRequest { mode }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Mode {
+    #[serde(rename = "graceful")]
+    Graceful,
+    #[serde(rename = "force")]
+    Force,
+}
+
+impl Default for Mode {
+    fn default() -> Mode {
+        Self::Graceful
     }
 }

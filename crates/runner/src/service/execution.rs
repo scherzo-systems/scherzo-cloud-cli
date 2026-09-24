@@ -1548,6 +1548,11 @@ fn observed_workflow_cancellation(
             | RunOutcome::Failed {
                 later_cancellation: None,
                 ..
+            }
+            // Direct force records phased force evidence, not an ordinary
+            // cancellation deadline. Do not fabricate one here.
+            | RunOutcome::Cancelled {
+                reason: CancellationReason::ForceAbort,
             },
         ) => Some(None),
         (

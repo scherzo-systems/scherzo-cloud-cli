@@ -17,71 +17,71 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GitHubInstallation {
+pub struct RunCancellationReceipt {
     #[serde(rename = "id")]
     pub id: String,
-    /// A canonical positive signed-64-bit provider identifier encoded as decimal text so browser clients preserve it exactly.
-    #[serde(rename = "providerInstallationId")]
-    pub provider_installation_id: String,
-    /// A canonical positive signed-64-bit provider identifier encoded as decimal text so browser clients preserve it exactly.
-    #[serde(rename = "providerAccountId")]
-    pub provider_account_id: String,
-    #[serde(rename = "providerAccountType")]
-    pub provider_account_type: ProviderAccountType,
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    #[serde(rename = "attemptId", deserialize_with = "Option::deserialize")]
+    pub attempt_id: Option<String>,
+    #[serde(rename = "mode")]
+    pub mode: Mode,
+    #[serde(rename = "acceptedAt")]
+    pub accepted_at: String,
     #[serde(rename = "state")]
     pub state: State,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: String,
+    #[serde(rename = "resolution", deserialize_with = "Option::deserialize")]
+    pub resolution: Option<Box<models::RunCancellationResolution>>,
 }
 
-impl GitHubInstallation {
+impl RunCancellationReceipt {
     pub fn new(
         id: String,
-        provider_installation_id: String,
-        provider_account_id: String,
-        provider_account_type: ProviderAccountType,
+        organization_id: String,
+        run_id: String,
+        attempt_id: Option<String>,
+        mode: Mode,
+        accepted_at: String,
         state: State,
-        created_at: String,
-        updated_at: String,
-    ) -> GitHubInstallation {
-        GitHubInstallation {
+        resolution: Option<models::RunCancellationResolution>,
+    ) -> RunCancellationReceipt {
+        RunCancellationReceipt {
             id,
-            provider_installation_id,
-            provider_account_id,
-            provider_account_type,
+            organization_id,
+            run_id,
+            attempt_id,
+            mode,
+            accepted_at,
             state,
-            created_at,
-            updated_at,
+            resolution: resolution.map(Box::new),
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum ProviderAccountType {
-    #[serde(rename = "Organization")]
-    Organization,
-    #[serde(rename = "User")]
-    User,
+pub enum Mode {
+    #[serde(rename = "graceful")]
+    Graceful,
+    #[serde(rename = "force")]
+    Force,
 }
 
-impl Default for ProviderAccountType {
-    fn default() -> ProviderAccountType {
-        Self::Organization
+impl Default for Mode {
+    fn default() -> Mode {
+        Self::Graceful
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum State {
-    #[serde(rename = "active")]
-    Active,
-    #[serde(rename = "disconnected")]
-    Disconnected,
-    #[serde(rename = "revoked")]
-    Revoked,
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "resolved")]
+    Resolved,
 }
 
 impl Default for State {
     fn default() -> State {
-        Self::Active
+        Self::Pending
     }
 }

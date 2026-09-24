@@ -2650,6 +2650,30 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "eventVersion": {"const": 1},
+            "eventType": {"const": "workflow_state_changed"},
+            "transitionSequence": {"$ref": "#/$defs/positiveSequence"},
+            "from": {"$ref": "#/$defs/WorkflowExecutingCancellingState"},
+            "to": {"$ref": "#/$defs/WorkflowFinalizingCancellingState"}
+          },
+          "required": ["eventVersion", "eventType", "transitionSequence", "from", "to"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eventVersion": {"const": 1},
+            "eventType": {"const": "workflow_state_changed"},
+            "transitionSequence": {"$ref": "#/$defs/positiveSequence"},
+            "from": {"$ref": "#/$defs/WorkflowExecutingCancellingAfterFailureState"},
+            "to": {"$ref": "#/$defs/WorkflowFinalizingCancellingState"}
+          },
+          "required": ["eventVersion", "eventType", "transitionSequence", "from", "to"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
             "eventVersion": {
               "const": 1
             },

@@ -17,40 +17,51 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunInputFileEntry {
-    #[serde(skip)]
+pub struct RunCancellationResolution {
+    #[serde(rename = "kind")]
     pub kind: Kind,
-    #[serde(rename = "mediaType")]
-    pub media_type: String,
-    #[serde(rename = "sizeBytes")]
-    pub size_bytes: i64,
-    #[serde(rename = "sha256")]
-    pub sha256: String,
+    #[serde(rename = "resolvedAt")]
+    pub resolved_at: String,
+    #[serde(
+        rename = "effectiveRequestId",
+        deserialize_with = "Option::deserialize"
+    )]
+    pub effective_request_id: Option<String>,
+    #[serde(rename = "runVersion", deserialize_with = "Option::deserialize")]
+    pub run_version: Option<i64>,
 }
 
-impl RunInputFileEntry {
+impl RunCancellationResolution {
     pub fn new(
         kind: Kind,
-        media_type: String,
-        size_bytes: i64,
-        sha256: String,
-    ) -> RunInputFileEntry {
-        RunInputFileEntry {
+        resolved_at: String,
+        effective_request_id: Option<String>,
+        run_version: Option<i64>,
+    ) -> RunCancellationResolution {
+        RunCancellationResolution {
             kind,
-            media_type,
-            size_bytes,
-            sha256,
+            resolved_at,
+            effective_request_id,
+            run_version,
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Kind {
-    #[serde(rename = "file")]
-    File,
+    #[serde(rename = "applied")]
+    Applied,
+    #[serde(rename = "already_requested")]
+    AlreadyRequested,
+    #[serde(rename = "superseded")]
+    Superseded,
+    #[serde(rename = "already_terminal")]
+    AlreadyTerminal,
+    #[serde(rename = "creation_rejected")]
+    CreationRejected,
 }
 
 impl Default for Kind {
     fn default() -> Kind {
-        Self::File
+        Self::Applied
     }
 }

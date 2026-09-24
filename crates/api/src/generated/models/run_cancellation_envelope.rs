@@ -17,33 +17,21 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ArtifactDownloadCapabilityMember {
-    #[serde(rename = "path")]
-    pub path: String,
-    #[serde(rename = "mediaType")]
-    pub media_type: String,
-    #[serde(rename = "sizeBytes")]
-    pub size_bytes: i64,
-    #[serde(rename = "digest")]
-    pub digest: Box<models::ArtifactDigest>,
-    #[serde(rename = "url")]
-    pub url: String,
+pub struct RunCancellationEnvelope {
+    #[serde(rename = "request")]
+    pub request: Box<models::RunCancellationReceipt>,
+    #[serde(rename = "run", deserialize_with = "Option::deserialize")]
+    pub run: Option<Box<models::Run>>,
 }
 
-impl ArtifactDownloadCapabilityMember {
+impl RunCancellationEnvelope {
     pub fn new(
-        path: String,
-        media_type: String,
-        size_bytes: i64,
-        digest: models::ArtifactDigest,
-        url: String,
-    ) -> ArtifactDownloadCapabilityMember {
-        ArtifactDownloadCapabilityMember {
-            path,
-            media_type,
-            size_bytes,
-            digest: Box::new(digest),
-            url,
+        request: models::RunCancellationReceipt,
+        run: Option<models::Run>,
+    ) -> RunCancellationEnvelope {
+        RunCancellationEnvelope {
+            request: Box::new(request),
+            run: run.map(Box::new),
         }
     }
 }
