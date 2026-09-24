@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud organization members history --help
+$ scherzo-cloud organization member history --help
 List organization membership history
 
-Usage: scherzo-cloud organization members history [OPTIONS] <ORGANIZATION>
+Usage: scherzo-cloud organization member history [OPTIONS] <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

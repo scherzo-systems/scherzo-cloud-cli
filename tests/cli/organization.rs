@@ -917,7 +917,7 @@ fn organization_commands_have_closed_transport_and_protocol_failures() {
         (
             &[
                 "organization",
-                "members",
+                "member",
                 "list",
                 "acme",
                 "--json",
@@ -931,7 +931,7 @@ fn organization_commands_have_closed_transport_and_protocol_failures() {
         (
             &[
                 "organization",
-                "members",
+                "member",
                 "list",
                 "acme",
                 "--json",
@@ -982,10 +982,10 @@ fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
         &["organization", "show", "acme/research"][..],
         &["organization", "show", "acme\\research"][..],
         &["organization", "leave", "acme/research", "--yes"][..],
-        &["organization", "members", "history", "acme/research"][..],
+        &["organization", "member", "history", "acme/research"][..],
         &[
             "organization",
-            "members",
+            "member",
             "update",
             "acme/research",
             "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -994,7 +994,7 @@ fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
         ][..],
         &[
             "organization",
-            "members",
+            "member",
             "remove",
             "acme/research",
             "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1004,12 +1004,12 @@ fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
         &["organization", "list", "--limit", "0"][..],
         &["organization", "list", "--limit", "201"][..],
         &["organization", "list", "--cursor", ""][..],
-        &["organization", "members", "list", "acme", "--limit", "0"][..],
-        &["organization", "members", "list", "acme", "--limit", "201"][..],
-        &["organization", "members", "list", "acme", "--cursor", ""][..],
+        &["organization", "member", "list", "acme", "--limit", "0"][..],
+        &["organization", "member", "list", "acme", "--limit", "201"][..],
+        &["organization", "member", "list", "acme", "--cursor", ""][..],
         &[
             "organization",
-            "members",
+            "member",
             "history",
             "acme",
             "--limit",
@@ -1017,7 +1017,7 @@ fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
         ][..],
         &[
             "organization",
-            "members",
+            "member",
             "update",
             "acme",
             "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1398,7 +1398,7 @@ fn members_list_preserves_omitted_and_opaque_query_values() {
         let environment = deployment_environment(&server.api_url, &credential_path);
         let mut args = vec![
             "organization",
-            "members",
+            "member",
             "list",
             "acme-research",
             "--json",
@@ -1446,7 +1446,7 @@ fn json_members_list_emits_one_continued_page_exactly() {
     let output = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "list",
             "acme",
             "--json",
@@ -1513,7 +1513,7 @@ fn human_and_empty_members_pages_have_exact_output() {
     let human = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "list",
             "acme",
             "--allow-insecure-http",
@@ -1543,7 +1543,7 @@ fn human_and_empty_members_pages_have_exact_output() {
     let empty_human = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "list",
             "acme",
             "--allow-insecure-http",
@@ -1567,7 +1567,7 @@ fn human_and_empty_members_pages_have_exact_output() {
     let empty = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "list",
             "acme",
             "--json",
@@ -1615,7 +1615,7 @@ fn members_list_rejects_explicit_null_optional_fields() {
         let output = run_with_env(
             &[
                 "organization",
-                "members",
+                "member",
                 "list",
                 "acme",
                 "--json",
@@ -1649,7 +1649,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
     let history = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "history",
             "acme-research",
             "--limit",
@@ -1682,7 +1682,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
     let update = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "update",
             "acme-research",
             "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1705,7 +1705,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
     let remove = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "remove",
             "acme-research",
             "mem_01k0z6r1w8f4jy2m7q9v3x5abd",
@@ -1783,7 +1783,7 @@ fn membership_management_preserves_closed_authorization_and_conflict_outcomes() 
         (
             vec![
                 "organization",
-                "members",
+                "member",
                 "history",
                 "acme",
                 "--json",
@@ -1799,7 +1799,7 @@ fn membership_management_preserves_closed_authorization_and_conflict_outcomes() 
         (
             vec![
                 "organization",
-                "members",
+                "member",
                 "update",
                 "acme",
                 "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1818,7 +1818,7 @@ fn membership_management_preserves_closed_authorization_and_conflict_outcomes() 
         (
             vec![
                 "organization",
-                "members",
+                "member",
                 "remove",
                 "acme",
                 "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1877,7 +1877,7 @@ fn membership_management_human_reports_use_the_expected_streams() {
     let history = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "history",
             "acme",
             "--allow-insecure-http",
@@ -1905,7 +1905,7 @@ fn membership_management_human_reports_use_the_expected_streams() {
     let rejected = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "update",
             "acme",
             "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1930,7 +1930,7 @@ fn organization_member_remove_rejects_self_route_alias() {
     let output = run_with_env(
         &[
             "organization",
-            "members",
+            "member",
             "remove",
             "acme",
             "me",
@@ -1950,7 +1950,7 @@ fn terminal_membership_commands_require_explicit_confirmation() {
     for args in [
         &[
             "organization",
-            "members",
+            "member",
             "remove",
             "acme",
             "mem_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -1982,7 +1982,7 @@ fn organization_commands_report_missing_credentials_without_network_requests() {
         &["organization", "list", "--json", "--allow-insecure-http"][..],
         &[
             "organization",
-            "members",
+            "member",
             "list",
             "acme",
             "--json",
@@ -2027,7 +2027,7 @@ fn organization_commands_keep_private_not_found_outputs_identical() {
         ][..],
         &[
             "organization",
-            "members",
+            "member",
             "list",
             "private-target",
             "--allow-insecure-http",

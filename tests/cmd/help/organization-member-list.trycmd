@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud organization members list --help
+$ scherzo-cloud organization member list --help
 List organization members
 
-Usage: scherzo-cloud organization members list [OPTIONS] <ORGANIZATION>
+Usage: scherzo-cloud organization member list [OPTIONS] <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

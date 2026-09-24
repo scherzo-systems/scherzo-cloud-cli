@@ -19,7 +19,7 @@ pub(super) struct Command {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     #[command(about = identities::ABOUT)]
-    Identities(identities::Command),
+    Identity(identities::Command),
     #[command(about = login::ABOUT)]
     Login(login::Command),
     #[command(about = logout::ABOUT)]
@@ -35,7 +35,7 @@ impl Command {
             Some(AuthCommand::Login(command)) => execute_leaf(command, login::Command::execute),
             Some(AuthCommand::Status(command)) => execute_leaf(command, status::Command::execute),
             Some(AuthCommand::Logout(command)) => execute_leaf(command, logout::Command::execute),
-            Some(AuthCommand::Identities(command)) => command.execute(),
+            Some(AuthCommand::Identity(command)) => command.execute(),
         }
     }
 }

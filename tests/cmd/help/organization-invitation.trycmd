@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud organization invitations --help
+$ scherzo-cloud organization invitation --help
 Manage organization invitations
 
-Usage: scherzo-cloud organization invitations [COMMAND]
+Usage: scherzo-cloud organization invitation [COMMAND]
 
 Commands:
   issue   Issue an organization invitation

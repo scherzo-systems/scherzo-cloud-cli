@@ -35,10 +35,10 @@ pub(super) struct Command {
 enum RunCommand {
     #[command(about = "Create a Scherzo Cloud run")]
     Create(CreateCommand),
+    #[command(about = inputs::ABOUT)]
+    Input(inputs::Command),
     #[command(about = input_set::ABOUT)]
     InputSet(input_set::Command),
-    #[command(about = inputs::ABOUT)]
-    Inputs(inputs::Command),
     #[command(about = "Show a Scherzo Cloud run")]
     Show(ShowCommand),
     #[command(about = "Wait for a Scherzo Cloud run")]
@@ -152,7 +152,7 @@ impl Command {
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::InputSet(command)) => command.execute(),
-            Some(RunCommand::Inputs(command)) => command.execute(),
+            Some(RunCommand::Input(command)) => command.execute(),
             Some(RunCommand::Show(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],

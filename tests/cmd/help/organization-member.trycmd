@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud organization members --help
+$ scherzo-cloud organization member --help
 Manage Scherzo Cloud organization members
 
-Usage: scherzo-cloud organization members [COMMAND]
+Usage: scherzo-cloud organization member [COMMAND]
 
 Commands:
   history  List organization membership history

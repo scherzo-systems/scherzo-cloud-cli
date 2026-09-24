@@ -41,7 +41,7 @@ impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         super::super::execute_deployment_command(
             self.command,
-            &["organization", "members"],
+            &["organization", "member"],
             "configure Scherzo Cloud organization access",
             |command, deployment| match command {
                 MembersCommand::List(command) => command

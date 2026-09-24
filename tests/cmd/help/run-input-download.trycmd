@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud run inputs download --help
+$ scherzo-cloud run input download --help
 Download and verify retained input members atomically
 
-Usage: scherzo-cloud run inputs download [OPTIONS] --output <DIRECTORY> <ORGANIZATION> <RUN>
+Usage: scherzo-cloud run input download [OPTIONS] --output <DIRECTORY> <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

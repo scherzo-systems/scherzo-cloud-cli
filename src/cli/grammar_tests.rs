@@ -44,13 +44,13 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         "limit" => match path {
             "organization audit list" => "limit:100",
             "artifact list"
-            | "auth identities list"
+            | "auth identity list"
             | "delegation list"
             | "invitation list"
             | "organization list"
-            | "organization invitations list"
-            | "organization members list"
-            | "organization members history"
+            | "organization invitation list"
+            | "organization member list"
+            | "organization member history"
             | "project list"
             | "publication list"
             | "runner pool list"
@@ -66,16 +66,16 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
             let family = if matches!(
                 path,
                 "auth login"
-                    | "auth identities link"
+                    | "auth identity link"
                     | "account deletion cancel"
                     | "organization deletion cancel"
             ) {
                 "streaming-events"
             } else if matches!(path, "auth logout" | "auth status") {
                 "sign-in"
-            } else if path.starts_with("auth identities ") {
+            } else if path.starts_with("auth identity ") {
                 "identity"
-            } else if path.starts_with("organization invitations ") {
+            } else if path.starts_with("organization invitation ") {
                 "invitation"
             } else if path.starts_with("account deletion ")
                 || path.starts_with("organization deletion ")
@@ -255,7 +255,7 @@ fn violations(root: &Command) -> BTreeSet<String> {
 
 // A ratchet: entries must be unique, sorted, and observed. Each entry has one burn-down owner.
 const BASELINE: &[(&str, &str)] = &[
-    ("confirmation|auth identities remove", "LIV-2427"),
+    ("confirmation|auth identity remove", "LIV-2427"),
     ("confirmation|github installation disconnect", "LIV-2427"),
     ("confirmation|project repository detach", "LIV-2427"),
     ("confirmation|project runner-pool remove", "LIV-2427"),
@@ -270,10 +270,6 @@ const BASELINE: &[(&str, &str)] = &[
         "description|github installation list|project repository installation list",
         "LIV-2428",
     ),
-    ("group-token|auth identities", "LIV-2425"),
-    ("group-token|organization invitations", "LIV-2425"),
-    ("group-token|organization members", "LIV-2425"),
-    ("group-token|run inputs", "LIV-2425"),
     ("leaf-token|github installation disconnect", "LIV-2426"),
     ("leaf-token|project repository detach", "LIV-2426"),
     (
@@ -285,7 +281,7 @@ const BASELINE: &[(&str, &str)] = &[
         "LIV-2427",
     ),
     (
-        "option-help|yes|account deletion request|organization invitations revoke",
+        "option-help|yes|account deletion request|organization invitation revoke",
         "LIV-2427",
     ),
     (
@@ -293,15 +289,15 @@ const BASELINE: &[(&str, &str)] = &[
         "LIV-2427",
     ),
     (
-        "option-help|yes|account deletion request|organization members remove",
+        "option-help|yes|account deletion request|organization member remove",
+        "LIV-2427",
+    ),
+    (
+        "option-help|yes|account deletion request|run input delete",
         "LIV-2427",
     ),
     (
         "option-help|yes|account deletion request|run input-set delete",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|run inputs delete",
         "LIV-2427",
     ),
     (
@@ -325,7 +321,7 @@ const BASELINE: &[(&str, &str)] = &[
         "LIV-2422",
     ),
     (
-        "placeholder|--output|artifact download|run inputs download",
+        "placeholder|--output|artifact download|run input download",
         "LIV-2422",
     ),
 ];
@@ -339,8 +335,6 @@ fn check_baseline(observed: &BTreeSet<String>, baseline: &[(&str, &str)]) -> Res
         }
         let expected_owner = if id.starts_with("placeholder|") {
             "LIV-2422"
-        } else if id.starts_with("group-token|") {
-            "LIV-2425"
         } else if id.starts_with("leaf-token|") {
             "LIV-2426"
         } else if id.starts_with("confirmation|") || id.starts_with("option-help|yes|") {
@@ -654,7 +648,7 @@ fn parameterized_option_classes_are_isolated_but_ratchet_within_each_class() {
     );
     assert_eq!(
         semantic_class("auth login", "json"),
-        semantic_class("auth identities link", "json")
+        semantic_class("auth identity link", "json")
     );
     assert_ne!(
         semantic_class("organization audit list", "limit"),
@@ -673,7 +667,7 @@ fn parameterized_option_classes_are_isolated_but_ratchet_within_each_class() {
                     .arg(limit("200")),
             )
             .subcommand(
-                Command::new("members")
+                Command::new("member")
                     .subcommand(Command::new("list").about("Members").arg(limit("changed"))),
             ),
     );
@@ -699,7 +693,7 @@ fn parameterized_option_classes_are_isolated_but_ratchet_within_each_class() {
                 ),
             )
             .subcommand(
-                Command::new("identities").subcommand(
+                Command::new("identity").subcommand(
                     Command::new("link").about("Link").arg(
                         Arg::new("json")
                             .long("json")

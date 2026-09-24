@@ -130,7 +130,7 @@ fn organization_invitation_issue_sends_target_and_idempotency_key() {
     let output = run_with_env(
         &[
             "organization",
-            "invitations",
+            "invitation",
             "issue",
             ORG_ID,
             "--principal",
@@ -177,7 +177,7 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     let output = run_with_env(
         &[
             "organization",
-            "invitations",
+            "invitation",
             "list",
             ORG_ID,
             "--limit",
@@ -358,7 +358,7 @@ fn invitation_decline_and_owner_revoke_have_deterministic_success_output() {
     let revoke = run_with_env(
         &[
             "organization",
-            "invitations",
+            "invitation",
             "revoke",
             ORG_ID,
             INVITATION_ID,
@@ -526,7 +526,7 @@ fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
         (
             vec![
                 "organization",
-                "invitations",
+                "invitation",
                 "issue",
                 ORG_ID,
                 "--email",

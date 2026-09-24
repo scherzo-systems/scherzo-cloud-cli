@@ -745,23 +745,23 @@ results preserve any server actions as complete opaque JSON values. The CLI does
 validate action IDs or guide origins, fetch guides, infer commands, or execute actions.
 Status always contacts the public API, including when no local credential exists.
 
-Manage the OIDC identities linked to the signed-in account under `auth identities`:
+Manage the OIDC identities linked to the signed-in account under `auth identity`:
 
 ```sh
 # List one page; the current local-session identity is marked when that page contains it.
-scherzo-cloud auth identities list --limit 50
+scherzo-cloud auth identity list --limit 50
 
 # Continue when the result includes a next cursor.
-scherzo-cloud auth identities list --limit 50 --cursor "$NEXT_CURSOR"
+scherzo-cloud auth identity list --limit 50 --cursor "$NEXT_CURSOR"
 
 # Prove control of another identity in a fresh browser/device flow and link it.
-scherzo-cloud auth identities link
+scherzo-cloud auth identity link
 
 # Remove a non-current identity by the opaque ID returned by list.
-scherzo-cloud auth identities remove idn_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud auth identity remove idn_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
-`auth identities link` keeps the session that passed preflight as the acting identity
+`auth identity link` keeps the session that passed preflight as the acting identity
 and uses a separately issued access token only as the proposed identity proof. It
 requests fresh browser/device authorization without `offline_access` and never writes
 the proof to the credential store. The final request stays bound to the preflight
@@ -919,12 +919,12 @@ scherzo-cloud organization deletion request acme-labs --yes
 scherzo-cloud organization deletion cancel acme-labs
 
 # Read one active member-directory page. Both pagination options are optional.
-scherzo-cloud organization members list acme-labs \
+scherzo-cloud organization member list acme-labs \
   --limit 50 \
   --cursor opaque-continuation
 
 # Read one owner-only page containing active, suspended, and ended memberships.
-scherzo-cloud organization members history acme-labs --limit 50
+scherzo-cloud organization member history acme-labs --limit 50
 
 # Read one owner-only page of privacy-safe audit records.
 scherzo-cloud organization audit list acme-labs \
@@ -932,12 +932,12 @@ scherzo-cloud organization audit list acme-labs \
   --cursor opaque-continuation
 
 # Change another member's organization role.
-scherzo-cloud organization members update acme-labs \
+scherzo-cloud organization member update acme-labs \
   mem_01k0z6r1w8f4jy2m7q9v3x5abc \
   --role owner
 
 # Permanently end another member's membership.
-scherzo-cloud organization members remove acme-labs \
+scherzo-cloud organization member remove acme-labs \
   mem_01k0z6r1w8f4jy2m7q9v3x5abc \
   --yes
 
@@ -1011,16 +1011,16 @@ invitation history, and revoke an outstanding invitation:
 
 ```sh
 # Issue to exactly one target kind.
-scherzo-cloud organization invitations issue acme-labs \
+scherzo-cloud organization invitation issue acme-labs \
   --principal prn_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud organization invitations issue acme-labs \
+scherzo-cloud organization invitation issue acme-labs \
   --email teammate@example.com
 
 # Read one owner-only page, including terminal history.
-scherzo-cloud organization invitations list acme-labs --limit 50
+scherzo-cloud organization invitation list acme-labs --limit 50
 
 # Revoke an outstanding invitation.
-scherzo-cloud organization invitations revoke acme-labs \
+scherzo-cloud organization invitation revoke acme-labs \
   inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
@@ -1378,12 +1378,12 @@ acceptance commitment rather than claiming that no run was created.
 Retained content is explicit run-scoped administration:
 
 ```sh
-scherzo-cloud run inputs show acme-labs "$run_id" --json
+scherzo-cloud run input show acme-labs "$run_id" --json
 # Omit --member to download every member, or repeat it for an exact subset.
-scherzo-cloud run inputs download acme-labs "$run_id" \
+scherzo-cloud run input download acme-labs "$run_id" \
   --member inputs/request \
   --output ./retained-inputs --json
-scherzo-cloud run inputs delete acme-labs "$run_id" --yes
+scherzo-cloud run input delete acme-labs "$run_id" --yes
 ```
 
 A download first validates the retained inventory, requests capabilities in batches of at

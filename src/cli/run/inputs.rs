@@ -88,22 +88,22 @@ struct DeleteCommand {
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         match self.command {
-            None => super::super::print_help(&[super::NAME, "inputs"]),
+            None => super::super::print_help(&[super::NAME, "input"]),
             Some(InputsCommand::Show(command)) => super::super::execute_deployment_command(
                 Some(command),
-                &[super::NAME, "inputs"],
+                &[super::NAME, "input"],
                 "configure retained run input access",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(InputsCommand::Download(command)) => super::super::execute_deployment_command(
                 Some(command),
-                &[super::NAME, "inputs"],
+                &[super::NAME, "input"],
                 "configure retained run input download",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(InputsCommand::Delete(command)) => super::super::execute_deployment_command(
                 Some(command),
-                &[super::NAME, "inputs"],
+                &[super::NAME, "input"],
                 "configure retained run input deletion",
                 |command, deployment| command.execute(deployment.clone()),
             ),

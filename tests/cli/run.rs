@@ -1875,7 +1875,7 @@ fn input_set_and_retained_input_show_commands_emit_structural_json() {
     let retained_output = run_with_env(
         &[
             "run",
-            "inputs",
+            "input",
             "show",
             ORGANIZATION,
             RUN_ID,
@@ -1966,7 +1966,7 @@ fn run_input_http_decoders_reject_duplicate_members_before_using_success_respons
     let output = run_with_env(
         &[
             "run",
-            "inputs",
+            "input",
             "show",
             ORGANIZATION,
             RUN_ID,
@@ -2052,7 +2052,7 @@ fn run_input_http_decoders_reject_duplicate_members_before_using_success_respons
     let output = run_with_env(
         &[
             "run",
-            "inputs",
+            "input",
             "download",
             ORGANIZATION,
             RUN_ID,
@@ -2085,7 +2085,7 @@ fn retained_inputs_download_uses_inventory_bound_logical_paths() {
     let output = run_with_env(
         &[
             "run",
-            "inputs",
+            "input",
             "download",
             ORGANIZATION,
             RUN_ID,
@@ -2174,7 +2174,7 @@ fn retained_inputs_download_selects_exact_members_only() {
     let output = run_with_env(
         &[
             "run",
-            "inputs",
+            "input",
             "download",
             ORGANIZATION,
             RUN_ID,
@@ -2231,7 +2231,7 @@ fn retained_inputs_download_accepts_a_relative_destination() {
     command
         .args([
             "run",
-            "inputs",
+            "input",
             "download",
             ORGANIZATION,
             RUN_ID,
@@ -2276,14 +2276,7 @@ fn retained_inputs_json_download_rejects_an_unrepresentable_destination_before_t
         .join(std::ffi::OsString::from_vec(b"download-\xff".to_vec()));
     let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
     command
-        .args([
-            "run",
-            "inputs",
-            "download",
-            ORGANIZATION,
-            RUN_ID,
-            "--output",
-        ])
+        .args(["run", "input", "download", ORGANIZATION, RUN_ID, "--output"])
         .arg(&destination)
         .args(["--json", "--allow-insecure-http"])
         .env_remove(CREDENTIALS_FILE_VARIABLE);
@@ -2318,7 +2311,7 @@ fn retained_input_integrity_failure_leaves_no_destination() {
     let output = run_with_env(
         &[
             "run",
-            "inputs",
+            "input",
             "download",
             ORGANIZATION,
             RUN_ID,
@@ -2403,7 +2396,7 @@ fn interrupted_retained_input_download_removes_verified_private_staging() {
     command
         .args([
             "run",
-            "inputs",
+            "input",
             "download",
             ORGANIZATION,
             RUN_ID,
@@ -2467,7 +2460,7 @@ fn interrupted_retained_input_download_removes_verified_private_staging() {
 #[test]
 fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_request() {
     let unconfirmed = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
-        .args(["run", "inputs", "delete", ORGANIZATION, RUN_ID])
+        .args(["run", "input", "delete", ORGANIZATION, RUN_ID])
         .output()
         .unwrap();
     assert_eq!(unconfirmed.status.code(), Some(2));
@@ -2483,7 +2476,7 @@ fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_reques
     let output = run_with_env(
         &[
             "run",
-            "inputs",
+            "input",
             "delete",
             ORGANIZATION,
             RUN_ID,

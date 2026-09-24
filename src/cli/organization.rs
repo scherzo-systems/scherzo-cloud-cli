@@ -38,13 +38,13 @@ enum OrganizationCommand {
     #[command(about = super::deletion::organization_about())]
     Deletion(super::deletion::OrganizationCommand),
     #[command(about = "Manage organization invitations")]
-    Invitations(super::invitation::OrganizationCommand),
+    Invitation(super::invitation::OrganizationCommand),
     #[command(about = leave::ABOUT)]
     Leave(leave::Command),
     #[command(about = list::ABOUT)]
     List(list::Command),
     #[command(about = members::ABOUT)]
-    Members(members::Command),
+    Member(members::Command),
     #[command(about = show::ABOUT)]
     Show(show::Command),
     #[command(about = update::ABOUT)]
@@ -130,14 +130,14 @@ impl Command {
             Some(OrganizationCommand::List(command)) => {
                 execute_leaf(command, list::Command::execute)
             }
-            Some(OrganizationCommand::Invitations(command)) => command.execute(),
+            Some(OrganizationCommand::Invitation(command)) => command.execute(),
             Some(OrganizationCommand::Show(command)) => {
                 execute_leaf(command, show::Command::execute)
             }
             Some(OrganizationCommand::Update(command)) => {
                 execute_leaf(command, update::Command::execute)
             }
-            Some(OrganizationCommand::Members(command)) => command.execute(),
+            Some(OrganizationCommand::Member(command)) => command.execute(),
         }
     }
 }

@@ -277,7 +277,7 @@ impl OrganizationCommand {
     pub(super) fn execute(self) -> super::CommandResult {
         super::execute_deployment_command(
             self.command,
-            &["organization", "invitations"],
+            &["organization", "invitation"],
             ERROR_CONTEXT,
             |command, deployment| match command {
                 OrganizationInvitationCommand::Issue(command) => {

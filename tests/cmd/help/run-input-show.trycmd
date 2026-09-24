@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud run inputs show --help
+$ scherzo-cloud run input show --help
 Show the retained input inventory for a run
 
-Usage: scherzo-cloud run inputs show [OPTIONS] <ORGANIZATION> <RUN>
+Usage: scherzo-cloud run input show [OPTIONS] <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

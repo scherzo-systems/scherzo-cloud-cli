@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud auth identities --help
+$ scherzo-cloud auth identity --help
 Manage your linked sign-in identities
 
-Usage: scherzo-cloud auth identities [COMMAND]
+Usage: scherzo-cloud auth identity [COMMAND]
 
 Commands:
   link    Link another sign-in identity

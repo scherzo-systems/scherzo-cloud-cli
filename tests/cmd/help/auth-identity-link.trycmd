@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud auth identities link --help
+$ scherzo-cloud auth identity link --help
 Link another sign-in identity
 
-Usage: scherzo-cloud auth identities link [OPTIONS]
+Usage: scherzo-cloud auth identity link [OPTIONS]
 
 Options:
       --workload-token-file <PATH|->   Prove a workload identity with a fresh token from a private file, or - for standard input

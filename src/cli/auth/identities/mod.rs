@@ -39,7 +39,7 @@ impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         super::super::execute_deployment_command(
             self.command,
-            &["auth", "identities"],
+            &["auth", "identity"],
             "configure Scherzo Cloud identity access",
             |command, deployment| match command {
                 IdentityCommand::List(command) => {

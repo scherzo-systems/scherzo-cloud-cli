@@ -1,18 +1,16 @@
 ```console
-$ scherzo-cloud auth identities list --help
-List linked sign-in identities
+$ scherzo-cloud auth identity remove --help
+Remove a linked sign-in identity
 
-Usage: scherzo-cloud auth identities list [OPTIONS]
+Usage: scherzo-cloud auth identity remove [OPTIONS] <IDENTITY_ID>
+
+Arguments:
+  <IDENTITY_ID>  Exact linked identity ID
 
 Options:
-      --limit <LIMIT>                  Maximum items to return (1-200)
-      --cursor <CURSOR>                Opaque continuation cursor
       --json                           Print the identity result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                           Print help
-
-Pagination:
-  This command returns one page. Pass --cursor <CURSOR> to continue.
 
 ```

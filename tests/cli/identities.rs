@@ -152,7 +152,7 @@ fn list_returns_one_exact_page_with_current_and_provenance_fields() {
     let output = run_with_env(
         &[
             "auth",
-            "identities",
+            "identity",
             "list",
             "--limit",
             "2",
@@ -213,7 +213,7 @@ fn service_link_reports_the_committed_result_when_interrupted_after_dispatch() {
     command
         .args([
             "auth",
-            "identities",
+            "identity",
             "link",
             "--service-api-key-file",
             service_key_path.to_str().unwrap(),
@@ -288,7 +288,7 @@ fn link_uses_fresh_separate_browser_proof_and_keeps_the_local_session() {
     let output = run_with_env(
         &[
             "auth",
-            "identities",
+            "identity",
             "link",
             "--json",
             "--allow-insecure-http",
@@ -387,7 +387,7 @@ fn link_keeps_the_preflight_acting_session_across_browser_proof() {
     command
         .args([
             "auth",
-            "identities",
+            "identity",
             "link",
             "--json",
             "--allow-insecure-http",
@@ -470,7 +470,7 @@ fn link_reports_identity_unavailable_without_exposing_or_replacing_credentials()
     let output = run_with_env(
         &[
             "auth",
-            "identities",
+            "identity",
             "link",
             "--json",
             "--allow-insecure-http",
@@ -528,7 +528,7 @@ fn service_link_reports_workload_policy_and_quantity_failures() {
         let output = run_with_env(
             &[
                 "auth",
-                "identities",
+                "identity",
                 "link",
                 "--service-api-key-file",
                 service_key_path.to_str().unwrap(),
@@ -586,7 +586,7 @@ fn link_does_not_report_an_unchanged_session_after_rejected_credential_cleanup()
     let output = run_with_env(
         &[
             "auth",
-            "identities",
+            "identity",
             "link",
             "--json",
             "--allow-insecure-http",
@@ -676,7 +676,7 @@ fn removing_the_former_session_identity_keeps_the_forced_login_session() {
     let removal = run_with_env(
         &[
             "auth",
-            "identities",
+            "identity",
             "remove",
             CURRENT_IDENTITY_ID,
             "--json",
@@ -742,7 +742,7 @@ fn remove_reports_freshness_and_retention_outcomes() {
         let output = run_with_env(
             &[
                 "auth",
-                "identities",
+                "identity",
                 "remove",
                 LINKED_IDENTITY_ID,
                 "--json",
@@ -777,7 +777,7 @@ fn service_remove_reports_disabled_workload_identity_linking() {
     let output = run_with_env(
         &[
             "auth",
-            "identities",
+            "identity",
             "remove",
             LINKED_IDENTITY_ID,
             "--service-api-key-file",
@@ -836,7 +836,7 @@ fn service_identity_link_uses_explicit_private_key_and_workload_token_files() {
     let output = run_with_env(
         &[
             "auth",
-            "identities",
+            "identity",
             "link",
             "--service-api-key-file",
             service_key_path.to_str().unwrap(),

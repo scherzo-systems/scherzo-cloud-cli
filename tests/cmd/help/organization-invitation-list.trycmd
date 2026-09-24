@@ -1,18 +1,21 @@
 ```console
-$ scherzo-cloud organization invitations issue --help
-Issue an organization invitation
+$ scherzo-cloud organization invitation list --help
+List organization invitation history
 
-Usage: scherzo-cloud organization invitations issue [OPTIONS] <--principal <PRINCIPAL>|--email <EMAIL>> <ORGANIZATION>
+Usage: scherzo-cloud organization invitation list [OPTIONS] <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
 
 Options:
-      --principal <PRINCIPAL>          Invite an exact active principal ID
-      --email <EMAIL>                  Invite one email address
+      --limit <LIMIT>                  Maximum items to return (1-200)
+      --cursor <CURSOR>                Opaque continuation cursor
       --json                           Print the invitation result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                           Print help
+
+Pagination:
+  This command returns one page. Pass --cursor <CURSOR> to continue.
 
 ```

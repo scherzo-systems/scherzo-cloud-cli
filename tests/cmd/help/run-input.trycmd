@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud run inputs --help
+$ scherzo-cloud run input --help
 View, download, or delete retained run inputs
 
-Usage: scherzo-cloud run inputs [COMMAND]
+Usage: scherzo-cloud run input [COMMAND]
 
 Commands:
   delete    Make retained input content logically unavailable and schedule cleanup

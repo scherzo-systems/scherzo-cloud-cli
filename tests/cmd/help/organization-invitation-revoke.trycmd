@@ -1,21 +1,18 @@
 ```console
-$ scherzo-cloud organization invitations list --help
-List organization invitation history
+$ scherzo-cloud organization invitation revoke --help
+Revoke an organization invitation
 
-Usage: scherzo-cloud organization invitations list [OPTIONS] <ORGANIZATION>
+Usage: scherzo-cloud organization invitation revoke [OPTIONS] --yes <ORGANIZATION> <INVITATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
+  <INVITATION>    Exact invitation ID
 
 Options:
-      --limit <LIMIT>                  Maximum items to return (1-200)
-      --cursor <CURSOR>                Opaque continuation cursor
+      --yes                            Confirm invitation revocation
       --json                           Print the invitation result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                           Print help
-
-Pagination:
-  This command returns one page. Pass --cursor <CURSOR> to continue.
 
 ```

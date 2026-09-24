@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud run inputs delete --help
+$ scherzo-cloud run input delete --help
 Make retained input content logically unavailable and schedule cleanup
 
-Usage: scherzo-cloud run inputs delete [OPTIONS] --yes <ORGANIZATION> <RUN>
+Usage: scherzo-cloud run input delete [OPTIONS] --yes <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

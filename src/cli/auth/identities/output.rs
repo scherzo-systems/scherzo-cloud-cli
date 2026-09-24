@@ -96,7 +96,7 @@ pub(super) fn write_remove(
             deployment,
             "not_found",
             None,
-            "! Linked identity not found or unavailable.\n\nList the identities attached to your account:\n  scherzo-cloud auth identities list",
+            "! Linked identity not found or unavailable.\n\nList the identities attached to your account:\n  scherzo-cloud auth identity list",
             OutcomeClass::GeneralFailure,
             json,
         ),
@@ -278,7 +278,7 @@ impl LinkOutput {
                         local_session_identity: "unchanged",
                     }
                     .with_credential_state(credential_state),
-                    "! The identity-link result is unknown.\n\nList linked identities before trying again:\n  scherzo-cloud auth identities list",
+                    "! The identity-link result is unknown.\n\nList linked identities before trying again:\n  scherzo-cloud auth identity list",
                     super::super::super::unreachable_outcome_class(*category),
                 ),
             },

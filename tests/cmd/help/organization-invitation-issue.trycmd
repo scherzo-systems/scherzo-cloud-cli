@@ -1,15 +1,15 @@
 ```console
-$ scherzo-cloud organization invitations revoke --help
-Revoke an organization invitation
+$ scherzo-cloud organization invitation issue --help
+Issue an organization invitation
 
-Usage: scherzo-cloud organization invitations revoke [OPTIONS] --yes <ORGANIZATION> <INVITATION>
+Usage: scherzo-cloud organization invitation issue [OPTIONS] <--principal <PRINCIPAL>|--email <EMAIL>> <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <INVITATION>    Exact invitation ID
 
 Options:
-      --yes                            Confirm invitation revocation
+      --principal <PRINCIPAL>          Invite an exact active principal ID
+      --email <EMAIL>                  Invite one email address
       --json                           Print the invitation result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
