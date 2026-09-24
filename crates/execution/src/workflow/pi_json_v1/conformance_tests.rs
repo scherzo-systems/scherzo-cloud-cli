@@ -1230,6 +1230,90 @@ async fn pinned_real_pi_03_no_value_and_typed_terminal_failures_conform() {
     .expect("pinned real-Pi terminal conformance watchdog expired");
 }
 
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_pi_03_pre_settlement_continuation_conforms() {
+    let _executable = require_conformance_executable();
+    for (mode, expected) in [
+        (
+            AgentValueMode::Response {
+                output: Arc::from("response"),
+            },
+            AgentOutcome::Completed(CompletedAgentInvocation::Response(
+                BoundedAgentResponse::from_bounded(Arc::from("second")),
+            )),
+        ),
+        (
+            AgentValueMode::None,
+            AgentOutcome::Completed(CompletedAgentInvocation::NoValue),
+        ),
+    ] {
+        let fixture = RealPiFixture::new(mode, false, false);
+        fs::write(
+            fixture
+                .project_directory
+                .join(".pi/extensions/before-settle.ts"),
+            concat!(
+                "import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';\n",
+                "export default function (pi: ExtensionAPI) {\n",
+                "  let requested = false;\n",
+                "  pi.on('agent_before_settle', () => {\n",
+                "    if (requested) return;\n",
+                "    requested = true;\n",
+                "    return { entries: [{ type: 'custom_message', customType: 'continuation', ",
+                "content: 'CONTINUATION_MARKER', display: false }], continue: true };\n",
+                "  });\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+        let mut running = RunningRealPi::launch(fixture);
+        running.release_startup().await;
+        let first = running.fixture.controller.next("model").await;
+        first.release(json!({"kind": "text", "blocks": ["first"], "stopReason": "stop"}));
+        running.await_started().await;
+        let second = running.fixture.controller.next("model").await;
+        assert!(
+            second.value["messages"]
+                .to_string()
+                .contains("CONTINUATION_MARKER")
+        );
+        second.release(json!({"kind": "text", "blocks": ["second"], "stopReason": "stop"}));
+        let (mut fixture, outcome) = running.finish().await;
+        assert_eq!(outcome, expected);
+        let milestones = std::iter::from_fn(|| fixture.observations.try_recv().ok())
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::Lifecycle { milestone } => Some(*milestone),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        use crate::workflow::agent::AgentLifecycleMilestone as Milestone;
+        assert_eq!(
+            milestones
+                .iter()
+                .filter(|&&m| m == Milestone::HarnessStarted)
+                .count(),
+            2
+        );
+        assert_eq!(
+            milestones
+                .iter()
+                .filter(|&&m| m == Milestone::HarnessCompleted)
+                .count(),
+            2
+        );
+        assert_eq!(
+            milestones
+                .iter()
+                .filter(|&&m| m == Milestone::HarnessQuiescent)
+                .count(),
+            1
+        );
+        fixture.assert_configuration_unchanged();
+        fixture.controller.shutdown().await;
+    }
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"

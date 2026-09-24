@@ -8,6 +8,7 @@ use crate::workflow::agent::{AgentOutcome, CapturedJson};
 
 const CWD: &str = "/execution/worktree";
 const RESPONSE_SUCCESS: &[u8] = include_bytes!("fixtures/response-success.jsonl");
+const CONTEXT_BOUNDARIES: &[u8] = include_bytes!("fixtures/context-boundaries.jsonl");
 const NATIVE_RECOVERY: &[u8] = include_bytes!("fixtures/native-recovery.jsonl");
 const SIBLING_RESULT_CORRECTION: &[u8] = include_bytes!("fixtures/sibling-result-correction.jsonl");
 const TERMINAL_TOOL_USE: &[u8] = include_bytes!("fixtures/terminal-tool-use.jsonl");
@@ -235,6 +236,37 @@ fn recorded_response_is_ordered_bounded_and_repeatable_across_chunking() {
         })
         .collect::<String>();
     assert_eq!(text, "hello world");
+}
+
+#[test]
+fn context_entries_and_partial_updates_do_not_change_terminal_authority() {
+    let events = values(CONTEXT_BOUNDARIES);
+    assert_eq!(
+        completed_response(&replay(CONTEXT_BOUNDARIES, AgentValueKind::Response).outcome),
+        "result"
+    );
+
+    // The new context edit and retain-none compaction entries are observations,
+    // not substitutes for a completed agent_end and settlement.
+    let before_end = replay(
+        &encoded(&events[..events.len() - 2]),
+        AgentValueKind::Response,
+    );
+    assert_failure(
+        &before_end.outcome,
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+
+    let mut unknown_terminal = events.clone();
+    unknown_terminal[events.len() - 2]["messages"][0]["stopReason"] = json!("pending");
+    let pending = replay(&encoded(&unknown_terminal), AgentValueKind::Response);
+    assert_failure(&pending.outcome, AgentFailureCause::HarnessProtocolFailed);
+
+    let mut malformed_lifecycle = events;
+    let end = malformed_lifecycle.len() - 2;
+    malformed_lifecycle[end]["willRetry"] = json!("false");
+    let invalid = replay(&encoded(&malformed_lifecycle), AgentValueKind::Response);
+    assert_failure(&invalid.outcome, AgentFailureCause::HarnessProtocolFailed);
 }
 
 #[test]
@@ -489,24 +521,33 @@ fn session_header_treats_native_id_and_timestamp_formats_as_informational() {
 }
 
 #[test]
-fn agent_start_after_non_retrying_end_is_a_protocol_failure() {
-    let terminal = assistant(json!([]), "stop", 2);
-    let mut parser = parser(AgentValueKind::None);
-    parser
-        .push_ignoring(&encoded(&[
-            session(),
-            json!({"type": "agent_start"}),
-            json!({"type": "agent_end", "messages": [terminal], "willRetry": false}),
-        ]))
-        .unwrap();
-
+fn pre_settlement_continuation_replaces_the_terminal_candidate() {
+    let first = assistant(json!([{"type": "text", "text": "first"}]), "stop", 2);
+    let final_message = assistant(json!([{"type": "text", "text": "second"}]), "stop", 3);
+    let before_continuation = [
+        session(),
+        json!({"type": "agent_start"}),
+        json!({"type": "agent_end", "messages": [first], "willRetry": false}),
+        json!({"type": "entry_appended", "entry": {"type": "custom_message", "content": "continue"}}),
+    ];
+    // The first non-retrying end has not settled; its candidate cannot commit.
+    assert_failure(
+        &replay(&encoded(&before_continuation), AgentValueKind::Response).outcome,
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+    let mut continued = before_continuation.to_vec();
+    continued.extend([
+        json!({"type": "agent_start"}),
+        json!({"type": "agent_end", "messages": [final_message], "willRetry": false}),
+        json!({"type": "agent_settled"}),
+    ]);
     assert_eq!(
-        parser.push_ignoring(b"{\"type\":\"agent_start\"}\n"),
-        Err(AgentFailureCause::HarnessProtocolFailed)
+        completed_response(&replay(&encoded(&continued), AgentValueKind::Response).outcome),
+        "second"
     );
     assert_eq!(
-        protocol_rejection(&parser.finish(PiJsonV1ProcessCompletion::exited(false)))["detail"]["reason"],
-        "event_transition_invalid"
+        replay(&encoded(&continued), AgentValueKind::None).outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
     );
 }
 

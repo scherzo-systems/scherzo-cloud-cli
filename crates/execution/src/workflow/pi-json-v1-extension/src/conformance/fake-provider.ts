@@ -1,13 +1,18 @@
 import type {
   AssistantMessage,
   AssistantMessageEventStream,
-  Context,
+  JsonObject,
   Model,
   SimpleStreamOptions,
   StopReason,
   ToolCall,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+  createAssistantMessageEventStream,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+} from "@earendil-works/pi-ai";
 import {
   createBashToolDefinition,
   type ExtensionAPI,
@@ -41,7 +46,8 @@ interface TextResponse extends ResponseUsage {
 interface ToolCallResponse {
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  // The controller response is parsed from a JSON frame before decoding.
+  arguments: JsonObject;
 }
 
 interface ToolCallsResponse extends ResponseUsage {
@@ -154,7 +160,7 @@ function decodeResponse(value: unknown): ProviderResponse {
       call: {
         id: value.call.id,
         name: value.call.name,
-        arguments: value.call.arguments,
+        arguments: value.call.arguments as JsonObject,
       },
     };
   }
@@ -176,7 +182,7 @@ function decodeResponse(value: unknown): ProviderResponse {
       call: {
         id: value.call.id,
         name: value.call.name,
-        arguments: value.call.arguments,
+        arguments: value.call.arguments as JsonObject,
       },
       message: value.message,
     };
@@ -195,7 +201,7 @@ function decodeResponse(value: unknown): ProviderResponse {
       call: {
         id: value.call.id,
         name: value.call.name,
-        arguments: value.call.arguments,
+        arguments: value.call.arguments as JsonObject,
       },
     };
   }
@@ -463,7 +469,7 @@ async function emitOpenToolCall(
     const delta = encodedArguments.slice(offset, offset + 1024);
     partialJson += delta;
     try {
-      toolCall.arguments = JSON.parse(partialJson) as Record<string, unknown>;
+      toolCall.arguments = JSON.parse(partialJson) as JsonObject;
     } catch {
       // OpenAI Codex exposes the last parseable partial argument object.
     }
@@ -576,7 +582,7 @@ function emitTruncatedToolCall(
 
 function streamFakeProvider(
   model: Model<string>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
@@ -589,9 +595,9 @@ function streamFakeProvider(
         await exchange(
           {
             kind: "model",
-            systemPrompt: context.systemPrompt,
+            systemPrompt: getCurrentSystemPrompt(context.messages),
             messages: context.messages,
-            tools: context.tools,
+            tools: getCurrentTools(context.messages),
             reasoning: options?.reasoning,
           },
           options?.signal,

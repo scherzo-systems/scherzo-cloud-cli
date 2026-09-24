@@ -14,10 +14,10 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.84.2 <0.86.0";
-pub const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.85.1";
+pub const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.84.2 <0.88.0";
+pub const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.87.1";
 const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 84, 2);
-const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 86, 0);
+const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 88, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 7] = [
     "--no-approve",
     "--no-extensions",
@@ -106,7 +106,7 @@ impl ValidatedPiInstallation {
     pub fn fixture(executable: PathBuf) -> Self {
         Self {
             executable,
-            version: PiVersion::fixture(0, 85, 1, PI_JSON_V1_QUALIFICATION_VERSION),
+            version: PiVersion::fixture(0, 87, 1, PI_JSON_V1_QUALIFICATION_VERSION),
             profile: PiCompatibilityProfile::PiJsonV1,
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,

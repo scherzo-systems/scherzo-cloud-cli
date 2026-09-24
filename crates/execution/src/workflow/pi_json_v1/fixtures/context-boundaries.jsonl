@@ -1,0 +1,11 @@
+{"type":"session","version":3,"id":"00000000-0000-4000-8000-000000000005","timestamp":"2026-09-22T19:43:43Z","cwd":"/execution/worktree"}
+{"type":"agent_start"}
+{"type":"message_start","message":{"role":"system","content":"Updated instructions","timestamp":1}}
+{"type":"message_end","message":{"role":"system","content":"Updated instructions","timestamp":1}}
+{"type":"entry_appended","entry":{"type":"context_edit","id":"edit-1","parentId":"message-1","timestamp":"2026-09-22T19:43:43Z","targetId":"message-1","replacement":null}}
+{"type":"entry_appended","entry":{"type":"compaction","id":"compact-1","parentId":"edit-1","timestamp":"2026-09-22T19:43:43Z","summary":"Summary","firstKeptEntryId":"compact-1","tokensBefore":300,"systemMessage":{"role":"system","content":"Updated instructions","toolsAdded":[],"timestamp":1}}}
+{"type":"message_start","message":{"role":"assistant","content":[],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":2}}
+{"type":"message_update","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"draft"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"result"}],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":2}}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"result"}],"api":"test-api","provider":"test-provider","model":"test-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":2}],"willRetry":false}
+{"type":"agent_settled"}

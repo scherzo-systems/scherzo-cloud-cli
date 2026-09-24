@@ -1547,12 +1547,10 @@ struct ProtocolState {
 
 impl ProtocolState {
     fn can_start_agent(&self) -> bool {
-        !self.settled
-            && !self.agent_active
-            && self
-                .last_agent_end
-                .as_ref()
-                .is_none_or(|end| end.will_retry)
+        // willRetry describes Pi's error-retry decision, not whether a queued
+        // message or pre-settlement extension boundary will start another run.
+        // Only settlement closes the lifecycle (accepted results are gated above).
+        !self.settled && !self.agent_active
     }
 
     fn can_settle(&self) -> bool {
