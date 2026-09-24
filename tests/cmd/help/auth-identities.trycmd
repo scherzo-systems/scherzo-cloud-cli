@@ -5,8 +5,8 @@ Manage your linked sign-in identities
 Usage: scherzo-cloud auth identities [COMMAND]
 
 Commands:
-  list    List linked sign-in identities
   link    Link another sign-in identity
+  list    List linked sign-in identities
   remove  Remove a linked sign-in identity
   help    Print this message or the help of the given subcommand(s)
 

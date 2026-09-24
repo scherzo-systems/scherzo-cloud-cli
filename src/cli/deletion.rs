@@ -37,10 +37,10 @@ pub(super) struct AccountCommand {
 
 #[derive(Debug, Subcommand)]
 enum AccountDeletionCommand {
-    #[command(about = "Request account deletion", after_help = ACCOUNT_REQUEST_AFTER_HELP)]
-    Request(AccountRequestCommand),
     #[command(about = "Cancel account deletion", after_help = ACCOUNT_CANCEL_AFTER_HELP)]
     Cancel(CancelCommand),
+    #[command(about = "Request account deletion", after_help = ACCOUNT_REQUEST_AFTER_HELP)]
+    Request(AccountRequestCommand),
 }
 
 #[derive(Debug, Args)]
@@ -52,15 +52,15 @@ pub(super) struct OrganizationCommand {
 #[derive(Debug, Subcommand)]
 enum OrganizationDeletionCommand {
     #[command(
-        about = "Request organization deletion",
-        after_help = ORGANIZATION_REQUEST_AFTER_HELP
-    )]
-    Request(OrganizationRequestCommand),
-    #[command(
         about = "Cancel organization deletion",
         after_help = ORGANIZATION_CANCEL_AFTER_HELP
     )]
     Cancel(OrganizationCancelCommand),
+    #[command(
+        about = "Request organization deletion",
+        after_help = ORGANIZATION_REQUEST_AFTER_HELP
+    )]
+    Request(OrganizationRequestCommand),
 }
 
 #[derive(Debug, Args)]

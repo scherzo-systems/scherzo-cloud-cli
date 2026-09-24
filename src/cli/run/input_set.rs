@@ -36,14 +36,14 @@ pub(super) struct Command {
 enum InputSetCommand {
     #[command(about = "Create an open immutable Run Input Set")]
     Create(CreateCommand),
+    #[command(about = "Logically delete a Run Input Set and schedule content cleanup")]
+    Delete(DeleteCommand),
+    #[command(about = "Seal an uploaded Run Input Set")]
+    Seal(SealCommand),
     #[command(about = "Show a Run Input Set and its manifest")]
     Show(ShowCommand),
     #[command(about = "Upload selected members to an open Run Input Set")]
     Upload(UploadCommand),
-    #[command(about = "Seal an uploaded Run Input Set")]
-    Seal(SealCommand),
-    #[command(about = "Logically delete a Run Input Set and schedule content cleanup")]
-    Delete(DeleteCommand),
 }
 
 // Input-set creation and runner-pool creation share only generic CLI shape; their

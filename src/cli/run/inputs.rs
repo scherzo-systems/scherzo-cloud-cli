@@ -27,12 +27,12 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum InputsCommand {
-    #[command(about = "Show the retained input inventory for a run")]
-    Show(ShowCommand),
-    #[command(about = "Download and verify retained input members atomically")]
-    Download(DownloadCommand),
     #[command(about = "Make retained input content logically unavailable and schedule cleanup")]
     Delete(DeleteCommand),
+    #[command(about = "Download and verify retained input members atomically")]
+    Download(DownloadCommand),
+    #[command(about = "Show the retained input inventory for a run")]
+    Show(ShowCommand),
 }
 
 #[derive(Debug, Args)]

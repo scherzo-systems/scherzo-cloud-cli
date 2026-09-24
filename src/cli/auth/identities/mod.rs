@@ -27,10 +27,10 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum IdentityCommand {
-    #[command(about = list::ABOUT)]
-    List(list::Command),
     #[command(about = link::ABOUT)]
     Link(link::Command),
+    #[command(about = list::ABOUT)]
+    List(list::Command),
     #[command(about = remove::ABOUT)]
     Remove(remove::Command),
 }

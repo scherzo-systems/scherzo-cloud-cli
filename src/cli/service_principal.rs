@@ -42,10 +42,10 @@ struct CredentialCommand {
 
 #[derive(Debug, Subcommand)]
 enum CredentialSubcommand {
-    #[command(about = "List active service credentials")]
-    List(ListCommand),
     #[command(about = "Issue a service credential")]
     Issue(IssueCommand),
+    #[command(about = "List active service credentials")]
+    List(ListCommand),
     #[command(about = "Revoke a service credential")]
     Revoke(RevokeCommand),
 }

@@ -27,10 +27,10 @@ pub(super) struct Command {
 enum PublicationCommand {
     #[command(about = "Create a Scherzo Cloud publication")]
     Create(CreateCommand),
-    #[command(about = "Show a Scherzo Cloud publication")]
-    Show(ShowCommand),
     #[command(about = "List Scherzo Cloud publications")]
     List(ListCommand),
+    #[command(about = "Show a Scherzo Cloud publication")]
+    Show(ShowCommand),
 }
 
 #[derive(Debug, Args)]

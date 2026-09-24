@@ -39,14 +39,14 @@ struct LinearCommand {
 enum Leaf {
     #[command(about = "Manage Linear authorization sessions")]
     Authorization(AuthorizationCommand),
-    #[command(about = "List Linear connections")]
-    List(List),
-    #[command(about = "Show a Linear connection and its authorization state")]
-    Show(Target),
-    #[command(about = "Remove a Linear connection credential and reserve its workspace")]
-    Remove(ConfirmationTarget),
     #[command(about = "Delete a Linear connection and release its workspace")]
     Delete(ConfirmationTarget),
+    #[command(about = "List Linear connections")]
+    List(List),
+    #[command(about = "Remove a Linear connection credential and reserve its workspace")]
+    Remove(ConfirmationTarget),
+    #[command(about = "Show a Linear connection and its authorization state")]
+    Show(Target),
 }
 #[derive(Debug, Args)]
 struct AuthorizationCommand {

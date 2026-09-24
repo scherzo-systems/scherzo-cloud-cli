@@ -21,12 +21,12 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum GitHubCommand {
-    #[command(about = "Connect organizations to GitHub")]
-    Setup(SetupCommand),
     #[command(about = "Manage GitHub installation bindings")]
     Installation(InstallationCommand),
     #[command(about = "Discover GitHub repositories")]
     Repository(RepositoryCommand),
+    #[command(about = "Connect organizations to GitHub")]
+    Setup(SetupCommand),
 }
 
 #[derive(Debug, Args)]
@@ -51,10 +51,10 @@ struct InstallationCommand {
 
 #[derive(Debug, Subcommand)]
 enum InstallationLeaf {
-    #[command(about = "List GitHub installation bindings")]
-    List(OrganizationTarget),
     #[command(about = "Disconnect a GitHub installation binding")]
     Disconnect(InstallationTarget),
+    #[command(about = "List GitHub installation bindings")]
+    List(OrganizationTarget),
 }
 
 #[derive(Debug, Args)]

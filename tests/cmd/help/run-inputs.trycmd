@@ -5,9 +5,9 @@ View, download, or delete retained run inputs
 Usage: scherzo-cloud run inputs [COMMAND]
 
 Commands:
-  show      Show the retained input inventory for a run
-  download  Download and verify retained input members atomically
   delete    Make retained input content logically unavailable and schedule cleanup
+  download  Download and verify retained input members atomically
+  show      Show the retained input inventory for a run
   help      Print this message or the help of the given subcommand(s)
 
 Options:

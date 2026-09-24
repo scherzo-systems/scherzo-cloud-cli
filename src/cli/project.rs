@@ -26,14 +26,14 @@ enum ProjectCommand {
     Create(CreateCommand),
     #[command(about = "List Scherzo Cloud projects")]
     List(ListCommand),
-    #[command(about = "Show a Scherzo Cloud project")]
-    Show(ShowCommand),
     #[command(about = "Rename a Scherzo Cloud project")]
     Rename(RenameCommand),
     #[command(about = "Manage a project's repository binding")]
     Repository(RepositoryCommand),
     #[command(about = "Manage a project's runner pool")]
     RunnerPool(RunnerPoolCommand),
+    #[command(about = "Show a Scherzo Cloud project")]
+    Show(ShowCommand),
 }
 
 type Options = super::CommonArgs<super::ProjectJson, super::PrincipalAuthenticationArgs>;
@@ -138,18 +138,18 @@ struct RepositoryCommand {
 
 #[derive(Debug, Subcommand)]
 enum RepositorySubcommand {
-    #[command(about = "List repositories selected for a GitHub installation")]
-    List(RepositoryListCommand),
-    #[command(about = "Show a project's repository binding")]
-    Show(RepositoryShowCommand),
-    #[command(about = "Bind or replace a project's repository")]
-    Set(RepositorySetCommand),
-    #[command(about = "Change a project's configured default branch")]
-    Update(RepositoryUpdateCommand),
     #[command(about = "Detach a project's repository")]
     Detach(RepositoryDetachCommand),
     #[command(about = "Discover GitHub installation bindings")]
     Installation(InstallationCommand),
+    #[command(about = "List repositories selected for a GitHub installation")]
+    List(RepositoryListCommand),
+    #[command(about = "Bind or replace a project's repository")]
+    Set(RepositorySetCommand),
+    #[command(about = "Show a project's repository binding")]
+    Show(RepositoryShowCommand),
+    #[command(about = "Change a project's configured default branch")]
+    Update(RepositoryUpdateCommand),
 }
 
 #[derive(Debug, Args)]
@@ -239,10 +239,10 @@ struct RunnerPoolCommand {
 
 #[derive(Debug, Subcommand)]
 enum RunnerPoolSubcommand {
-    #[command(about = "Assign or replace a project's runner pool")]
-    Set(RunnerPoolSetCommand),
     #[command(about = "Remove a project's runner pool")]
     Remove(RunnerPoolRemoveCommand),
+    #[command(about = "Assign or replace a project's runner pool")]
+    Set(RunnerPoolSetCommand),
 }
 
 #[derive(Debug, Args)]

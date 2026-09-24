@@ -29,36 +29,36 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum RunnerCommand {
-    #[command(about = pool::ABOUT)]
-    Pool(pool::Command),
-    #[command(about = "Create a runner registration and enrollment activation")]
-    Create(CreateCommand),
     #[command(about = activation::ABOUT)]
     Activation(activation::Command),
+    #[command(about = "Create a runner registration and enrollment activation")]
+    Create(CreateCommand),
     #[command(about = credential::ABOUT)]
     Credential(credential::Command),
+    #[command(about = "Delete a quiescent Scherzo Cloud runner registration")]
+    Delete(DeleteCommand),
+    #[command(about = "Disable a Scherzo Cloud runner registration")]
+    Disable(ModeCommand),
+    #[command(about = doctor::ABOUT)]
+    Doctor(doctor::Command),
+    #[command(about = "Drain a Scherzo Cloud runner registration")]
+    Drain(ModeCommand),
+    #[command(about = "Enable a Scherzo Cloud runner registration")]
+    Enable(ModeCommand),
     #[command(about = enroll::ABOUT)]
     Enroll(enroll::Command),
     #[command(about = "List Scherzo Cloud runner registrations")]
     List(ListCommand),
-    #[command(about = "Show a Scherzo Cloud runner registration")]
-    Show(ShowCommand),
-    #[command(about = "Enable a Scherzo Cloud runner registration")]
-    Enable(ModeCommand),
-    #[command(about = "Drain a Scherzo Cloud runner registration")]
-    Drain(ModeCommand),
-    #[command(about = "Disable a Scherzo Cloud runner registration")]
-    Disable(ModeCommand),
     #[command(about = "Move a quiescent Scherzo Cloud runner registration")]
     Move(MoveCommand),
+    #[command(about = pool::ABOUT)]
+    Pool(pool::Command),
     #[command(about = "Rename a Scherzo Cloud runner registration")]
     Rename(RenameCommand),
-    #[command(about = "Delete a quiescent Scherzo Cloud runner registration")]
-    Delete(DeleteCommand),
-    #[command(about = doctor::ABOUT)]
-    Doctor(doctor::Command),
     #[command(about = serve::ABOUT)]
     Serve(serve::Command),
+    #[command(about = "Show a Scherzo Cloud runner registration")]
+    Show(ShowCommand),
     #[command(about = status::ABOUT)]
     Status(status::Command),
 }

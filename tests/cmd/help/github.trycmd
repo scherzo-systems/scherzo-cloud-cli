@@ -5,9 +5,9 @@ Manage GitHub connections
 Usage: scherzo-cloud github [COMMAND]
 
 Commands:
-  setup         Connect organizations to GitHub
   installation  Manage GitHub installation bindings
   repository    Discover GitHub repositories
+  setup         Connect organizations to GitHub
   help          Print this message or the help of the given subcommand(s)
 
 Options:

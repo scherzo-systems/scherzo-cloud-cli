@@ -177,6 +177,11 @@ Banned from human prose:
 
 ## Command grammar
 
+- **Command list order:** list each group's explicit subcommands alphabetically
+  by their rendered command token (including nested noun groups). Clap's
+  generated `help` entry follows the explicit commands, last. This is a
+  presentation rule, not a change to command behavior.
+
 A **command group** is a command path that has subcommands. A **leaf** is a
 command path with no subcommands. An entity family's leaf set consists of the
 action leaves directly below its command group; a nested noun group starts a

@@ -540,12 +540,12 @@ enum Command {
     Artifact(artifact::Command),
     #[command(about = auth::ABOUT)]
     Auth(auth::Command),
+    #[command(about = connection::ABOUT)]
+    Connection(connection::Command),
     #[command(about = delegation::ABOUT)]
     Delegation(delegation::Command),
     #[command(about = github::ABOUT)]
     Github(github::Command),
-    #[command(about = connection::ABOUT)]
-    Connection(connection::Command),
     #[command(about = invitation::ABOUT)]
     Invitation(invitation::Command),
     #[command(about = organization::ABOUT)]
@@ -556,12 +556,12 @@ enum Command {
     Publication(publication::Command),
     #[command(about = run::ABOUT)]
     Run(run::Command),
-    #[command(about = version::ABOUT)]
-    Version(version::Command),
     #[command(about = runner::ABOUT)]
     Runner(runner::Command),
     #[command(about = service_principal::ABOUT)]
     ServicePrincipal(service_principal::Command),
+    #[command(about = version::ABOUT)]
+    Version(version::Command),
     #[command(about = workflow::ABOUT)]
     Workflow(workflow::Command),
 }
@@ -1930,6 +1930,34 @@ mod tests {
                 collect_command_paths(child, &path, paths);
             }
         }
+    }
+
+    fn assert_command_order(command: &clap::Command, prefix: &str) {
+        let children = command.get_subcommands().collect::<Vec<_>>();
+        let names = children
+            .iter()
+            .map(|child| child.get_name())
+            .collect::<Vec<_>>();
+        let mut expected = names.clone();
+        expected.sort_unstable_by(|left, right| match (*left == "help", *right == "help") {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => left.cmp(right),
+        });
+        assert_eq!(names, expected, "command order at {prefix}");
+
+        for child in children
+            .into_iter()
+            .filter(|child| child.get_name() != "help")
+        {
+            let path = format!("{prefix} {}", child.get_name());
+            assert_command_order(child, &path);
+        }
+    }
+
+    #[test]
+    fn command_groups_are_alphabetical_with_help_last() {
+        assert_command_order(&Cli::command(), "scherzo-cloud");
     }
 
     fn customer_command_paths() -> Vec<String> {

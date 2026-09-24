@@ -37,18 +37,18 @@ enum OrganizationCommand {
     Create(create::Command),
     #[command(about = super::deletion::organization_about())]
     Deletion(super::deletion::OrganizationCommand),
+    #[command(about = "Manage organization invitations")]
+    Invitations(super::invitation::OrganizationCommand),
     #[command(about = leave::ABOUT)]
     Leave(leave::Command),
     #[command(about = list::ABOUT)]
     List(list::Command),
-    #[command(about = "Manage organization invitations")]
-    Invitations(super::invitation::OrganizationCommand),
+    #[command(about = members::ABOUT)]
+    Members(members::Command),
     #[command(about = show::ABOUT)]
     Show(show::Command),
     #[command(about = update::ABOUT)]
     Update(update::Command),
-    #[command(about = members::ABOUT)]
-    Members(members::Command),
 }
 
 type LeafOptions = super::CommonArgs<super::OrganizationJson, super::PrincipalAuthenticationArgs>;

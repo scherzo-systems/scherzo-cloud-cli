@@ -18,14 +18,14 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    #[command(about = login::ABOUT)]
-    Login(login::Command),
-    #[command(about = status::ABOUT)]
-    Status(status::Command),
-    #[command(about = logout::ABOUT)]
-    Logout(logout::Command),
     #[command(about = identities::ABOUT)]
     Identities(identities::Command),
+    #[command(about = login::ABOUT)]
+    Login(login::Command),
+    #[command(about = logout::ABOUT)]
+    Logout(logout::Command),
+    #[command(about = status::ABOUT)]
+    Status(status::Command),
 }
 
 impl Command {

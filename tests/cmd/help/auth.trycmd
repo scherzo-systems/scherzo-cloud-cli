@@ -5,10 +5,10 @@ Manage your Scherzo Cloud sign-in
 Usage: scherzo-cloud auth [COMMAND]
 
 Commands:
-  login       Sign in to Scherzo Cloud
-  status      Show your Scherzo Cloud sign-in status
-  logout      Sign out of Scherzo Cloud on this device
   identities  Manage your linked sign-in identities
+  login       Sign in to Scherzo Cloud
+  logout      Sign out of Scherzo Cloud on this device
+  status      Show your Scherzo Cloud sign-in status
   help        Print this message or the help of the given subcommand(s)
 
 Options:

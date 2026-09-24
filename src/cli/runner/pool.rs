@@ -19,14 +19,14 @@ pub(super) struct Command {
 enum PoolCommand {
     #[command(about = "Create a Scherzo Cloud runner pool")]
     Create(CreateCommand),
-    #[command(about = "List Scherzo Cloud runner pools")]
-    List(ListCommand),
-    #[command(about = "Show a Scherzo Cloud runner pool")]
-    Show(ShowCommand),
-    #[command(about = "Rename a Scherzo Cloud runner pool")]
-    Rename(RenameCommand),
     #[command(about = "Delete an unused Scherzo Cloud runner pool")]
     Delete(DeleteCommand),
+    #[command(about = "List Scherzo Cloud runner pools")]
+    List(ListCommand),
+    #[command(about = "Rename a Scherzo Cloud runner pool")]
+    Rename(RenameCommand),
+    #[command(about = "Show a Scherzo Cloud runner pool")]
+    Show(ShowCommand),
 }
 
 #[derive(Debug, Args)]

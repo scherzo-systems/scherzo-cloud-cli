@@ -36,14 +36,14 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum InvitationCommand {
-    #[command(about = "List your invitation inbox")]
-    List(InboxCommand),
-    #[command(about = "Preview an invitation")]
-    Preview(AccessCommand),
     #[command(about = "Accept an invitation")]
     Accept(AccessCommand),
     #[command(about = "Decline an invitation")]
     Decline(DeclineCommand),
+    #[command(about = "List your invitation inbox")]
+    List(InboxCommand),
+    #[command(about = "Preview an invitation")]
+    Preview(AccessCommand),
 }
 
 #[derive(Debug, Args)]

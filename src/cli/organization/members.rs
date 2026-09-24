@@ -27,14 +27,14 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum MembersCommand {
-    #[command(about = LIST_ABOUT)]
-    List(PageCommand),
     #[command(about = HISTORY_ABOUT, after_help = HISTORY_AFTER_HELP)]
     History(PageCommand),
-    #[command(about = UPDATE_ABOUT)]
-    Update(UpdateCommand),
+    #[command(about = LIST_ABOUT)]
+    List(PageCommand),
     #[command(about = REMOVE_ABOUT)]
     Remove(RemoveCommand),
+    #[command(about = UPDATE_ABOUT)]
+    Update(UpdateCommand),
 }
 
 impl Command {

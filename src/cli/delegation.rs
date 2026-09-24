@@ -29,16 +29,16 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum DelegationCommand {
+    #[command(about = "Accept a delegation as its service principal")]
+    Accept(AcceptCommand),
+    #[command(about = "End a delegation")]
+    End(EndCommand),
     #[command(about = "List your delegation history")]
     List(ListCommand),
     #[command(about = "Propose delegation to a service principal")]
     Propose(ProposeCommand),
     #[command(about = "Show a delegation")]
     Show(ShowCommand),
-    #[command(about = "Accept a delegation as its service principal")]
-    Accept(AcceptCommand),
-    #[command(about = "End a delegation")]
-    End(EndCommand),
 }
 
 type DelegationOptions =
