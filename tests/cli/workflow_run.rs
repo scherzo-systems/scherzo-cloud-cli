@@ -4131,61 +4131,20 @@ fn invalid_local_input_fails_before_resolution_presentation_or_publication() {
 }
 
 #[test]
-fn corrupt_authoritative_state_stops_before_a_later_action_is_released() {
+fn exchange_failure_quiesces_already_running_steps() {
     let bundle = RunBundle::new(
         r#"schemaVersion: 1
 steps:
-  corrupt:
+  removeState:
     kind: cmd
     command:
       argv:
         - sh
         - -c
         - |
-          while ! grep -q '\"state\": \"running\"' "$RUN_STATE"; do sleep 0.01; done
-          printf partial > "$RUN_STATE.corrupt"
-          mv "$RUN_STATE.corrupt" "$RUN_STATE"
-  forbidden:
-    kind: cmd
-    dependsOn: [corrupt]
-    command:
-      argv: ["sh", "-c", "touch \"$LATER_ACTION\""]
-"#,
-    );
-    let destination = bundle.result("corrupt-state");
-    let later_action = bundle.execution_root.join("later-action");
-
-    let output = isolated_command(&bundle.args(&destination))
-        .env("RUN_STATE", destination.join("state.json"))
-        .env("LATER_ACTION", &later_action)
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        fs::read(destination.join("state.json")).unwrap(),
-        b"partial"
-    );
-    assert!(!later_action.exists());
-    assert!(!attempt_result(&destination).exists());
-}
-
-#[test]
-fn state_persistence_failure_quiesces_already_running_steps() {
-    let bundle = RunBundle::new(
-        r#"schemaVersion: 1
-steps:
-  corrupt:
-    kind: cmd
-    command:
-      argv:
-        - sh
-        - -c
-        - |
-          while [ "$(grep -c '\"state\": \"running\"' "$RUN_STATE")" -lt 3 ]; do sleep 0.01; done
-          IFS= read -r _ < "$CORRUPTION_RELEASE_FIFO"
-          printf partial > "$RUN_STATE.corrupt"
-          mv "$RUN_STATE.corrupt" "$RUN_STATE"
+          printf '\001' > "$REMOVER_READY"
+          IFS= read -r _ < "$REMOVER_RELEASE"
+          rm "$RUN_STATE"
   survivor:
     kind: cmd
     command:
@@ -4194,24 +4153,25 @@ steps:
         - -c
         - |
           printf '%s\n' "$$" > "$SURVIVOR_PID"
-          printf '\001' > "$SURVIVOR_READY_FIFO"
-          IFS= read -r _ < "$SURVIVOR_RELEASE_FIFO"
+          printf '\001' > "$SURVIVOR_READY"
+          IFS= read -r _ < "$SURVIVOR_RELEASE"
           touch "$LATE_SIDE_EFFECT"
 "#,
     );
-    let destination = bundle.result("persistence-failure-quiescence");
+    let destination = bundle.result("exchange-failure-quiescence");
     let late_side_effect = bundle.execution_root.join("late-side-effect");
     let survivor_pid = bundle.initial_cwd().join("survivor.pid");
-    let survivor_ready_fifo = bundle.initial_cwd().join("survivor-ready.fifo");
-    let survivor_release_fifo = bundle.initial_cwd().join("survivor-release.fifo");
-    let corruption_release_fifo = bundle.initial_cwd().join("corruption-release.fifo");
-    let fifo_mode = Mode::S_IRUSR | Mode::S_IWUSR;
+    let remover_ready_path = bundle.initial_cwd().join("remover-ready.fifo");
+    let remover_release_path = bundle.initial_cwd().join("remover-release.fifo");
+    let survivor_ready_path = bundle.initial_cwd().join("survivor-ready.fifo");
+    let survivor_release_path = bundle.initial_cwd().join("survivor-release.fifo");
     for path in [
-        &survivor_ready_fifo,
-        &survivor_release_fifo,
-        &corruption_release_fifo,
+        &remover_ready_path,
+        &remover_release_path,
+        &survivor_ready_path,
+        &survivor_release_path,
     ] {
-        mkfifo(path, fifo_mode).unwrap();
+        mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
     }
     let open_control = |path: &Path| {
         OpenOptions::new()
@@ -4220,32 +4180,32 @@ steps:
             .open(path)
             .unwrap()
     };
-    let mut survivor_ready = open_control(&survivor_ready_fifo);
-    let mut survivor_release = open_control(&survivor_release_fifo);
-    let mut corruption_release = open_control(&corruption_release_fifo);
+    let mut remover_ready = open_control(&remover_ready_path);
+    let mut remover_release = open_control(&remover_release_path);
+    let mut survivor_ready = open_control(&survivor_ready_path);
+    let mut survivor_release = open_control(&survivor_release_path);
     let mut args = bundle.args(&destination);
     args.splice(
         args.len() - 1..args.len() - 1,
         ["--max-parallel".to_owned(), "2".to_owned()],
     );
-
     let child = isolated_command(&args)
         .env("RUN_STATE", destination.join("state.json"))
-        .env("LATE_SIDE_EFFECT", &late_side_effect)
+        .env("REMOVER_READY", &remover_ready_path)
+        .env("REMOVER_RELEASE", &remover_release_path)
         .env("SURVIVOR_PID", &survivor_pid)
-        .env("SURVIVOR_READY_FIFO", &survivor_ready_fifo)
-        .env("SURVIVOR_RELEASE_FIFO", &survivor_release_fifo)
-        .env("CORRUPTION_RELEASE_FIFO", &corruption_release_fifo)
+        .env("SURVIVOR_READY", &survivor_ready_path)
+        .env("SURVIVOR_RELEASE", &survivor_release_path)
+        .env("LATE_SIDE_EFFECT", &late_side_effect)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut ready = [0_u8; 1];
+    remover_ready.read_exact(&mut ready).unwrap();
     survivor_ready.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [1]);
-    corruption_release.write_all(b"corrupt\n").unwrap();
+    remover_release.write_all(b"release\n").unwrap();
     let output = child.wait_with_output().unwrap();
-
     assert_eq!(output.status.code(), Some(1));
     let survivor = Pid::from_raw(
         fs::read_to_string(&survivor_pid)
@@ -4255,12 +4215,7 @@ steps:
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        test_kill_process(survivor),
-        Err(rustix::io::Errno::SRCH),
-        "work already owned when persistence fails must be quiesced"
-    );
-    assert!(!late_side_effect.exists());
+    assert_eq!(test_kill_process(survivor), Err(rustix::io::Errno::SRCH));
     survivor_release.write_all(b"release\n").unwrap();
     assert!(!late_side_effect.exists());
 }

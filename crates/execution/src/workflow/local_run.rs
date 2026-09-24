@@ -1723,11 +1723,8 @@ impl StateStore {
         observer: &mut impl StateCommitObserver,
     ) -> Result<(), LocalRunDirectoryError> {
         let mut current = lock_state(&self.current)?;
-        let authoritative_bytes = read_regular_file(&self.root, STATE_FILE)?;
-        let authoritative = decode_state(&authoritative_bytes)?;
-        if authoritative != *current {
-            return Err(LocalRunDirectoryError::StateConflict);
-        }
+        // The exclusive run lock and this mutex serialize writers. Disk is decoded
+        // when ownership is acquired, not on every commit.
         let mut next = current.clone();
         mutate(&mut next)?;
         next.revision = next
@@ -1735,15 +1732,7 @@ impl StateStore {
             .checked_add(1)
             .ok_or(LocalRunDirectoryError::StateInvalid)?;
         validate_state(&next)?;
-        replace_state(
-            &self.root,
-            &self.private,
-            &authoritative_bytes,
-            &next,
-            observer,
-        )?;
-        *current = next;
-        Ok(())
+        replace_state(&self.root, &self.private, &mut current, next, observer)
     }
 }
 
@@ -1798,36 +1787,25 @@ impl DurableProcessGuardStore for StateStore {
         Ok(guard_id)
     }
 
-    fn mark_released(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
-        update_process_guard_state(self, guard_id, ProcessGuardStateV1::Released)
+    fn mark_released(&self, _guard_id: &str) -> Result<(), ProcessGuardStoreError> {
+        // Prepared was durably committed before continuation. Until quiescence,
+        // recovery treats it exactly like released: the child may have run.
+        // The quiesced commit folds both later transitions into one write.
+        Ok(())
     }
 
     fn mark_quiesced(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
-        update_process_guard_state(self, guard_id, ProcessGuardStateV1::Quiesced)
-    }
-}
-
-fn update_process_guard_state(
-    store: &StateStore,
-    guard_id: &str,
-    next: ProcessGuardStateV1,
-) -> Result<(), ProcessGuardStoreError> {
-    store
-        .update(|state| {
+        self.update(|state| {
             let guard = current_attempt_mut(state)?
                 .process_guards
                 .iter_mut()
                 .find(|guard| guard.guard_id == guard_id)
                 .ok_or(LocalRunDirectoryError::StateConflict)?;
-            match (guard.state, next) {
-                (ProcessGuardStateV1::Prepared, ProcessGuardStateV1::Released)
-                | (_, ProcessGuardStateV1::Quiesced) => guard.state = next,
-                (ProcessGuardStateV1::Released, ProcessGuardStateV1::Released) => {}
-                _ => return Err(LocalRunDirectoryError::StateConflict),
-            }
+            guard.state = ProcessGuardStateV1::Quiesced;
             Ok(())
         })
         .map_err(|_| ProcessGuardStoreError)
+    }
 }
 
 fn lock_state(
@@ -3628,17 +3606,21 @@ fn retained_file_name(ordinal: u64) -> Result<String, LocalRunDirectoryError> {
 fn replace_state(
     root: &OwnedFd,
     private: &OwnedFd,
-    expected_authoritative: &[u8],
-    state: &LocalRunStateV1,
+    current: &mut LocalRunStateV1,
+    next: LocalRunStateV1,
     observer: &mut impl StateCommitObserver,
 ) -> Result<(), LocalRunDirectoryError> {
-    let bytes = encode_json(state)?;
-    decode_state(&bytes)?;
+    let bytes = encode_json(&next)?;
+    if u64::try_from(bytes.len())
+        .ok()
+        .is_none_or(|size| size > MAXIMUM_DURABLE_JSON_BYTES)
+    {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
     let (temporary_name, mut temporary) = create_state_temporary(private)?;
-    let mut cleanup = StateTemporary {
+    let _cleanup = StateTemporary {
         parent: private,
         name: temporary_name.clone(),
-        committed: false,
     };
     observer
         .write_temporary(&mut temporary, &bytes)
@@ -3649,36 +3631,33 @@ fn replace_state(
         .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
     drop(temporary);
     observer.temporary_complete()?;
-    renameat_with(
-        private,
-        &temporary_name,
-        root,
-        STATE_FILE,
-        RenameFlags::EXCHANGE,
-    )
-    .map_err(|_| LocalRunDirectoryError::AtomicCommitUnavailable)?;
-    let replaced = read_regular_file(private, &temporary_name)?;
-    if replaced != expected_authoritative {
-        if renameat_with(
-            private,
-            &temporary_name,
-            root,
-            STATE_FILE,
-            RenameFlags::EXCHANGE,
-        )
-        .is_err()
-        {
-            cleanup.committed = true;
-            return Err(LocalRunDirectoryError::AtomicCommitUnavailable);
-        }
-        return Err(LocalRunDirectoryError::StateConflict);
-    }
+    observer
+        .exchange(private, &temporary_name, root)
+        .map_err(|_| LocalRunDirectoryError::AtomicCommitUnavailable)?;
+    // An error after exchange cannot undo the commit. Keep memory aligned with
+    // the visible snapshot even when directory sync or the observer fails.
+    *current = next;
     sync_directory(root)?;
     observer.replaced()?;
     Ok(())
 }
 
 trait StateCommitObserver {
+    fn exchange(
+        &mut self,
+        private: &OwnedFd,
+        temporary_name: &str,
+        root: &OwnedFd,
+    ) -> rustix::io::Result<()> {
+        renameat_with(
+            private,
+            temporary_name,
+            root,
+            STATE_FILE,
+            RenameFlags::EXCHANGE,
+        )
+    }
+
     fn write_temporary(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)
     }
@@ -3699,14 +3678,11 @@ impl StateCommitObserver for NoopStateCommitObserver {}
 struct StateTemporary<'a> {
     parent: &'a OwnedFd,
     name: String,
-    committed: bool,
 }
 
 impl Drop for StateTemporary<'_> {
     fn drop(&mut self) {
-        if !self.committed {
-            let _ = unlinkat(self.parent, &self.name, AtFlags::empty());
-        }
+        let _ = unlinkat(self.parent, &self.name, AtFlags::empty());
     }
 }
 

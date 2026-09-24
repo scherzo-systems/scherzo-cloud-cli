@@ -710,6 +710,7 @@ fn atomic_state_crash_boundaries_expose_only_complete_snapshots() {
     let after = read_state(run.root_handle()).unwrap();
     assert_eq!(after.revision, before.revision + 1);
     assert_eq!(after.diagnostics.len(), 1);
+    assert_eq!(*lock_state(&run.state.current).unwrap(), after);
     assert!(decode_state(&encode_json(&after).unwrap()).is_ok());
 
     fs::set_permissions(
@@ -725,15 +726,14 @@ fn atomic_state_crash_boundaries_expose_only_complete_snapshots() {
 }
 
 #[test]
-fn atomic_state_replace_rejects_a_concurrent_authoritative_change() {
+fn locked_state_store_replaces_without_reloading_disk() {
     let fixture = AdmittedFixture::new();
     let run = InitialLocalRun::create(&fixture.run_path("concurrent"), &fixture.admitted).unwrap();
     let mut observer = CorruptBeforeReplace {
         state_path: run.run_directory().join(STATE_FILE),
     };
 
-    let failure = run
-        .state
+    run.state
         .update_with_observer(
             |state| {
                 append_diagnostic(
@@ -744,13 +744,141 @@ fn atomic_state_replace_rejects_a_concurrent_authoritative_change() {
             },
             &mut observer,
         )
-        .unwrap_err();
+        .unwrap();
+    let state = read_state(run.root_handle()).unwrap();
+    assert_eq!(state.diagnostics.len(), 1);
+    assert_eq!(*lock_state(&run.state.current).unwrap(), state);
+}
 
-    assert_eq!(failure, LocalRunDirectoryError::StateConflict);
+#[test]
+fn oversized_state_update_preserves_the_last_readable_snapshot() {
+    let fixture = AdmittedFixture::new();
+    let run = InitialLocalRun::create(&fixture.run_path("oversized"), &fixture.admitted).unwrap();
+    let before = read_state(run.root_handle()).unwrap();
+    let oversized_id = "x".repeat(usize::try_from(MAXIMUM_DURABLE_JSON_BYTES).unwrap());
+    let failure = run.state.update(|state| {
+        state.attempts[0].progress.steps[0].id = oversized_id;
+        // The document is otherwise valid; only its encoded size exceeds the reader limit.
+        validate_state(state)
+    });
+
+    assert_eq!(failure, Err(LocalRunDirectoryError::StateInvalid));
+    assert_eq!(read_state(run.root_handle()).unwrap(), before);
+    assert_eq!(*lock_state(&run.state.current).unwrap(), before);
+}
+
+struct NoExchange;
+
+impl StateCommitObserver for NoExchange {
+    fn exchange(
+        &mut self,
+        _private: &OwnedFd,
+        _temporary_name: &str,
+        _root: &OwnedFd,
+    ) -> rustix::io::Result<()> {
+        // Filesystems without exchange support return EOPNOTSUPP.
+        Err(Errno::OPNOTSUPP)
+    }
+}
+
+#[test]
+fn unsupported_atomic_exchange_leaves_the_last_snapshot_authoritative() {
+    let fixture = AdmittedFixture::new();
+    let run = InitialLocalRun::create(&fixture.run_path("no-exchange"), &fixture.admitted).unwrap();
+    let before = read_state(run.root_handle()).unwrap();
     assert_eq!(
-        fs::read(run.run_directory().join(STATE_FILE)).unwrap(),
-        b"partial"
+        run.state.update_with_observer(
+            |state| append_diagnostic(
+                state,
+                INITIAL_ATTEMPT_NUMBER,
+                DiagnosticCodeV1::StaleOccurrence
+            ),
+            &mut NoExchange,
+        ),
+        Err(LocalRunDirectoryError::AtomicCommitUnavailable)
     );
+    assert_eq!(read_state(run.root_handle()).unwrap(), before);
+    assert_eq!(*lock_state(&run.state.current).unwrap(), before);
+}
+
+#[test]
+fn guard_preparation_is_durable_before_release_and_quiescence_is_one_later_commit() {
+    let fixture = AdmittedFixture::new();
+    let run = InitialLocalRun::create(&fixture.run_path("guard-batch"), &fixture.admitted).unwrap();
+    let initial_revision = read_state(run.root_handle()).unwrap().revision;
+    let store = run.process_guard_registry();
+    for (action_id, step) in [(1, "first"), (2, "second")] {
+        run.state
+            .update(|state| {
+                let attempt = current_attempt_mut(state)?;
+                attempt.progress.last_transition_sequence = action_id;
+                attempt
+                    .progress
+                    .outstanding_actions
+                    .push(OutstandingActionV1 {
+                        action_id,
+                        kind: OutstandingActionKindV1::StartStep,
+                        step_id: Some(step.to_owned()),
+                        node_role: Some(AttemptNodeRoleV1::Step),
+                        target_execution: Some(1),
+                        recovery_round: None,
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let identity = AuthenticatedProcessGroup::new(
+            rustix::process::Pid::from_raw(41 + i32::try_from(action_id).unwrap()).unwrap(),
+            "9001".to_owned(),
+        )
+        .unwrap();
+        let mut registration = store.register(step, action_id, &identity).unwrap();
+        let prepared = read_state(run.root_handle()).unwrap();
+        assert_eq!(prepared.revision, initial_revision + 3 * action_id - 1);
+        assert_eq!(
+            prepared.attempts[0].process_guards.last().unwrap().state,
+            ProcessGuardStateV1::Prepared
+        );
+        registration.mark_released().unwrap();
+        let during = read_state(run.root_handle()).unwrap();
+        assert_eq!(during, prepared);
+        let guard = during.attempts[0].process_guards.last().unwrap();
+        assert_eq!(
+            recovery_status_with(
+                &during.attempts[0],
+                false,
+                &FixtureRecoveryAuthority {
+                    host: Ok(guard.execution_host.clone()),
+                    observation: ProcessIdentityObservation::Unavailable,
+                }
+            ),
+            LocalRecoveryStatus::OwnershipUnproven {
+                guard_ids: vec![guard.guard_id.clone()],
+                reason: OwnershipUnprovenReason::ProcessIdentityInspectionUnavailable,
+            }
+        );
+        if action_id == 2 {
+            let failure = run.state.update_with_observer(
+                |state| {
+                    current_attempt_mut(state)?
+                        .process_guards
+                        .last_mut()
+                        .unwrap()
+                        .state = ProcessGuardStateV1::Quiesced;
+                    Ok(())
+                },
+                &mut FailBeforeReplace,
+            );
+            assert_eq!(failure, Err(LocalRunDirectoryError::StateWriteUnavailable));
+            assert_eq!(read_state(run.root_handle()).unwrap(), prepared);
+        }
+        registration.mark_quiesced().unwrap();
+        let after = read_state(run.root_handle()).unwrap();
+        assert_eq!(after.revision, prepared.revision + 1);
+        assert_eq!(
+            after.attempts[0].process_guards.last().unwrap().state,
+            ProcessGuardStateV1::Quiesced
+        );
+    }
 }
 
 fn fixture_settlement_snapshot() -> WorkspaceSnapshotV1 {
