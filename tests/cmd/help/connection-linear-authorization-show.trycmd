@@ -1,0 +1,17 @@
+```console
+$ scherzo-cloud connection linear authorization show --help
+Show an authorization session
+
+Usage: scherzo-cloud connection linear authorization show [OPTIONS] <ORGANIZATION> <SESSION>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <SESSION>       Exact Linear authorization session ID
+
+Options:
+      --json                           Emit newline-delimited JSON events
+      --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
+      --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
+  -h, --help                           Print help
+
+```

@@ -1,0 +1,16 @@
+```console
+$ scherzo-cloud connection linear authorization --help
+Manage Linear authorization sessions
+
+Usage: scherzo-cloud connection linear authorization [COMMAND]
+
+Commands:
+  create  Create a Linear authorization session
+  show    Show an authorization session
+  wait    Wait for an authorization session
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

@@ -14,6 +14,7 @@ mod http_util;
 mod human_principal;
 mod identities;
 mod lifecycle;
+mod linear;
 mod organizations;
 mod principal_profile;
 mod problem;
@@ -75,6 +76,9 @@ pub use delegations::{
     GetDelegationOutcome, ListDelegationsOutcome, ProposeDelegationOutcome, accept_delegation,
     end_delegation, get_delegation, list_current_principal_delegations, propose_delegation,
 };
+pub use generated::models::{
+    linear_authorization_session, linear_connection, linear_connection_error,
+};
 pub use github::{
     GitHubAccountType, GitHubApi, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
@@ -93,6 +97,10 @@ pub use lifecycle::{
     LifecycleResourceKind, LifecycleState, LifecycleTransition, RequestDeletionOutcome,
     cancel_current_principal_deletion, cancel_organization_deletion,
     request_current_principal_deletion, request_organization_deletion,
+};
+pub use linear::{
+    LinearApi, LinearConnection, LinearConnectionList, LinearFailure, LinearSession,
+    LinearSessionStatus,
 };
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,

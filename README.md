@@ -1109,6 +1109,47 @@ identity because the API defines exact replay; setup initiation and reads make o
 request attempt. A later completion retry must reuse the same setup session and provider
 installation ID.
 
+## Linear connections
+
+An active organization owner can connect a Linear workspace without supplying a Linear
+credential to the CLI. The deployment manages the OAuth exchange and stores the grant;
+the CLI prints only a consent URL, session identity, and nonsecret connection status.
+It does not open a browser or listen for the callback. Use the selected human session
+(or explicitly pass `--service-api-key-file PATH|-` for the same authorized principal):
+
+```sh
+scherzo-cloud connection linear authorization create acme-labs
+scherzo-cloud connection linear authorization create acme-labs --connection-id lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+Open the URL in a browser as the initiating owner. By default, the command polls the
+owner-bound authorization session until completion, failure, expiry, or recovery-required
+status (up to 15 minutes). Use `--timeout 2m` to stop waiting earlier, or `--no-wait`
+to return immediately after the consent URL. Neither stopping the CLI nor losing
+access cancels callback processing. Save the session ID and inspect it later as the
+same owner; do not start another session merely because polling stopped:
+
+```sh
+scherzo-cloud connection linear authorization show acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud connection linear authorization wait acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc --timeout 5m
+scherzo-cloud connection linear list acme-labs
+scherzo-cloud connection linear show acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud connection linear remove acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+scherzo-cloud connection linear delete acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+```
+
+Remove erases the credential but reserves the workspace binding; delete also
+releases that binding. Reauthorization targets the exact connection ID. Use `--json`
+for schema-version-1 newline-delimited events when starting or waiting and a single
+JSON line for inspection/lifecycle commands. A lost start response is retried only
+with the same internally generated request key during that invocation. If commitment
+remains unknown, inspect existing connections as the initiating owner before
+deliberately starting another request; the CLI cannot recover an unknown session
+by replaying a key in a later invocation. A known session ID remains available on
+timeout, interruption, or polling failure. `recovery_required` is not success; inspect the
+connection and start a deliberate reauthorization if appropriate. No response includes
+Linear tokens, authorization codes, or PKCE verifiers.
+
 ## Project management
 
 Project commands use the selected human OAuth credential by default and accept

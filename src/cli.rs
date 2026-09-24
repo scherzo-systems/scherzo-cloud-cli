@@ -32,6 +32,7 @@ mod account;
 mod artifact;
 mod atomic_directory;
 mod auth;
+mod connection;
 mod delegation;
 mod deletion;
 mod entity;
@@ -543,6 +544,8 @@ enum Command {
     Delegation(delegation::Command),
     #[command(about = github::ABOUT)]
     Github(github::Command),
+    #[command(about = connection::ABOUT)]
+    Connection(connection::Command),
     #[command(about = invitation::ABOUT)]
     Invitation(invitation::Command),
     #[command(about = organization::ABOUT)]
@@ -580,6 +583,7 @@ impl Cli {
             Some(Command::Auth(command)) => command.execute(),
             Some(Command::Delegation(command)) => command.execute(),
             Some(Command::Github(command)) => command.execute(),
+            Some(Command::Connection(command)) => command.execute(),
             Some(Command::Invitation(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Project(command)) => command.execute(),
@@ -2070,6 +2074,16 @@ mod tests {
             "auth login",
             "auth logout",
             "auth status",
+            "connection",
+            "connection linear",
+            "connection linear authorization",
+            "connection linear authorization create",
+            "connection linear authorization show",
+            "connection linear authorization wait",
+            "connection linear delete",
+            "connection linear list",
+            "connection linear remove",
+            "connection linear show",
             "delegation",
             "delegation accept",
             "delegation end",

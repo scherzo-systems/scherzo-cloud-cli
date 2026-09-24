@@ -1,0 +1,18 @@
+```console
+$ scherzo-cloud connection linear --help
+Manage Linear workspace connections
+
+Usage: scherzo-cloud connection linear [COMMAND]
+
+Commands:
+  authorization  Manage Linear authorization sessions
+  list           List Linear connections
+  show           Show a Linear connection and its authorization state
+  remove         Remove a Linear connection credential and reserve its workspace
+  delete         Delete a Linear connection and release its workspace
+  help           Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+```

@@ -6,12 +6,21 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 use super::Cli;
 
 const LEAVES: &str = "accept begin cancel complete create decline delete disable doctor download drain enable end enroll history issue leave link list login logout move preview propose reference remove rename request retire retry revoke run schema seal serve set show signup status update upload validate version view wait";
-const GROUPS: &str = "account activation artifact audit auth credential delegation deletion github identity input input-set installation invitation member organization pool project publication repository run runner runner-pool service-principal setup workflow";
+const GROUPS: &str = "account activation artifact audit auth authorization connection credential delegation deletion github identity input input-set installation invitation linear member organization pool project publication repository run runner runner-pool service-principal setup workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
 fn semantic_class(path: &str, long: &str) -> Option<String> {
+    if long == "yes"
+        && matches!(
+            path,
+            "connection linear remove" | "connection linear delete"
+        )
+    {
+        // Both connection lifecycle operations use the same ConfirmationTarget.
+        return Some("yes:connection-lifecycle".to_owned());
+    }
     let shared = match long {
         "service-api-key-file"
         | "allow-insecure-http"

@@ -1,0 +1,18 @@
+```console
+$ scherzo-cloud connection linear authorization wait --help
+Wait for an authorization session
+
+Usage: scherzo-cloud connection linear authorization wait [OPTIONS] <ORGANIZATION> <SESSION>
+
+Arguments:
+  <ORGANIZATION>  Organization ID or exact slug
+  <SESSION>       Exact Linear authorization session ID
+
+Options:
+      --json                           Emit newline-delimited JSON events
+      --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
+      --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
+      --timeout <DURATION>             Stop waiting after a positive duration (units: ms, s, m, or h)
+  -h, --help                           Print help
+
+```

@@ -10,6 +10,7 @@ Commands:
   auth               Manage your Scherzo Cloud sign-in
   delegation         Manage Scherzo Cloud delegations
   github             Manage GitHub connections
+  connection         Manage source connections
   invitation         Manage Scherzo Cloud invitations
   organization       Manage Scherzo Cloud organizations
   project            Manage Scherzo Cloud projects
