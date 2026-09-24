@@ -365,7 +365,7 @@ fn classify_validation_failure(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, atomic::Ordering};
 
     use ring::digest::{SHA256, digest};
@@ -376,7 +376,7 @@ mod tests {
 
     struct FakeSource {
         inventory: VecDeque<ArtifactInventoryPage>,
-        bytes: Vec<(String, Vec<u8>)>,
+        bytes: HashMap<String, Vec<u8>>,
         issue_count: usize,
         issued_paths: Vec<Vec<String>>,
         capability_expirations: VecDeque<String>,
@@ -406,12 +406,7 @@ mod tests {
             let members = paths
                 .iter()
                 .map(|path| {
-                    let bytes = self
-                        .bytes
-                        .iter()
-                        .find(|(candidate, _)| candidate == path)
-                        .map(|(_, bytes)| bytes)
-                        .ok_or(ArtifactApiError::NotFound)?;
+                    let bytes = self.bytes.get(path).ok_or(ArtifactApiError::NotFound)?;
                     Ok(ArtifactCapabilityMember {
                         member: member(path, bytes),
                         url: format!("https://fixture.invalid/exact?path={path}"),
@@ -439,9 +434,7 @@ mod tests {
             }
             let bytes = self
                 .bytes
-                .iter()
-                .find(|(path, _)| path == &capability.member.path)
-                .map(|(_, bytes)| bytes)
+                .get(&capability.member.path)
                 .ok_or(ArtifactApiError::NotFound)?;
             destination
                 .write_all(bytes)
@@ -583,7 +576,7 @@ mod tests {
     ) -> FakeSource {
         FakeSource {
             inventory,
-            bytes,
+            bytes: bytes.into_iter().collect(),
             issue_count: 0,
             issued_paths: Vec::new(),
             capability_expirations: VecDeque::new(),
