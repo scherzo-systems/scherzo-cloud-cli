@@ -136,6 +136,18 @@ pub(crate) fn render_plain(
         human_duration(attempt.execution.duration),
     ));
 
+    let modified = match attempt.workspace_modified {
+        super::publication::WorkspaceModifiedV1::Known(true) => "true",
+        super::publication::WorkspaceModifiedV1::Known(false) => "false",
+        super::publication::WorkspaceModifiedV1::Unknown(_) => "unknown",
+    };
+    rendered.push_str(&format!("workspace modified {modified}\n"));
+    if let Some(continuation) = &attempt.continuation {
+        rendered.push_str(&format!(
+            "continuation · definition {:?}\n",
+            continuation.definition_source
+        ));
+    }
     rendered.push_str(&styled("ordinary phase", STYLE_SECONDARY, color));
     rendered.push('\n');
     let finalization_start = attempt.workflow.finalization_start;
@@ -323,7 +335,10 @@ fn archived_step_detail(step: &ArchivedStep, definition: &WorkflowPresentationSt
                 count => format!("{count} outputs committed"),
             },
         },
-        ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)) => String::new(),
+        ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => format!(
+            "prior attempt {} ({:?}) · definition changed {}",
+            detail.prior_attempt_number, detail.prior_state, detail.definition_changed,
+        ),
         ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
             archived_failure_detail(failure)
         }
@@ -590,7 +605,8 @@ pub(crate) const fn archived_role(role: WorkflowNodeRole) -> &'static str {
 
 pub(crate) const fn archived_step_state(state: ArchivedStepState) -> &'static str {
     match state {
-        ArchivedStepState::Succeeded | ArchivedStepState::Inherited => "succeeded",
+        ArchivedStepState::Succeeded => "succeeded",
+        ArchivedStepState::Inherited => "inherited",
         ArchivedStepState::Failed => "failed",
         ArchivedStepState::Blocked => "blocked",
         ArchivedStepState::Skipped => "skipped",

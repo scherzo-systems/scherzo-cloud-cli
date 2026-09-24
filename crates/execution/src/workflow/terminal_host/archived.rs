@@ -426,7 +426,9 @@ impl StepProjection for ArchivedTerminalStepView {
                         .map(|_| self.with_recovery_detail(String::new())),
                 }
             }
-            ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)) => None,
+            ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => {
+                Some(inherited_detail(detail))
+            }
             ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
                 Some(self.with_recovery_detail(issue_detail_for_step(
                     archived_failure_detail(failure),
@@ -480,7 +482,9 @@ impl StepProjection for ArchivedTerminalStepView {
                 output_count_detail(self.definition.outputs().len()),
                 Tone::Success,
             )),
-            ArchivedStepDetail::Evidence(NodeDetail::Inherited(_)) => None,
+            ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => Some(
+                InspectorField::new("inheritance", inherited_detail(detail), Tone::Neutral),
+            ),
             ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => Some(InspectorField::new(
                 "failure",
                 archived_failure_detail(failure),
@@ -555,6 +559,13 @@ impl ArchivedTerminalStepView {
             format!("{base} · {recovery_detail}")
         }
     }
+}
+
+fn inherited_detail(detail: &crate::workflow::evidence::InheritedDetail) -> String {
+    format!(
+        "prior attempt {} ({:?}) · definition changed {}",
+        detail.prior_attempt_number, detail.prior_state, detail.definition_changed,
+    )
 }
 
 fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> {
@@ -632,6 +643,24 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
             tone: Tone::Muted,
         },
     ];
+    let modified = match attempt.workspace_modified {
+        crate::workflow::publication::WorkspaceModifiedV1::Known(true) => "true",
+        crate::workflow::publication::WorkspaceModifiedV1::Known(false) => "false",
+        crate::workflow::publication::WorkspaceModifiedV1::Unknown(_) => "unknown",
+    };
+    lines.push(ArchivedSummaryLine {
+        text: format!("workspace modified {modified}"),
+        tone: Tone::Neutral,
+    });
+    if let Some(continuation) = &attempt.continuation {
+        lines.push(ArchivedSummaryLine {
+            text: format!(
+                "continuation definition {:?}",
+                continuation.definition_source
+            ),
+            tone: Tone::Neutral,
+        });
+    }
     if let Some(primary) = &attempt.primary_issue {
         let detail = match &primary.detail {
             PrimaryIssueDetail::Failed(detail) => archived_failure_detail(detail),
@@ -718,7 +747,8 @@ fn archived_outcome_status(outcome: ArchivedWorkflowOutcome) -> (&'static str, T
 
 fn archived_step_state(state: ArchivedStepState) -> StepStateKind {
     match state {
-        ArchivedStepState::Succeeded | ArchivedStepState::Inherited => StepStateKind::Succeeded,
+        ArchivedStepState::Succeeded => StepStateKind::Succeeded,
+        ArchivedStepState::Inherited => StepStateKind::Inherited,
         ArchivedStepState::Failed => StepStateKind::Failed,
         ArchivedStepState::Blocked => StepStateKind::Blocked,
         ArchivedStepState::Skipped => StepStateKind::Skipped,

@@ -993,6 +993,7 @@ pub struct ExecutionContext {
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
     git_capture: GitCaptureAdmission,
+    continuation_reexecuted: Option<BTreeSet<String>>,
     capacity_budget: WorkflowCapacityBudget,
 }
 
@@ -1013,6 +1014,7 @@ impl ExecutionContext {
             claude_code_installation: None,
             codex_installation: None,
             git_capture: GitCaptureAdmission::None,
+            continuation_reexecuted: None,
             capacity_budget: WorkflowCapacityBudget::supported_maximum(),
         }
     }
@@ -1037,6 +1039,13 @@ impl ExecutionContext {
 
     pub fn with_cloud_git_capture(mut self, projection: CloudGitCaptureProjection) -> Self {
         self.git_capture = GitCaptureAdmission::Cloud(projection);
+        self
+    }
+
+    /// Continuation alone can avoid re-admitting Git outputs that are inherited.
+    /// The locked claim independently verifies the exact reexecution partition.
+    pub fn with_continuation_reexecuted_steps(mut self, steps: &[String]) -> Self {
+        self.continuation_reexecuted = Some(steps.iter().cloned().collect());
         self
     }
 
@@ -1280,6 +1289,16 @@ impl AdmittedWorkflow {
         &self.execution
     }
 
+    /// Engine-only binding after the continuation claim, never from caller-supplied
+    /// environment (which admission strips as an engine-reserved variable).
+    pub(crate) fn with_continuation_context(mut self, path: &Path) -> Self {
+        self.execution.environment = self.execution.environment.with_variable(
+            "SCHERZO_CONTINUATION_CONTEXT".into(),
+            path.as_os_str().to_owned(),
+        );
+        self
+    }
+
     pub(crate) fn agent_step(&self, step: &str) -> Option<&AdmittedHarness> {
         self.agent_steps.get(step)
     }
@@ -1436,7 +1455,56 @@ pub fn admit_local_workflow(
     inputs: ResolvedInputs,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    admit_workflow(workflow, inputs, context)
+    admit_local_workflow_for(workflow, inputs, context)
+}
+
+/// Continuation discovery already reports missing harness installations separately.
+/// Admit the independently checkable execution-root and Git context first so those
+/// diagnostics are not hidden by an unavailable harness.
+pub fn local_continuation_input_failures(
+    workflow: &ResolvedWorkflow,
+    inputs: &ResolvedInputs,
+) -> Vec<AdmissionFailure> {
+    collect_input_admission_failures(workflow, inputs)
+}
+
+pub fn admit_local_continuation_workflow(
+    workflow: ResolvedWorkflow,
+    inputs: ResolvedInputs,
+    context: ExecutionContext,
+) -> Result<AdmittedWorkflow, Vec<AdmissionFailure>> {
+    let mut failures = collect_input_admission_failures(&workflow, &inputs);
+    let admission = admit_workflow_for(
+        workflow,
+        inputs,
+        context,
+        WorkflowExecutionContract::General,
+        false,
+        false,
+    );
+    match (admission, failures.is_empty()) {
+        (Ok(admitted), true) => Ok(admitted),
+        (Ok(_), false) => Err(failures),
+        (Err(failure), _) => {
+            failures.push(failure);
+            Err(failures)
+        }
+    }
+}
+
+fn admit_local_workflow_for(
+    workflow: ResolvedWorkflow,
+    inputs: ResolvedInputs,
+    context: ExecutionContext,
+) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    admit_workflow_for(
+        workflow,
+        inputs,
+        context,
+        WorkflowExecutionContract::General,
+        true,
+        true,
+    )
 }
 
 pub fn admit_runner_workflow(
@@ -1449,6 +1517,8 @@ pub fn admit_runner_workflow(
         inputs,
         context,
         WorkflowExecutionContract::WorkflowV1CloudInputsArtifactsV1,
+        true,
+        true,
     )
 }
 
@@ -1457,22 +1527,15 @@ pub fn admit_workflow(
     inputs: ResolvedInputs,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    admit_workflow_for(
-        workflow,
-        inputs,
-        context,
-        WorkflowExecutionContract::General,
-    )
+    admit_local_workflow(workflow, inputs, context)
 }
 
-fn admit_workflow_for(
-    workflow: ResolvedWorkflow,
-    inputs: ResolvedInputs,
-    context: ExecutionContext,
-    execution_contract: WorkflowExecutionContract,
-) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    let capacity = admit_capacity(&workflow, context.capacity_budget, execution_contract)?;
+fn collect_input_admission_failures(
+    workflow: &ResolvedWorkflow,
+    inputs: &ResolvedInputs,
+) -> Vec<AdmissionFailure> {
     let declared = workflow.required_inputs();
+    let mut failures = Vec::new();
     for name in declared
         .keys()
         .chain(inputs.values().keys())
@@ -1481,23 +1544,29 @@ fn admit_workflow_for(
         let declaration = declared.get(name.as_str());
         let supplied = inputs.get(name);
         match (declaration, supplied) {
-            (Some(_), None) => {
-                return Err(AdmissionFailure::new(
-                    AdmissionFailureKind::MissingRequiredInput,
-                    AdmissionLocation::Input { name: name.clone() },
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(AdmissionFailure::new(
-                    AdmissionFailureKind::UnexpectedInput,
-                    AdmissionLocation::Input { name: name.clone() },
-                ));
-            }
+            (Some(_), None) => failures.push(AdmissionFailure::new(
+                AdmissionFailureKind::MissingRequiredInput,
+                AdmissionLocation::Input { name: name.clone() },
+            )),
+            (None, Some(_)) => failures.push(AdmissionFailure::new(
+                AdmissionFailureKind::UnexpectedInput,
+                AdmissionLocation::Input { name: name.clone() },
+            )),
             (Some(super::validated::WorkflowValueType::Text), Some(ResolvedInput::Text(_))) => {}
-            (Some(super::validated::WorkflowValueType::Json), Some(ResolvedInput::Json(_))) => {}
+            (Some(super::validated::WorkflowValueType::Json), Some(ResolvedInput::Json(json))) => {
+                if workflow
+                    .input_json_schema(name)
+                    .is_some_and(|schema| !schema.is_valid(json.value()))
+                {
+                    failures.push(AdmissionFailure::new(
+                        AdmissionFailureKind::InputSchemaMismatch,
+                        AdmissionLocation::Input { name: name.clone() },
+                    ));
+                }
+            }
             (Some(super::validated::WorkflowValueType::File), Some(ResolvedInput::File(file))) => {
                 if !super::is_valid_media_type(file.media_type()) {
-                    return Err(AdmissionFailure::new(
+                    failures.push(AdmissionFailure::new(
                         AdmissionFailureKind::InvalidFileMediaType,
                         AdmissionLocation::Input { name: name.clone() },
                     ));
@@ -1508,7 +1577,7 @@ fn admit_workflow_for(
                     .get(name)
                     .is_some_and(|required| required != file.media_type())
                 {
-                    return Err(AdmissionFailure::new(
+                    failures.push(AdmissionFailure::new(
                         AdmissionFailureKind::InputMediaTypeMismatch,
                         AdmissionLocation::Input { name: name.clone() },
                     ));
@@ -1518,51 +1587,63 @@ fn admit_workflow_for(
                 Some(super::validated::WorkflowValueType::AttachmentCollection),
                 Some(ResolvedInput::Attachments(attachments)),
             ) => {
-                if let Some((index, _)) = attachments
-                    .iter()
-                    .enumerate()
-                    .find(|(_, attachment)| !super::is_valid_media_type(attachment.media_type()))
-                {
-                    return Err(AdmissionFailure::new(
-                        AdmissionFailureKind::InvalidAttachmentMediaType,
-                        AdmissionLocation::AttachmentInput {
-                            name: name.clone(),
-                            index,
-                        },
-                    ));
-                }
+                failures.extend(
+                    attachments
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, attachment)| {
+                            !super::is_valid_media_type(attachment.media_type())
+                        })
+                        .map(|(index, _)| {
+                            AdmissionFailure::new(
+                                AdmissionFailureKind::InvalidAttachmentMediaType,
+                                AdmissionLocation::AttachmentInput {
+                                    name: name.clone(),
+                                    index,
+                                },
+                            )
+                        }),
+                );
             }
-            (Some(_), Some(_)) => {
-                return Err(AdmissionFailure::new(
-                    AdmissionFailureKind::InputKindMismatch,
-                    AdmissionLocation::Input { name: name.clone() },
-                ));
-            }
+            (Some(_), Some(_)) => failures.push(AdmissionFailure::new(
+                AdmissionFailureKind::InputKindMismatch,
+                AdmissionLocation::Input { name: name.clone() },
+            )),
             (None, None) => {}
         }
     }
-    for (name, input) in inputs.values() {
-        let ResolvedInput::Json(json) = input else {
-            continue;
-        };
-        if workflow
-            .input_json_schema(name)
-            .is_some_and(|schema| !schema.is_valid(json.value()))
-        {
-            return Err(AdmissionFailure::new(
-                AdmissionFailureKind::InputSchemaMismatch,
-                AdmissionLocation::Input { name: name.clone() },
-            ));
-        }
-    }
+    failures
+}
 
-    let available_harnesses = AvailableHarnesses::new(
-        context.pi_installation.as_ref(),
-        context.claude_code_installation.as_ref(),
-        context.codex_installation.as_ref(),
-    );
-    let agent_steps = admit_agent_steps(&workflow, &available_harnesses)?;
-    let recovery_handlers = admit_recovery_handlers(&workflow, &available_harnesses)?;
+fn admit_workflow_for(
+    workflow: ResolvedWorkflow,
+    inputs: ResolvedInputs,
+    context: ExecutionContext,
+    execution_contract: WorkflowExecutionContract,
+    admit_harnesses_first: bool,
+    validate_inputs: bool,
+) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    let capacity = admit_capacity(&workflow, context.capacity_budget, execution_contract)?;
+    if validate_inputs
+        && let Some(failure) = collect_input_admission_failures(&workflow, &inputs)
+            .into_iter()
+            .next()
+    {
+        return Err(failure);
+    }
+    let admitted_harnesses = if admit_harnesses_first {
+        let available_harnesses = AvailableHarnesses::new(
+            context.pi_installation.as_ref(),
+            context.claude_code_installation.as_ref(),
+            context.codex_installation.as_ref(),
+        );
+        Some((
+            admit_agent_steps(&workflow, &available_harnesses)?,
+            admit_recovery_handlers(&workflow, &available_harnesses)?,
+        ))
+    } else {
+        None
+    };
 
     let maximum_parallel_steps = NonZeroUsize::new(context.limits.maximum_parallel_steps)
         .ok_or_else(|| {
@@ -1709,7 +1790,24 @@ fn admit_workflow_for(
         environment,
         cancellation: context.cancellation,
     };
-    let git_capture = if workflow.requires_git_capture() {
+    let needs_git_capture = context.continuation_reexecuted.as_ref().map_or_else(
+        || workflow.requires_git_capture(),
+        |steps| {
+            workflow
+                .definition
+                .finalizers
+                .values()
+                .any(|node| has_git_output(&node.body))
+                || steps.iter().any(|id| {
+                    workflow
+                        .definition
+                        .steps
+                        .get(id)
+                        .is_some_and(has_git_output)
+                })
+        },
+    );
+    let git_capture = if needs_git_capture {
         if let GitCaptureAdmission::Cloud(projection) = &context.git_capture
             && projection.workflow_digest() != workflow.content_digest.value
         {
@@ -1749,6 +1847,20 @@ fn admit_workflow_for(
         Some(Arc::new(capture))
     } else {
         None
+    };
+    let (agent_steps, recovery_handlers) = match admitted_harnesses {
+        Some(admitted) => admitted,
+        None => {
+            let available_harnesses = AvailableHarnesses::new(
+                context.pi_installation.as_ref(),
+                context.claude_code_installation.as_ref(),
+                context.codex_installation.as_ref(),
+            );
+            (
+                admit_agent_steps(&workflow, &available_harnesses)?,
+                admit_recovery_handlers(&workflow, &available_harnesses)?,
+            )
+        }
     };
     Ok(AdmittedWorkflow {
         workflow: Arc::new(workflow),
@@ -1821,6 +1933,19 @@ fn admit_capacity(
         resolved: workflow.capacity.clone(),
         execution_contract,
         maximum_transitions,
+    })
+}
+
+pub(crate) fn has_git_output(step: &ValidatedStep) -> bool {
+    let common = match step {
+        ValidatedStep::Command(node) => &node.common,
+        ValidatedStep::Agent(node) => &node.common,
+    };
+    common.outputs.values().any(|output| {
+        matches!(
+            output.definition,
+            super::document::Output::GitBranchWorkspace
+        )
     })
 }
 

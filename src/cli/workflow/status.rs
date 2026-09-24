@@ -90,6 +90,8 @@ struct StatusSuccess<'a> {
     state: &'a Value,
     recovery: RecoveryOutput<'a>,
     retry: RetryOutput,
+    continuation: ContinuationOutput,
+    workspace_modified: Value,
 }
 
 #[derive(Serialize)]
@@ -145,6 +147,38 @@ impl From<LocalRetryEligibility> for RetryOutput {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ContinuationOutput {
+    eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    request_admission: &'static str,
+}
+
+impl From<LocalRetryEligibility> for ContinuationOutput {
+    fn from(eligibility: LocalRetryEligibility) -> Self {
+        match eligibility {
+            LocalRetryEligibility::Eligible => Self {
+                eligible: true,
+                reason: None,
+                request_admission: "not_evaluated",
+            },
+            LocalRetryEligibility::Ineligible(reason) => Self {
+                eligible: false,
+                reason: Some(match reason {
+                    RetryIneligibilityReason::LatestAttemptSucceeded
+                    | RetryIneligibilityReason::LatestAttemptRejected => {
+                        "continuation_disposition_ineligible"
+                    }
+                    _ => reason.as_str(),
+                }),
+                request_admission: "not_evaluated",
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StatusErrorOutput<'a> {
     schema_version: u8,
     command: &'static str,
@@ -178,6 +212,21 @@ fn render_json(snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>) -> io
                 state: &snapshot.state,
                 recovery: RecoveryOutput::from(&snapshot.recovery),
                 retry: snapshot.retry.into(),
+                continuation: snapshot.continuation.into(),
+                workspace_modified: snapshot.state["attempts"]
+                    .as_array()
+                    .and_then(|attempts| attempts.last())
+                    .and_then(|attempt| {
+                        attempt["continuation"]["workspace"]["modified"]
+                            .as_str()
+                            .map(|value| serde_json::json!(value))
+                            .or_else(|| {
+                                attempt["continuation"]["workspace"]["modified"]
+                                    .as_bool()
+                                    .map(|value| serde_json::json!(value))
+                            })
+                    })
+                    .unwrap_or_else(|| serde_json::json!("unknown")),
             })?;
             Ok(ExitCode::Success)
         }
@@ -236,6 +285,32 @@ fn write_plain_snapshot(
         styled_recovery(&snapshot.recovery, color)
     )?;
     writeln!(writer, "retry: {}", styled_retry(snapshot.retry, color))?;
+    writeln!(
+        writer,
+        "continuation (base eligibility): {}",
+        match snapshot.continuation {
+            LocalRetryEligibility::Eligible => styled("eligible", STYLE_SUCCESS, color),
+            LocalRetryEligibility::Ineligible(
+                RetryIneligibilityReason::LatestAttemptSucceeded
+                | RetryIneligibilityReason::LatestAttemptRejected,
+            ) => styled(
+                "ineligible (continuation_disposition_ineligible)",
+                STYLE_BLOCKED,
+                color
+            ),
+            other => styled_retry(other, color),
+        }
+    )?;
+    writeln!(
+        writer,
+        "workspace modified: {}",
+        snapshot.state["attempts"]
+            .as_array()
+            .and_then(|attempts| attempts.last())
+            .map(|attempt| &attempt["continuation"]["workspace"]["modified"])
+            .filter(|value| !value.is_null())
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+    )?;
     let archived_result = if matches!(
         &snapshot.current_result,
         LocalStatusResult::Published { .. }

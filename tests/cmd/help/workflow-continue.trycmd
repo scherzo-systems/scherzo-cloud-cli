@@ -1,0 +1,21 @@
+```console
+$ scherzo-cloud workflow continue --help
+Continue selected steps of a local workflow run
+
+Usage: scherzo-cloud workflow continue [OPTIONS] --from <NODE> <RUN_DIR>
+
+Arguments:
+  <RUN_DIR>  Directory containing the workflow run
+
+Options:
+      --from <NODE>            Ordinary step to reexecute (repeatable)
+      --workflow <FILE>        Replacement workflow file within the run's original source root
+      --execution-root <PATH>  Existing execution root; defaults to the previous attempt's root
+      --plain                  Force plain human presentation
+      --json                   Print the workflow result as JSON
+      --color <WHEN>           Select renderer color behavior [default: auto] [possible values: auto, always, never]
+  -h, --help                   Print help
+
+Select one or more ordinary steps with --from. Their downstream ordinary dependents run again; other eligible ordinary steps are inherited. Every finalizer runs again. The original run inputs and Git baseline remain authoritative.
+
+```

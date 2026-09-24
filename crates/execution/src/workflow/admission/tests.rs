@@ -20,6 +20,28 @@ use crate::workflow::codex::CodexConfig;
 use crate::workflow::pi::Thinking;
 use crate::workflow::resolution::{self, ResolvedWorkflow};
 
+#[test]
+fn inherited_only_git_output_does_not_require_a_new_workspace_baseline() {
+    let fixture = WorkflowFixture::new(
+        "schemaVersion: 1\nsteps:\n  inheritedGit:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      branch: {kind: git_branch, from: workspace}\n  rerun:\n    kind: cmd\n    command: {argv: [\"true\"]}\nexports:\n  branch: {ref: outputs.inheritedGit.branch}\n",
+    );
+    let workflow = fixture.resolve();
+    assert!(workflow.requires_git_capture());
+    let context = fixture
+        .context(1, Duration::from_secs(10))
+        .with_continuation_reexecuted_steps(&["rerun".to_owned()]);
+    assert!(
+        admit_local_workflow(workflow.clone(), ResolvedInputs::default(), context)
+            .unwrap()
+            .git_capture()
+            .is_none()
+    );
+    let context = fixture
+        .context(1, Duration::from_secs(10))
+        .with_continuation_reexecuted_steps(&["inheritedGit".to_owned()]);
+    assert!(admit_local_workflow(workflow, ResolvedInputs::default(), context).is_err());
+}
+
 const COMMAND_WORKFLOW: &str = r#"schemaVersion: 1
 inputs:
   request:

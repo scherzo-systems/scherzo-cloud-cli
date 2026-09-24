@@ -2061,6 +2061,669 @@ fn abandoned_exact_group_is_authenticated_terminated_and_proven_absent() {
     assert_eq!(authority.terminations.get(), 1);
 }
 
+#[test]
+fn corrupted_retained_definition_after_quiescence_still_settles_abandonment() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("abandoned-invalid-retention");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    drop(original);
+    fs::remove_file(path.join("workflow/manifest.json")).unwrap();
+    fs::write(path.join("workflow/manifest.json"), b"corrupt manifest").unwrap();
+    assert!(acquire_local_continuation(&path).is_err());
+    let state = read_state(&open_directory_path(&path).unwrap()).unwrap();
+    assert_eq!(state.attempts.len(), 1);
+    assert_eq!(state.attempts[0].state, AttemptStateV1::Interrupted);
+    assert_eq!(
+        state.attempts[0]
+            .settlement_snapshot
+            .as_ref()
+            .unwrap()
+            .settled_by,
+        Some(WorkspaceSnapshotSettlementV1::AbandonmentRecovery)
+    );
+}
+
+#[test]
+fn abandoned_continuation_rejection_settles_only_the_prior_attempt() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("abandoned-continuation-rejection");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    drop(original);
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("unowned created attempt must be recoverable");
+    };
+    assert!(
+        pending
+            .partition(pending.previous_definition(), &["second".to_owned()])
+            .is_err()
+    );
+    pending.settle_abandoned().unwrap();
+    let state = read_state(&open_directory_path(&path).unwrap()).unwrap();
+    assert_eq!(state.attempts.len(), 1);
+    assert_eq!(state.attempts[0].state, AttemptStateV1::Interrupted);
+    assert_eq!(
+        state.attempts[0].interruption.as_ref().unwrap().cause,
+        InterruptionCauseV1::ExecutionOwnerLost
+    );
+    assert_eq!(
+        state.attempts[0]
+            .settlement_snapshot
+            .as_ref()
+            .unwrap()
+            .settled_by,
+        Some(WorkspaceSnapshotSettlementV1::AbandonmentRecovery)
+    );
+    assert!(!path.join("attempts/000002").exists());
+}
+
+#[test]
+fn abandoned_continuation_claim_settles_and_claims_in_one_state_revision() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("abandoned-continuation-claim");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    drop(original);
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("unowned created attempt must be recoverable");
+    };
+    let owned = pending
+        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .unwrap();
+    let state = read_state(owned.state.root.as_ref()).unwrap();
+    assert_eq!(state.revision, 2);
+    assert_eq!(state.attempts.len(), 2);
+    assert_eq!(state.attempts[0].state, AttemptStateV1::Interrupted);
+    assert_eq!(
+        state.attempts[0]
+            .settlement_snapshot
+            .as_ref()
+            .unwrap()
+            .settled_by,
+        Some(WorkspaceSnapshotSettlementV1::AbandonmentRecovery)
+    );
+    assert_eq!(state.attempts[1].state, AttemptStateV1::Created);
+    assert_eq!(
+        state.attempts[1]
+            .continuation
+            .as_ref()
+            .unwrap()
+            .workspace
+            .modified,
+        super::super::publication::WorkspaceModifiedV1::Unknown(
+            super::super::publication::WorkspaceModifiedUnknownV1::Unknown
+        )
+    );
+}
+
+#[test]
+fn continuation_context_rejects_a_rebound_run_path() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("continuation-context-rebound");
+    let moved = fixture.run_path("continuation-context-original");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&original);
+    drop(original);
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("eligible failed run");
+    };
+    let owned = pending
+        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .unwrap();
+
+    fs::rename(&path, moved).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::create_dir(path.join(ATTEMPTS_DIRECTORY)).unwrap();
+    fs::create_dir(path.join(ATTEMPTS_DIRECTORY).join("000002")).unwrap();
+
+    assert!(matches!(
+        owned.bind_continuation_context(fixture.admitted.clone()),
+        Err(LocalRunDirectoryError::StateInvalid)
+    ));
+}
+
+#[test]
+fn continuation_context_rejects_a_symlink_rebound_run_path() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("continuation-context-symlink");
+    let moved = fixture.run_path("continuation-context-symlink-original");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&original);
+    drop(original);
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("eligible failed run");
+    };
+    let owned = pending
+        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .unwrap();
+
+    fs::rename(&path, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &path).unwrap();
+
+    assert!(matches!(
+        owned.bind_continuation_context(fixture.admitted.clone()),
+        Err(LocalRunDirectoryError::StateInvalid)
+    ));
+}
+
+#[test]
+fn postclaim_owner_loss_remains_auditable_and_can_be_settled_again() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("postclaim-owner-loss");
+    let first = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&first);
+    drop(first);
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("eligible failed run");
+    };
+    let owned = pending
+        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .unwrap();
+    drop(owned); // Simulate owner death before seed/dispatch.
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("committed continuation must be recoverable");
+    };
+    assert_eq!(pending.prior_attempt_number(), 2);
+    pending.settle_abandoned().unwrap();
+    let state = read_state(&open_directory_path(&path).unwrap()).unwrap();
+    assert_eq!(state.attempts.len(), 2);
+    assert_eq!(state.attempts[1].trigger, AttemptTriggerV1::Continuation);
+    assert_eq!(state.attempts[1].state, AttemptStateV1::Interrupted);
+    assert_eq!(
+        state.attempts[1].interruption.as_ref().unwrap().cause,
+        InterruptionCauseV1::ExecutionOwnerLost
+    );
+}
+
+#[test]
+fn orphaned_preclaim_attempt_directory_is_removed_under_the_next_lock() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("orphaned-continuation-stage");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&original);
+    drop(original);
+    fs::create_dir_all(path.join("attempts/000002/workflow/files")).unwrap();
+    fs::write(
+        path.join("attempts/000002/workflow/manifest.json"),
+        b"staged only",
+    )
+    .unwrap();
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("staged directory cannot count as an attempt");
+    };
+    assert_eq!(pending.prior_attempt_number(), 1);
+    assert!(!path.join("attempts/000002").exists());
+}
+
+#[test]
+fn continuation_claim_commits_one_partitioned_attempt_after_failed_run() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("continuation-claim");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&original);
+    drop(original);
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("failed run should allow claim");
+    };
+    let owned = pending
+        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .unwrap();
+    assert_eq!(owned.attempt_number(), 2);
+    let state = read_state(owned.state.root.as_ref()).unwrap();
+    assert_eq!(state.attempts.len(), 2);
+    let current = state.attempts.last().unwrap();
+    assert_eq!(current.trigger, AttemptTriggerV1::Continuation);
+    let record = current.continuation.as_ref().unwrap();
+    assert_eq!(record.reexecuted_steps, ["first", "second"]);
+    assert!(record.inherited_steps.is_empty());
+    assert_eq!(record.workspace.quiescence.groups_recorded, 0);
+    drop(owned);
+}
+
+#[test]
+fn continuation_claim_rechecks_immutable_source_and_execution_policy() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("continuation-bound-admission");
+    let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&original);
+    drop(original);
+
+    let altered_policy = admit_workflow(
+        fixture.admitted.workflow().clone(),
+        fixture.admitted.inputs().clone(),
+        ExecutionContext::new(
+            fixture.execution_root.clone(),
+            ExecutionPolicyLimits::new(
+                3,
+                CaptureLimits::new(16, 1024, 4096),
+                InputLimits::new(16, 1024, 4096, 4096),
+                1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
+        ),
+    )
+    .unwrap();
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("failed run should allow claim inspection");
+    };
+    assert!(matches!(
+        pending.begin(&altered_policy, vec!["first".to_owned()], false),
+        Err(LocalRunDirectoryError::StateConflict)
+    ));
+
+    let alternate_source = fixture._temporary.path().join("alternate-source");
+    fs::create_dir(&alternate_source).unwrap();
+    fs::copy(
+        fixture
+            .admitted
+            .workflow()
+            .source
+            .source_root
+            .join("workflow.yaml"),
+        alternate_source.join("workflow.yaml"),
+    )
+    .unwrap();
+    let alternate_workflow =
+        resolution::resolve(&alternate_source, Path::new("workflow.yaml")).unwrap();
+    let altered_source = admit_workflow(
+        alternate_workflow,
+        fixture.admitted.inputs().clone(),
+        ExecutionContext::new(
+            fixture.execution_root.clone(),
+            ExecutionPolicyLimits::new(
+                2,
+                CaptureLimits::new(16, 1024, 4096),
+                InputLimits::new(16, 1024, 4096, 4096),
+                1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
+        ),
+    )
+    .unwrap();
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+    else {
+        panic!("failed run should remain available after rejected claim");
+    };
+    assert!(matches!(
+        pending.begin(&altered_source, vec!["first".to_owned()], true),
+        Err(LocalRunDirectoryError::StateConflict)
+    ));
+    assert_eq!(
+        read_state(&open_directory_path(&path).unwrap())
+            .unwrap()
+            .attempts
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn producer_workflow_cache_reads_a_shared_closure_once() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("shared-producer-closure-cache");
+    let run = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    let metadata = read_run(run.root_handle()).unwrap();
+    let definition = attempt_definition_for_run(&metadata);
+    let workflow = fixture.admitted.workflow().clone();
+    let loads = std::cell::Cell::new(0);
+    let mut workflows = BTreeMap::new();
+
+    for _ in 0..16 {
+        let loaded = cached_producer_workflow(&mut workflows, definition.clone(), || {
+            loads.set(loads.get() + 1);
+            Ok(workflow.clone())
+        })
+        .unwrap();
+        assert_eq!(loaded.content_digest, workflow.content_digest);
+    }
+
+    assert_eq!(loads.get(), 1);
+    assert_eq!(workflows.len(), 1);
+}
+
+#[test]
+fn continuation_state_index_resolves_long_inheritance_chains_once() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("long-continuation-chain");
+    let initial = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    let mut state = read_state(initial.state.root.as_ref()).unwrap();
+    drop(initial);
+    let first = state.attempts[0]
+        .progress
+        .steps
+        .iter_mut()
+        .find(|step| step.id == "first")
+        .unwrap();
+    first.state = AttemptStepStateV1::Succeeded;
+    first.detail = None;
+
+    for attempt_number in 2..=128 {
+        let prior = state.attempts.last().unwrap();
+        let prior_attempt_id = prior.attempt_id.clone();
+        let prior_attempt_number = prior.attempt_number;
+        let mut attempt = prior.clone();
+        attempt.attempt_number = attempt_number;
+        attempt.prior_attempt_number = Some(prior_attempt_number);
+        attempt.trigger = AttemptTriggerV1::Continuation;
+        let first = attempt
+            .progress
+            .steps
+            .iter_mut()
+            .find(|step| step.id == "first")
+            .unwrap();
+        first.state = AttemptStepStateV1::Inherited;
+        first.detail = Some(NodeDetail::Inherited(
+            super::super::evidence::InheritedDetail {
+                prior_attempt_id,
+                prior_attempt_number,
+                prior_state: if attempt_number == 2 {
+                    super::super::evidence::InheritedPriorState::Succeeded
+                } else {
+                    super::super::evidence::InheritedPriorState::Inherited
+                },
+                definition_changed: false,
+            },
+        ));
+        state.attempts.push(attempt);
+    }
+
+    let index = LocalRunStateIndex::new(&state).unwrap();
+    assert_eq!(
+        index.disposition(128, "first"),
+        Some(InheritedDisposition::Succeeded)
+    );
+}
+
+#[test]
+fn continuation_acquisition_keeps_run_locked_during_partition_admission() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("continue-admission");
+    let initial = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&initial);
+    drop(initial);
+
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&run_path).unwrap()
+    else {
+        panic!("failed run should admit a continuation inspection");
+    };
+    pending.verify_locked_history().unwrap();
+    assert_eq!(pending.quiescence_counts(), (0, 0, 0));
+    let unchanged =
+        pending.definition_changes(pending.previous_definition(), &["first".to_owned()]);
+    assert_eq!(unchanged.get("first"), Some(&false));
+    let mut revised = pending.previous_definition().clone();
+    if let Some(super::super::validated::ValidatedStep::Command(command)) =
+        revised.definition.steps.get_mut("first")
+    {
+        command.argv.push("new-argument".to_owned());
+    }
+    let changed = pending.definition_changes(&revised, &["first".to_owned()]);
+    assert_eq!(changed.get("first"), Some(&true));
+    let mut subset = pending.previous_definition().clone();
+    subset.definition.required_inputs.remove("request");
+    assert!(
+        pending
+            .projected_inputs(&subset)
+            .unwrap()
+            .get("request")
+            .is_none()
+    );
+    subset.definition.required_inputs.insert(
+        "extra".to_owned(),
+        super::super::validated::WorkflowValueType::Text,
+    );
+    assert_eq!(
+        pending.projected_inputs(&subset).err(),
+        Some(vec!["extra".to_owned()])
+    );
+    let selection = pending.partition(pending.previous_definition(), &["second".to_owned()]);
+    assert!(selection.is_err()); // 'first' has not succeeded and cannot be inherited.
+    assert_eq!(read_state(&pending.root).unwrap().attempts.len(), 1);
+    drop(pending);
+    let LocalRetryOpen::Acquired(_) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("planning must release the lock without creating an attempt");
+    };
+}
+
+#[test]
+fn malformed_inherited_disposition_is_returned_for_combined_admission_reporting() {
+    let fixture = AdmittedFixture::new();
+    let path = fixture.run_path("malformed-disposition");
+    let owned = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+    let state = read_state(&open_directory_path(&path).unwrap()).unwrap();
+    drop(owned);
+    let (skipped, violations) = effective_skipped_sources(
+        &state,
+        1,
+        &["first".to_owned()],
+        &BTreeMap::from([(
+            "first".to_owned(),
+            super::super::continuation::PriorState::Inherited,
+        )]),
+    );
+    assert!(skipped.is_empty());
+    assert_eq!(
+        violations,
+        vec![super::super::continuation::AdmissionViolation::Node {
+            id: "first".to_owned(),
+            prior: Some(super::super::continuation::PriorState::Inherited)
+        }]
+    );
+}
+
+#[test]
+fn continuation_admission_follows_skipped_disposition_through_inherited_history() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      value: {kind: text, from: path, path: value.txt}\n  second:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.first.value}\n    command: {argv: [\"true\"]}\n",
+    );
+    let run =
+        InitialLocalRun::create(&fixture.run_path("skipped-history"), &fixture.admitted).unwrap();
+    let mut state = read_state(run.root_handle()).unwrap();
+    state.attempts[0].progress.steps[0].state = AttemptStepStateV1::Skipped;
+    let prior_id = state.attempts[0].attempt_id.clone();
+    let mut inherited = state.attempts[0].clone();
+    inherited.attempt_number = 2;
+    inherited.progress.steps[0].state = AttemptStepStateV1::Inherited;
+    inherited.progress.steps[0].detail = Some(NodeDetail::Inherited(
+        crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: prior_id,
+            prior_attempt_number: 1,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Skipped,
+            definition_changed: false,
+        },
+    ));
+    state.attempts.push(inherited);
+    let (skipped, violations) = effective_skipped_sources(
+        &state,
+        2,
+        &["first".to_owned()],
+        &BTreeMap::from([(
+            "first".to_owned(),
+            super::super::continuation::PriorState::Inherited,
+        )]),
+    );
+    assert!(violations.is_empty());
+    assert_eq!(skipped, BTreeSet::from(["first".to_owned()]));
+    let workflow = &fixture.admitted.workflow().definition;
+    let partition =
+        super::super::continuation::partition(workflow, &["second".to_owned()]).unwrap();
+    let violations = super::super::continuation::check_inheritance(
+        workflow,
+        workflow,
+        &partition,
+        &BTreeMap::from([(
+            "first".to_owned(),
+            super::super::continuation::PriorState::Inherited,
+        )]),
+        &skipped,
+    );
+    assert_eq!(
+        violations,
+        vec![
+            super::super::continuation::AdmissionViolation::RequiredSkipped {
+                consumer: "second".to_owned(),
+                producer: "first".to_owned(),
+            }
+        ]
+    );
+}
+
+#[test]
+fn continuation_with_no_groups_needs_no_host_identity() {
+    struct NoHost;
+    impl LocalRecoveryAuthority for NoHost {
+        fn execution_host(&self) -> Result<ExecutionHostV1, ()> {
+            Err(())
+        }
+        fn observe_process(&self, _: &ProcessGuardV1) -> ProcessIdentityObservation {
+            panic!("no group should be inspected")
+        }
+    }
+    impl LocalQuiescenceAuthority for NoHost {
+        fn terminate_process(&self, _: &ProcessGuardV1) -> AuthenticatedSignalResult {
+            panic!("no group should be signaled")
+        }
+        fn wait_for_process_change(&self) {}
+    }
+    let fixture = AdmittedFixture::new();
+    let run = InitialLocalRun::create(&fixture.run_path("no-guards"), &fixture.admitted).unwrap();
+    let state = read_state(run.root_handle()).unwrap();
+    let proof = quiesce_run(&state, &NoHost).unwrap();
+    assert_eq!(
+        (
+            proof.groups_recorded,
+            proof.groups_terminated,
+            proof.groups_absent
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn continuation_quiescence_covers_prior_attempts_and_ignores_foreign_host_ids() {
+    let first = fixture_guarded_attempt();
+    let mut foreign = first.clone();
+    foreign.attempt_number = 2;
+    foreign.process_guards[0].execution_host.value = "another-boot".to_owned();
+    let authority = ExactThenAbsentAuthority {
+        host: first.owner.execution_host.clone(),
+        observations: std::cell::RefCell::new(VecDeque::from([
+            ProcessIdentityObservation::Exact {
+                leader: crate::workflow::process_group::LeaderState::Running,
+            },
+            ProcessIdentityObservation::Absent,
+        ])),
+        terminations: std::cell::Cell::new(0),
+    };
+    let state = LocalRunStateV1 {
+        schema_version: 1,
+        local_run_id: "fixture".to_owned(),
+        revision: 0,
+        current_attempt_number: 2,
+        attempts: vec![first, foreign],
+        diagnostics: Vec::new(),
+    };
+    let proof = quiesce_run(&state, &authority).unwrap();
+    assert_eq!(
+        (
+            proof.groups_recorded,
+            proof.groups_terminated,
+            proof.groups_absent
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!(authority.terminations.get(), 1);
+    assert!(authority.observations.borrow().is_empty());
+}
+
+struct ControlledQuiescenceAuthority {
+    host: ExecutionHostV1,
+    observations: std::cell::RefCell<VecDeque<ProcessIdentityObservation>>,
+    signal: AuthenticatedSignalResult,
+    signalled: std::cell::Cell<usize>,
+}
+
+impl LocalRecoveryAuthority for ControlledQuiescenceAuthority {
+    fn execution_host(&self) -> Result<ExecutionHostV1, ()> {
+        Ok(self.host.clone())
+    }
+    fn observe_process(&self, _guard: &ProcessGuardV1) -> ProcessIdentityObservation {
+        self.observations.borrow_mut().pop_front().unwrap()
+    }
+}
+
+impl LocalQuiescenceAuthority for ControlledQuiescenceAuthority {
+    fn terminate_process(&self, _guard: &ProcessGuardV1) -> AuthenticatedSignalResult {
+        self.signalled.set(self.signalled.get() + 1);
+        self.signal
+    }
+    fn wait_for_process_change(&self) {}
+}
+
+#[test]
+fn continuation_quiescence_rejects_unproven_identity_before_any_signal() {
+    let mut attempt = fixture_guarded_attempt();
+    let mut second = attempt.process_guards[0].clone();
+    second.guard_id = "22222222-2222-4222-8222-222222222222".to_owned();
+    attempt.process_guards.push(second);
+    let state = LocalRunStateV1 {
+        schema_version: 1,
+        local_run_id: "fixture".to_owned(),
+        revision: 0,
+        current_attempt_number: 1,
+        attempts: vec![attempt.clone()],
+        diagnostics: Vec::new(),
+    };
+    for observations in [
+        vec![
+            ProcessIdentityObservation::Exact {
+                leader: crate::workflow::process_group::LeaderState::Running,
+            },
+            ProcessIdentityObservation::Unavailable,
+        ],
+        vec![
+            ProcessIdentityObservation::Exact {
+                leader: crate::workflow::process_group::LeaderState::Running,
+            },
+            ProcessIdentityObservation::Exact {
+                leader: crate::workflow::process_group::LeaderState::Running,
+            },
+        ],
+    ] {
+        let signal = if observations.len() == 2
+            && matches!(observations[1], ProcessIdentityObservation::Unavailable)
+        {
+            AuthenticatedSignalResult::Signalled
+        } else {
+            AuthenticatedSignalResult::Unavailable
+        };
+        let authority = ControlledQuiescenceAuthority {
+            host: attempt.owner.execution_host.clone(),
+            observations: std::cell::RefCell::new(VecDeque::from(observations)),
+            signal,
+            signalled: std::cell::Cell::new(0),
+        };
+        assert!(quiesce_run(&state, &authority).is_err());
+        assert_eq!(
+            authority.signalled.get(),
+            if signal == AuthenticatedSignalResult::Signalled {
+                0
+            } else {
+                2
+            }
+        );
+    }
+}
+
 struct DelayedAbsentAuthority {
     host: ExecutionHostV1,
     observations: std::cell::Cell<usize>,

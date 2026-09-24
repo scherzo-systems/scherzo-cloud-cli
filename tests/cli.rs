@@ -72,6 +72,8 @@ mod runner_enrollment;
 mod runner_status;
 #[path = "cli/service_principal.rs"]
 mod service_principal;
+#[path = "cli/workflow_continue.rs"]
+mod workflow_continue;
 #[path = "cli/workflow_reference.rs"]
 mod workflow_reference;
 #[path = "cli/workflow_retry.rs"]

@@ -67,6 +67,7 @@ const CANCELLATION_GRACE: Duration = Duration::from_secs(10);
 pub(super) enum ExecutionLeaf {
     Run,
     Retry,
+    Continue,
 }
 
 #[derive(Debug, Args)]
@@ -655,10 +656,12 @@ pub(super) async fn execute_owned_attempt(
                 &publication_artifacts,
                 &publication_run,
             );
-            if leaf == ExecutionLeaf::Retry
-                && let Ok(terminal) = &mut publication
-            {
-                terminal.mark_retry();
+            if let Ok(terminal) = &mut publication {
+                match leaf {
+                    ExecutionLeaf::Retry => terminal.mark_retry(),
+                    ExecutionLeaf::Continue => terminal.mark_continue(),
+                    ExecutionLeaf::Run => {}
+                }
             }
             let state_publication = match &publication {
                 Ok(_) => owned_run.record_result_published(),
@@ -744,6 +747,7 @@ fn execution_output(
     match leaf {
         ExecutionLeaf::Run => output,
         ExecutionLeaf::Retry => output.for_retry(owned_run.run_directory()),
+        ExecutionLeaf::Continue => output.for_continue(owned_run.run_directory()),
     }
 }
 
@@ -845,6 +849,41 @@ pub(super) fn execution_context_for_workflow(
     maximum_parallel_steps: usize,
     cancellation: CancellationSource,
 ) -> Result<ExecutionContext, AgentHarnessInstallationFailure> {
+    let (context, mut failures) = execution_context_with_profile_failures(
+        workflow,
+        root,
+        maximum_parallel_steps,
+        cancellation,
+        false,
+    );
+    match failures.pop() {
+        Some(failure) => Err(failure),
+        None => Ok(context),
+    }
+}
+
+pub(super) fn continuation_execution_context(
+    workflow: &ResolvedWorkflow,
+    root: PathBuf,
+    maximum_parallel_steps: usize,
+    cancellation: CancellationSource,
+) -> (ExecutionContext, Vec<AgentHarnessInstallationFailure>) {
+    execution_context_with_profile_failures(
+        workflow,
+        root,
+        maximum_parallel_steps,
+        cancellation,
+        true,
+    )
+}
+
+fn execution_context_with_profile_failures(
+    workflow: &ResolvedWorkflow,
+    root: PathBuf,
+    maximum_parallel_steps: usize,
+    cancellation: CancellationSource,
+    collect_all: bool,
+) -> (ExecutionContext, Vec<AgentHarnessInstallationFailure>) {
     let environment = EnvironmentSnapshot::new(env::vars_os());
     let mut context = ExecutionContext::new(
         root,
@@ -859,32 +898,51 @@ pub(super) fn execution_context_for_workflow(
     let mut pi_validated = false;
     let mut claude_code_validated = false;
     let mut codex_validated = false;
+    let mut failures = Vec::new();
     for harness in required_agent_harnesses(workflow) {
-        match harness {
+        let failure = match harness {
             ValidatedHarness::Pi(_) if !pi_validated => {
-                let installation = discover_and_validate_pi_installation()
-                    .map_err(AgentHarnessInstallationFailure::Pi)?;
-                context = context.with_pi_installation(installation);
                 pi_validated = true;
+                match discover_and_validate_pi_installation() {
+                    Ok(installation) => {
+                        context = context.with_pi_installation(installation);
+                        None
+                    }
+                    Err(error) => Some(AgentHarnessInstallationFailure::Pi(error)),
+                }
             }
             ValidatedHarness::ClaudeCode(_) if !claude_code_validated => {
-                let installation = discover_and_validate_claude_code_installation()
-                    .map_err(AgentHarnessInstallationFailure::ClaudeCode)?;
-                context = context.with_claude_code_installation(installation);
                 claude_code_validated = true;
+                match discover_and_validate_claude_code_installation() {
+                    Ok(installation) => {
+                        context = context.with_claude_code_installation(installation);
+                        None
+                    }
+                    Err(error) => Some(AgentHarnessInstallationFailure::ClaudeCode(error)),
+                }
             }
             ValidatedHarness::Codex(_) if !codex_validated => {
-                let installation = discover_and_validate_codex_installation()
-                    .map_err(AgentHarnessInstallationFailure::Codex)?;
-                context = context.with_codex_installation(installation);
                 codex_validated = true;
+                match discover_and_validate_codex_installation() {
+                    Ok(installation) => {
+                        context = context.with_codex_installation(installation);
+                        None
+                    }
+                    Err(error) => Some(AgentHarnessInstallationFailure::Codex(error)),
+                }
             }
             ValidatedHarness::Pi(_)
             | ValidatedHarness::ClaudeCode(_)
-            | ValidatedHarness::Codex(_) => {}
+            | ValidatedHarness::Codex(_) => None,
+        };
+        if let Some(failure) = failure {
+            failures.push(failure);
+            if !collect_all {
+                break;
+            }
         }
     }
-    Ok(context)
+    (context, failures)
 }
 
 #[derive(Debug)]
@@ -1614,6 +1672,7 @@ impl ActiveRunHost {
                 let output = match *leaf {
                     ExecutionLeaf::Run => output,
                     ExecutionLeaf::Retry => output.for_retry(&run.run_directory),
+                    ExecutionLeaf::Continue => output.for_continue(&run.run_directory),
                 };
                 let presented = match publication {
                     Ok(terminal) => output.render_standard_summary(

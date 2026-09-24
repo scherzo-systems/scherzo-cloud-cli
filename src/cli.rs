@@ -2222,6 +2222,7 @@ mod tests {
             "service-principal credential revoke",
             "version",
             "workflow",
+            "workflow continue",
             "workflow reference",
             "workflow retry",
             "workflow run",

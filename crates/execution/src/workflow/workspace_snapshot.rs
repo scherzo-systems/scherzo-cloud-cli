@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
@@ -87,6 +87,39 @@ impl WorkspaceSnapshotV1 {
             unavailable: Some(reason),
             settled_by,
         }
+    }
+}
+
+pub(super) fn capture_start_snapshot(execution_root: &Path) -> WorkspaceSnapshotV1 {
+    capture_with(
+        execution_root,
+        None,
+        &SystemCommandRunner,
+        &mut NoopSnapshotObserver,
+    )
+}
+
+pub(super) fn compare_continuation_snapshots(
+    execution_root: &Path,
+    prior_execution_root: &Path,
+    start: &WorkspaceSnapshotV1,
+    settlement: Option<&WorkspaceSnapshotV1>,
+) -> super::publication::WorkspaceModifiedV1 {
+    use super::publication::{WorkspaceModifiedUnknownV1, WorkspaceModifiedV1};
+    let Some(previous) = settlement else {
+        return WorkspaceModifiedV1::Unknown(WorkspaceModifiedUnknownV1::Unknown);
+    };
+    match (&start.value, &previous.value) {
+        (Some(current), Some(prior))
+            if execution_root == prior_execution_root
+                && start.validate(false)
+                && previous.validate(true)
+                && start.algorithm == previous.algorithm
+                && previous.settled_by == Some(WorkspaceSnapshotSettlementV1::Engine) =>
+        {
+            WorkspaceModifiedV1::Known(current != prior)
+        }
+        _ => WorkspaceModifiedV1::Unknown(WorkspaceModifiedUnknownV1::Unknown),
     }
 }
 
@@ -225,14 +258,19 @@ fn run_git(
     root: &Path,
     args: &[&str],
 ) -> Result<crate::process::CommandOutput, WorkspaceSnapshotUnavailableReasonV1> {
+    let environment = sanitized_git_environment(std::env::vars_os());
+    let environment = environment
+        .iter()
+        .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+        .collect::<Vec<_>>();
     let output = runner
         .run(CommandRequest {
             program: Path::new("git"),
             args,
             timeout: GIT_TIMEOUT,
             maximum_stdout_bytes: MAXIMUM_GIT_OUTPUT_BYTES,
-            clear_environment: false,
-            environment: &[],
+            clear_environment: true,
+            environment: &environment,
             current_directory: Some(root),
         })
         .map_err(|failure| match failure {
@@ -247,6 +285,30 @@ fn run_git(
     } else {
         Ok(output)
     }
+}
+
+fn sanitized_git_environment(
+    source: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = source
+        .into_iter()
+        .filter(|(name, _)| name != "LC_ALL" && !super::git_capture::reserved_git_environment(name))
+        .collect::<Vec<_>>();
+    environment.extend([
+        (OsString::from("LC_ALL"), OsString::from("C")),
+        (
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            OsString::from("/dev/null"),
+        ),
+        (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+        (OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")),
+        (
+            OsString::from("GIT_NO_REPLACE_OBJECTS"),
+            OsString::from("1"),
+        ),
+        (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+    ]);
+    environment
 }
 
 fn parse_staged_entries(
@@ -562,6 +624,100 @@ mod tests {
 
     fn available(snapshot: &WorkspaceSnapshotV1) -> &str {
         snapshot.value.as_deref().unwrap()
+    }
+
+    #[test]
+    fn snapshot_git_environment_removes_repository_routing_and_configuration() {
+        let environment = sanitized_git_environment([
+            (OsString::from("PATH"), OsString::from("/fixture/bin")),
+            (OsString::from("GIT_DIR"), OsString::from("/hostile/git")),
+            (
+                OsString::from("GIT_WORK_TREE"),
+                OsString::from("/hostile/tree"),
+            ),
+            (
+                OsString::from("GIT_INDEX_FILE"),
+                OsString::from("/hostile/index"),
+            ),
+            (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
+            (
+                OsString::from("GIT_CONFIG_KEY_0"),
+                OsString::from("core.hooksPath"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_VALUE_0"),
+                OsString::from("/hostile/hooks"),
+            ),
+            (OsString::from("LC_ALL"), OsString::from("hostile")),
+        ]);
+        let environment = environment.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new("PATH")),
+            Some(&OsString::from("/fixture/bin"))
+        );
+        for removed in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+        ] {
+            assert!(!environment.contains_key(OsStr::new(removed)), "{removed}");
+        }
+        assert_eq!(
+            environment.get(OsStr::new("LC_ALL")),
+            Some(&OsString::from("C"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_GLOBAL")),
+            Some(&OsString::from("/dev/null"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_NOSYSTEM")),
+            Some(&OsString::from("1"))
+        );
+    }
+
+    #[test]
+    fn continuation_comparison_requires_same_root_and_engine_settlement() {
+        use super::super::publication::{WorkspaceModifiedUnknownV1, WorkspaceModifiedV1};
+        let repo = repository();
+        let start = capture_start_snapshot(repo.path());
+        let previous =
+            capture_settlement_snapshot(repo.path(), WorkspaceSnapshotSettlementV1::Engine);
+        assert_eq!(
+            compare_continuation_snapshots(repo.path(), repo.path(), &start, Some(&previous)),
+            WorkspaceModifiedV1::Known(false)
+        );
+        std::fs::write(repo.path().join("modified.txt"), "changed").unwrap();
+        let changed = capture_start_snapshot(repo.path());
+        assert_eq!(
+            compare_continuation_snapshots(repo.path(), repo.path(), &changed, Some(&previous)),
+            WorkspaceModifiedV1::Known(true)
+        );
+        let unknown = WorkspaceModifiedV1::Unknown(WorkspaceModifiedUnknownV1::Unknown);
+        assert_eq!(
+            compare_continuation_snapshots(
+                repo.path(),
+                Path::new("/other-root"),
+                &start,
+                Some(&previous)
+            ),
+            unknown
+        );
+        let abandoned = capture_settlement_snapshot(
+            repo.path(),
+            WorkspaceSnapshotSettlementV1::AbandonmentRecovery,
+        );
+        assert_eq!(
+            compare_continuation_snapshots(repo.path(), repo.path(), &start, Some(&abandoned)),
+            unknown
+        );
+        assert_eq!(
+            compare_continuation_snapshots(repo.path(), repo.path(), &start, None),
+            unknown
+        );
     }
 
     #[test]

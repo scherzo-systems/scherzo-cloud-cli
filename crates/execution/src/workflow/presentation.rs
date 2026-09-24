@@ -43,6 +43,7 @@ use crate::AgentHarnessInstallationFailure;
 
 const RUN_COMMAND: &str = "scherzo-cloud workflow run";
 const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
+const CONTINUE_COMMAND: &str = "scherzo-cloud workflow continue";
 const EVENT_TOKEN_WIDTH: usize = 10;
 const MIN_INLINE_DETAIL_WIDTH: usize = 24;
 const STACKED_DETAIL_INDENT: usize = 2;
@@ -334,6 +335,12 @@ where
         self
     }
 
+    pub fn for_continue(mut self, run_directory: &Path) -> Self {
+        self.command = CONTINUE_COMMAND;
+        self.retry_run_directory = run_directory.to_str().map(str::to_owned);
+        self
+    }
+
     pub fn render_resolution_rejection(
         self,
         failure: &ResolutionFailure,
@@ -430,9 +437,30 @@ where
                 PresentationFailureOperation::InvalidTerminalResult,
             ));
         };
-        let message = retry_rejection_message(rejection.reason());
+        let continuing = self.command == CONTINUE_COMMAND;
+        let message = if continuing {
+            match rejection.reason() {
+                RetryIneligibilityReason::LatestAttemptSucceeded
+                | RetryIneligibilityReason::LatestAttemptRejected => {
+                    "A succeeded or rejected predecessor cannot be continued; create a new run."
+                }
+                _ => retry_rejection_message(rejection.reason()),
+            }
+        } else {
+            retry_rejection_message(rejection.reason())
+        };
+        let code = if continuing
+            && matches!(
+                rejection.reason(),
+                RetryIneligibilityReason::LatestAttemptSucceeded
+                    | RetryIneligibilityReason::LatestAttemptRejected
+            ) {
+            "continuation_disposition_ineligible"
+        } else {
+            rejection.reason().as_str()
+        };
         let diagnostic = RetryDiagnosticV1 {
-            code: rejection.reason().as_str(),
+            code,
             message,
             location: RetryLocationV1 {
                 kind: "attempt",
@@ -443,15 +471,150 @@ where
         };
         let terminal = RetryRejectionV1 {
             schema_version: 1,
-            command: RETRY_COMMAND,
+            command: self.command,
             outcome: "rejected",
             exit_status: 1,
-            phase: "retry",
+            phase: if self.command == CONTINUE_COMMAND {
+                "continuation"
+            } else {
+                "retry"
+            },
             run_directory,
             attempt_number: rejection.attempt_number(),
             diagnostics: [diagnostic],
         };
-        self.write_rejection(&terminal, &human_retry_rejection(rejection))
+        let human = if continuing {
+            format!(
+                "continuation blocked: attempt {} ({code})\n\n{message}",
+                rejection.attempt_number()
+            )
+        } else {
+            human_retry_rejection(rejection)
+        };
+        self.write_rejection(&terminal, &human)
+    }
+
+    pub fn render_continuation_resolution_rejection(
+        self,
+        run_directory: &Path,
+        prior_attempt_number: u64,
+        failure: &ResolutionFailure,
+    ) -> WorkflowRunPresentationResult {
+        let Ok(mut diagnostic) =
+            serde_json::to_value(RejectionDiagnostic::from_resolution(failure))
+        else {
+            return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                PresentationFailureOperation::InvalidTerminalResult,
+            ));
+        };
+        diagnostic["code"] =
+            serde_json::Value::String("continuation_definition_invalid".to_owned());
+        self.write_continuation_rejection(run_directory, prior_attempt_number, vec![diagnostic])
+    }
+
+    pub fn render_continuation_admission_rejection(
+        self,
+        run_directory: &Path,
+        prior_attempt_number: u64,
+        violations: &[super::continuation::AdmissionViolation],
+        unsatisfied_inputs: &[String],
+        installation: &[AgentHarnessInstallationFailure],
+        admission: &[&AdmissionFailure],
+    ) -> WorkflowRunPresentationResult {
+        let mut diagnostics = Vec::new();
+        for violation in violations {
+            let (code, location) = match violation {
+                super::continuation::AdmissionViolation::InvalidFrom { id } => (
+                    "continuation_definition_invalid",
+                    serde_json::json!({"kind":"from_step","id":id}),
+                ),
+                super::continuation::AdmissionViolation::Node { id, prior } => (
+                    "continuation_nodes_unsatisfied",
+                    serde_json::json!({"kind":"step","id":id,"priorState":prior.map(|state| match state {
+                        super::continuation::PriorState::Succeeded => "succeeded",
+                        super::continuation::PriorState::Skipped => "skipped",
+                        super::continuation::PriorState::Inherited => "inherited",
+                        super::continuation::PriorState::Unsatisfied => "unsatisfied",
+                    })}),
+                ),
+                super::continuation::AdmissionViolation::RequiredSkipped { consumer, producer } => {
+                    (
+                        "continuation_nodes_unsatisfied",
+                        serde_json::json!({"kind":"required_skipped","consumer":consumer,"producer":producer}),
+                    )
+                }
+                super::continuation::AdmissionViolation::Reference { reference } => (
+                    "continuation_references_unsatisfied",
+                    serde_json::json!({"kind":"reference","reference":reference}),
+                ),
+            };
+            diagnostics.push(serde_json::json!({"code": code, "location": location}));
+        }
+        for input in unsatisfied_inputs {
+            diagnostics.push(serde_json::json!({"code":"continuation_inputs_unsatisfied", "location":{"kind":"input","name":input}}));
+        }
+        for failure in installation {
+            let Ok(diagnostic) = serde_json::to_value(
+                RejectionDiagnostic::from_agent_harness_installation(failure),
+            ) else {
+                return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                    PresentationFailureOperation::InvalidTerminalResult,
+                ));
+            };
+            diagnostics.push(diagnostic);
+        }
+        for admission in admission {
+            let Some(failure) = RejectionDiagnostic::from_admission(admission) else {
+                return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                    PresentationFailureOperation::UnsupportedRejection,
+                ));
+            };
+            let Ok(mut diagnostic) = serde_json::to_value(failure) else {
+                return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                    PresentationFailureOperation::InvalidTerminalResult,
+                ));
+            };
+            if matches!(
+                admission.kind(),
+                super::admission::AdmissionFailureKind::MissingRequiredInput
+                    | super::admission::AdmissionFailureKind::UnexpectedInput
+                    | super::admission::AdmissionFailureKind::InputKindMismatch
+                    | super::admission::AdmissionFailureKind::InputSchemaMismatch
+                    | super::admission::AdmissionFailureKind::InvalidFileMediaType
+                    | super::admission::AdmissionFailureKind::InvalidAttachmentMediaType
+                    | super::admission::AdmissionFailureKind::InputMediaTypeMismatch
+            ) {
+                diagnostic["code"] =
+                    serde_json::Value::String("continuation_inputs_unsatisfied".to_owned());
+            }
+            diagnostics.push(diagnostic);
+        }
+        self.write_continuation_rejection(run_directory, prior_attempt_number, diagnostics)
+    }
+
+    fn write_continuation_rejection(
+        mut self,
+        run_directory: &Path,
+        prior_attempt_number: u64,
+        mut diagnostics: Vec<serde_json::Value>,
+    ) -> WorkflowRunPresentationResult {
+        diagnostics.sort_by_key(|detail| match detail["code"].as_str() {
+            Some("continuation_definition_invalid") => 0,
+            Some("continuation_inputs_unsatisfied") => 1,
+            Some("continuation_nodes_unsatisfied") => 2,
+            _ => 3,
+        });
+        let terminal = serde_json::json!({
+            "schemaVersion": 1,
+            "command": CONTINUE_COMMAND,
+            "outcome": "rejected",
+            "exitStatus": 1,
+            "phase": "continuation",
+            "runDirectory": run_directory,
+            "attemptNumber": prior_attempt_number,
+            "diagnostics": diagnostics,
+        });
+        self.write_rejection(&terminal, "continuation admission rejected")
     }
 
     fn write_rejection(
@@ -2088,7 +2251,14 @@ fn summary_step(
             success_detail(success, outputs.len()),
             TokenRole::Success,
         )),
-        StepState::Inherited { .. } => None,
+        StepState::Inherited { detail, .. } => Some((
+            "inherited",
+            format!(
+                "prior attempt {} ({:?}); definition changed: {}",
+                detail.prior_attempt_number, detail.prior_state, detail.definition_changed
+            ),
+            TokenRole::Neutral,
+        )),
         StepState::Failed { detail } => Some((
             "failed",
             issue_detail(canonical_failure_detail(detail), step.failure_policy),

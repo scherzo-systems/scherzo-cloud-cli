@@ -4,10 +4,10 @@ use std::fs::{File, Permissions};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat, stat, statat};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat, statat};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -830,10 +830,46 @@ fn write_private_file(
     fchmod(file.as_fd(), Mode::RUSR).map_err(|_| RecoveryHandlerFailure::ContextUnavailable)
 }
 
-fn verify_regular_path_binding(path: &Path, directory: &OwnedFd, name: &str) -> Result<(), ()> {
+pub(super) fn verify_regular_path_binding(
+    path: &Path,
+    directory: &OwnedFd,
+    name: &str,
+) -> Result<(), ()> {
     let (_, opened) = crate::owned_tree::open_regular_file_at(directory, name).map_err(|_| ())?;
-    let named = stat(path).map_err(|_| ())?;
-    if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+    if !path.is_absolute() {
+        return Err(());
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir if components.is_empty() => {}
+            Component::Normal(component) => components.push(component),
+            _ => return Err(()),
+        }
+    }
+    let (file_name, directories) = components.split_last().ok_or(())?;
+    let mut parent = open_directory_path(Path::new("/")).map_err(|_| ())?;
+    for component in directories {
+        parent = openat(
+            &parent,
+            *component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ())?;
+    }
+    let named = openat(
+        &parent,
+        *file_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ())?;
+    let named = fstat(&named).map_err(|_| ())?;
+    if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+        || opened.st_dev != named.st_dev
+        || opened.st_ino != named.st_ino
+    {
         return Err(());
     }
     Ok(())

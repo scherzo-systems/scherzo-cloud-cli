@@ -41,7 +41,8 @@ pub use workflow::admission::{
     CancellationReason, CancellationSource, EnvironmentSnapshot, ExecutionContext,
     OrdinaryCancellationRequestResult, ResolvedAttachment, ResolvedFile, ResolvedInput,
     ResolvedInputs, ResolvedJsonInput, SourceRevisionProvenance, WorkflowCapacityBudget,
-    admit_local_workflow, admit_runner_workflow, default_execution_policy_limits,
+    admit_local_continuation_workflow, admit_local_workflow, admit_runner_workflow,
+    default_execution_policy_limits, local_continuation_input_failures,
 };
 pub use workflow::agent::WorkflowRunId;
 pub use workflow::agent::dispatch::{ProductionAgentDispatcher, production_agent_dispatcher};
@@ -60,6 +61,9 @@ pub use workflow::child_guard::{
     internal_worker_requested as child_guard_worker_requested,
     run_internal_worker as run_child_guard_worker,
 };
+pub use workflow::continuation::{
+    AdmissionViolation as ContinuationAdmissionViolation, PriorState as ContinuationPriorState,
+};
 pub use workflow::coordinator::{CoordinationError, CoordinatorClock};
 pub use workflow::diagnostic::StepDiagnosticLog;
 pub use workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
@@ -75,9 +79,10 @@ pub use workflow::input::InputStaging;
 pub use workflow::invocation_accounting::InvocationAccountingLog;
 pub use workflow::local_run::{
     DurableDeadline, DurableInvocationStateV1, DurableInvocationV1, InitialLocalRun,
-    LocalAttemptOwner, LocalAttemptOwnershipReleased, LocalRecoveryStatus, LocalRetryBeginError,
-    LocalRetryEligibility, LocalRetryOpen, LocalRetryRejection, LocalRunStatusSnapshot,
-    LocalStatusError, LocalStatusResult, PublicationFailurePhaseV1, RetryIneligibilityReason,
+    LocalAttemptOwner, LocalAttemptOwnershipReleased, LocalContinuationOpen, LocalRecoveryStatus,
+    LocalRetryBeginError, LocalRetryEligibility, LocalRetryOpen, LocalRetryRejection,
+    LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PendingLocalContinuation,
+    PublicationFailurePhaseV1, RetryIneligibilityReason, acquire_local_continuation,
     acquire_local_retry, read_local_run_status,
 };
 pub use workflow::observation::{

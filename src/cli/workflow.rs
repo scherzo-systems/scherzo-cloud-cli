@@ -1,3 +1,4 @@
+mod r#continue;
 mod reference;
 mod retry;
 mod run;
@@ -84,6 +85,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
+    #[command(about = r#continue::ABOUT, after_help = r#continue::AFTER_HELP)]
+    Continue(r#continue::Command),
     #[command(about = reference::ABOUT)]
     Reference(reference::Command),
     #[command(about = retry::ABOUT, after_help = retry::AFTER_HELP)]
@@ -143,6 +146,7 @@ impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
             None => super::print_help(&[NAME]),
+            Some(WorkflowCommand::Continue(command)) => command.execute(),
             Some(WorkflowCommand::Reference(command)) => command.execute(),
             Some(WorkflowCommand::Retry(command)) => command.execute(),
             Some(WorkflowCommand::Run(command)) => command.execute(),

@@ -212,6 +212,11 @@ impl fmt::Debug for GitCaptureContext {
 }
 
 impl GitCaptureContext {
+    pub(crate) fn uses_local_baseline(&self, baseline: &LocalGitBaseline) -> bool {
+        self.object_format == baseline.object_format()
+            && self.baseline_oid.as_ref() == baseline.commit_oid()
+    }
+
     #[cfg(test)]
     pub(crate) fn admit(
         execution: &AdmittedExecutionContext,
@@ -1457,7 +1462,7 @@ fn git_command_description(arguments: &[OsString]) -> Arc<str> {
     Arc::from(command)
 }
 
-fn reserved_git_environment(name: &OsStr) -> bool {
+pub(super) fn reserved_git_environment(name: &OsStr) -> bool {
     let name = name.as_encoded_bytes();
     matches!(
         name,

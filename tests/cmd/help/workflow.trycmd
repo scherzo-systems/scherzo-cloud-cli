@@ -5,6 +5,7 @@ Work with local workflow definitions and runs
 Usage: scherzo-cloud workflow [COMMAND]
 
 Commands:
+  continue   Continue selected steps of a local workflow run
   reference  Show the workflow authoring reference
   retry      Retry a local workflow run
   run        Run a local command and agent workflow

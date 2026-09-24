@@ -359,6 +359,7 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
             .collect::<Vec<_>>(),
         [
             "command",
+            "continuation",
             "exitStatus",
             "outcome",
             "recovery",
@@ -367,6 +368,7 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
             "runDirectory",
             "schemaVersion",
             "state",
+            "workspaceModified",
         ]
     );
     assert_eq!(result["schemaVersion"], 1);
@@ -374,6 +376,8 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
     assert_eq!(result["outcome"], "status");
     assert_eq!(result["exitStatus"], 0);
     assert_eq!(result["recovery"], serde_json::json!({"status": "settled"}));
+    assert_eq!(result["workspaceModified"], "unknown");
+    assert_eq!(result["continuation"]["requestAdmission"], "not_evaluated");
     assert_eq!(
         result["retry"],
         serde_json::json!({

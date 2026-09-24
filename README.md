@@ -615,6 +615,33 @@ initial working directory. Retry uses the same durable handle explicitly:
 scherzo-cloud workflow retry ./runs/check-001 --execution-root ./my-checkout
 ```
 
+To reexecute a selected ordinary step and its downstream ordinary dependents,
+inherit the other eligible ordinary steps by reference, and rerun all finalizers:
+
+```sh
+scherzo-cloud workflow continue ./runs/check-001 --from build --from verify
+scherzo-cloud workflow continue ./runs/check-001 --from verify \
+  --workflow ./revised-workflow.yaml --execution-root ./another-checkout
+```
+
+`--workflow` selects a replacement within the original retained source-root boundary;
+without it the immediately prior attempt's retained definition is used. The execution
+root is selected independently and defaults to the prior attempt's root. Accepted
+`--json` writes the terminal result as one stdout object and emits the same accepted
+partition record to stderr before execution. The initial
+run inputs and primary-workspace Git baseline remain immutable. A continuation is
+allowed only from an eligible latest failed, cancelled, or interrupted attempt, after
+all retained process groups are proven quiescent. Before actions run, plain output
+reports the ordered reexecuted and inherited partitions. Executed steps, recovery
+handlers, and finalizers can read the credential-free `SCHERZO_CONTINUATION_CONTEXT`
+file; initial runs and explicit retries do not receive this variable. A continued
+step starts fresh; an inherited step has neither a new invocation nor a copied log.
+A required body-data consumer of an inherited skipped output is rejected, while
+conditions, advisory consumers, finalizers, and exports retain their normal
+unavailable-value behavior. `workflow status` reports only base continuation
+eligibility, not request-specific admission; an unavailable or incomparable historical
+workspace snapshot yields `workspaceModified: "unknown"`.
+
 Status reads only the closed `run.json` and `state.json` contracts and an existing
 regular `run.lock`. For activated step recovery, plain and JSON snapshots report the
 active or terminal target/handler role, round, target execution, decision, invocation

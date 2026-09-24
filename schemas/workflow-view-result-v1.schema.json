@@ -1070,7 +1070,8 @@
             "blocked",
             "skipped",
             "not_run",
-            "cancelled"
+            "cancelled",
+            "inherited"
           ]
         },
         "startedAt": {
@@ -1112,11 +1113,17 @@
             },
             {
               "$ref": "#/$defs/RuntimeCancellationDetail"
-            }
+            },
+            {"$ref": "#/$defs/InheritedDetail"}
           ]
         }
       },
       "allOf": [
+        {"if": {"properties": {"state": {"const": "inherited"}}, "required": ["state"]},
+         "then": {"required": ["detail"], "properties": {"detail": {"$ref": "#/$defs/InheritedDetail"}},
+           "not": {"anyOf": [{"required": ["startedAt"]}, {"required": ["durationMilliseconds"]},
+             {"required": ["commandOutput"]}, {"required": ["invocations"]}]}}},
+
         {
           "if": {
             "properties": {
@@ -1507,7 +1514,9 @@
         },
         "digest": {
           "$ref": "#/$defs/Digest"
-        }
+        },
+        "provenance": {"const": "inherited"},
+        "producer": {"$ref": "#/$defs/OutputProducer"}
       }
     },
     "GitCarrier": {
@@ -1575,7 +1584,9 @@
         },
         "carrier": {
           "$ref": "#/$defs/GitCarrier"
-        }
+        },
+        "provenance": {"const": "inherited"},
+        "producer": {"$ref": "#/$defs/OutputProducer"}
       }
     },
     "UnavailableExport": {
@@ -1615,6 +1626,360 @@
         }
       ]
     },
+      "Uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "OutputProducer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attemptId",
+          "attemptNumber",
+          "node",
+          "output"
+        ],
+        "properties": {
+          "attemptId": {
+            "$ref": "#/$defs/Uuid"
+          },
+          "attemptNumber": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "node": {
+            "type": "string",
+            "minLength": 1
+          },
+          "output": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "InheritedDetail": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "priorAttemptId",
+          "priorAttemptNumber",
+          "priorState",
+          "definitionChanged"
+        ],
+        "properties": {
+          "priorAttemptId": {
+            "$ref": "#/$defs/Uuid"
+          },
+          "priorAttemptNumber": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "priorState": {
+            "enum": [
+              "succeeded",
+              "skipped",
+              "inherited"
+            ]
+          },
+          "definitionChanged": {
+            "type": "boolean"
+          }
+        }
+      },
+      "StartSnapshot": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "algorithm",
+              "value",
+              "takenAt"
+            ],
+            "properties": {
+              "algorithm": {
+                "const": "git_worktree_sha256_v1"
+              },
+              "value": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "takenAt": {
+                "$ref": "#/$defs/Timestamp"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "algorithm",
+              "unavailable"
+            ],
+            "properties": {
+              "algorithm": {
+                "const": "git_worktree_sha256_v1"
+              },
+              "unavailable": {"enum": ["git_unavailable", "git_output_limit_exceeded", "not_work_tree", "execution_root_not_work_tree_root", "entry_limit_exceeded", "content_limit_exceeded", "gitlink", "unsupported_entry", "io_unavailable", "mutation_around_read"]}
+            }
+          }
+        ]
+      },
+      "SettlementSnapshot": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "algorithm",
+              "value",
+              "takenAt",
+              "settledBy"
+            ],
+            "properties": {
+              "algorithm": {
+                "const": "git_worktree_sha256_v1"
+              },
+              "value": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "takenAt": {
+                "$ref": "#/$defs/Timestamp"
+              },
+              "settledBy": {
+                "enum": [
+                  "engine",
+                  "abandonment_recovery"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "algorithm",
+              "unavailable",
+              "settledBy"
+            ],
+            "properties": {
+              "algorithm": {
+                "const": "git_worktree_sha256_v1"
+              },
+              "unavailable": {
+                "enum": [
+                  "git_unavailable",
+                  "git_output_limit_exceeded",
+                  "not_work_tree",
+                  "execution_root_not_work_tree_root",
+                  "entry_limit_exceeded",
+                  "content_limit_exceeded",
+                  "gitlink",
+                  "unsupported_entry",
+                  "io_unavailable",
+                  "mutation_around_read"
+                ]
+              },
+              "settledBy": {
+                "enum": [
+                  "engine",
+                  "abandonment_recovery"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "Continuation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "request",
+          "fromSteps",
+          "reexecutedSteps",
+          "inheritedSteps",
+          "definitionSource",
+          "workspace"
+        ],
+        "properties": {
+          "request": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "fromSteps",
+              "definition"
+            ],
+            "properties": {
+              "fromSteps": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "definition": {
+                "oneOf": [
+                  {
+                    "const": "inherited"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "replaced"
+                    ],
+                    "properties": {
+                      "replaced": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "path"
+                        ],
+                        "properties": {
+                          "path": {
+                            "$ref": "#/$defs/AbsolutePath"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "executionRoot": {
+                "$ref": "#/$defs/AbsolutePath"
+              }
+            }
+          },
+          "fromSteps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "reexecutedSteps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "inheritedSteps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "priorState",
+                "definitionChanged"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "priorState": {
+                  "enum": [
+                    "succeeded",
+                    "skipped",
+                    "inherited"
+                  ]
+                },
+                "definitionChanged": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "definitionSource": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "manifestDigest",
+              "priorManifestDigest"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "inherited",
+                  "replaced"
+                ]
+              },
+              "manifestDigest": {
+                "$ref": "#/$defs/Digest"
+              },
+              "priorManifestDigest": {
+                "$ref": "#/$defs/Digest"
+              }
+            }
+          },
+          "workspace": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "executionRoot",
+              "priorExecutionRoot",
+              "startSnapshot",
+              "modified",
+              "quiescence"
+            ],
+            "properties": {
+              "executionRoot": {
+                "$ref": "#/$defs/AbsolutePath"
+              },
+              "priorExecutionRoot": {
+                "$ref": "#/$defs/AbsolutePath"
+              },
+              "startSnapshot": {
+                "$ref": "#/$defs/StartSnapshot"
+              },
+              "priorSettlementSnapshot": {
+                "$ref": "#/$defs/SettlementSnapshot"
+              },
+              "modified": {
+                "oneOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "const": "unknown"
+                  }
+                ]
+              },
+              "quiescence": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "groupsRecorded",
+                  "groupsTerminated",
+                  "groupsAbsent",
+                  "provenAt"
+                ],
+                "properties": {
+                  "groupsRecorded": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "groupsTerminated": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "groupsAbsent": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "provenAt": {
+                    "$ref": "#/$defs/Timestamp"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
     "WorkflowResult": {
       "type": "object",
       "additionalProperties": false,
@@ -1637,6 +2002,17 @@
           "type": "integer",
           "minimum": 1
         },
+        "continuation": {"$ref": "#/$defs/Continuation"},
+        "outputProducers": {"type": "object", "propertyNames": {"$ref": "#/$defs/Identifier"},
+          "additionalProperties": {"type": "object", "propertyNames": {"$ref": "#/$defs/Identifier"},
+            "additionalProperties": {"$ref": "#/$defs/OutputProducer"}}},
+        "exportSources": {"type": "object", "propertyNames": {"$ref": "#/$defs/Identifier"},
+          "additionalProperties": {"type": "object", "additionalProperties": false,
+            "required": ["node", "output"], "properties": {
+              "node": {"type": "object", "additionalProperties": false,
+                "required": ["id", "role"], "properties": {"id": {"$ref": "#/$defs/Identifier"},
+                  "role": {"$ref": "#/$defs/NodeRole"}}},
+              "output": {"$ref": "#/$defs/Identifier"}}}},
         "workflow": {
           "type": "object",
           "additionalProperties": false,

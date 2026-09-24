@@ -16,6 +16,7 @@ pub(crate) mod claude_code_stream_json_v1;
 pub(crate) mod codex;
 pub(crate) mod codex_app_server_v1;
 pub(crate) mod condition;
+pub(crate) mod continuation;
 pub(crate) mod coordinator;
 pub(crate) mod diagnostic;
 pub(crate) mod document;

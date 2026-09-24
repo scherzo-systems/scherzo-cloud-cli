@@ -402,7 +402,7 @@ fn normalized_run_directory(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap()
 }
 
-fn git(repository: &Path, arguments: &[&str]) -> String {
+pub(super) fn git(repository: &Path, arguments: &[&str]) -> String {
     let path = std::env::var_os("PATH");
     let mut command = Command::new("git");
     command
@@ -447,7 +447,7 @@ fn git(repository: &Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn initialize_git_repository(repository: &Path) {
+pub(super) fn initialize_git_repository(repository: &Path) {
     git(repository, &["init", "--quiet"]);
     git(repository, &["config", "user.name", "Scherzo Test"]);
     git(

@@ -55,6 +55,7 @@ use super::workspace_snapshot::WorkspaceSnapshotV1;
 
 const COMMAND: &str = "scherzo-cloud workflow run";
 const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
+const CONTINUE_COMMAND: &str = "scherzo-cloud workflow continue";
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
 const STAGING_ATTEMPTS: usize = 16;
@@ -120,6 +121,16 @@ pub struct ContinuationRecordV1 {
     pub(crate) inherited_steps: Vec<ContinuationInheritedStepV1>,
     pub(crate) definition_source: ContinuationDefinitionSourceV1,
     pub(crate) workspace: ContinuationWorkspaceV1,
+}
+
+impl ContinuationRecordV1 {
+    pub fn reexecuted_steps(&self) -> &[String] {
+        &self.reexecuted_steps
+    }
+
+    pub fn inherited_step_ids(&self) -> impl Iterator<Item = &str> {
+        self.inherited_steps.iter().map(|step| step.id.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -496,6 +507,10 @@ impl WorkflowRunTerminalResultV1 {
 
     pub fn mark_retry(&mut self) {
         self.command = RETRY_COMMAND;
+    }
+
+    pub fn mark_continue(&mut self) {
+        self.command = CONTINUE_COMMAND;
     }
 }
 
