@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud github setup --help
-Connect organizations to GitHub
+Manage GitHub setup for organizations
 
 Usage: scherzo-cloud github setup [COMMAND]
 

@@ -18,7 +18,7 @@ use scherzo_cloud_support::generate_idempotency_key;
 
 use super::{OrganizationArg, PaginationArgs, PoolArg};
 
-pub(super) const ABOUT: &str = "Work with the Scherzo Cloud runner";
+pub(super) const ABOUT: &str = "Manage the Scherzo Cloud runner";
 const NAME: &str = "runner";
 
 #[derive(Debug, Args)]

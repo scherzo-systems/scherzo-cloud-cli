@@ -17,7 +17,7 @@ use scherzo_cloud_api::{
     transfer_capability_batch,
 };
 
-pub(super) const ABOUT: &str = "View, download, or delete retained run inputs";
+pub(super) const ABOUT: &str = "Manage retained run inputs";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

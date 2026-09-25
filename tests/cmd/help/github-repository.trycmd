@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud github repository --help
-Discover GitHub repositories
+Work with GitHub repositories
 
 Usage: scherzo-cloud github repository [COMMAND]
 

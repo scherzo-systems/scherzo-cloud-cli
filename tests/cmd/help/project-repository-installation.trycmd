@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud project repository installation --help
-Discover GitHub installation bindings
+Work with GitHub installation bindings
 
 Usage: scherzo-cloud project repository installation [COMMAND]
 

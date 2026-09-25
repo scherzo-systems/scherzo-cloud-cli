@@ -15,7 +15,7 @@ use scherzo_cloud_api::{
 use super::super::{OrganizationArg, ProjectArg};
 use super::acquisition::{self, AcquiredInputs};
 
-pub(super) const ABOUT: &str = "Administer single-use Run Input Sets";
+pub(super) const ABOUT: &str = "Manage Run Input Sets";
 
 macro_rules! require_run_success {
     ($result:expr) => {

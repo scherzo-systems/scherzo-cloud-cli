@@ -23,9 +23,9 @@ pub(super) struct Command {
 enum GitHubCommand {
     #[command(about = "Manage GitHub installation bindings")]
     Installation(InstallationCommand),
-    #[command(about = "Discover GitHub repositories")]
+    #[command(about = "Work with GitHub repositories")]
     Repository(RepositoryCommand),
-    #[command(about = "Connect organizations to GitHub")]
+    #[command(about = "Manage GitHub setup for organizations")]
     Setup(SetupCommand),
 }
 

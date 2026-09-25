@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud publication --help
-Work with Scherzo Cloud publications
+Manage Scherzo Cloud publications
 
 Usage: scherzo-cloud publication [COMMAND]
 

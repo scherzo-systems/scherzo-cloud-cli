@@ -14,9 +14,9 @@ Commands:
   invitation         Manage Scherzo Cloud invitations
   organization       Manage Scherzo Cloud organizations
   project            Manage Scherzo Cloud projects
-  publication        Work with Scherzo Cloud publications
-  run                Work with Scherzo Cloud runs
-  runner             Work with the Scherzo Cloud runner
+  publication        Manage Scherzo Cloud publications
+  run                Manage Scherzo Cloud runs
+  runner             Manage the Scherzo Cloud runner
   service-principal  Manage Scherzo Cloud service principals
   version            Print version information
   workflow           Work with local workflow definitions and runs

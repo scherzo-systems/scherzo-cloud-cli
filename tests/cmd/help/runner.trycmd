@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner --help
-Work with the Scherzo Cloud runner
+Manage the Scherzo Cloud runner
 
 Usage: scherzo-cloud runner [COMMAND]
 

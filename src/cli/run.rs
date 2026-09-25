@@ -47,7 +47,7 @@ macro_rules! write_cloud {
     };
 }
 
-pub(super) const ABOUT: &str = "Work with Scherzo Cloud runs";
+pub(super) const ABOUT: &str = "Manage Scherzo Cloud runs";
 const NAME: &str = "run";
 
 #[derive(Debug, Args)]

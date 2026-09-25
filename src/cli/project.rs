@@ -140,7 +140,7 @@ struct RepositoryCommand {
 enum RepositorySubcommand {
     #[command(about = "Detach a project's repository")]
     Detach(RepositoryDetachCommand),
-    #[command(about = "Discover GitHub installation bindings")]
+    #[command(about = "Work with GitHub installation bindings")]
     Installation(InstallationCommand),
     #[command(about = "List repositories selected for a GitHub installation")]
     List(RepositoryListCommand),

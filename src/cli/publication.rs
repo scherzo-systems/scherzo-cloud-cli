@@ -14,7 +14,7 @@ use scherzo_cloud_api::{
 
 use super::OrganizationArg;
 
-pub(super) const ABOUT: &str = "Work with Scherzo Cloud publications";
+pub(super) const ABOUT: &str = "Manage Scherzo Cloud publications";
 const NAME: &str = "publication";
 
 #[derive(Debug, Args)]

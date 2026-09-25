@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud run input-set --help
-Administer single-use Run Input Sets
+Manage Run Input Sets
 
 Usage: scherzo-cloud run input-set [COMMAND]
 

@@ -6,7 +6,7 @@ Usage: scherzo-cloud project repository [COMMAND]
 
 Commands:
   detach        Detach a project's repository
-  installation  Discover GitHub installation bindings
+  installation  Work with GitHub installation bindings
   list          List repositories selected for a GitHub installation
   set           Bind or replace a project's repository
   show          Show a project's repository binding
