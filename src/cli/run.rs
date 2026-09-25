@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use scherzo_cloud_api::{
     CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunCancellationMode,
-    RunCancellationResolutionKind, RunFailure, RunObservation, RunState,
+    RunCancellationResolutionKind, RunFailure, RunList, RunListFilter, RunObservation, RunState,
 };
 #[cfg(test)]
 use scherzo_cloud_api::{HttpClient, RunRead};
@@ -21,6 +21,7 @@ use super::{OrganizationArg, ProjectArg};
 mod acquisition;
 mod input_set;
 mod inputs;
+mod list;
 mod observation;
 mod output;
 use output::{CloudOutput, CloudSnapshot};
@@ -66,6 +67,8 @@ enum RunCommand {
     Input(inputs::Command),
     #[command(about = input_set::ABOUT)]
     InputSet(input_set::Command),
+    #[command(about = "List Scherzo Cloud runs")]
+    List(ListCommand),
     #[command(about = "Show a Scherzo Cloud run")]
     Show(ShowCommand),
 }
@@ -158,6 +161,34 @@ struct RunReference {
 }
 
 #[derive(Debug, Args)]
+struct ListCommand {
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
+    #[arg(long, value_name = ProjectArg::VALUE_NAME, help = ProjectArg::HELP)]
+    project_id: Option<ProjectArg>,
+    #[arg(long, value_parser = ["active", "terminal"], help = "Filter by run state group")]
+    state_group: Option<String>,
+    #[arg(
+        long,
+        value_name = "RFC3339",
+        help = "List runs created strictly after this time"
+    )]
+    created_after: Option<String>,
+    #[arg(
+        long = "integration-context",
+        value_name = "KEY=VALUE",
+        help = "Match an exact integration context entry (repeatable)"
+    )]
+    integration_context: Vec<String>,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=100), help = "Maximum runs to return (1-100)")]
+    limit: Option<u16>,
+    #[arg(long, help = "Opaque continuation cursor")]
+    cursor: Option<String>,
+    #[command(flatten)]
+    options: RunOptions,
+}
+
+#[derive(Debug, Args)]
 struct ShowCommand {
     #[command(flatten)]
     run: RunReference,
@@ -198,6 +229,12 @@ impl Command {
             Some(RunCommand::InputSet(command)) => command.execute(),
             Some(RunCommand::Input(command)) => command.execute(),
             Some(RunCommand::Show(command)) => super::execute_deployment_command(
+                Some(command),
+                &[NAME],
+                "configure Scherzo Cloud run access",
+                |command, deployment| command.execute(deployment.clone()),
+            ),
+            Some(RunCommand::List(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
                 "configure Scherzo Cloud run access",

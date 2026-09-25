@@ -142,6 +142,13 @@ pub async fn read_bounded_body(
 pub(crate) fn buffer_blocking_response(
     response: BlockingResponse,
 ) -> Result<BufferedBlockingResponse, BoundedBodyError> {
+    buffer_blocking_response_with_limit(response, MAX_RESPONSE_BODY_BYTES)
+}
+
+pub(crate) fn buffer_blocking_response_with_limit(
+    response: BlockingResponse,
+    limit: usize,
+) -> Result<BufferedBlockingResponse, BoundedBodyError> {
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
     let idempotency_keys = response
@@ -168,7 +175,7 @@ pub(crate) fn buffer_blocking_response(
         .iter()
         .cloned()
         .collect();
-    let body = read_bounded_blocking_body(response)?;
+    let body = read_bounded_blocking_body_with_limit(response, limit)?;
     Ok(BufferedBlockingResponse {
         status,
         content_type,
@@ -181,11 +188,20 @@ pub(crate) fn buffer_blocking_response(
 }
 
 pub(crate) fn read_bounded_blocking_body(
-    mut response: BlockingResponse,
+    response: BlockingResponse,
 ) -> Result<Vec<u8>, BoundedBodyError> {
-    let body = bounded_body_buffer(response.content_length()).ok_or(BoundedBodyError::TooLarge)?;
+    read_bounded_blocking_body_with_limit(response, MAX_RESPONSE_BODY_BYTES)
+}
+
+fn read_bounded_blocking_body_with_limit(
+    mut response: BlockingResponse,
+    limit: usize,
+) -> Result<Vec<u8>, BoundedBodyError> {
+    let body =
+        bounded_body_buffer(response.content_length(), limit).ok_or(BoundedBodyError::TooLarge)?;
     let mut writer = BoundedBodyWriter {
         body,
+        limit,
         limit_exceeded: false,
     };
     if let Err(error) = response.copy_to(&mut writer) {
@@ -200,12 +216,13 @@ pub(crate) fn read_bounded_blocking_body(
 
 struct BoundedBodyWriter {
     body: Vec<u8>,
+    limit: usize,
     limit_exceeded: bool,
 }
 
 impl io::Write for BoundedBodyWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if buffer.len() > MAX_RESPONSE_BODY_BYTES.saturating_sub(self.body.len()) {
+        if buffer.len() > self.limit.saturating_sub(self.body.len()) {
             self.limit_exceeded = true;
             return Err(io::Error::other("response body exceeds limit"));
         }
@@ -218,14 +235,14 @@ impl io::Write for BoundedBodyWriter {
     }
 }
 
-fn bounded_body_buffer(content_length: Option<u64>) -> Option<Vec<u8>> {
-    if content_length.is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES_U64) {
+fn bounded_body_buffer(content_length: Option<u64>, limit: usize) -> Option<Vec<u8>> {
+    if content_length.is_some_and(|length| length > limit as u64) {
         return None;
     }
     let initial_capacity = content_length
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or_default()
-        .min(MAX_RESPONSE_BODY_BYTES);
+        .min(limit);
     Some(Vec::with_capacity(initial_capacity))
 }
 

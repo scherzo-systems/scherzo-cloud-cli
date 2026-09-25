@@ -2265,6 +2265,7 @@ mod tests {
             "run input-set seal",
             "run input-set show",
             "run input-set upload",
+            "run list",
             "run show",
             "runner",
             "runner activation",

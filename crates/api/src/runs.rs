@@ -19,8 +19,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
 const PRIVATE_CACHE_CONTROL: &str = "private, no-store";
 const RUN_CREATION_REJECTED: &str = "https://api.scherzo.dev/problems/run-creation-rejected";
+// 100 rows can each carry 16 KiB of context. Go's JSON encoder may expand
+// HTML-sensitive bytes sixfold; workflow paths and display/placement names add
+// less than 3 MiB at their admitted bounds. Keep the larger budget list-only.
+const MAX_RUN_LIST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub type Run = models::Run;
+pub type RunList = models::RunList;
 pub type RunObservation = models::RunObservation;
 pub type RunState = models::run::State;
 pub type RunCreationAcceptance = models::RunCreationAcceptance;
@@ -50,6 +55,15 @@ pub struct CreateRunInput<'a> {
     pub display_name: Option<&'a str>,
     pub input_set_id: Option<&'a str>,
     pub integration_context: Option<&'a BTreeMap<String, String>>,
+}
+
+pub struct RunListFilter<'a> {
+    pub limit: Option<u16>,
+    pub cursor: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub state_group: Option<&'a str>,
+    pub created_after: Option<&'a str>,
+    pub context: &'a [(String, String)],
 }
 
 pub struct RunApi<'a> {
@@ -283,6 +297,54 @@ impl<'a> RunApi<'a> {
         Ok(envelope)
     }
 
+    pub fn list(
+        &self,
+        organization: &str,
+        filter: RunListFilter<'_>,
+    ) -> Result<RunList, RunFailure> {
+        let mut endpoint = Url::parse(&self.collection_endpoint(organization))
+            .map_err(|_| RunFailure::protocol(false))?;
+        {
+            let mut query = endpoint.query_pairs_mut();
+            if let Some(limit) = filter.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(cursor) = filter.cursor {
+                query.append_pair("cursor", cursor);
+            }
+            if let Some(project_id) = filter.project_id {
+                query.append_pair("projectId", project_id);
+            }
+            if let Some(state_group) = filter.state_group {
+                query.append_pair("stateGroup", state_group);
+            }
+            if let Some(created_after) = filter.created_after {
+                query.append_pair("createdAfter", created_after);
+            }
+            for (key, value) in filter.context {
+                query.append_pair("integrationContext", &format!("{key}={value}"));
+            }
+        }
+        let response =
+            self.read_response_with_limit(endpoint.as_str(), None, MAX_RUN_LIST_BODY_BYTES)?;
+        if response.status != StatusCode::OK {
+            return Err(classify_failure(&response, RunOperation::Get));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let list: RunList =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        if list.items.len() > 100
+            || list.items.iter().any(|item| {
+                !scherzo_cloud_support::valid_typed_id(&item.id, "run_")
+                    || !scherzo_cloud_support::valid_typed_id(&item.project_id, "prj_")
+            })
+        {
+            return Err(RunFailure::protocol(false));
+        }
+        Ok(list)
+    }
+
     pub fn get(&self, organization: &str, run_id: &str) -> Result<RunRead, RunFailure> {
         self.get_with_timeout(organization, run_id, None)
     }
@@ -306,6 +368,15 @@ impl<'a> RunApi<'a> {
         endpoint: &str,
         timeout: Option<Duration>,
     ) -> Result<ReceivedResponse, RunFailure> {
+        self.read_response_with_limit(endpoint, timeout, http_util::MAX_RESPONSE_BODY_BYTES)
+    }
+
+    fn read_response_with_limit(
+        &self,
+        endpoint: &str,
+        timeout: Option<Duration>,
+        limit: usize,
+    ) -> Result<ReceivedResponse, RunFailure> {
         let mut request = self.request(Method::GET, endpoint);
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
@@ -314,7 +385,13 @@ impl<'a> RunApi<'a> {
             .send()
             .map_err(|error| RunFailure::Unreachable(classify_reqwest_error(&error)))?;
         let status = response.status();
-        http_util::buffer_blocking_response(response).map_err(|error| match error {
+        let limit = if status == StatusCode::OK {
+            limit
+        } else {
+            http_util::MAX_RESPONSE_BODY_BYTES
+        };
+        http_util::buffer_blocking_response_with_limit(response, limit).map_err(|error| match error
+        {
             BoundedBodyError::TooLarge => RunFailure::protocol(status == StatusCode::UNAUTHORIZED),
             BoundedBodyError::Transport(_) if status == StatusCode::UNAUTHORIZED => {
                 RunFailure::protocol(true)

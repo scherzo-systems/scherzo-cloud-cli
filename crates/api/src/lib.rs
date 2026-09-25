@@ -150,8 +150,8 @@ pub use runs::{
     RunCancellationEffectiveMode, RunCancellationEnvelope, RunCancellationMode,
     RunCancellationReceipt, RunCancellationReceiptMode, RunCancellationReceiptState,
     RunCancellationResolutionKind, RunCreationAcceptance, RunCreationPending, RunFailure,
-    RunInterruption, RunObservation, RunPublicationHandoffState, RunRead, RunState,
-    valid_integration_context,
+    RunInterruption, RunList, RunListFilter, RunObservation, RunPublicationHandoffState, RunRead,
+    RunState, valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

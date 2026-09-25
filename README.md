@@ -1263,6 +1263,27 @@ same-organization repository and runner-pool checks remain server-enforced.
 
 ## Cloud runs
 
+List materialized runs within one organization (newest first) with bounded,
+opaque-cursor pages. Filters combine with AND; repeat exact context matches:
+
+```sh
+scherzo-cloud run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --state-group active --created-after 2025-01-01T00:00:00Z \
+  --integration-context source=linear --integration-context linearIssue=LIV-123 \
+  --limit 50 --json
+scherzo-cloud run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --state-group active --created-after 2025-01-01T00:00:00Z \
+  --integration-context source=linear --integration-context linearIssue=LIV-123 \
+  --limit 50 --cursor 'CURSOR_FROM_NEXT_CURSOR' --json
+```
+
+Text output includes run IDs, state, timestamps, project, workflow, context,
+placement when available, and the next cursor; `--json` returns `items` and
+`nextCursor` as in the API. Context is private: avoid shell-history exposure when
+using context filters, and do not put context in logs. For ticket dispatch, write
+`{"source":"linear","linearIssue":"LIV-123"}` to a protected file and supply
+`run create --integration-context-file PATH`.
+
 Run commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when an API operation permits a service actor. They use
 the configured Scherzo Cloud deployment and remain separate from `scherzo-cloud workflow`,

@@ -17,26 +17,15 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CreateRunnerRegistrationRequest {
-    #[serde(rename = "runnerPoolId")]
-    pub runner_pool_id: String,
-    /// A canonical lowercase organization-scoped runner resource name.
-    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// An optional active human delegator used only for service-action audit attribution.
-    #[serde(
-        rename = "delegatorPrincipalId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub delegator_principal_id: Option<String>,
+pub struct RunList {
+    #[serde(rename = "items")]
+    pub items: Vec<models::RunListItem>,
+    #[serde(rename = "nextCursor", deserialize_with = "Option::deserialize")]
+    pub next_cursor: Option<String>,
 }
 
-impl CreateRunnerRegistrationRequest {
-    pub fn new(runner_pool_id: String) -> CreateRunnerRegistrationRequest {
-        CreateRunnerRegistrationRequest {
-            runner_pool_id,
-            name: None,
-            delegator_principal_id: None,
-        }
+impl RunList {
+    pub fn new(items: Vec<models::RunListItem>, next_cursor: Option<String>) -> RunList {
+        RunList { items, next_cursor }
     }
 }

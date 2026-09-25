@@ -34,6 +34,171 @@ fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, 
     (server, credential_directory, credential_path)
 }
 
+#[test]
+fn list_runs_filters_and_renders_text_and_json() {
+    let body = serde_json::json!({
+        "items": [{
+            "id": RUN_ID, "displayName": "Release checks", "projectId": PROJECT_ID,
+            "workflowPath": WORKFLOW_PATH, "state": "running",
+            "createdAt": "2025-01-03T00:00:00Z", "updatedAt": "2025-01-03T01:00:00Z",
+            "integrationContext": {"source": "linear", "linearIssue": "LIV-123"},
+            "placement": {"runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "runnerName": "build-runner", "poolId": "rpl_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "poolName": "build-pool"}
+        }],
+        "nextCursor": "opaque-page"
+    });
+    let reply = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&body).unwrap(),
+    );
+    let (server, _directory, credential_path) = prepared_run(vec![reply.clone(), reply]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let arguments = [
+        "run",
+        "list",
+        ORGANIZATION,
+        "--project-id",
+        PROJECT_ID,
+        "--state-group",
+        "active",
+        "--created-after",
+        "2025-01-01T00:00:00Z",
+        "--integration-context",
+        "source=linear",
+        "--integration-context",
+        "linearIssue=LIV-123",
+        "--limit",
+        "1",
+        "--cursor",
+        "prior-page",
+        "--allow-insecure-http",
+    ];
+    let text = run_with_env(&arguments, &environment);
+    assert_eq!(
+        text.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let report = String::from_utf8(text.stdout).unwrap();
+    println!("scherzo-cloud run list {ORGANIZATION} [filters]:\n{report}");
+    assert!(
+        report.contains(RUN_ID)
+            && report.contains("build-runner")
+            && report.contains("LIV-123")
+            && report.contains("opaque-page")
+    );
+    let json_args = [arguments.as_slice(), &["--json"]].concat();
+    let structured = run_with_env(&json_args, &environment);
+    assert_eq!(
+        structured.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&structured.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
+    println!(
+        "scherzo-cloud run list {ORGANIZATION} [filters] --json:\n{}",
+        String::from_utf8_lossy(&structured.stdout)
+    );
+    assert_eq!(parsed, body);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert!(
+            request.contains("projectId=")
+                && request.contains("stateGroup=active")
+                && request.contains("createdAfter=")
+                && request.contains("integrationContext=source%3Dlinear")
+                && request.contains("integrationContext=linearIssue%3DLIV-123")
+                && request.contains("cursor=prior-page")
+                && request.contains("limit=1"),
+            "{request}"
+        );
+    }
+}
+
+#[test]
+fn list_runs_accepts_full_pages_with_large_valid_contexts() {
+    let context = (0..15)
+        .map(|index| {
+            (
+                format!("key{index}"),
+                serde_json::Value::String("<".repeat(1024)),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let item = serde_json::json!({
+        "id": RUN_ID, "displayName": "Release checks", "projectId": PROJECT_ID,
+        "workflowPath": WORKFLOW_PATH, "state": "running",
+        "createdAt": "2025-01-03T00:00:00Z", "updatedAt": "2025-01-03T01:00:00Z",
+        "integrationContext": context, "placement": null
+    });
+    let items = (0..100)
+        .rev()
+        .map(|index| {
+            let mut row = item.clone();
+            row["id"] = serde_json::json!(format!("run_01k0z6r1w8f4jy2m7q9v3x5{index:03}"));
+            row
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({"items": items, "nextCursor": "next-page"});
+    // Gateway's Go JSON encoder escapes HTML-sensitive context bytes as \u003c.
+    let encoded = serde_json::to_string(&body)
+        .unwrap()
+        .replace('<', "\\u003c")
+        .into_bytes();
+    assert!(encoded.len() > 8 * 1024 * 1024);
+    let reply = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &encoded,
+    );
+    let (server, _directory, credential_path) = prepared_run(vec![reply.clone(), reply]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let arguments = [
+        "run",
+        "list",
+        ORGANIZATION,
+        "--limit",
+        "100",
+        "--allow-insecure-http",
+    ];
+    let text = run_with_env(&arguments, &environment);
+    assert_eq!(
+        text.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let report = String::from_utf8(text.stdout).unwrap();
+    assert_eq!(
+        report
+            .lines()
+            .filter(|line| line.starts_with("run_"))
+            .count(),
+        100
+    );
+    assert!(report.contains("next cursor: next-page"));
+    let json_args = [arguments.as_slice(), &["--json"]].concat();
+    let structured = run_with_env(&json_args, &environment);
+    assert_eq!(
+        structured.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&structured.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&structured.stdout).unwrap(),
+        body
+    );
+    assert_eq!(server.finish().len(), 2);
+}
+
 fn acceptance_body(run_id: &str, replayed: bool) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "runId": run_id,

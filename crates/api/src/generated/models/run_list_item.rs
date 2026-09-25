@@ -17,71 +17,80 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GitHubInstallation {
+pub struct RunListItem {
     #[serde(rename = "id")]
     pub id: String,
-    /// A canonical positive signed-64-bit provider identifier encoded as decimal text so browser clients preserve it exactly.
-    #[serde(rename = "providerInstallationId")]
-    pub provider_installation_id: String,
-    /// A canonical positive signed-64-bit provider identifier encoded as decimal text so browser clients preserve it exactly.
-    #[serde(rename = "providerAccountId")]
-    pub provider_account_id: String,
-    #[serde(rename = "providerAccountType")]
-    pub provider_account_type: ProviderAccountType,
+    #[serde(rename = "displayName", deserialize_with = "Option::deserialize")]
+    pub display_name: Option<String>,
+    #[serde(rename = "projectId")]
+    pub project_id: String,
+    #[serde(rename = "workflowPath")]
+    pub workflow_path: String,
     #[serde(rename = "state")]
     pub state: State,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
+    #[serde(rename = "integrationContext")]
+    pub integration_context: std::collections::HashMap<String, String>,
+    #[serde(rename = "placement", deserialize_with = "Option::deserialize")]
+    pub placement: Option<Box<models::RunPlacement>>,
 }
 
-impl GitHubInstallation {
+impl RunListItem {
     pub fn new(
         id: String,
-        provider_installation_id: String,
-        provider_account_id: String,
-        provider_account_type: ProviderAccountType,
+        display_name: Option<String>,
+        project_id: String,
+        workflow_path: String,
         state: State,
         created_at: String,
         updated_at: String,
-    ) -> GitHubInstallation {
-        GitHubInstallation {
+        integration_context: std::collections::HashMap<String, String>,
+        placement: Option<models::RunPlacement>,
+    ) -> RunListItem {
+        RunListItem {
             id,
-            provider_installation_id,
-            provider_account_id,
-            provider_account_type,
+            display_name,
+            project_id,
+            workflow_path,
             state,
             created_at,
             updated_at,
+            integration_context,
+            placement: placement.map(Box::new),
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum ProviderAccountType {
-    #[serde(rename = "Organization")]
-    Organization,
-    #[serde(rename = "User")]
-    User,
-}
-
-impl Default for ProviderAccountType {
-    fn default() -> ProviderAccountType {
-        Self::Organization
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum State {
-    #[serde(rename = "active")]
-    Active,
-    #[serde(rename = "disconnected")]
-    Disconnected,
-    #[serde(rename = "revoked")]
-    Revoked,
+    #[serde(rename = "queued")]
+    Queued,
+    #[serde(rename = "assigning")]
+    Assigning,
+    #[serde(rename = "preparing")]
+    Preparing,
+    #[serde(rename = "assigned")]
+    Assigned,
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "cancelling")]
+    Cancelling,
+    #[serde(rename = "succeeded")]
+    Succeeded,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "cancelled")]
+    Cancelled,
+    #[serde(rename = "interrupted")]
+    Interrupted,
+    #[serde(rename = "rejected")]
+    Rejected,
 }
 
 impl Default for State {
     fn default() -> State {
-        Self::Active
+        Self::Queued
     }
 }
