@@ -143,6 +143,27 @@ pub(super) fn show_once(
     Ok(snapshot)
 }
 
+// A materialized run may require a second GET. Its admission is separate from
+// the run GET: record() can yield to a signal handler before we reach this point.
+fn record_then_read_publication<T, E>(
+    record: impl FnOnce(),
+    timeout: Option<Duration>,
+    started: Instant,
+    control: &impl super::super::ObservationControl,
+    clock: &impl super::super::ObservationClock,
+    read: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    record();
+    if (timeout.is_none()
+        || super::super::remaining_observation_wait(timeout, started, clock.now()).is_some())
+        && control.admit_read()
+    {
+        read().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn publication_settled(snapshot: &CloudSnapshot) -> bool {
     let Some(run) = snapshot.run.as_deref() else {
         return false;
@@ -205,7 +226,6 @@ pub(super) fn wait_run(
                 RunRead::Materialized(run) => {
                     current.run = Some(run);
                     current.publication = None;
-                    record(current.clone());
                     if current
                         .run
                         .as_deref()
@@ -216,18 +236,26 @@ pub(super) fn wait_run(
                             .and_then(|run| run.publication.as_ref())
                         && let Some(publication_id) = handoff.publication_id.as_deref()
                     {
-                        let budget =
-                            super::super::remaining_observation_wait(timeout, started, clock.now());
-                        if timeout.is_none() || budget.is_some() {
-                            current.publication = Some(Box::new(read_publication(
-                                deployment,
-                                options,
-                                organization,
-                                run_id,
-                                publication_id,
-                                deadline,
-                            )?));
-                        }
+                        current.publication = record_then_read_publication(
+                            || record(current.clone()),
+                            timeout,
+                            started,
+                            control,
+                            clock,
+                            || {
+                                read_publication(
+                                    deployment,
+                                    options,
+                                    organization,
+                                    run_id,
+                                    publication_id,
+                                    deadline,
+                                )
+                            },
+                        )?
+                        .map(Box::new);
+                    } else {
+                        record(current.clone());
                     }
                 }
                 RunRead::Pending(_) => {
@@ -374,4 +402,73 @@ pub(super) fn wait_receipt_with(
         control,
         clock,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::observation_test_support::ControlledObservationClock;
+    use crate::cli::{ObservationControl as _, OperationControl, TerminalObservation};
+
+    #[test]
+    fn stop_between_run_and_publication_reads_prevents_second_request() {
+        let started = scherzo_cloud_support::monotonic_now();
+        let clock = ControlledObservationClock::new(started);
+        let control = OperationControl::new(());
+        let mut requests = Vec::new();
+        let result = super::super::super::wait_for_terminal_observation_bounded(
+            |_| {
+                requests.push("run GET");
+                // The production helper records the run before admitting the
+                // second GET. Stop wins while the record callback is running.
+                record_then_read_publication(
+                    || assert!(control.claim_signal().is_some()),
+                    None,
+                    started,
+                    &control,
+                    &clock,
+                    || {
+                        requests.push("publication GET");
+                        Ok::<_, ()>(())
+                    },
+                )?;
+                Ok::<_, ()>(())
+            },
+            |_| None::<()>,
+            |_| false,
+            None,
+            started,
+            &control,
+            &clock,
+        )
+        .unwrap();
+        assert!(matches!(result, TerminalObservation::Stopped));
+        assert_eq!(requests, ["run GET"]);
+        assert!(!control.admit_read());
+    }
+
+    #[test]
+    fn publication_read_respects_expiry_and_allows_active_observation() {
+        let started = scherzo_cloud_support::monotonic_now();
+        let clock = ControlledObservationClock::new(started);
+        let control = OperationControl::new(());
+        for (elapsed, expected) in [
+            (Duration::ZERO, Some("publication GET")),
+            (Duration::from_millis(10), None),
+        ] {
+            clock.advance(elapsed);
+            assert_eq!(
+                record_then_read_publication(
+                    || {},
+                    Some(Duration::from_millis(10)),
+                    started,
+                    &control,
+                    &clock,
+                    || Ok::<_, ()>("publication GET"),
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
 }

@@ -5,7 +5,6 @@ use ring::digest::{SHA256, digest};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt as _;
-#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 const TOKEN: &str = "unique-cloud-run-command-token-sentinel";
@@ -5226,16 +5225,12 @@ fn show_wait_bounds_transport_retries_and_emits_one_unavailable_result() {
     assert_eq!(server.finish().len(), 2);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn timeout_and_signals_stop_only_cloud_run_show_observation() {
-    let cases = [
-        (None, Some(rustix::process::Signal::INT), 130, None),
-        (None, Some(rustix::process::Signal::TERM), 143, None),
-        (Some("1s"), None, 1, Some("timed_out")),
-    ];
-
-    for (timeout, signal, expected_exit, expected_outcome) in cases {
+fn signals_stop_only_active_cloud_run_show_observation() {
+    for (signal, expected_exit) in [
+        (rustix::process::Signal::INT, 130),
+        (rustix::process::Signal::TERM, 143),
+    ] {
         let mut server =
             ScriptedServer::respond_with_paused_first_response(vec![run_response(run_body())]);
         let credential_directory = private_credential_directory();
@@ -5248,11 +5243,15 @@ fn timeout_and_signals_stop_only_cloud_run_show_observation() {
         );
         let environment =
             deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-        let mut args = vec!["run", "show", ORGANIZATION, RUN_ID, "--wait", "--json"];
-        if let Some(timeout) = timeout {
-            args.extend(["--timeout", timeout]);
-        }
-        args.push("--allow-insecure-http");
+        let args = [
+            "run",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            "--wait",
+            "--json",
+            "--allow-insecure-http",
+        ];
         let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
         command
             .args(args)
@@ -5267,36 +5266,24 @@ fn timeout_and_signals_stop_only_cloud_run_show_observation() {
             command.env(name, value);
         }
         let child = command.spawn().unwrap();
-        let request = server.next_request();
+        let request = server.wait_for_request();
         assert!(request.starts_with(&format!(
             "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID} HTTP/1.1\r\n"
         )));
 
-        if let Some(signal) = signal {
-            rustix::process::kill_process(
-                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
-                signal,
-            )
-            .unwrap();
-        }
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+            signal,
+        )
+        .unwrap();
         let output = child.wait_with_output().unwrap();
         server.release_paused_response();
 
         assert_eq!(output.status.code(), Some(expected_exit));
         assert!(output.stderr.is_empty());
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(
-            result["outcome"],
-            expected_outcome.unwrap_or("observation_stopped")
-        );
-        assert_eq!(
-            result["error"]["code"],
-            if expected_outcome.is_some() {
-                "wait_timed_out"
-            } else {
-                "observation_stopped"
-            }
-        );
+        assert_eq!(result["outcome"], "observation_stopped");
+        assert_eq!(result["error"]["code"], "observation_stopped");
         assert_eq!(result["organizationRef"], ORGANIZATION);
         assert_eq!(result["runId"], RUN_ID);
         assert_no_secret_output(&output, &[TOKEN]);

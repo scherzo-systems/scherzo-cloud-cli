@@ -884,6 +884,9 @@ const OBSERVATION_STOPPED: u8 = 2;
 
 trait ObservationControl {
     fn is_stopped(&self) -> bool;
+    // This is the read's admission point. A stop that wins first bars the read;
+    // a read admitted first may finish while the stop owns the local output.
+    fn admit_read(&self) -> bool;
 }
 
 struct BlockingObservationControl {
@@ -927,6 +930,17 @@ impl BlockingObservationControl {
 impl ObservationControl for BlockingObservationControl {
     fn is_stopped(&self) -> bool {
         self.is_stopped()
+    }
+
+    fn admit_read(&self) -> bool {
+        self.state
+            .compare_exchange(
+                OBSERVATION_ACTIVE,
+                OBSERVATION_ACTIVE,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
@@ -1036,6 +1050,10 @@ mod observation_test_support {
         pub(super) fn into_sleeps(self) -> Vec<Duration> {
             self.sleeps.into_inner()
         }
+
+        pub(super) fn advance(&self, duration: Duration) {
+            self.now.set(self.now.get() + duration);
+        }
     }
 
     impl super::ObservationClock for ControlledObservationClock {
@@ -1089,13 +1107,21 @@ fn wait_for_terminal_observation_bounded<T, S, E>(
         if control.is_stopped() {
             return Ok(TerminalObservation::Stopped);
         }
-        if remaining_observation_wait(timeout, started_at, clock.now()).is_none() {
-            return Ok(TerminalObservation::TimedOut);
+        let remaining = remaining_observation_wait(timeout, started_at, clock.now());
+        // Stop can win while the deadline is sampled. Admit no new read in that case.
+        if control.is_stopped() {
+            return Ok(TerminalObservation::Stopped);
         }
+        let Some(remaining) = remaining else {
+            return Ok(TerminalObservation::TimedOut);
+        };
 
-        match observe(
-            timeout.and_then(|_| remaining_observation_wait(timeout, started_at, clock.now())),
-        ) {
+        // Linearize read admission with signal/timeout stop, not with an earlier
+        // status sample. Do not hold the control lock across a blocking GET.
+        if !control.admit_read() {
+            return Ok(TerminalObservation::Stopped);
+        }
+        match observe(timeout.map(|_| remaining)) {
             Ok(resource) => {
                 consecutive_failures = 0;
                 if let Some(state) = terminal_state(&resource) {
@@ -1253,6 +1279,10 @@ struct OperationControl<R> {
 impl<R> ObservationControl for OperationControl<R> {
     fn is_stopped(&self) -> bool {
         self.is_cancelled()
+    }
+
+    fn admit_read(&self) -> bool {
+        self.lock_owned_state(OperationOwner::Active).is_some()
     }
 }
 
@@ -1869,6 +1899,164 @@ mod tests {
                 assert_eq!(worker_exit, ExitCode::Success);
                 assert_eq!(document["outcome"], "completed");
             }
+        }
+    }
+
+    fn observe_at_read_boundary(
+        clock: &impl super::ObservationClock,
+        control: &impl super::ObservationControl,
+        started: std::time::Instant,
+    ) -> (
+        super::TerminalObservation<(), ()>,
+        Vec<Option<std::time::Duration>>,
+    ) {
+        let mut requests = Vec::new();
+        let outcome = super::wait_for_terminal_observation_bounded(
+            |remaining| {
+                requests.push(remaining);
+                Ok::<_, ()>(())
+            },
+            |_| None::<()>,
+            |_| false,
+            Some(std::time::Duration::from_millis(10)),
+            started,
+            control,
+            clock,
+        )
+        .unwrap();
+        (outcome, requests)
+    }
+
+    #[test]
+    fn cloud_run_observation_expiry_before_read_admission_sends_no_request() {
+        use super::observation_test_support::ControlledObservationClock;
+        use std::time::Duration;
+
+        let started = scherzo_cloud_support::monotonic_now();
+        let clock = ControlledObservationClock::new(started);
+        let control = super::OperationControl::new(());
+        // The timeout wins after observation starts, before its first GET is admitted.
+        clock.advance(Duration::from_millis(10));
+        let (result, requests) = observe_at_read_boundary(&clock, &control, started);
+        assert!(matches!(result, super::TerminalObservation::TimedOut));
+        assert!(requests.is_empty());
+        let mut outputs = Vec::new();
+        assert_eq!(
+            super::complete_operation(&control, || {
+                outputs.push("timed_out");
+                Ok(ExitCode::GeneralFailure)
+            })
+            .unwrap_or_else(|failure| panic!("{}", failure.error())),
+            ExitCode::GeneralFailure
+        );
+        assert_eq!(outputs, ["timed_out"]);
+    }
+
+    #[test]
+    fn cloud_run_observation_stop_at_read_boundary_prevents_dispatch() {
+        use std::sync::{Arc, mpsc};
+
+        struct PauseBeforeAdmission<'a> {
+            control: &'a super::OperationControl<()>,
+            at_boundary: mpsc::Sender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl super::ObservationControl for PauseBeforeAdmission<'_> {
+            fn is_stopped(&self) -> bool {
+                self.control.is_cancelled()
+            }
+            fn admit_read(&self) -> bool {
+                self.at_boundary.send(()).unwrap();
+                self.resume.recv().unwrap();
+                super::ObservationControl::admit_read(self.control)
+            }
+        }
+
+        let started = scherzo_cloud_support::monotonic_now();
+        let control = Arc::new(super::OperationControl::new(()));
+        let (at_boundary, reached) = mpsc::channel();
+        let (resume, continue_read) = mpsc::channel();
+        let worker_control = Arc::clone(&control);
+        let worker = std::thread::spawn(move || {
+            let clock = super::observation_test_support::ControlledObservationClock::new(started);
+            let gate = PauseBeforeAdmission {
+                control: &worker_control,
+                at_boundary,
+                resume: continue_read,
+            };
+            observe_at_read_boundary(&clock, &gate, started)
+        });
+        // Both status checks and the deadline sample have completed. Stop wins
+        // the actual read-admission claim before the worker can make its GET.
+        reached.recv().unwrap();
+        let mut outputs = Vec::new();
+        if control.claim_signal().is_some() {
+            outputs.push("observation_stopped");
+        }
+        resume.send(()).unwrap();
+        let (result, requests) = worker.join().unwrap();
+        assert!(matches!(result, super::TerminalObservation::Stopped));
+        assert!(requests.is_empty());
+        assert_eq!(
+            super::complete_operation(&control, || Ok(ExitCode::Success))
+                .unwrap_or_else(|failure| panic!("{}", failure.error())),
+            ExitCode::GeneralFailure
+        );
+        assert_eq!(outputs, ["observation_stopped"]);
+    }
+
+    #[test]
+    fn cloud_run_observation_timeout_and_stop_after_get_do_not_dispatch_another() {
+        use super::observation_test_support::ControlledObservationClock;
+        use std::time::Duration;
+
+        for signal_after_get in [false, true] {
+            let started = scherzo_cloud_support::monotonic_now();
+            let clock = ControlledObservationClock::new(started);
+            let control = super::OperationControl::new(());
+            let mut requests = Vec::new();
+            let mut outputs = Vec::new();
+            let result = super::wait_for_terminal_observation_bounded(
+                |remaining| {
+                    requests.push(remaining);
+                    // This GET has started. The timeout or stop wins before another poll.
+                    if signal_after_get {
+                        assert!(control.claim_signal().is_some());
+                        outputs.push("observation_stopped");
+                    } else {
+                        clock.advance(Duration::from_millis(10));
+                    }
+                    Ok::<_, ()>(())
+                },
+                |_| None::<()>,
+                |_| false,
+                Some(Duration::from_millis(10)),
+                started,
+                &control,
+                &clock,
+            )
+            .unwrap();
+            if signal_after_get {
+                assert!(matches!(result, super::TerminalObservation::Stopped));
+                assert_eq!(
+                    super::complete_operation(&control, || Ok(ExitCode::Success))
+                        .unwrap_or_else(|failure| panic!("{}", failure.error())),
+                    ExitCode::GeneralFailure
+                );
+                assert_eq!(outputs, ["observation_stopped"]);
+            } else {
+                assert!(matches!(result, super::TerminalObservation::TimedOut));
+                assert_eq!(
+                    super::complete_operation(&control, || {
+                        outputs.push("timed_out");
+                        Ok(ExitCode::GeneralFailure)
+                    })
+                    .unwrap_or_else(|failure| panic!("{}", failure.error())),
+                    ExitCode::GeneralFailure
+                );
+                assert_eq!(outputs, ["timed_out"]);
+            }
+            assert_eq!(requests, [Some(Duration::from_millis(10))]);
         }
     }
 
