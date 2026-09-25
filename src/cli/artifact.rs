@@ -6,8 +6,8 @@ mod validate;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{ArtifactApi, ArtifactApiError, HttpClient, HttpTransportPolicy};
+use scherzo_cloud_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Work with portable workflow artifacts";
 const NAME: &str = "artifact";

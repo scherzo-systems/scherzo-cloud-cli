@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_human_auth::Deployment;
 use scherzo_cloud_support::generate_idempotency_key;
 
 use super::{OrganizationArg, PaginationArgs, PoolArg};

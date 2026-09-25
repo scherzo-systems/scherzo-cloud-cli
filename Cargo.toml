@@ -13,6 +13,7 @@ members = [
   ".",
   "crates/api",
   "crates/execution",
+  "crates/human-auth",
   "crates/runner",
   "crates/runner-protocol",
   "crates/support",
@@ -72,6 +73,7 @@ rustix = { version = "1.1.4", features = ["fs", "net", "process", "termios"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 scherzo-cloud-api = { path = "crates/api" }
 scherzo-cloud-execution = { path = "crates/execution" }
+scherzo-cloud-human-auth = { path = "crates/human-auth" }
 scherzo-cloud-runner = { path = "crates/runner" }
 scherzo-cloud-runner-protocol = { path = "crates/runner-protocol" }
 scherzo-cloud-support = { path = "crates/support" }
@@ -98,15 +100,14 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 flate2.workspace = true
-fs4.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
 nix.workspace = true
-reqwest.workspace = true
 ring.workspace = true
 rustix.workspace = true
 scherzo-cloud-api.workspace = true
 scherzo-cloud-execution.workspace = true
+scherzo-cloud-human-auth.workspace = true
 scherzo-cloud-runner.workspace = true
 scherzo-cloud-support.workspace = true
 serde.workspace = true
@@ -118,6 +119,7 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+fs4.workspace = true
 futures-util.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
 scherzo-cloud-execution = { workspace = true, features = ["test-fixtures"] }

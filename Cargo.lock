@@ -2083,11 +2083,11 @@ dependencies = [
  "jsonschema",
  "libc",
  "nix",
- "reqwest",
  "ring",
  "rustix",
  "scherzo-cloud-api",
  "scherzo-cloud-execution",
+ "scherzo-cloud-human-auth",
  "scherzo-cloud-runner",
  "scherzo-cloud-support",
  "scherzo-cloud-test-support",
@@ -2152,6 +2152,25 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "yaml-rust2",
+]
+
+[[package]]
+name = "scherzo-cloud-human-auth"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "reqwest",
+ "ring",
+ "rustix",
+ "scherzo-cloud-api",
+ "scherzo-cloud-support",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

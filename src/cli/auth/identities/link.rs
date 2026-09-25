@@ -5,11 +5,11 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 
 use crate::exit_code::OutcomeClass;
-use crate::human_auth::cancellation::Cancellation;
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::device_authorization::AuthorizationError;
-use crate::human_auth::device_flow::{self, DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 use scherzo_cloud_api::{ListIdentitiesOutcome, link_identity, list_identities};
+use scherzo_cloud_human_auth::AuthorizationError;
+use scherzo_cloud_human_auth::Cancellation;
+use scherzo_cloud_human_auth::Deployment;
+use scherzo_cloud_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 
 use super::{
     BoundHumanSession, OutputOptions, output, with_bound_human_session, with_human_session_binding,
@@ -96,7 +96,7 @@ impl Command {
             }
         };
 
-        let proof = device_flow::identity_proof(
+        let proof = scherzo_cloud_human_auth::identity_proof(
             &client,
             deployment,
             cancellation,
@@ -230,7 +230,7 @@ impl Command {
             .api_outcome(
                 deployment.fingerprint().api_url(),
                 &outcome,
-                crate::human_auth::session::LocalCredentialState::Retained,
+                scherzo_cloud_human_auth::LocalCredentialState::Retained,
                 true,
             )
             .map_err(Into::into)

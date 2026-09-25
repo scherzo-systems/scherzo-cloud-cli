@@ -2,8 +2,8 @@ use anyhow::anyhow;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{create_organization, create_organization_with_delegator};
+use scherzo_cloud_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 

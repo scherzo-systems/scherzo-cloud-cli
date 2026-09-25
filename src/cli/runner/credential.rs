@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 
 use super::{CloudOptions, OrganizationArg, PaginationArgs, cloud};
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_human_auth::Deployment;
 use scherzo_cloud_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner credential lifecycle";

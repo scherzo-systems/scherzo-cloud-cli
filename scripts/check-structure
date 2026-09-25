@@ -60,6 +60,8 @@ required_files=(
   crates/execution/Cargo.toml
   crates/execution/src/lib.rs
   crates/execution/src/process.rs
+  crates/human-auth/Cargo.toml
+  crates/human-auth/src/lib.rs
   crates/execution/src/workflow/pi-json-v1-extension/package.json
   crates/execution/src/workflow/pi-json-v1-extension/package-lock.json
   crates/execution/src/workflow/pi-json-v1-extension/tsconfig.json

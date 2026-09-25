@@ -6,11 +6,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     HttpTransportPolicy, Publication, PublicationApi, PublicationFailure, PublicationList,
     PublicationState,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 use super::OrganizationArg;
 

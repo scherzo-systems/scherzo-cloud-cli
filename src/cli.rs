@@ -66,13 +66,13 @@ use serde::Serialize;
 
 use self::entity::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::cancellation::Cancellation;
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::session::{self, RequiredOperation};
 use crate::service_auth::{ServiceApiKey, read_api_key};
 use scherzo_cloud_api::{
     HttpClient, HttpTransportPolicy, MembershipRole, MembershipState, UnreachableCategory,
 };
+use scherzo_cloud_human_auth::Cancellation;
+use scherzo_cloud_human_auth::Deployment;
+use scherzo_cloud_human_auth::RequiredOperation;
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
@@ -1573,7 +1573,7 @@ fn execute_selected_api_observation<T, E>(
             Ok(Err(unreachable(UnreachableCategory::Timeout)))
         }
     } else {
-        match session::execute_required_until(
+        match scherzo_cloud_human_auth::execute_required_until(
             context.client,
             context.deployment,
             |access_token, budget| operation(access_token.expose(), budget),
@@ -1638,7 +1638,7 @@ fn execute_required_api_operation_retrying_result<T, E>(
     unreachable: impl Fn(UnreachableCategory) -> E,
     session_context: &'static str,
 ) -> anyhow::Result<Result<T, E>> {
-    match session::execute_required(
+    match scherzo_cloud_human_auth::execute_required(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
@@ -1661,7 +1661,7 @@ fn execute_human_api_operation<O, E>(
     adapters: HumanApiOutcomeAdapters<O, E>,
     api_context: String,
 ) -> anyhow::Result<O> {
-    match session::execute_required(
+    match scherzo_cloud_human_auth::execute_required(
         client,
         deployment,
         |access_token| operation(access_token.expose()),

@@ -156,22 +156,24 @@ or arbitrary errors into either projection. Local or export queue saturation, JS
 failures, malformed export configuration, receiver failures, and export shutdown timeout
 do not change connection, acknowledgement, retry, terminal result, or shutdown behavior.
 
-API, runner protocol, support, execution, and runner are unpublished workspace packages;
-human authentication and command composition remain root modules. Runner depends only
-on support, runner protocol, and execution in production, and on test-support for tests;
-it has no API, human-authentication, command, or root-package edge. A second runner binary
-should be introduced only if platform dependencies, privilege isolation, artifact size,
-or independent release cadence creates a demonstrated need.
+API, runner protocol, support, execution, human authentication, and runner are
+unpublished workspace packages; command composition remains in the root binary.
+Runner depends only on support, runner protocol, and execution in production, and on
+test-support for tests; it has no API, human-authentication, command, or root-package
+edge. A second runner binary should be introduced only if platform dependencies,
+privilege isolation, artifact size, or independent release cadence creates a
+demonstrated need.
 
 ## Credential separation
 
 Human sessions, service-principal credentials, and runners use distinct security
 identities and storage rules.
 
-Human commands use the credential implementation beneath `src/human_auth/`. The store
-binds each renewable access-and-refresh credential to the exact API URL, issuer,
-audience, and public client ID that issued it. It rejects symbolic links, unexpected
-ownership or modes, malformed schemas, duplicate fingerprints, and oversized tokens;
+Human commands use the explicit facade at `crates/human-auth/src/lib.rs`; its private
+credential implementation never enters runner connectivity. The store binds each
+renewable access-and-refresh credential to the exact API URL, issuer, audience,
+and public client ID that issued it. It rejects symbolic links, unexpected ownership
+or modes, malformed schemas, duplicate fingerprints, and oversized tokens;
 serializes file access with a bounded inter-process lock; and atomically replaces files
 using user-private modes. Refresh, replacement login, rejection cleanup, and logout use
 an additional lock derived from the exact deployment fingerprint.
@@ -358,8 +360,8 @@ second ID policy inside the API boundary.
 
 ## Rust source shape
 
-`cli/Cargo.toml` is both the workspace root and the sole binary package. Six unpublished
-library members now occupy their final roots:
+`cli/Cargo.toml` is both the workspace root and the sole binary package. Seven unpublished
+library members occupy their final roots:
 
 - `scherzo-cloud-support` owns shared public-ID, timing, TLS-provider, and Workflow
   contract leaves and has no internal dependency;
@@ -372,16 +374,18 @@ library members now occupy their final roots:
 - `scherzo-cloud-execution` owns execution, harness adapters, process containment,
   workflow assets, and their tests, depends on support in production, and uses
   test-support only for tests. Its test-only internal-worker example keeps package
-  suites independent of a previously built root executable; and
+  suites independent of a previously built root executable;
+- `scherzo-cloud-human-auth` owns human OAuth sessions and credential storage, depends
+  on support and API, and exposes only the command-facing facade; and
 - `scherzo-cloud-runner` owns Runner Serve, enrollment, doctor, local control,
   assignment execution, artifact delivery, and telemetry. It depends only on support,
   runner-protocol, and execution in production and uses test-support only for tests.
 
-The binary depends on support, API, execution, and runner in production and on
-test-support for tests. Its dev dependencies enable only the `test-fixtures` seams used
-by root tests; production dependencies do not expose fixture constructors. Commands,
-human authentication, service credential files, build identity, and exit policy remain
-rooted in `src/`. There is one `scherzo-cloud` executable, Cargo continues to provide
+The binary depends on support, API, execution, runner, and human-auth in production
+and on test-support for tests. Its dev dependencies enable only the `test-fixtures`
+seams used by root tests; production dependencies do not expose fixture constructors.
+Commands, service credential policy, build identity, and exit policy remain rooted in
+`src/`. There is one `scherzo-cloud` executable, Cargo continues to provide
 `CARGO_BIN_EXE_scherzo-cloud`, and the archive shape is unchanged.
 
 The remaining seams have this closed ownership matrix:
@@ -391,12 +395,13 @@ The remaining seams have this closed ownership matrix:
 | Execution implementation | Private modules beneath `crates/execution/src/` | Non-execution code uses only the explicit flat facade in `crates/execution/src/lib.rs`; implementation modules are not public. |
 | Process implementation | Private `crates/execution/src/process.rs` module | Execution uses it internally and its facade exports exactly `ManagedProcessGroup`, `CommandRunner`, `CommandRequest`, `CommandOutput`, `CommandProbeError`, and `SystemCommandRunner` for runner consumers. |
 | Runner implementation | Private modules beneath `crates/runner/src/` | Root commands and the binary helper dispatch use only the explicit flat facade; the runner package receives the root-resolved version when Runner Serve starts. |
+| Human authentication | Private modules beneath `crates/human-auth/src/` | Root commands use the flat facade; the runner has no human-auth edge or access to its store. |
 | Build identity | `src/build_info.rs` and the crate root | Root CLI dispatch injects the resolved version into local agent dispatch and Runner Serve. Execution and runner code do not read build environment or root build policy. |
 | Exit policy | `src/exit_code.rs` and the crate root | Execution returns the closed `ExecutionOutcome` domain value. Root command dispatch maps that value to the unchanged process exit statuses. |
 
 `tests/architecture.rs` enforces the exact member and internal-edge inventories, each
 member's inherited lint policy, the residual root-module graph, private generated API,
-the final execution, process, runner, and idempotency ownership, and confinement of
+the final execution, process, runner, human-auth, and idempotency ownership, and confinement of
 command parsing, HTTP, WebSocket, telemetry, and terminal dependencies to their owning
 packages. The dev-only
 `scherzo-cloud-test-support` facade supplies the Git fixture to execution and runner tests

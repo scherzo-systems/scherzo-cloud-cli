@@ -12,7 +12,6 @@ mod build_info;
 mod cli;
 mod error;
 mod exit_code;
-mod human_auth;
 mod service_auth;
 
 use std::env;

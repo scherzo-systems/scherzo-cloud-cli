@@ -8,10 +8,10 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     HttpClient, LinearApi, LinearConnection, LinearFailure, LinearSession, LinearSessionStatus,
 };
+use scherzo_cloud_human_auth::Deployment;
 // jscpd:ignore-end
 
 use super::{OrganizationArg, PrincipalAuthenticationArgs};

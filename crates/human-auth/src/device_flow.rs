@@ -14,7 +14,7 @@ use scherzo_cloud_api::HttpClient;
 
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
-pub(crate) enum DeviceFlowOutcome<T> {
+pub enum DeviceFlowOutcome<T> {
     Issued(T),
     Denied,
     Expired,
@@ -23,7 +23,7 @@ pub(crate) enum DeviceFlowOutcome<T> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ActivationEvent<'a> {
+pub struct ActivationEvent<'a> {
     schema_version: u8,
     event: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,7 +36,7 @@ pub(crate) struct ActivationEvent<'a> {
     expires_at: String,
 }
 
-pub(crate) fn activation_event<'a>(
+pub fn activation_event<'a>(
     deployment: &'a Deployment,
     authorization: &'a DeviceAuthorization,
     expires_at: OffsetDateTime,
@@ -55,12 +55,12 @@ pub(crate) fn activation_event<'a>(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum DeviceFlowPhase {
+pub enum DeviceFlowPhase {
     DeviceAuthorization,
     TokenPolling,
 }
 
-pub(crate) enum DeviceFlowError {
+pub enum DeviceFlowError {
     Authorization {
         phase: DeviceFlowPhase,
         error: AuthorizationError,
@@ -69,7 +69,7 @@ pub(crate) enum DeviceFlowError {
     ActivationOutput(anyhow::Error),
 }
 
-pub(crate) fn session(
+pub fn session(
     client: &HttpClient,
     deployment: &Deployment,
     cancellation: &Cancellation,
@@ -85,7 +85,7 @@ pub(crate) fn session(
     )
 }
 
-pub(crate) fn identity_proof(
+pub fn identity_proof(
     client: &HttpClient,
     deployment: &Deployment,
     cancellation: &Cancellation,
@@ -206,25 +206,27 @@ fn expiration_after(duration: Duration) -> Option<OffsetDateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
 
     #[test]
-    fn poll_schedule_honors_interval_and_slow_down() {
+    fn poll_schedule_honors_interval_and_slow_down() -> anyhow::Result<()> {
         let start = scherzo_cloud_support::monotonic_now();
         let mut schedule =
             PollSchedule::new(start, Duration::from_secs(2), Duration::from_secs(30))
-                .expect("poll schedule should be representable");
+                .context("poll schedule should be representable")?;
 
-        assert_eq!(schedule.next_wait(start), Some(Duration::from_secs(2)));
+        check_eq!(schedule.next_wait(start), Some(Duration::from_secs(2)));
         schedule.slow_down();
-        assert_eq!(schedule.next_wait(start), Some(Duration::from_secs(7)));
-        assert_eq!(
+        check_eq!(schedule.next_wait(start), Some(Duration::from_secs(7)));
+        check_eq!(
             schedule.next_wait(start + Duration::from_secs(29)),
             Some(Duration::from_secs(1))
         );
-        assert!(
+        check!(
             schedule
                 .next_wait(start + Duration::from_secs(30))
                 .is_none()
         );
+        Ok(())
     }
 }

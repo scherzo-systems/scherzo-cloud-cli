@@ -24,7 +24,7 @@ const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const SESSION_SCOPES: &str = "openid profile email offline_access";
 const IDENTITY_PROOF_SCOPES: &str = "openid profile email";
 
-pub(crate) struct DeviceAuthorization {
+pub struct DeviceAuthorization {
     device_code: String,
     user_code: String,
     verification_uri: String,
@@ -48,32 +48,32 @@ impl fmt::Debug for DeviceAuthorization {
 }
 
 impl DeviceAuthorization {
-    pub(crate) fn device_code(&self) -> &str {
+    pub fn device_code(&self) -> &str {
         &self.device_code
     }
 
-    pub(crate) fn user_code(&self) -> &str {
+    pub fn user_code(&self) -> &str {
         &self.user_code
     }
 
-    pub(crate) fn verification_uri(&self) -> &str {
+    pub fn verification_uri(&self) -> &str {
         &self.verification_uri
     }
 
-    pub(crate) fn verification_uri_complete(&self) -> Option<&str> {
+    pub fn verification_uri_complete(&self) -> Option<&str> {
         self.verification_uri_complete.as_deref()
     }
 
-    pub(crate) fn activation_uri(&self) -> &str {
+    pub fn activation_uri(&self) -> &str {
         self.verification_uri_complete()
             .unwrap_or_else(|| self.verification_uri())
     }
 
-    pub(crate) fn expires_in(&self) -> Duration {
+    pub fn expires_in(&self) -> Duration {
         self.expires_in
     }
 
-    pub(crate) fn interval(&self) -> Duration {
+    pub fn interval(&self) -> Duration {
         self.interval
     }
 }
@@ -87,7 +87,7 @@ pub(crate) enum TokenPoll<T> {
     Issued(T),
 }
 
-pub(crate) struct IssuedToken {
+pub struct IssuedToken {
     access_token: SecretToken,
     refresh_token: SecretToken,
     expires_in: Duration,
@@ -105,15 +105,15 @@ impl fmt::Debug for IssuedToken {
 }
 
 impl IssuedToken {
-    pub(crate) fn access_token(&self) -> &SecretToken {
+    pub fn access_token(&self) -> &SecretToken {
         &self.access_token
     }
 
-    pub(crate) fn refresh_token(&self) -> &SecretToken {
+    pub fn refresh_token(&self) -> &SecretToken {
         &self.refresh_token
     }
 
-    pub(crate) fn expires_in(&self) -> Duration {
+    pub fn expires_in(&self) -> Duration {
         self.expires_in
     }
 }
@@ -244,7 +244,7 @@ fn poll_token_with<T>(
 }
 
 #[derive(Debug)]
-pub(crate) enum AuthorizationError {
+pub enum AuthorizationError {
     Local(AuthorizationLocalError),
     Unreachable(UnreachableCategory),
     Protocol { reason: &'static str },
@@ -272,7 +272,7 @@ impl fmt::Display for AuthorizationError {
 }
 
 #[derive(Debug)]
-pub(crate) enum AuthorizationLocalError {
+pub enum AuthorizationLocalError {
     Endpoint(HttpEndpointError),
 }
 

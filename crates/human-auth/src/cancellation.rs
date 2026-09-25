@@ -3,7 +3,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Clone)]
-pub(crate) struct Cancellation {
+pub struct Cancellation {
     state: Arc<CancellationState>,
 }
 
@@ -17,8 +17,14 @@ struct CancellationState {
     changed: Condvar,
 }
 
+impl Default for Cancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Cancellation {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: Arc::new(CancellationState {
                 ownership: AtomicU8::new(CANCELLATION_ACTIVE),
@@ -28,7 +34,7 @@ impl Cancellation {
         }
     }
 
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         let mut generation = self
             .state
             .wake
@@ -51,14 +57,14 @@ impl Cancellation {
         drop(generation);
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.state.ownership.load(Ordering::Acquire) == CANCELLATION_CANCELLED
     }
 
     /// Claims authorization to dispatch an operation whose bounded completion must survive a
     /// later signal. Cancellation and this claim are one atomic ordering boundary; the actual
     /// network send remains outside that boundary.
-    pub(crate) fn claim_bounded_completion(&self) -> bool {
+    pub fn claim_bounded_completion(&self) -> bool {
         self.state
             .ownership
             .compare_exchange(
@@ -70,7 +76,7 @@ impl Cancellation {
             .is_ok()
     }
 
-    pub(crate) fn change_token(&self) -> u64 {
+    pub fn change_token(&self) -> u64 {
         *self
             .state
             .wake
@@ -78,7 +84,7 @@ impl Cancellation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(crate) fn notify_change(&self) {
+    pub fn notify_change(&self) {
         let mut generation = self
             .state
             .wake
@@ -88,7 +94,7 @@ impl Cancellation {
         self.state.changed.notify_all();
     }
 
-    pub(crate) fn wait_for_change(&self, observed: u64) {
+    pub fn wait_for_change(&self, observed: u64) {
         let generation = self
             .state
             .wake
@@ -103,7 +109,7 @@ impl Cancellation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 
-    pub(crate) fn wait(&self, duration: Duration) -> bool {
+    pub fn wait(&self, duration: Duration) -> bool {
         if self.is_cancelled() {
             return true;
         }
@@ -126,23 +132,25 @@ mod tests {
     use super::Cancellation;
 
     #[test]
-    fn cancellation_that_wins_prevents_bounded_completion_ownership() {
+    fn cancellation_that_wins_prevents_bounded_completion_ownership() -> anyhow::Result<()> {
         let cancellation = Cancellation::new();
 
         cancellation.cancel();
 
-        assert!(cancellation.is_cancelled());
-        assert!(!cancellation.claim_bounded_completion());
+        check!(cancellation.is_cancelled());
+        check!(!cancellation.claim_bounded_completion());
+        Ok(())
     }
 
     #[test]
-    fn bounded_completion_ownership_rejects_later_cancellation() {
+    fn bounded_completion_ownership_rejects_later_cancellation() -> anyhow::Result<()> {
         let cancellation = Cancellation::new();
 
-        assert!(cancellation.claim_bounded_completion());
+        check!(cancellation.claim_bounded_completion());
         cancellation.cancel();
 
-        assert!(!cancellation.is_cancelled());
-        assert!(!cancellation.claim_bounded_completion());
+        check!(!cancellation.is_cancelled());
+        check!(!cancellation.claim_bounded_completion());
+        Ok(())
     }
 }

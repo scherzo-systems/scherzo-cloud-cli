@@ -6,19 +6,19 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::cancellation::Cancellation;
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::device_authorization::{AuthorizationError, DeviceAuthorization};
-use crate::human_auth::device_flow::{self, DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
-use crate::human_auth::session::{
-    self, LocalCredentialState, RequiredOperationWithBinding, SessionBinding,
-};
 use scherzo_cloud_api::{
     CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, HttpClient,
     HttpTransportPolicy, LifecycleApiError, LifecycleTransition, RequestDeletionOutcome,
     UnreachableCategory, cancel_current_principal_deletion, cancel_organization_deletion,
     request_current_principal_deletion, request_organization_deletion,
 };
+use scherzo_cloud_human_auth::Cancellation;
+use scherzo_cloud_human_auth::Deployment;
+use scherzo_cloud_human_auth::{
+    self, LocalCredentialState, RequiredOperationWithBinding, SessionBinding,
+};
+use scherzo_cloud_human_auth::{AuthorizationError, DeviceAuthorization};
+use scherzo_cloud_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 
 use super::OrganizationArg;
 
@@ -175,20 +175,22 @@ impl AccountRequestCommand {
         let (credential, cleanup_error) = if matches!(outcome, RequestDeletionOutcome::Scheduled(_))
         {
             match binding {
-                Some(binding) => match session::remove_bound_credential(deployment, &binding) {
-                    Ok(LocalCredentialState::Removed) => {
-                        (Some(LocalCredentialDisposition::Removed), None)
+                Some(binding) => {
+                    match scherzo_cloud_human_auth::remove_bound_credential(deployment, &binding) {
+                        Ok(LocalCredentialState::Removed) => {
+                            (Some(LocalCredentialDisposition::Removed), None)
+                        }
+                        Ok(LocalCredentialState::Retained) => {
+                            (Some(LocalCredentialDisposition::Changed), None)
+                        }
+                        Err(error) => (
+                            Some(LocalCredentialDisposition::RemovalUnconfirmed),
+                            Some(anyhow!(error).context(
+                                "remove the local credential after scheduling account deletion",
+                            )),
+                        ),
                     }
-                    Ok(LocalCredentialState::Retained) => {
-                        (Some(LocalCredentialDisposition::Changed), None)
-                    }
-                    Err(error) => (
-                        Some(LocalCredentialDisposition::RemovalUnconfirmed),
-                        Some(anyhow!(error).context(
-                            "remove the local credential after scheduling account deletion",
-                        )),
-                    ),
-                },
+                }
                 None => (
                     Some(LocalCredentialDisposition::RemovalUnconfirmed),
                     Some(anyhow!(
@@ -301,7 +303,7 @@ fn request_deletion_with_credential(
         .context(api_context);
     }
 
-    match session::execute_required_with_binding(
+    match scherzo_cloud_human_auth::execute_required_with_binding(
         client,
         deployment,
         |access_token| {
@@ -426,7 +428,7 @@ fn execute_cancellation(
         .map_err(|error| anyhow!(error))
         .context("prepare deletion cancellation networking")?;
     let mut output = CancellationOutput::new(json, &target);
-    let proof = device_flow::identity_proof(
+    let proof = scherzo_cloud_human_auth::identity_proof(
         &client,
         deployment,
         cancellation,
@@ -825,8 +827,10 @@ impl<'a> CancellationOutput<'a> {
         authorization: &DeviceAuthorization,
         expires_at: OffsetDateTime,
     ) -> anyhow::Result<()> {
+        // Keep deletion-cancellation presentation and its error context next to this command.
+        // jscpd:ignore-start
         if self.json {
-            let event = device_flow::activation_event(
+            let event = scherzo_cloud_human_auth::activation_event(
                 deployment,
                 authorization,
                 expires_at,
@@ -834,6 +838,7 @@ impl<'a> CancellationOutput<'a> {
             )
             .context("format deletion cancellation activation expiration")?;
             write_json_line(&event)
+        // jscpd:ignore-end
         } else {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "Cancel {} deletion\n", self.target.noun())?;

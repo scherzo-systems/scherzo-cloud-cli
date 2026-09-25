@@ -8,7 +8,7 @@ use super::{
     validate_activation_destination, write_activation_issuance, write_activation_summary,
 };
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_human_auth::Deployment;
 use scherzo_cloud_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner enrollment activations";

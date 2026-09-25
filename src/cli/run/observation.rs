@@ -8,7 +8,7 @@ use scherzo_cloud_api::{
 };
 
 use super::{CloudSnapshot, RunOptions, TerminalRunState, terminal_run_state};
-use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_human_auth::Deployment;
 
 fn publication_failure(failure: PublicationFailure) -> RunFailure {
     match failure {

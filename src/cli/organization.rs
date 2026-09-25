@@ -11,7 +11,6 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
     ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
@@ -19,6 +18,7 @@ use scherzo_cloud_api::{
     MembershipTerminationOutcome, OrganizationError, UpdateOrganizationMembershipOutcome,
     UpdateOrganizationOutcome,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organizations";
 const NAME: &str = "organization";

@@ -6,11 +6,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     RunFailure, RunInputSet, RunInputUpload, RunInputUploadOutcome, input_set_is_open,
     input_set_state_name,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 use super::super::{OrganizationArg, ProjectArg};
 use super::acquisition::{self, AcquiredInputs};

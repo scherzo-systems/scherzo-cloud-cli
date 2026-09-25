@@ -5,72 +5,81 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::*;
+use anyhow::Context as _;
 use scherzo_cloud_api::MAX_RESPONSE_BODY_BYTES;
 
 struct ScriptedServer {
     issuer: String,
     requests: Receiver<String>,
-    thread: JoinHandle<()>,
+    thread: JoinHandle<anyhow::Result<()>>,
     expected_requests: usize,
 }
 
 impl ScriptedServer {
-    fn new(responses: Vec<Vec<u8>>) -> Self {
+    fn new(responses: Vec<Vec<u8>>) -> anyhow::Result<Self> {
         let expected_requests = responses.len();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
-        let address = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").context("fixture listener should bind")?;
+        let address = listener
+            .local_addr()
+            .context("fixture value should exist")?;
         let (sender, requests) = mpsc::channel();
         let thread = thread::spawn(move || {
             for response in responses {
-                let (mut stream, _) = listener.accept().expect("fixture request should arrive");
-                let request = read_request(&mut stream);
+                let (mut stream, _) = listener.accept().context("fixture request should arrive")?;
+                let request = read_request(&mut stream)?;
                 sender
-                    .send(String::from_utf8(request).expect("request should be text"))
-                    .unwrap();
-                let _ = stream.write_all(&response);
+                    .send(String::from_utf8(request).context("request should be text")?)
+                    .context("fixture value should exist")?;
+                stream.write_all(&response)?;
             }
+            Ok(())
         });
 
-        Self {
+        Ok(Self {
             issuer: format!("http://{address}/tenant/"),
             requests,
             thread,
             expected_requests,
-        }
+        })
     }
 
-    fn deployment(&self) -> Deployment {
-        Deployment::for_test("http://api.fixture.example".to_owned(), self.issuer.clone())
+    fn deployment(&self) -> anyhow::Result<Deployment> {
+        Ok(Deployment::for_test(
+            "http://api.fixture.example".to_owned(),
+            self.issuer.clone(),
+        )?)
     }
 
     #[expect(
         clippy::disallowed_methods,
         reason = "wall time only bounds the external HTTP fixture's readiness messages"
     )]
-    fn finish(self) -> Vec<String> {
-        let requests = (0..self.expected_requests)
+    fn finish(self) -> anyhow::Result<Vec<String>> {
+        let requests: anyhow::Result<Vec<_>> = (0..self.expected_requests)
             .map(|_| {
                 self.requests
                     .recv_timeout(Duration::from_secs(2))
-                    .expect("fixture should capture request")
+                    .context("fixture should capture request")
             })
             .collect();
-        self.thread.join().expect("fixture server should stop");
+        self.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
         requests
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+fn read_request(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+        .context("fixture value should exist")?;
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     let mut expected_length = None;
     loop {
         let read = stream
             .read(&mut buffer)
-            .expect("request should be readable");
+            .context("request should be readable")?;
         if read == 0 {
             break;
         }
@@ -91,9 +100,9 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
                 break;
             }
         }
-        assert!(request.len() < 128 * 1024);
+        check!(request.len() < 128 * 1024);
     }
-    request
+    Ok(request)
 }
 
 fn response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
@@ -109,23 +118,23 @@ fn response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
     response
 }
 
-fn json_response(status: &str, value: serde_json::Value) -> Vec<u8> {
-    response(
+fn json_response(status: &str, value: serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    Ok(response(
         status,
         Some("application/json; charset=utf-8"),
-        &serde_json::to_vec(&value).unwrap(),
-    )
+        &serde_json::to_vec(&value).context("fixture value should exist")?,
+    ))
 }
 
-fn keep_alive_json_response(status: &str, value: serde_json::Value) -> Vec<u8> {
-    let body = serde_json::to_vec(&value).unwrap();
+fn keep_alive_json_response(status: &str, value: serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    let body = serde_json::to_vec(&value).context("fixture value should exist")?;
     let mut response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
     )
     .into_bytes();
     response.extend_from_slice(&body);
-    response
+    Ok(response)
 }
 
 fn request_form(request: &str) -> std::collections::HashMap<String, String> {
@@ -136,7 +145,7 @@ fn request_form(request: &str) -> std::collections::HashMap<String, String> {
 }
 
 #[test]
-fn device_authorization_requests_the_exact_client_audience_and_scopes() {
+fn device_authorization_requests_the_exact_client_audience_and_scopes() -> anyhow::Result<()> {
     let server = ScriptedServer::new(vec![json_response(
         "200 OK",
         serde_json::json!({
@@ -147,35 +156,46 @@ fn device_authorization_requests_the_exact_client_audience_and_scopes() {
             "expires_in": 600,
             "interval": 2
         }),
-    )]);
-    let deployment = server.deployment();
-    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+    )?])?;
+    let deployment = server.deployment()?;
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let authorization = authorize(&client, &deployment).unwrap();
+    let authorization =
+        authorize(&client, &deployment).map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    assert_eq!(authorization.device_code(), "unique-private-device-code");
-    assert_eq!(authorization.user_code(), "ABCD-EFGH");
-    assert_eq!(authorization.expires_in(), Duration::from_secs(600));
-    assert_eq!(authorization.interval(), Duration::from_secs(2));
+    check_eq!(authorization.device_code(), "unique-private-device-code");
+    check_eq!(authorization.user_code(), "ABCD-EFGH");
+    check_eq!(authorization.expires_in(), Duration::from_secs(600));
+    check_eq!(authorization.interval(), Duration::from_secs(2));
     let debug = format!("{authorization:?}");
-    assert!(!debug.contains("unique-private-device-code"));
-    assert!(!debug.contains("ABCD-EFGH"));
-    assert!(!debug.contains("auth.fixture.example"));
+    check!(!debug.contains("unique-private-device-code"));
+    check!(!debug.contains("ABCD-EFGH"));
+    check!(!debug.contains("auth.fixture.example"));
 
-    let requests = server.finish();
-    assert!(requests[0].starts_with("POST /tenant/oauth/device/code HTTP/1.1\r\n"));
+    let requests = server.finish()?;
+    check!(requests[0].starts_with("POST /tenant/oauth/device/code HTTP/1.1\r\n"));
     let form = request_form(&requests[0]);
-    assert_eq!(form.get("client_id").unwrap(), "fixture-public-client");
-    assert_eq!(form.get("audience").unwrap(), "https://api.fixture.example");
-    assert_eq!(
-        form.get("scope").unwrap(),
+    check_eq!(
+        form.get("client_id")
+            .context("fixture value should exist")?,
+        "fixture-public-client"
+    );
+    check_eq!(
+        form.get("audience").context("fixture value should exist")?,
+        "https://api.fixture.example"
+    );
+    check_eq!(
+        form.get("scope").context("fixture value should exist")?,
         "openid profile email offline_access"
     );
-    assert!(!form.contains_key("refresh_token"));
+    check!(!form.contains_key("refresh_token"));
+    Ok(())
 }
 
 #[test]
-fn device_authorization_defaults_the_poll_interval_and_allows_missing_complete_uri() {
+fn device_authorization_defaults_the_poll_interval_and_allows_missing_complete_uri()
+-> anyhow::Result<()> {
     let authorization = decode_device_authorization(
         &serde_json::to_vec(&serde_json::json!({
             "device_code": "private",
@@ -183,34 +203,36 @@ fn device_authorization_defaults_the_poll_interval_and_allows_missing_complete_u
             "verification_uri": "https://auth.fixture.example/activate",
             "expires_in": 60
         }))
-        .unwrap(),
+        .context("fixture value should exist")?,
         HttpTransportPolicy::HttpsOnly,
     )
-    .unwrap();
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    assert_eq!(authorization.interval(), DEFAULT_POLL_INTERVAL);
-    assert_eq!(authorization.verification_uri_complete(), None);
+    check_eq!(authorization.interval(), DEFAULT_POLL_INTERVAL);
+    check_eq!(authorization.verification_uri_complete(), None);
+    Ok(())
 }
 
 #[test]
-fn insecure_activation_urls_require_the_invocation_opt_in() {
+fn insecure_activation_urls_require_the_invocation_opt_in() -> anyhow::Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({
         "device_code": "private",
         "user_code": "VISIBLE",
         "verification_uri": "http://auth.fixture.example/activate",
         "expires_in": 60
     }))
-    .unwrap();
+    .context("fixture value should exist")?;
 
-    assert!(matches!(
+    check!(matches!(
         decode_device_authorization(&body, HttpTransportPolicy::HttpsOnly),
         Err(AuthorizationError::Protocol { .. })
     ));
-    assert!(decode_device_authorization(&body, HttpTransportPolicy::AllowInsecureHttp).is_ok());
+    check!(decode_device_authorization(&body, HttpTransportPolicy::AllowInsecureHttp).is_ok());
+    Ok(())
 }
 
 #[test]
-fn token_polling_handles_standard_device_grant_outcomes() {
+fn token_polling_handles_standard_device_grant_outcomes() -> anyhow::Result<()> {
     let responses = [
         ("authorization_pending", "400 Bad Request"),
         ("slow_down", "429 Too Many Requests"),
@@ -218,84 +240,106 @@ fn token_polling_handles_standard_device_grant_outcomes() {
         ("expired_token", "400 Bad Request"),
     ]
     .map(|(error, status)| json_response(status, serde_json::json!({ "error": error })))
-    .to_vec();
-    let server = ScriptedServer::new(responses);
-    let deployment = server.deployment();
-    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+    .into_iter()
+    .collect::<anyhow::Result<Vec<_>>>()?;
+    let server = ScriptedServer::new(responses)?;
+    let deployment = server.deployment()?;
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    assert!(matches!(
-        poll_token(&client, &deployment, "private-device-code").unwrap(),
+    check!(matches!(
+        poll_token(&client, &deployment, "private-device-code")
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
         TokenPoll::Pending
     ));
-    assert!(matches!(
-        poll_token(&client, &deployment, "private-device-code").unwrap(),
+    check!(matches!(
+        poll_token(&client, &deployment, "private-device-code")
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
         TokenPoll::SlowDown
     ));
-    assert!(matches!(
-        poll_token(&client, &deployment, "private-device-code").unwrap(),
+    check!(matches!(
+        poll_token(&client, &deployment, "private-device-code")
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
         TokenPoll::Denied
     ));
-    assert!(matches!(
-        poll_token(&client, &deployment, "private-device-code").unwrap(),
+    check!(matches!(
+        poll_token(&client, &deployment, "private-device-code")
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
         TokenPoll::Expired
     ));
 
-    for request in server.finish() {
-        assert!(request.starts_with("POST /tenant/oauth/token HTTP/1.1\r\n"));
+    for request in server.finish()? {
+        check!(request.starts_with("POST /tenant/oauth/token HTTP/1.1\r\n"));
         let form = request_form(&request);
-        assert_eq!(
-            form.get("grant_type").unwrap(),
+        check_eq!(
+            form.get("grant_type")
+                .context("fixture value should exist")?,
             "urn:ietf:params:oauth:grant-type:device_code"
         );
-        assert_eq!(form.get("device_code").unwrap(), "private-device-code");
-        assert_eq!(form.get("client_id").unwrap(), "fixture-public-client");
+        check_eq!(
+            form.get("device_code")
+                .context("fixture value should exist")?,
+            "private-device-code"
+        );
+        check_eq!(
+            form.get("client_id")
+                .context("fixture value should exist")?,
+            "fixture-public-client"
+        );
     }
+    Ok(())
 }
 
 #[test]
-fn token_polling_reuses_one_http_connection() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
+fn token_polling_reuses_one_http_connection() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("fixture value should exist")?;
+    let address = listener
+        .local_addr()
+        .context("fixture value should exist")?;
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = listener.accept().context("fixture value should exist")?;
         let mut requests = Vec::new();
         for error in ["authorization_pending", "access_denied"] {
-            requests.push(String::from_utf8(read_request(&mut stream)).unwrap());
-            stream
-                .write_all(&keep_alive_json_response(
-                    "400 Bad Request",
-                    serde_json::json!({ "error": error }),
-                ))
-                .unwrap();
+            requests.push(String::from_utf8(read_request(&mut stream)?)?);
+            stream.write_all(&keep_alive_json_response(
+                "400 Bad Request",
+                serde_json::json!({ "error": error }),
+            )?)?;
         }
-        requests
+        Ok::<_, anyhow::Error>(requests)
     });
     let deployment = Deployment::for_test(
         "http://api.fixture.example".to_owned(),
         format!("http://{address}/tenant/"),
-    );
-    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+    )?;
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    assert!(matches!(
-        poll_token(&client, &deployment, "private-device-code").unwrap(),
+    check!(matches!(
+        poll_token(&client, &deployment, "private-device-code")
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
         TokenPoll::Pending
     ));
-    assert!(matches!(
-        poll_token(&client, &deployment, "private-device-code").unwrap(),
+    check!(matches!(
+        poll_token(&client, &deployment, "private-device-code")
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
         TokenPoll::Denied
     ));
 
-    let requests = server.join().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert!(
+    let requests = server
+        .join()
+        .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
+    check_eq!(requests.len(), 2);
+    check!(
         requests
             .iter()
             .all(|request| request.starts_with("POST /tenant/oauth/token HTTP/1.1\r\n"))
     );
+    Ok(())
 }
 
 #[test]
-fn issued_access_and_refresh_tokens_are_validated_and_redacted() {
+fn issued_access_and_refresh_tokens_are_validated_and_redacted() -> anyhow::Result<()> {
     let server = ScriptedServer::new(vec![json_response(
         "200 OK",
         serde_json::json!({
@@ -304,26 +348,29 @@ fn issued_access_and_refresh_tokens_are_validated_and_redacted() {
             "expires_in": 300,
             "refresh_token": "unique-issued-refresh-token"
         }),
-    )]);
-    let deployment = server.deployment();
-    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+    )?])?;
+    let deployment = server.deployment()?;
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let TokenPoll::Issued(token) = poll_token(&client, &deployment, "private-device-code").unwrap()
+    let TokenPoll::Issued(token) = poll_token(&client, &deployment, "private-device-code")
+        .map_err(|error| anyhow::anyhow!("{error}"))?
     else {
-        panic!("expected an issued token");
+        anyhow::bail!("expected an issued token");
     };
 
-    assert_eq!(token.access_token(), "unique-issued-access-token");
-    assert_eq!(token.refresh_token(), "unique-issued-refresh-token");
-    assert_eq!(token.expires_in(), Duration::from_secs(300));
+    check_eq!(token.access_token(), "unique-issued-access-token");
+    check_eq!(token.refresh_token(), "unique-issued-refresh-token");
+    check_eq!(token.expires_in(), Duration::from_secs(300));
     let debug = format!("{token:?}");
-    assert!(!debug.contains("unique-issued-access-token"));
-    assert!(!debug.contains("unique-issued-refresh-token"));
-    server.finish();
+    check!(!debug.contains("unique-issued-access-token"));
+    check!(!debug.contains("unique-issued-refresh-token"));
+    server.finish()?;
+    Ok(())
 }
 
 #[test]
-fn invalid_device_and_token_payloads_are_protocol_errors() {
+fn invalid_device_and_token_payloads_are_protocol_errors() -> anyhow::Result<()> {
     for body in [
         serde_json::json!({
             "device_code": "",
@@ -357,9 +404,9 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
             "interval": 0
         }),
     ] {
-        assert!(matches!(
+        check!(matches!(
             decode_device_authorization(
-                &serde_json::to_vec(&body).unwrap(),
+                &serde_json::to_vec(&body).context("fixture value should exist")?,
                 HttpTransportPolicy::HttpsOnly,
             ),
             Err(AuthorizationError::Protocol { .. })
@@ -367,7 +414,7 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
     }
 
     let boundary_token = "x".repeat(MAX_ACCESS_TOKEN_BYTES);
-    assert!(
+    check!(
         decode_issued_token(
             &serde_json::to_vec(&serde_json::json!({
                 "access_token": boundary_token,
@@ -375,7 +422,7 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
                 "token_type": "Bearer",
                 "expires_in": 60
             }))
-            .unwrap()
+            .context("fixture value should exist")?
         )
         .is_ok()
     );
@@ -411,51 +458,66 @@ fn invalid_device_and_token_payloads_are_protocol_errors() {
             "expires_in": 60
         }),
     ] {
-        assert!(matches!(
-            decode_issued_token(&serde_json::to_vec(&body).unwrap()),
+        check!(matches!(
+            decode_issued_token(&serde_json::to_vec(&body).context("fixture value should exist")?),
             Err(AuthorizationError::Protocol { .. })
         ));
     }
+    Ok(())
 }
 
 #[test]
-fn oauth_request_deadline_bounds_the_complete_exchange() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
+fn oauth_request_deadline_bounds_the_complete_exchange() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("fixture value should exist")?;
+    let address = listener
+        .local_addr()
+        .context("fixture value should exist")?;
     // Keep the peer pending so this isolated check observes only the production
     // request deadline; release it deterministically after classification.
     let (release_response, response_release) = mpsc::sync_channel(0);
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        read_request(&mut stream);
+        let (mut stream, _) = listener.accept().context("fixture value should exist")?;
+        read_request(&mut stream)?;
         response_release
             .recv()
-            .expect("OAuth response should be released");
-        let _ = stream.write_all(&json_response("200 OK", serde_json::json!({})));
+            .context("OAuth response should be released")?;
+        stream.write_all(&json_response("200 OK", serde_json::json!({}))?)?;
+        Ok::<_, anyhow::Error>(())
     });
 
-    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let Err(error) = post_form_with_timeout(
         &client,
-        Url::parse(&format!("http://{address}/oauth/token")).unwrap(),
+        Url::parse(&format!("http://{address}/oauth/token"))
+            .context("fixture value should exist")?,
         &[],
         Duration::from_millis(20),
     ) else {
-        panic!("slow OAuth request should time out");
+        release_response
+            .send(())
+            .context("OAuth response should be released")?;
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
+        anyhow::bail!("slow OAuth request should time out");
     };
 
-    assert!(matches!(
+    check!(matches!(
         error,
         AuthorizationError::Unreachable(UnreachableCategory::Timeout)
     ));
     release_response
         .send(())
-        .expect("OAuth response should be released");
-    server.join().unwrap();
+        .context("OAuth response should be released")?;
+    server
+        .join()
+        .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
+    Ok(())
 }
 
 #[test]
-fn redirects_oversized_responses_and_temporary_failures_are_classified() {
+fn redirects_oversized_responses_and_temporary_failures_are_classified() -> anyhow::Result<()> {
     let oversized = format!(
         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         MAX_RESPONSE_BODY_BYTES + 1
@@ -467,27 +529,29 @@ fn redirects_oversized_responses_and_temporary_failures_are_classified() {
         oversized,
         response("429 Too Many Requests", None, &[]),
         response("503 Service Unavailable", None, &[]),
-    ]);
-    let deployment = server.deployment();
-    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+    ])?;
+    let deployment = server.deployment()?;
+    let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    assert!(matches!(
+    check!(matches!(
         authorize(&client, &deployment),
         Err(AuthorizationError::Protocol { .. })
     ));
-    assert!(matches!(
+    check!(matches!(
         authorize(&client, &deployment),
         Err(AuthorizationError::Protocol { .. })
     ));
-    assert!(matches!(
+    check!(matches!(
         authorize(&client, &deployment),
         Err(AuthorizationError::Unreachable(
             UnreachableCategory::RateLimited
         ))
     ));
-    assert!(matches!(
+    check!(matches!(
         authorize(&client, &deployment),
         Err(AuthorizationError::Unreachable(UnreachableCategory::Server))
     ));
-    server.finish();
+    server.finish()?;
+    Ok(())
 }

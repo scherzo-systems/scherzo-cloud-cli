@@ -7,7 +7,6 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     AcceptDelegationOutcome, CommonDelegationFailure, Delegation, DelegationApiError,
     DelegationPage, DelegationState, DelegationTerminalReason, EndDelegationOutcome,
@@ -15,6 +14,7 @@ use scherzo_cloud_api::{
     accept_delegation, end_delegation, get_delegation, list_current_principal_delegations,
     propose_delegation,
 };
+use scherzo_cloud_human_auth::Deployment;
 // jscpd:ignore-end
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud delegations";

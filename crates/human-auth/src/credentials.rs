@@ -41,7 +41,7 @@ const MAX_CREDENTIAL_FILE_BYTES_U64: u64 = 1024 * 1024;
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) struct CredentialStore {
+pub struct CredentialStore {
     path: PathBuf,
     lock_path: PathBuf,
     lock_timeout: Duration,
@@ -49,7 +49,7 @@ pub(crate) struct CredentialStore {
 }
 
 #[derive(Clone)]
-pub(crate) struct StoredCredential {
+pub struct StoredCredential {
     access_token: SecretToken,
     expires_at: OffsetDateTime,
     refresh_token: SecretToken,
@@ -95,11 +95,11 @@ pub(crate) struct RefreshAuthority {
 }
 
 impl CredentialStore {
-    pub(crate) fn from_environment() -> Result<Self, CredentialError> {
+    pub fn from_environment() -> Result<Self, CredentialError> {
         Self::from_lookup(|name| env::var_os(name))
     }
 
-    pub(crate) fn selected(
+    pub fn selected(
         &self,
         deployment: &DeploymentFingerprint,
     ) -> Result<Option<StoredCredential>, CredentialError> {
@@ -120,7 +120,7 @@ impl CredentialStore {
             .transpose()
     }
 
-    pub(crate) fn replace(
+    pub fn replace(
         &self,
         deployment: &DeploymentFingerprint,
         access_token: &(impl TokenSource + ?Sized),
@@ -154,10 +154,7 @@ impl CredentialStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn remove(
-        &self,
-        deployment: &DeploymentFingerprint,
-    ) -> Result<bool, CredentialError> {
+    pub fn remove(&self, deployment: &DeploymentFingerprint) -> Result<bool, CredentialError> {
         let _authority = self.refresh_authority(deployment)?;
         self.remove_matching(deployment, |_| true)
     }
@@ -519,7 +516,7 @@ impl CredentialStore {
 }
 
 #[derive(Debug)]
-pub(crate) enum CredentialError {
+pub enum CredentialError {
     InvalidCredentialPath {
         reason: &'static str,
     },

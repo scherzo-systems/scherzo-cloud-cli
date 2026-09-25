@@ -4,9 +4,9 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::status::{self, AuthenticationState, AuthenticationStatus};
 use scherzo_cloud_api::HttpClient;
+use scherzo_cloud_human_auth::Deployment;
+use scherzo_cloud_human_auth::{AuthenticationState, AuthenticationStatus};
 
 use super::super::principal::PrincipalResult;
 
@@ -27,10 +27,12 @@ impl Command {
         let authentication = self.authentication.kind();
         let service_api_key = self.authentication.service_api_key()?;
         let status = match service_api_key {
-            Some(api_key) => {
-                status::check_with_service_api_key(&client, deployment, api_key.expose())
-            }
-            None => status::check(&client, deployment),
+            Some(api_key) => scherzo_cloud_human_auth::check_with_service_api_key(
+                &client,
+                deployment,
+                api_key.expose(),
+            ),
+            None => scherzo_cloud_human_auth::check_auth_status(&client, deployment),
         }
         .map_err(|error| anyhow!(error))
         .with_context(|| {

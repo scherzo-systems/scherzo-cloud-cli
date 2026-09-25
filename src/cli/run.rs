@@ -7,7 +7,6 @@ use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunCancellationMode,
     RunCancellationResolutionKind, RunFailure, RunObservation, RunState,
@@ -15,6 +14,7 @@ use scherzo_cloud_api::{
 #[cfg(test)]
 use scherzo_cloud_api::{HttpClient, RunRead};
 use scherzo_cloud_execution::visible_text;
+use scherzo_cloud_human_auth::Deployment;
 
 use super::{OrganizationArg, ProjectArg};
 

@@ -5,7 +5,6 @@ use std::io::{self, Write};
 use zeroize::Zeroizing;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 use crate::service_auth::{ApiKeyCleanup, ApiKeyDestination, ServiceApiKey, ServiceApiKeyError};
 use scherzo_cloud_api::{
     CreateServicePrincipalOutcome, HttpClient, IssueServiceCredentialOutcome,
@@ -13,6 +12,7 @@ use scherzo_cloud_api::{
     ServiceCredential, ServiceCredentialPage, ServicePrincipalApiError, create_service_principal,
     issue_service_credential, list_service_credentials, revoke_service_credential,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 use super::write_api_failure as write_failure;
 

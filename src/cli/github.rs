@@ -4,8 +4,8 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{GitHubApi, GitHubFailure, HttpClient, HttpTransportPolicy};
+use scherzo_cloud_human_auth::Deployment;
 
 use super::{InstallationArg, OrganizationArg};
 

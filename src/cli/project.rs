@@ -4,10 +4,10 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure, RunnerFailure,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 use super::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
 

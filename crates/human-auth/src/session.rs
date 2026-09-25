@@ -17,16 +17,16 @@ const TOKEN_PATH: [&str; 2] = ["oauth", "token"];
 const REVOCATION_PATH: [&str; 2] = ["oauth", "revoke"];
 const MAX_REFRESH_ATTEMPTS: usize = 2;
 
-pub(crate) enum RequiredOperation<T, E> {
+pub enum RequiredOperation<T, E> {
     Completed(Result<T, E>),
     Unauthenticated,
 }
 
-pub(crate) struct SessionBinding {
+pub struct SessionBinding {
     credential: StoredCredential,
 }
 
-pub(crate) enum RequiredOperationWithBinding<T, E> {
+pub enum RequiredOperationWithBinding<T, E> {
     Completed {
         result: Result<T, E>,
         binding: SessionBinding,
@@ -35,12 +35,12 @@ pub(crate) enum RequiredOperationWithBinding<T, E> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum LocalCredentialState {
+pub enum LocalCredentialState {
     Retained,
     Removed,
 }
 
-pub(crate) enum BoundRequiredOperation<T, E> {
+pub enum BoundRequiredOperation<T, E> {
     Completed {
         result: Result<T, E>,
         credential_state: LocalCredentialState,
@@ -52,28 +52,28 @@ pub(crate) enum BoundRequiredOperation<T, E> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RevocationState {
+pub enum RevocationState {
     Confirmed,
     Unconfirmed,
     NotApplicable,
 }
 
-pub(crate) struct LogoutOutcome {
+pub struct LogoutOutcome {
     credential_removed: bool,
     revocation: RevocationState,
 }
 
 impl LogoutOutcome {
-    pub(crate) fn credential_removed(&self) -> bool {
+    pub fn credential_removed(&self) -> bool {
         self.credential_removed
     }
 
-    pub(crate) fn revocation(&self) -> RevocationState {
+    pub fn revocation(&self) -> RevocationState {
         self.revocation
     }
 }
 
-pub(crate) fn execute_optional<T, E>(
+pub fn execute_optional<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
     mut operation: impl FnMut(Option<&SecretToken>) -> Result<T, E>,
@@ -101,7 +101,7 @@ pub(crate) fn execute_optional<T, E>(
     Ok(second)
 }
 
-pub(crate) fn execute_required<T, E>(
+pub fn execute_required<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
     mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
@@ -116,7 +116,7 @@ pub(crate) fn execute_required<T, E>(
     )
 }
 
-pub(crate) fn execute_required_with_binding<T, E>(
+pub fn execute_required_with_binding<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
     mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
@@ -131,7 +131,7 @@ pub(crate) fn execute_required_with_binding<T, E>(
     )
 }
 
-pub(crate) fn execute_required_until<T, E>(
+pub fn execute_required_until<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
     operation: impl FnMut(&SecretToken, Option<Duration>) -> Result<T, E>,
@@ -207,7 +207,7 @@ fn execute_required_with_binding_until<T, E>(
     })
 }
 
-pub(crate) fn remove_bound_credential(
+pub fn remove_bound_credential(
     deployment: &Deployment,
     binding: &SessionBinding,
 ) -> Result<LocalCredentialState, SessionError> {
@@ -229,7 +229,7 @@ pub(crate) fn remove_bound_credential(
     })
 }
 
-pub(crate) fn execute_bound_required<T, E>(
+pub fn execute_bound_required<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
     binding: &SessionBinding,
@@ -290,7 +290,7 @@ pub(crate) fn execute_bound_required<T, E>(
     })
 }
 
-pub(crate) fn logout(
+pub fn logout(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
 ) -> Result<LogoutOutcome, SessionError> {
@@ -638,7 +638,7 @@ enum RefreshExchangeError {
 }
 
 #[derive(Debug)]
-pub(crate) enum SessionError {
+pub enum SessionError {
     CredentialStore(CredentialError),
     RefreshLocal(AuthorizationLocalError),
     RefreshUnreachable(UnreachableCategory),
@@ -646,7 +646,7 @@ pub(crate) enum SessionError {
 }
 
 impl SessionError {
-    pub(crate) fn unreachable_category(&self) -> Option<UnreachableCategory> {
+    pub fn unreachable_category(&self) -> Option<UnreachableCategory> {
         match self {
             Self::RefreshUnreachable(category) => Some(*category),
             _ => None,

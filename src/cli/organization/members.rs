@@ -1,12 +1,12 @@
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     HttpClient, MembershipRole, OrganizationError, end_organization_membership,
     list_organization_membership_history, list_organization_memberships,
     update_organization_membership_role,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 use crate::cli::{OrganizationArg, PaginationArgs};

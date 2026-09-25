@@ -1,6 +1,6 @@
 //! Cargo-workspace and source-boundary architecture tests.
 //!
-//! Slice 3 gives runner behavior and idempotency their final package owners.
+//! The final workspace gives human authentication its own package owner.
 //! These tests keep Cargo's package graph, residual root modules, explicit
 //! component facades, generated-source privacy, and external-crate ownership
 //! aligned with `ARCHITECTURE.md`.
@@ -26,10 +26,11 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const INTERNAL_PACKAGES: [&str; 7] = [
+const INTERNAL_PACKAGES: [&str; 8] = [
     "scherzo-cloud",
     "scherzo-cloud-api",
     "scherzo-cloud-execution",
+    "scherzo-cloud-human-auth",
     "scherzo-cloud-runner",
     "scherzo-cloud-runner-protocol",
     "scherzo-cloud-support",
@@ -37,7 +38,7 @@ const INTERNAL_PACKAGES: [&str; 7] = [
 ];
 
 #[test]
-fn workspace_members_and_edges_match_slice_three() {
+fn workspace_members_and_edges_match_final_graph() {
     let root = cli_root();
     let metadata = cargo_metadata(&root);
     let packages = metadata["packages"]
@@ -54,6 +55,7 @@ fn workspace_members_and_edges_match_slice_three() {
         ("scherzo-cloud", "Cargo.toml"),
         ("scherzo-cloud-api", "crates/api/Cargo.toml"),
         ("scherzo-cloud-execution", "crates/execution/Cargo.toml"),
+        ("scherzo-cloud-human-auth", "crates/human-auth/Cargo.toml"),
         ("scherzo-cloud-runner", "crates/runner/Cargo.toml"),
         (
             "scherzo-cloud-runner-protocol",
@@ -87,7 +89,7 @@ fn workspace_members_and_edges_match_slice_three() {
     assert_eq!(
         workspace_packages.keys().copied().collect::<BTreeSet<_>>(),
         INTERNAL_PACKAGES.into_iter().collect(),
-        "Slice 3 must contain the root package and six final component members"
+        "the workspace must contain the root package and seven final component members"
     );
 
     for (name, relative_manifest) in expected_manifests {
@@ -137,12 +139,19 @@ fn workspace_members_and_edges_match_slice_three() {
         ("scherzo-cloud", "scherzo-cloud-api", "normal"),
         ("scherzo-cloud", "scherzo-cloud-execution", "normal"),
         ("scherzo-cloud", "scherzo-cloud-execution", "dev"),
+        ("scherzo-cloud", "scherzo-cloud-human-auth", "normal"),
         ("scherzo-cloud", "scherzo-cloud-runner", "normal"),
         ("scherzo-cloud", "scherzo-cloud-runner", "dev"),
         ("scherzo-cloud", "scherzo-cloud-support", "normal"),
         ("scherzo-cloud", "scherzo-cloud-test-support", "dev"),
         ("scherzo-cloud-api", "scherzo-cloud-support", "normal"),
         ("scherzo-cloud-api", "scherzo-cloud-test-support", "dev"),
+        ("scherzo-cloud-human-auth", "scherzo-cloud-api", "normal"),
+        (
+            "scherzo-cloud-human-auth",
+            "scherzo-cloud-support",
+            "normal",
+        ),
         ("scherzo-cloud-execution", "scherzo-cloud-support", "normal"),
         (
             "scherzo-cloud-execution",
@@ -179,6 +188,7 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
         "src/execution",
         "src/process.rs",
         "src/runner",
+        "src/human_auth",
         "src/idempotency.rs",
         "src/test_support.rs",
         "tests/liv_2331_remediation_repro.rs",
@@ -213,6 +223,33 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
     assert!(support_facade.contains("mod idempotency;"));
     assert!(support_facade.contains("pub use idempotency::generate_idempotency_key;"));
 
+    let auth_facade = read_source(&root.join("crates/human-auth/src/lib.rs"));
+    for implementation in [
+        "cancellation",
+        "credentials",
+        "deployment",
+        "device_authorization",
+        "device_flow",
+        "session",
+        "status",
+        "token",
+    ] {
+        assert!(
+            auth_facade.contains(&format!("mod {implementation};")),
+            "human-auth facade does not privately own {implementation}"
+        );
+    }
+    for consumed in [
+        "pub use credentials::CredentialStore;",
+        "pub use deployment::Deployment;",
+        "pub use session::{",
+    ] {
+        assert!(
+            auth_facade.contains(consumed),
+            "human-auth facade is missing `{consumed}`"
+        );
+    }
+
     let runner_facade = read_source(&root.join("crates/runner/src/lib.rs"));
     for implementation in [
         "control_client",
@@ -244,6 +281,7 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
     for facade in [
         "crates/api/src/lib.rs",
         "crates/execution/src/lib.rs",
+        "crates/human-auth/src/lib.rs",
         "crates/runner/src/lib.rs",
         "crates/runner-protocol/src/lib.rs",
         "crates/support/src/lib.rs",
@@ -261,6 +299,14 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
     for source in all_package_sources(&root) {
         let relative = source.strip_prefix(&root).unwrap();
         let text = read_source(&source);
+        if text.contains("crate::human_auth")
+            || text.contains("scherzo_cloud_human_auth::credentials::")
+        {
+            violations.push(format!(
+                "{} bypasses the human-auth facade",
+                relative.display()
+            ));
+        }
         if text.contains("scherzo_cloud_api::generated") {
             violations.push(format!(
                 "{} names the private generated API module",
@@ -276,7 +322,7 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
     }
     assert!(
         violations.is_empty(),
-        "generated API boundary violations:\n{}",
+        "package facade boundary violations:\n{}",
         violations.join("\n")
     );
 }
@@ -286,13 +332,9 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
 fn allowed_dependencies() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     let entries: &[(&str, &[&str])] = &[
         ("build_info", &[]),
-        (
-            "cli",
-            &["build_info", "exit_code", "human_auth", "service_auth"],
-        ),
+        ("cli", &["build_info", "exit_code", "service_auth"]),
         ("error", &["exit_code"]),
         ("exit_code", &[]),
-        ("human_auth", &[]),
         ("service_auth", &[]),
     ];
     entries
@@ -463,7 +505,11 @@ fn execution_boundary_policy_rejects_public_modules() {
 fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
     let root = cli_root();
     let mut violations = Vec::new();
-    for owner in ["crates/execution/src", "crates/runner/src"] {
+    for owner in [
+        "crates/execution/src",
+        "crates/runner/src",
+        "crates/human-auth/src",
+    ] {
         for source in rust_sources(&root.join(owner)) {
             let relative = source.strip_prefix(&root).unwrap();
             let text = read_source(&source);
@@ -673,7 +719,11 @@ fn external_crate_containment() -> Vec<(&'static str, Vec<&'static str>)> {
         ("clap", vec!["src/cli.rs", "src/cli/"]),
         (
             "reqwest",
-            vec!["crates/api/src/", "src/human_auth/", "crates/runner/src/"],
+            vec![
+                "crates/api/src/",
+                "crates/human-auth/src/",
+                "crates/runner/src/",
+            ],
         ),
         (
             "tokio_tungstenite",

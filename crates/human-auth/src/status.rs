@@ -10,13 +10,13 @@ use super::deployment::Deployment;
 use super::session::{self, SessionError};
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct AuthenticationStatus {
+pub struct AuthenticationStatus {
     deployment: String,
     state: AuthenticationState,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum AuthenticationState {
+pub enum AuthenticationState {
     Authenticated(AuthenticatedPrincipal),
     SignupRequired {
         actions: Option<Vec<serde_json::Value>>,
@@ -26,16 +26,16 @@ pub(crate) enum AuthenticationState {
 }
 
 impl AuthenticationStatus {
-    pub(crate) fn deployment(&self) -> &str {
+    pub fn deployment(&self) -> &str {
         &self.deployment
     }
 
-    pub(crate) fn state(&self) -> &AuthenticationState {
+    pub fn state(&self) -> &AuthenticationState {
         &self.state
     }
 }
 
-pub(crate) fn check(
+pub fn check(
     client: &HttpClient,
     deployment: &Deployment,
 ) -> Result<AuthenticationStatus, StatusError> {
@@ -66,7 +66,7 @@ pub(crate) fn check(
     Ok(status_from_outcome(deployment, outcome))
 }
 
-pub(crate) fn check_with_service_api_key(
+pub fn check_with_service_api_key(
     client: &HttpClient,
     deployment: &Deployment,
     api_key: &str,
@@ -101,7 +101,7 @@ fn status_from_outcome(
 }
 
 #[derive(Debug)]
-pub(crate) enum StatusError {
+pub enum StatusError {
     Session(SessionError),
     PublicApi(CurrentPrincipalError),
 }

@@ -11,11 +11,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     RetainedRunInputs, RunFailure, UnreachableCategory, capability_batches, retained_manifest,
     transfer_capability_batch,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage retained run inputs";
 

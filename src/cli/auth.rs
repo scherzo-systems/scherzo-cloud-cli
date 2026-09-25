@@ -5,7 +5,7 @@ mod status;
 
 use clap::{Args, Subcommand};
 
-use crate::human_auth::deployment::Deployment;
+use scherzo_cloud_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage your Scherzo Cloud sign-in";
 const NAME: &str = "auth";

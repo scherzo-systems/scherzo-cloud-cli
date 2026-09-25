@@ -23,13 +23,13 @@ const OVERRIDE_VARIABLES: [&str; 4] = [
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Deployment {
+pub struct Deployment {
     fingerprint: DeploymentFingerprint,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct DeploymentFingerprint {
+pub struct DeploymentFingerprint {
     api_url: String,
     issuer: String,
     audience: String,
@@ -37,23 +37,22 @@ pub(crate) struct DeploymentFingerprint {
 }
 
 impl Deployment {
-    pub(crate) fn load() -> Result<Self, DeploymentError> {
+    pub fn load() -> Result<Self, DeploymentError> {
         Self::load_from(|name| env::var_os(name))
     }
 
-    pub(crate) fn fingerprint(&self) -> &DeploymentFingerprint {
+    pub fn fingerprint(&self) -> &DeploymentFingerprint {
         &self.fingerprint
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(api_url: String, issuer: String) -> Self {
+    pub(crate) fn for_test(api_url: String, issuer: String) -> Result<Self, DeploymentError> {
         Self::from_values(
             api_url,
             issuer,
             "https://api.fixture.example".to_owned(),
             "fixture-public-client".to_owned(),
         )
-        .expect("test deployment should be valid")
     }
 
     fn load_from<F>(lookup: F) -> Result<Self, DeploymentError>
@@ -106,12 +105,7 @@ impl Deployment {
 }
 
 impl DeploymentFingerprint {
-    pub(crate) fn new(
-        api_url: String,
-        issuer: String,
-        audience: String,
-        client_id: String,
-    ) -> Self {
+    pub fn new(api_url: String, issuer: String, audience: String, client_id: String) -> Self {
         Self {
             api_url,
             issuer,
@@ -120,19 +114,19 @@ impl DeploymentFingerprint {
         }
     }
 
-    pub(crate) fn api_url(&self) -> &str {
+    pub fn api_url(&self) -> &str {
         &self.api_url
     }
 
-    pub(crate) fn issuer(&self) -> &str {
+    pub fn issuer(&self) -> &str {
         &self.issuer
     }
 
-    pub(crate) fn audience(&self) -> &str {
+    pub fn audience(&self) -> &str {
         &self.audience
     }
 
-    pub(crate) fn client_id(&self) -> &str {
+    pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
@@ -143,7 +137,7 @@ impl DeploymentFingerprint {
 }
 
 #[derive(Debug)]
-pub(crate) enum DeploymentError {
+pub enum DeploymentError {
     PartialOverride {
         missing: Vec<&'static str>,
     },
@@ -255,6 +249,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use anyhow::Context as _;
 
     fn load(values: &[(&str, &str)]) -> Result<Deployment, DeploymentError> {
         let environment: HashMap<&str, &str> = values.iter().copied().collect();
@@ -271,10 +266,10 @@ mod tests {
     }
 
     #[test]
-    fn absent_overrides_select_the_production_deployment() {
-        let deployment = load(&[]).expect("production deployment should be valid");
+    fn absent_overrides_select_the_production_deployment() -> anyhow::Result<()> {
+        let deployment = load(&[]).context("production deployment should be valid")?;
 
-        assert_eq!(
+        check_eq!(
             deployment.fingerprint().as_tuple(),
             (
                 PRODUCTION_API_URL,
@@ -283,17 +278,18 @@ mod tests {
                 PRODUCTION_CLIENT_ID,
             )
         );
+        Ok(())
     }
 
     #[test]
-    fn complete_override_is_preserved_as_one_deployment() {
+    fn complete_override_is_preserved_as_one_deployment() -> anyhow::Result<()> {
         let values = complete_override(
             "https://api.fixture.example/base/",
             "https://auth.fixture.example/tenant/",
         );
-        let deployment = load(&values).expect("complete override should be valid");
+        let deployment = load(&values).context("complete override should be valid")?;
 
-        assert_eq!(
+        check_eq!(
             deployment.fingerprint().as_tuple(),
             (
                 "https://api.fixture.example/base/",
@@ -302,10 +298,11 @@ mod tests {
                 "fixture-public-client",
             )
         );
+        Ok(())
     }
 
     #[test]
-    fn every_partial_override_combination_is_rejected() {
+    fn every_partial_override_combination_is_rejected() -> anyhow::Result<()> {
         for mask in 1_u8..15 {
             let values: Vec<(&str, &str)> = OVERRIDE_VARIABLES
                 .iter()
@@ -314,9 +311,11 @@ mod tests {
                 .map(|(_, name)| (*name, "configured"))
                 .collect();
 
-            let error = load(&values).expect_err("partial override should fail");
+            let error = load(&values)
+                .err()
+                .context("partial override should fail")?;
             let DeploymentError::PartialOverride { missing } = error else {
-                panic!("expected partial-override error");
+                anyhow::bail!("expected partial-override error");
             };
             let expected_missing: Vec<&str> = OVERRIDE_VARIABLES
                 .iter()
@@ -325,24 +324,26 @@ mod tests {
                 .map(|(_, name)| *name)
                 .collect();
 
-            assert_eq!(missing, expected_missing);
+            check_eq!(missing, expected_missing);
         }
+        Ok(())
     }
 
     #[test]
-    fn http_urls_are_preserved_for_request_time_transport_policy() {
+    fn http_urls_are_preserved_for_request_time_transport_policy() -> anyhow::Result<()> {
         let values = complete_override(
             "http://api.fixture.example:8080/base/",
             "http://auth.fixture.example:9090/tenant/",
         );
-        let deployment = load(&values).expect("HTTP overrides should be structurally valid");
+        let deployment = load(&values).context("HTTP overrides should be structurally valid")?;
 
-        assert_eq!(deployment.fingerprint().as_tuple().0, values[0].1);
-        assert_eq!(deployment.fingerprint().as_tuple().1, values[1].1);
+        check_eq!(deployment.fingerprint().as_tuple().0, values[0].1);
+        check_eq!(deployment.fingerprint().as_tuple().1, values[1].1);
+        Ok(())
     }
 
     #[test]
-    fn malformed_and_non_network_urls_are_rejected() {
+    fn malformed_and_non_network_urls_are_rejected() -> anyhow::Result<()> {
         for api_url in [
             "not a URL",
             "file:///tmp/api",
@@ -352,12 +353,13 @@ mod tests {
         ] {
             let values = complete_override(api_url, "https://auth.fixture.example/");
 
-            assert!(load(&values).is_err(), "accepted {api_url}");
+            check!(load(&values).is_err(), "accepted {api_url}");
         }
+        Ok(())
     }
 
     #[test]
-    fn empty_audience_and_client_id_are_rejected() {
+    fn empty_audience_and_client_id_are_rejected() -> anyhow::Result<()> {
         for variable in [AUDIENCE_VARIABLE, CLIENT_ID_VARIABLE] {
             let mut values = complete_override(
                 "https://api.fixture.example",
@@ -366,14 +368,15 @@ mod tests {
             let (_, value) = values
                 .iter_mut()
                 .find(|(name, _)| *name == variable)
-                .expect("variable should be present");
+                .context("variable should be present")?;
             *value = "";
 
-            let error = load(&values).expect_err("empty override should fail");
-            assert!(matches!(
+            let error = load(&values).err().context("empty override should fail")?;
+            check!(matches!(
                 error,
                 DeploymentError::EmptyValue { variable: actual } if actual == variable
             ));
         }
+        Ok(())
     }
 }

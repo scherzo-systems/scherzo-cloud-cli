@@ -5,13 +5,13 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::device_authorization::DeviceAuthorization;
-use crate::human_auth::session::LocalCredentialState;
 use scherzo_cloud_api::{
     CommonIdentityFailure, LinkIdentityOutcome, ListIdentitiesOutcome, OidcIdentity,
     RemoveIdentityOutcome, UnreachableCategory,
 };
+use scherzo_cloud_human_auth::Deployment;
+use scherzo_cloud_human_auth::DeviceAuthorization;
+use scherzo_cloud_human_auth::LocalCredentialState;
 
 pub(super) fn write_list(
     deployment: &str,
@@ -166,8 +166,10 @@ impl LinkOutput {
         authorization: &DeviceAuthorization,
         expires_at: OffsetDateTime,
     ) -> anyhow::Result<()> {
+        // Keep identity-link presentation and its error context next to this command.
+        // jscpd:ignore-start
         if self.json {
-            let event = crate::human_auth::device_flow::activation_event(
+            let event = scherzo_cloud_human_auth::activation_event(
                 deployment,
                 authorization,
                 expires_at,
@@ -175,6 +177,7 @@ impl LinkOutput {
             )
             .context("format identity-link activation expiration")?;
             self.json_line(&event)
+        // jscpd:ignore-end
         } else {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();

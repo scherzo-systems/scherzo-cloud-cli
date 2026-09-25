@@ -4,19 +4,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::Zeroizing;
 
 #[derive(Clone)]
-pub(crate) struct SecretToken(Zeroizing<String>);
+pub struct SecretToken(Zeroizing<String>);
 
-pub(crate) trait TokenSource {
+pub trait TokenSource {
     fn expose(&self) -> &str;
     fn to_secret(&self) -> SecretToken;
 }
 
 impl SecretToken {
-    pub(crate) fn new(value: String) -> Self {
+    pub fn new(value: String) -> Self {
         Self(Zeroizing::new(value))
     }
 
-    pub(crate) fn expose(&self) -> &str {
+    pub fn expose(&self) -> &str {
         self.0.as_str()
     }
 }

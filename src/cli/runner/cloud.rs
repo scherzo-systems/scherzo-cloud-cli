@@ -4,11 +4,11 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use crate::human_auth::deployment::Deployment;
 use scherzo_cloud_api::{
     HttpTransportPolicy, RunnerApi, RunnerDeletionBlocker, RunnerFailure, RunnerPool,
     RunnerPoolList, RunnerRegistration, RunnerRegistrationList,
 };
+use scherzo_cloud_human_auth::Deployment;
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,

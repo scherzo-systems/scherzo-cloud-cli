@@ -11,8 +11,6 @@ use clap::{ArgGroup, Args, Subcommand, builder::NonEmptyStringValueParser};
 use zeroize::Zeroizing;
 
 use crate::exit_code::ExitCode;
-use crate::human_auth::deployment::Deployment;
-use crate::human_auth::token::SecretToken;
 use scherzo_cloud_api::{
     AcceptInvitationOutcome, HttpClient, InvitationTarget, InvitationTerminationOutcome,
     IssueInvitationOutcome, ListInvitationInboxOutcome, ListOrganizationInvitationsOutcome,
@@ -20,6 +18,8 @@ use scherzo_cloud_api::{
     issue_invitation, list_invitation_inbox, list_organization_invitations, preview_invitation,
     revoke_invitation,
 };
+use scherzo_cloud_human_auth::Deployment;
+use scherzo_cloud_human_auth::SecretToken;
 
 use super::{OrganizationArg, PaginationArgs};
 
