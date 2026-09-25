@@ -300,14 +300,17 @@ async fn run_assignment_scenario() -> Vec<String> {
 
         let assignment_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
-        fixture.inbound.send(effect_observation_acknowledgement(
-            acknowledgement_message_id,
-            2,
-        ));
         let preparing = next_outbound(&mut fixture.outbound).await;
         let preparing = decode_text(&preparing, "assignment preparation acknowledgement");
         assert_eq!(preparing["type"], "assignment_preparing");
         assert_eq!(preparing["sequence"], 3);
+        // The connection can write preparing before it reads the offer's
+        // observation ack. Queue that ack only after the write so the
+        // transcript has a causal order rather than a scheduler-dependent one.
+        fixture.inbound.send(effect_observation_acknowledgement(
+            acknowledgement_message_id,
+            2,
+        ));
         let preparing_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
         fixture.inbound.send(effect_observation_acknowledgement(
