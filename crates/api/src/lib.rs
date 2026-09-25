@@ -142,8 +142,8 @@ pub use run_inputs::{
 };
 pub use runners::{
     RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,
-    RunnerCredentialStoredState, RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList,
-    RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
+    RunnerCredentialStoredState, RunnerCurrentAssignment, RunnerDeletionBlocker, RunnerFailure,
+    RunnerPool, RunnerPoolList, RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub use runs::{
     CreateRunInput, Run, RunApi, RunArtifactDelivery, RunCancellation,

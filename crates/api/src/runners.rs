@@ -27,6 +27,7 @@ const POOL_MOVE_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/runner-poo
 
 pub type RunnerPool = models::RunnerPool;
 pub type RunnerPoolList = models::RunnerPoolList;
+pub type RunnerCurrentAssignment = models::RunnerCurrentAssignment;
 pub type RunnerRegistration = models::RunnerRegistration;
 pub type RunnerRegistrationList = models::RunnerRegistrationList;
 pub(crate) type RunnerActivation = models::RunnerActivation;

@@ -16,24 +16,28 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
+/// RunnerCurrentAssignment : The runner's reserved assignment, absent when idle. Assigned at is the offer creation time.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RenameRunnerPoolPatch {
-    /// A canonical lowercase organization-scoped runner resource name.
-    #[serde(rename = "name")]
-    pub name: String,
-    /// An optional active human delegator used only for service-action audit attribution.
-    #[serde(
-        rename = "delegatorPrincipalId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub delegator_principal_id: Option<String>,
+pub struct RunnerCurrentAssignment {
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    /// Present when the run has a display name.
+    #[serde(rename = "runDisplayName", skip_serializing_if = "Option::is_none")]
+    pub run_display_name: Option<String>,
+    #[serde(rename = "projectId")]
+    pub project_id: String,
+    #[serde(rename = "assignedAt")]
+    pub assigned_at: String,
 }
 
-impl RenameRunnerPoolPatch {
-    pub fn new(name: String) -> RenameRunnerPoolPatch {
-        RenameRunnerPoolPatch {
-            name,
-            delegator_principal_id: None,
+impl RunnerCurrentAssignment {
+    /// The runner's reserved assignment, absent when idle. Assigned at is the offer creation time.
+    pub fn new(run_id: String, project_id: String, assigned_at: String) -> RunnerCurrentAssignment {
+        RunnerCurrentAssignment {
+            run_id,
+            run_display_name: None,
+            project_id,
+            assigned_at,
         }
     }
 }

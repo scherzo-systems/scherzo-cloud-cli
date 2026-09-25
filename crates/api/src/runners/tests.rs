@@ -59,7 +59,14 @@ fn registration_body() -> Vec<u8> {
             "connectedAt": "2026-08-09T12:03:00Z",
             "lastSeenAt": "2026-08-09T12:04:00Z"
         },
-        "activity": {"state": "assigned", "currentAssignmentCount": 1},
+        "activity": {"state": "assigned", "currentAssignmentCount": 1,
+            "currentAssignment": {
+                "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "runDisplayName": "Production release",
+                "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "assignedAt": "2026-08-09T12:05:00Z"
+            }
+        },
         "advertisedMetadata": {
             "runnerVersion": "1.2.3",
             "protocolVersion": 1
@@ -86,6 +93,17 @@ fn generated_runner_client_decodes_independent_cloud_and_advertised_projections(
         Some("2026-08-09T12:04:00Z")
     );
     assert_eq!(runner.activity.current_assignment_count, 1);
+    let assignment = runner
+        .activity
+        .current_assignment
+        .expect("assigned runner has a run");
+    assert_eq!(assignment.run_id, "run_01k0z6r1w8f4jy2m7q9v3x5abc");
+    assert_eq!(
+        assignment.run_display_name.as_deref(),
+        Some("Production release")
+    );
+    assert_eq!(assignment.project_id, "prj_01k0z6r1w8f4jy2m7q9v3x5abc");
+    assert_eq!(assignment.assigned_at, "2026-08-09T12:05:00Z");
     assert_eq!(
         runner
             .advertised_metadata

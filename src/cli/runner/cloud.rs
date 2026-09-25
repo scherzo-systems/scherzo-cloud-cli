@@ -211,34 +211,44 @@ pub(super) fn write_runner_list(
                     next_cursor: page.next_cursor.as_deref(),
                 })?;
             } else {
-                let stdout = io::stdout();
-                let mut stdout = stdout.lock();
-                writeln!(stdout, "✓ Runners listed.\n")?;
-                for runner in &page.items {
-                    writeln!(
-                        stdout,
-                        "  Runner: {}  Name: {}  Pool: {}  Mode: {}  Enrollment: {}  Connectivity: {}  Activity: {}",
-                        runner.id,
-                        runner.name,
-                        runner.runner_pool.name,
-                        enum_text(&runner.administration.mode)?,
-                        enum_text(&runner.enrollment.state)?,
-                        enum_text(&runner.connectivity.state)?,
-                        enum_text(&runner.activity.state)?,
-                    )?;
-                }
-                if !page.items.is_empty() {
-                    writeln!(stdout)?;
-                }
-                if let Some(cursor) = &page.next_cursor {
-                    writeln!(stdout, "  Next cursor: {cursor}")?;
-                }
-                writeln!(stdout, "  Deployment: {deployment}")?;
+                write_runner_list_human_to(&mut io::stdout().lock(), deployment, page)?;
             }
             Ok(ExitCode::Success)
         }
         Err(failure) => write_failure(deployment, failure, authentication, json),
     }
+}
+
+fn write_runner_list_human_to(
+    output: &mut impl Write,
+    deployment: &str,
+    page: &RunnerRegistrationList,
+) -> anyhow::Result<()> {
+    writeln!(output, "✓ Runners listed.\n")?;
+    for runner in &page.items {
+        writeln!(
+            output,
+            "  Runner: {}  Name: {}  Pool: {}  Mode: {}  Enrollment: {}  Connectivity: {}  Activity: {}",
+            runner.id,
+            runner.name,
+            runner.runner_pool.name,
+            enum_text(&runner.administration.mode)?,
+            enum_text(&runner.enrollment.state)?,
+            enum_text(&runner.connectivity.state)?,
+            enum_text(&runner.activity.state)?,
+        )?;
+        if let Some(assignment) = &runner.activity.current_assignment {
+            write_assignment_to(output, assignment, "    ")?;
+        }
+    }
+    if !page.items.is_empty() {
+        writeln!(output)?;
+    }
+    if let Some(cursor) = &page.next_cursor {
+        writeln!(output, "  Next cursor: {cursor}")?;
+    }
+    writeln!(output, "  Deployment: {deployment}")?;
+    Ok(())
 }
 // jscpd:ignore-end
 
@@ -395,6 +405,11 @@ fn write_runner_human_to(
         "    Assignments: {} current",
         runner.activity.current_assignment_count
     )?;
+    if let Some(assignment) = &runner.activity.current_assignment {
+        write_assignment_to(output, assignment, "    ")?;
+    } else {
+        writeln!(output, "    Current assignment: none")?;
+    }
     writeln!(output, "\n  Advertised metadata (informational)")?;
     if let Some(metadata) = &runner.advertised_metadata {
         writeln!(output, "    Runner version: {}", metadata.runner_version)?;
@@ -403,6 +418,20 @@ fn write_runner_human_to(
         writeln!(output, "    Not reported")?;
     }
     writeln!(output, "\n  Deployment: {deployment}")?;
+    Ok(())
+}
+
+fn write_assignment_to(
+    output: &mut impl Write,
+    assignment: &scherzo_cloud_api::RunnerCurrentAssignment,
+    indent: &str,
+) -> anyhow::Result<()> {
+    writeln!(output, "{indent}Run:         {}", assignment.run_id)?;
+    if let Some(name) = &assignment.run_display_name {
+        writeln!(output, "{indent}Run name:    {name}")?;
+    }
+    writeln!(output, "{indent}Project:     {}", assignment.project_id)?;
+    writeln!(output, "{indent}Assigned at: {}", assignment.assigned_at)?;
     Ok(())
 }
 
@@ -837,7 +866,14 @@ mod tests {
                 "connectedAt": "2026-08-09T12:03:00Z",
                 "lastSeenAt": "2026-08-09T12:04:00Z"
             },
-            "activity": {"state": "assigned", "currentAssignmentCount": 1},
+            "activity": {"state": "assigned", "currentAssignmentCount": 1,
+                "currentAssignment": {
+                    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    "runDisplayName": "Production release",
+                    "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    "assignedAt": "2026-08-09T12:05:00Z"
+                }
+            },
             "advertisedMetadata": {
                 "runnerVersion": "1.2.3",
                 "protocolVersion": 1
@@ -845,6 +881,31 @@ mod tests {
         }))
         .expect("runner fixture should match the generated API model");
 
+        let page = RunnerRegistrationList {
+            items: vec![runner.clone()],
+            next_cursor: None,
+        };
+        let mut list_output = Vec::new();
+        write_runner_list_human_to(&mut list_output, "https://api.scherzo.dev", &page)
+            .expect("runner list should render");
+        let list_output = String::from_utf8(list_output).expect("runner list should be UTF-8");
+        for expected in [
+            "Activity: assigned",
+            "Run:         run_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "Run name:    Production release",
+            "Project:     prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "Assigned at: 2026-08-09T12:05:00Z",
+        ] {
+            assert!(
+                list_output.contains(expected),
+                "missing {expected:?} in runner list"
+            );
+        }
+        let json = serde_json::to_value(&page).expect("runner list JSON");
+        assert_eq!(
+            json["items"][0]["activity"]["currentAssignment"]["runId"],
+            "run_01k0z6r1w8f4jy2m7q9v3x5abc"
+        );
         let mut output = Vec::new();
         write_runner_human_to(
             &mut output,
@@ -860,6 +921,10 @@ mod tests {
             "  Enrollment\n    State:      credentialed",
             "  Connectivity\n    State:      online",
             "  Activity\n    State:      assigned",
+            "    Run:         run_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "    Run name:    Production release",
+            "    Project:     prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "    Assigned at: 2026-08-09T12:05:00Z",
             "  Advertised metadata (informational)\n    Runner version: 1.2.3",
         ] {
             assert!(
@@ -870,6 +935,23 @@ mod tests {
         assert!(
             !output.contains("Status:"),
             "runner output must not overload status"
+        );
+        let mut idle = runner;
+        idle.activity.state = serde_json::from_str("\"idle\"").expect("idle state");
+        idle.activity.current_assignment_count = 0;
+        idle.activity.current_assignment = None;
+        let mut idle_output = Vec::new();
+        write_runner_human_to(&mut idle_output, "https://api.scherzo.dev", "Idle", &idle)
+            .expect("idle runner should render");
+        assert!(
+            String::from_utf8(idle_output)
+                .unwrap()
+                .contains("Current assignment: none")
+        );
+        assert!(
+            serde_json::to_value(&idle).unwrap()["activity"]
+                .get("currentAssignment")
+                .is_none()
         );
     }
 }

@@ -1396,6 +1396,83 @@ fn runner_move_resolves_the_destination_and_sends_only_its_id() {
 }
 
 #[test]
+fn runner_commands_report_reserved_run_and_idle_capacity() {
+    for assigned in [true, false] {
+        let mut runner = registration_body();
+        if assigned {
+            runner["activity"]["currentAssignment"] = serde_json::json!({
+                "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "runDisplayName": "Production release",
+                "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "assignedAt": "2026-08-09T12:05:00Z"
+            });
+        } else {
+            runner["activity"] = serde_json::json!({
+                "state": "idle", "currentAssignmentCount": 0
+            });
+        }
+        let responses = vec![
+            json_http_response("200 OK", runner.clone()),
+            json_http_response("200 OK", runner.clone()),
+            json_http_response("200 OK", serde_json::json!({"items": [runner.clone()]})),
+            json_http_response("200 OK", serde_json::json!({"items": [runner.clone()]})),
+        ];
+        let (server, _directory, credential_path) = prepared_runner(responses);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        for (command, arguments) in [("show", vec![RUNNER_ID]), ("list", vec![])] {
+            for json in [false, true] {
+                let mut args = vec!["runner", command, ORGANIZATION];
+                args.extend(arguments.iter().copied());
+                if json {
+                    args.push("--json");
+                }
+                args.push("--allow-insecure-http");
+                let output = run_with_env(&args, &environment);
+                assert!(
+                    output.status.success(),
+                    "{command} failed: {:?}",
+                    output.stderr
+                );
+                assert!(output.stderr.is_empty());
+                if json {
+                    let document: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).unwrap();
+                    let activity = if command == "show" {
+                        &document["runner"]["activity"]
+                    } else {
+                        &document["items"][0]["activity"]
+                    };
+                    assert_eq!(
+                        activity["currentAssignmentCount"],
+                        if assigned { 1 } else { 0 }
+                    );
+                    if assigned {
+                        assert_eq!(
+                            activity["currentAssignment"],
+                            runner["activity"]["currentAssignment"]
+                        );
+                    } else {
+                        assert!(activity.get("currentAssignment").is_none());
+                    }
+                } else {
+                    let text = String::from_utf8(output.stdout).unwrap();
+                    assert!(text.contains(if assigned { "assigned" } else { "idle" }));
+                    for field in [
+                        "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "Production release",
+                        "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "2026-08-09T12:05:00Z",
+                    ] {
+                        assert_eq!(text.contains(field), assigned, "{command} {field}: {text}");
+                    }
+                }
+            }
+        }
+        assert_eq!(server.finish().len(), 4);
+    }
+}
+
+#[test]
 fn runner_show_reports_independent_cloud_and_informational_projections() {
     let (server, _directory, credential_path) =
         prepared_runner(vec![json_http_response("200 OK", registration_body())]);
