@@ -8,7 +8,7 @@ use scherzo_cloud_runner::RequestFailure;
 use scherzo_cloud_runner::{ControlError, Operation, Response};
 use scherzo_cloud_runner::{EnrollmentOutcome, EnrollmentResponse, ReplacementDisposition, enroll};
 
-pub(super) const ABOUT: &str = "Enroll a protected runner credential";
+pub(super) const ABOUT: &str = "Enroll a runner credential";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

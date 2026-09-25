@@ -6,14 +6,14 @@ Usage: scherzo-cloud organization [COMMAND]
 
 Commands:
   audit       Work with organization audit records
-  create      Create a Scherzo Cloud organization
+  create      Create an organization
   deletion    Manage an organization deletion schedule
   invitation  Manage organization invitations
-  leave       Leave a Scherzo Cloud organization
-  list        List your Scherzo Cloud organization memberships
+  leave       Leave an organization
+  list        List your organization memberships
   member      Manage Scherzo Cloud organization members
-  show        Show a Scherzo Cloud organization
-  update      Update a Scherzo Cloud organization
+  show        Show an organization
+  update      Update an organization
   help        Print this message or the help of the given subcommand(s)
 
 Options:

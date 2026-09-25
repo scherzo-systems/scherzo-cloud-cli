@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud organization show --help
-Show a Scherzo Cloud organization
+Show an organization
 
 Usage: scherzo-cloud organization show [OPTIONS] <ORGANIZATION>
 

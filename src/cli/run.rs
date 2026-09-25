@@ -61,7 +61,7 @@ pub(super) struct Command {
 enum RunCommand {
     #[command(about = "Request cancellation of a Scherzo Cloud run")]
     Cancel(CancelCommand),
-    #[command(about = "Create a Scherzo Cloud run")]
+    #[command(about = "Create a run")]
     Create(CreateCommand),
     #[command(about = inputs::ABOUT)]
     Input(inputs::Command),
@@ -69,7 +69,7 @@ enum RunCommand {
     InputSet(input_set::Command),
     #[command(about = "List Scherzo Cloud runs")]
     List(ListCommand),
-    #[command(about = "Show a Scherzo Cloud run")]
+    #[command(about = "Show a run")]
     Show(ShowCommand),
 }
 
@@ -96,13 +96,15 @@ struct CreateCommand {
 
     #[arg(
         long,
+        value_name = "BRANCH",
         value_parser = NonEmptyStringValueParser::new(),
-        help = "Exact source branch (the project default when omitted)"
+        help = "Source branch (the project default when omitted)"
     )]
     source_branch: Option<String>,
 
     #[arg(
         long,
+        value_name = "NAME",
         value_parser = NonEmptyStringValueParser::new(),
         help = "Set the run display name"
     )]
@@ -130,7 +132,7 @@ struct CreateCommand {
 
     #[arg(
         long,
-        value_name = "PATH",
+        value_name = "PATH|-",
         help = "Read private immutable integration context from a JSON file, or - for standard input"
     )]
     integration_context_file: Option<PathBuf>,
@@ -156,7 +158,7 @@ struct RunReference {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization: OrganizationArg,
 
-    #[arg(value_name = "RUN", help = "Exact Run ID")]
+    #[arg(value_name = "RUN", help = "Run ID")]
     run_id: String,
 }
 

@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner pool rename --help
-Rename a Scherzo Cloud runner pool
+Rename a runner pool
 
 Usage: scherzo-cloud runner pool rename [OPTIONS] --name <NAME> <ORGANIZATION> <POOL>
 

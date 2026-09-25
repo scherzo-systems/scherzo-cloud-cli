@@ -6,8 +6,8 @@ Usage: scherzo-cloud account [COMMAND]
 
 Commands:
   deletion  Manage your account deletion schedule
-  signup    Create your Scherzo Cloud account
-  update    Update your Scherzo Cloud account
+  signup    Create your account
+  update    Update your account
   help      Print this message or the help of the given subcommand(s)
 
 Options:

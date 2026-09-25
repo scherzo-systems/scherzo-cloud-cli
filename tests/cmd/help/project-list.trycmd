@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud project list --help
-List Scherzo Cloud projects
+List projects
 
 Usage: scherzo-cloud project list [OPTIONS] <ORGANIZATION>
 

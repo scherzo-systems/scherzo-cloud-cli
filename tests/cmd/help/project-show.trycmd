@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud project show --help
-Show a Scherzo Cloud project
+Show a project
 
 Usage: scherzo-cloud project show [OPTIONS] <ORGANIZATION> <PROJECT>
 

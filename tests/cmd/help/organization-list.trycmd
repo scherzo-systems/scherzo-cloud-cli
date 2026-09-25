@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud organization list --help
-List your Scherzo Cloud organization memberships
+List your organization memberships
 
 Usage: scherzo-cloud organization list [OPTIONS]
 

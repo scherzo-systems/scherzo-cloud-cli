@@ -140,7 +140,7 @@ struct MembershipTarget {
     #[arg(
         value_name = "MEMBERSHIP",
         value_parser = parse_membership_id,
-        help = "Exact membership ID"
+        help = "Membership ID"
     )]
     membership_id: String,
 }

@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner show --help
-Show a Scherzo Cloud runner registration
+Show a runner registration
 
 Usage: scherzo-cloud runner show [OPTIONS] <ORGANIZATION> <RUNNER>
 

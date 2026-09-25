@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner enroll --help
-Enroll a protected runner credential
+Enroll a runner credential
 
 Usage: scherzo-cloud runner enroll [OPTIONS] --config <PATH>
 

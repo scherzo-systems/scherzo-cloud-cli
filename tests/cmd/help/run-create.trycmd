@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud run create --help
-Create a Scherzo Cloud run
+Create a run
 
 Usage: scherzo-cloud run create [OPTIONS] --project-id <PROJECT> --workflow-path <WORKFLOW> <ORGANIZATION>
 
@@ -12,19 +12,19 @@ Options:
           Project ID
       --workflow-path <WORKFLOW>
           Canonical repository-relative workflow path
-      --source-branch <SOURCE_BRANCH>
-          Exact source branch (the project default when omitted)
-      --display-name <DISPLAY_NAME>
+      --source-branch <BRANCH>
+          Source branch (the project default when omitted)
+      --display-name <NAME>
           Set the run display name
       --input-set-id <INPUT_SET>
           Consume an existing sealed Run Input Set without restaging
       --input-text <NAME> <TEXT>
           Supply one required named Text value
-      --input-text-file <NAME> <PATH>
+      --input-text-file <NAME> <PATH|->
           Supply one required named Text value from a regular file, or - for standard input
       --input-json <NAME> <JSON>
           Supply one required named JSON value
-      --input-json-file <NAME> <PATH>
+      --input-json-file <NAME> <PATH|->
           Supply one required named JSON value from a regular file, or - for standard input
       --input-file <NAME> <MEDIA_TYPE> <PATH>
           Supply one required named File value with an explicit media type (maximum 64 MiB)
@@ -32,7 +32,7 @@ Options:
           Append an immutable member to a named attachment collection
       --input-attachments-empty <NAME>
           Supply a present named attachment collection with no members
-      --integration-context-file <PATH>
+      --integration-context-file <PATH|->
           Read private immutable integration context from a JSON file, or - for standard input
       --wait
           Observe the run until it settles

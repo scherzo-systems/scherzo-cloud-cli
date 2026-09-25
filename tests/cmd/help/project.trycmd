@@ -5,12 +5,12 @@ Manage Scherzo Cloud projects
 Usage: scherzo-cloud project [COMMAND]
 
 Commands:
-  create       Create a Scherzo Cloud project
-  list         List Scherzo Cloud projects
-  rename       Rename a Scherzo Cloud project
+  create       Create a project
+  list         List projects
+  rename       Rename a project
   repository   Manage a project's repository binding
   runner-pool  Manage a project's runner pool
-  show         Show a Scherzo Cloud project
+  show         Show a project
   help         Print this message or the help of the given subcommand(s)
 
 Options:

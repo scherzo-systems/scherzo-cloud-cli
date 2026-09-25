@@ -44,7 +44,10 @@ struct CredentialCommand {
 enum CredentialSubcommand {
     #[command(about = "Issue a service credential")]
     Issue(IssueCommand),
-    #[command(about = "List active service credentials")]
+    #[command(
+        about = "List service credentials",
+        after_help = "Results:\n  Only active service credentials are listed."
+    )]
     List(ListCommand),
     #[command(about = "Revoke a service credential")]
     Revoke(RevokeCommand),
@@ -97,7 +100,7 @@ struct RevokeCommand {
     #[arg(
         value_name = "CREDENTIAL",
         value_parser = parse_credential_id,
-        help = "Exact service credential ID"
+        help = "Service credential ID"
     )]
     credential_id: String,
 

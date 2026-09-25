@@ -2,14 +2,14 @@
 $ scherzo-cloud artifact download --help
 Download and verify a run's Artifact Set
 
-Usage: scherzo-cloud artifact download [OPTIONS] --output <PATH> <ORGANIZATION> <RUN>
+Usage: scherzo-cloud artifact download [OPTIONS] --output <DIRECTORY> <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Run identifier containing the Artifact Set
+  <RUN>           Run ID
 
 Options:
-      --output <PATH>                  Directory to create for the complete Artifact Set (must not already exist)
+      --output <DIRECTORY>             Directory to create for the complete Artifact Set (must not already exist)
       --json                           Print the artifact result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections

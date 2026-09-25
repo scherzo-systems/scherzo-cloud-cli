@@ -248,22 +248,6 @@ fn violations(root: &Command) -> BTreeSet<String> {
 const BASELINE: &[(&str, &str)] = &[
     ("leaf-token|github installation disconnect", "LIV-2426"),
     ("leaf-token|project repository detach", "LIV-2426"),
-    (
-        "placeholder|--display-name|account update|organization create",
-        "LIV-2422",
-    ),
-    (
-        "placeholder|--display-name|account update|organization update",
-        "LIV-2422",
-    ),
-    (
-        "placeholder|--display-name|account update|run create",
-        "LIV-2422",
-    ),
-    (
-        "placeholder|--output|artifact download|run input download",
-        "LIV-2422",
-    ),
 ];
 
 fn check_baseline(observed: &BTreeSet<String>, baseline: &[(&str, &str)]) -> Result<(), String> {

@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner drain --help
-Drain a Scherzo Cloud runner registration
+Drain a runner registration
 
 Usage: scherzo-cloud runner drain [OPTIONS] <ORGANIZATION> <RUNNER>
 

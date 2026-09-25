@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner pool list --help
-List Scherzo Cloud runner pools
+List runner pools
 
 Usage: scherzo-cloud runner pool list [OPTIONS] <ORGANIZATION>
 

@@ -6,7 +6,7 @@ Usage: scherzo-cloud run input show [OPTIONS] <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Exact Run ID
+  <RUN>           Run ID
 
 Options:
       --json                           Print the run result as JSON

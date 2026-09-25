@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner pool show --help
-Show a Scherzo Cloud runner pool
+Show a runner pool
 
 Usage: scherzo-cloud runner pool show [OPTIONS] <ORGANIZATION> <POOL>
 

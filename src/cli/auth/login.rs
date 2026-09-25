@@ -17,7 +17,7 @@ use scherzo_cloud_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPha
 
 use super::status::{StatusResult, write_human_status};
 
-pub(super) const ABOUT: &str = "Sign in to Scherzo Cloud";
+pub(super) const ABOUT: &str = "Sign in";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

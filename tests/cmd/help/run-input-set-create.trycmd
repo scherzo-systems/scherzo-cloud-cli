@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud run input-set create --help
-Create an open immutable Run Input Set
+Create a Run Input Set
 
 Usage: scherzo-cloud run input-set create [OPTIONS] --project-id <PROJECT> <ORGANIZATION>
 
@@ -12,11 +12,11 @@ Options:
           Project ID
       --input-text <NAME> <TEXT>
           Supply one required named Text value
-      --input-text-file <NAME> <PATH>
+      --input-text-file <NAME> <PATH|->
           Supply one required named Text value from a regular file, or - for standard input
       --input-json <NAME> <JSON>
           Supply one required named JSON value
-      --input-json-file <NAME> <PATH>
+      --input-json-file <NAME> <PATH|->
           Supply one required named JSON value from a regular file, or - for standard input
       --input-file <NAME> <MEDIA_TYPE> <PATH>
           Supply one required named File value with an explicit media type (maximum 64 MiB)
@@ -32,5 +32,8 @@ Options:
           Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help
           Print help
+
+Lifecycle:
+  Creation fixes the manifest and each member's content. While open, the set accepts matching uploads; sealing verifies every declared member.
 
 ```

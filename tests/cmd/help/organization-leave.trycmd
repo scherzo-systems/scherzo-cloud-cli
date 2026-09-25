@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud organization leave --help
-Leave a Scherzo Cloud organization
+Leave an organization
 
 Usage: scherzo-cloud organization leave [OPTIONS] --yes <ORGANIZATION>
 

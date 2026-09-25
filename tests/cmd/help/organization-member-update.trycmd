@@ -6,7 +6,7 @@ Usage: scherzo-cloud organization member update [OPTIONS] --role <ROLE> <ORGANIZ
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <MEMBERSHIP>    Exact membership ID
+  <MEMBERSHIP>    Membership ID
 
 Options:
       --role <ROLE>                    Set the organization role [possible values: owner, member]

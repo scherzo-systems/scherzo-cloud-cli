@@ -1,14 +1,14 @@
 ```console
 $ scherzo-cloud organization update --help
-Update a Scherzo Cloud organization
+Update an organization
 
-Usage: scherzo-cloud organization update [OPTIONS] <--display-name <DISPLAY_NAME>|--slug <SLUG>> <ORGANIZATION>
+Usage: scherzo-cloud organization update [OPTIONS] <--display-name <NAME>|--slug <SLUG>> <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
 
 Options:
-      --display-name <DISPLAY_NAME>    Set the organization display name
+      --display-name <NAME>            Set the organization display name
       --slug <SLUG>                    Set the exact organization slug
       --json                           Print the organization result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input

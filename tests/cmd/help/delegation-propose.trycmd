@@ -5,7 +5,7 @@ Propose delegation to a service principal
 Usage: scherzo-cloud delegation propose [OPTIONS] <SERVICE_PRINCIPAL>
 
 Arguments:
-  <SERVICE_PRINCIPAL>  Exact service principal ID
+  <SERVICE_PRINCIPAL>  Service principal ID
 
 Options:
       --json                 Print the delegation result as JSON

@@ -6,7 +6,7 @@ Usage: scherzo-cloud organization invitation revoke [OPTIONS] --yes <ORGANIZATIO
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <INVITATION>    Exact invitation ID
+  <INVITATION>    Invitation ID
 
 Options:
       --yes                            Confirm this action

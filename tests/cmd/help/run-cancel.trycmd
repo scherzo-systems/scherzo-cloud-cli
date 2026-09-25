@@ -6,7 +6,7 @@ Usage: scherzo-cloud run cancel [OPTIONS] <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Exact Run ID
+  <RUN>           Run ID
 
 Options:
       --force                          Request immediate containment instead of graceful stopping

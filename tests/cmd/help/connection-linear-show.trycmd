@@ -6,7 +6,7 @@ Usage: scherzo-cloud connection linear show [OPTIONS] <ORGANIZATION> <CONNECTION
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <CONNECTION>    Exact Linear connection ID
+  <CONNECTION>    Linear connection ID
 
 Options:
       --json                           Emit newline-delimited JSON events

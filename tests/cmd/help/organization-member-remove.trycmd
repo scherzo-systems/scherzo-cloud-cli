@@ -6,7 +6,7 @@ Usage: scherzo-cloud organization member remove [OPTIONS] --yes <ORGANIZATION> <
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <MEMBERSHIP>    Exact membership ID
+  <MEMBERSHIP>    Membership ID
 
 Options:
       --yes                            Confirm this action

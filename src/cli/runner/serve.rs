@@ -12,7 +12,7 @@ use scherzo_cloud_execution::{
 };
 use scherzo_cloud_runner::Config;
 
-pub(super) const ABOUT: &str = "Connect to Scherzo Cloud and serve run assignments";
+pub(super) const ABOUT: &str = "Serve run assignments";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

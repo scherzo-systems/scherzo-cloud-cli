@@ -22,17 +22,17 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
-    #[command(about = "Create a Scherzo Cloud project")]
+    #[command(about = "Create a project")]
     Create(CreateCommand),
-    #[command(about = "List Scherzo Cloud projects")]
+    #[command(about = "List projects")]
     List(ListCommand),
-    #[command(about = "Rename a Scherzo Cloud project")]
+    #[command(about = "Rename a project")]
     Rename(RenameCommand),
     #[command(about = "Manage a project's repository binding")]
     Repository(RepositoryCommand),
     #[command(about = "Manage a project's runner pool")]
     RunnerPool(RunnerPoolCommand),
-    #[command(about = "Show a Scherzo Cloud project")]
+    #[command(about = "Show a project")]
     Show(ShowCommand),
 }
 
@@ -56,6 +56,7 @@ struct RepositorySelectionArgs {
 
     #[arg(
         long,
+        value_name = "BRANCH",
         value_parser = NonEmptyStringValueParser::new(),
         help = "Set the configured default branch (the provider default when omitted)"
     )]
@@ -176,6 +177,7 @@ struct RepositoryUpdateCommand {
 
     #[arg(
         long,
+        value_name = "BRANCH",
         value_parser = NonEmptyStringValueParser::new(),
         help = "Set the configured default branch"
     )]

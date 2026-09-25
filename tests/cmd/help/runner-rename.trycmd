@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner rename --help
-Rename a Scherzo Cloud runner registration
+Rename a runner registration
 
 Usage: scherzo-cloud runner rename [OPTIONS] --name <NAME> <ORGANIZATION> <RUNNER>
 

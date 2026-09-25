@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud account signup --help
-Create your Scherzo Cloud account
+Create your account
 
 Usage: scherzo-cloud account signup [OPTIONS]
 

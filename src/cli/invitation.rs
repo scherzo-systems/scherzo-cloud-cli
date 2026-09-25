@@ -142,7 +142,7 @@ struct InvitationAccess {
     #[arg(
         value_name = "INVITATION",
         value_parser = parse_invitation_id,
-        help = "Exact invitation ID"
+        help = "Invitation ID"
     )]
     invitation_id: String,
 
@@ -230,7 +230,7 @@ struct RevokeCommand {
     #[arg(
         value_name = "INVITATION",
         value_parser = parse_invitation_id,
-        help = "Exact invitation ID"
+        help = "Invitation ID"
     )]
     invitation_id: String,
 

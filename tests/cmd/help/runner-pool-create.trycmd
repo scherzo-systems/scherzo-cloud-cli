@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner pool create --help
-Create a Scherzo Cloud runner pool
+Create a runner pool
 
 Usage: scherzo-cloud runner pool create [OPTIONS] --name <NAME> <ORGANIZATION>
 

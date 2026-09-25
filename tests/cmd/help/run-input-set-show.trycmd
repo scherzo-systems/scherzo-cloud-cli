@@ -6,7 +6,7 @@ Usage: scherzo-cloud run input-set show [OPTIONS] <ORGANIZATION> <INPUT_SET>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <INPUT_SET>     Exact Run Input Set ID
+  <INPUT_SET>     Run Input Set ID
 
 Options:
       --json                           Print the run result as JSON

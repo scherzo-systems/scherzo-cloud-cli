@@ -6,7 +6,7 @@ Usage: scherzo-cloud artifact list [OPTIONS] <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Run identifier containing the Artifact Set
+  <RUN>           Run ID
 
 Options:
       --limit <LIMIT>                  Maximum items to return (1-200)

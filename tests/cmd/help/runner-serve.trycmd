@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner serve --help
-Connect to Scherzo Cloud and serve run assignments
+Serve run assignments
 
 Usage: scherzo-cloud runner serve --config <PATH>
 

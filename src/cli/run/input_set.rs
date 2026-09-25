@@ -34,15 +34,27 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum InputSetCommand {
-    #[command(about = "Create an open immutable Run Input Set")]
+    #[command(
+        about = "Create a Run Input Set",
+        after_help = "Lifecycle:\n  Creation fixes the manifest and each member's content. While open, the set accepts matching uploads; sealing verifies every declared member."
+    )]
     Create(CreateCommand),
-    #[command(about = "Logically delete a Run Input Set and schedule content cleanup")]
+    #[command(
+        about = "Delete a Run Input Set and schedule content cleanup",
+        after_help = "Deletion:\n  The Run Input Set becomes logically unavailable; content cleanup is scheduled."
+    )]
     Delete(DeleteCommand),
-    #[command(about = "Seal an uploaded Run Input Set")]
+    #[command(
+        about = "Seal a Run Input Set",
+        after_help = "Eligibility:\n  Upload the declared members to an open Run Input Set before sealing it."
+    )]
     Seal(SealCommand),
     #[command(about = "Show a Run Input Set and its manifest")]
     Show(ShowCommand),
-    #[command(about = "Upload selected members to an open Run Input Set")]
+    #[command(
+        about = "Upload members to a Run Input Set",
+        after_help = "Eligibility:\n  The Run Input Set must still be open for uploads."
+    )]
     Upload(UploadCommand),
 }
 
@@ -73,7 +85,7 @@ struct InputSetReference {
     #[arg(
         value_name = "INPUT_SET",
         value_parser = super::parse_input_set_id,
-        help = "Exact Run Input Set ID"
+        help = "Run Input Set ID"
     )]
     input_set_id: String,
 }

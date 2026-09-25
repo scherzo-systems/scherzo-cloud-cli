@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud auth login --help
-Sign in to Scherzo Cloud
+Sign in
 
 Usage: scherzo-cloud auth login [OPTIONS]
 

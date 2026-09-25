@@ -14,7 +14,7 @@ pub(super) const ABOUT: &str = "Remove a linked sign-in identity";
 // jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(value_name = "IDENTITY_ID", help = "Exact linked identity ID")]
+    #[arg(value_name = "IDENTITY_ID", help = "Linked identity ID")]
     identity_id: String,
 
     #[command(flatten)]

@@ -1,12 +1,12 @@
 ```console
 $ scherzo-cloud run input-set delete --help
-Logically delete a Run Input Set and schedule content cleanup
+Delete a Run Input Set and schedule content cleanup
 
 Usage: scherzo-cloud run input-set delete [OPTIONS] --yes <ORGANIZATION> <INPUT_SET>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <INPUT_SET>     Exact Run Input Set ID
+  <INPUT_SET>     Run Input Set ID
 
 Options:
       --yes                            Confirm this action
@@ -14,5 +14,8 @@ Options:
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                           Print help
+
+Deletion:
+  The Run Input Set becomes logically unavailable; content cleanup is scheduled.
 
 ```

@@ -5,11 +5,11 @@ Manage Run Input Sets
 Usage: scherzo-cloud run input-set [COMMAND]
 
 Commands:
-  create  Create an open immutable Run Input Set
-  delete  Logically delete a Run Input Set and schedule content cleanup
-  seal    Seal an uploaded Run Input Set
+  create  Create a Run Input Set
+  delete  Delete a Run Input Set and schedule content cleanup
+  seal    Seal a Run Input Set
   show    Show a Run Input Set and its manifest
-  upload  Upload selected members to an open Run Input Set
+  upload  Upload members to a Run Input Set
   help    Print this message or the help of the given subcommand(s)
 
 Options:

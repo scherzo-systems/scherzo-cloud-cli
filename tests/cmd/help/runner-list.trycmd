@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner list --help
-List Scherzo Cloud runner registrations
+List runner registrations
 
 Usage: scherzo-cloud runner list [OPTIONS] <ORGANIZATION>
 

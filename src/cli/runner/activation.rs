@@ -25,7 +25,10 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum ActivationCommand {
-    #[command(about = "Create a single-use runner activation")]
+    #[command(
+        about = "Create a runner activation",
+        after_help = "Activation:\n  Each activation can be used only once."
+    )]
     Create(CreateCommand),
     #[command(about = "List runner activations")]
     List(ListCommand),

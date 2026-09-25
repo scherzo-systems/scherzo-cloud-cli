@@ -87,7 +87,7 @@ struct Start {
 struct SessionTarget {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization: OrganizationArg,
-    #[arg(value_name = "SESSION", help = "Exact Linear authorization session ID")]
+    #[arg(value_name = "SESSION", help = "Linear authorization session ID")]
     session: String,
     #[command(flatten)]
     options: Options,
@@ -103,7 +103,7 @@ struct Wait {
 struct Target {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization: OrganizationArg,
-    #[arg(value_name = "CONNECTION", help = "Exact Linear connection ID")]
+    #[arg(value_name = "CONNECTION", help = "Linear connection ID")]
     connection: String,
     #[command(flatten)]
     options: Options,

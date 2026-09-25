@@ -6,11 +6,11 @@ Usage: scherzo-cloud run [COMMAND]
 
 Commands:
   cancel     Request cancellation of a Scherzo Cloud run
-  create     Create a Scherzo Cloud run
+  create     Create a run
   input      Manage retained run inputs
   input-set  Manage Run Input Sets
   list       List Scherzo Cloud runs
-  show       Show a Scherzo Cloud run
+  show       Show a run
   help       Print this message or the help of the given subcommand(s)
 
 Options:

@@ -62,10 +62,7 @@ pub(super) struct RunArtifactReference {
     )]
     organization: super::OrganizationArg,
 
-    #[arg(
-        value_name = "RUN",
-        help = "Run identifier containing the Artifact Set"
-    )]
+    #[arg(value_name = "RUN", help = "Run ID")]
     run_id: String,
 }
 

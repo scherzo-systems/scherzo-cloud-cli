@@ -1,13 +1,13 @@
 ```console
 $ scherzo-cloud publication show --help
-Show a Scherzo Cloud publication
+Show a publication
 
 Usage: scherzo-cloud publication show [OPTIONS] <ORGANIZATION> <RUN> <PUBLICATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Exact Run ID
-  <PUBLICATION>   Exact Publication ID
+  <RUN>           Run ID
+  <PUBLICATION>   Publication ID
 
 Options:
       --wait                           Wait for a terminal publication

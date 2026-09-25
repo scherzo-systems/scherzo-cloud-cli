@@ -7,7 +7,7 @@ use crate::exit_code::ExitCode;
 use scherzo_cloud_human_auth::Deployment;
 use scherzo_cloud_human_auth::{LogoutOutcome, RevocationState};
 
-pub(super) const ABOUT: &str = "Sign out of Scherzo Cloud on this device";
+pub(super) const ABOUT: &str = "Sign out on this device";
 
 pub(super) type Command =
     super::super::CommonArgs<super::super::SignInJson, super::super::NoAuthenticationArgs>;

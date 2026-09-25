@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud auth status --help
-Show your Scherzo Cloud sign-in status
+Show your sign-in status
 
 Usage: scherzo-cloud auth status [OPTIONS]
 

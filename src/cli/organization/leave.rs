@@ -7,7 +7,7 @@ use scherzo_cloud_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 
-pub(super) const ABOUT: &str = "Leave a Scherzo Cloud organization";
+pub(super) const ABOUT: &str = "Leave an organization";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

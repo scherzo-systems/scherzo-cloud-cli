@@ -1,12 +1,12 @@
 ```console
 $ scherzo-cloud publication list --help
-List Scherzo Cloud publications
+List publications
 
 Usage: scherzo-cloud publication list [OPTIONS] <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Exact Run ID
+  <RUN>           Run ID
 
 Options:
       --limit <LIMIT>                  Maximum items to return (1-200)

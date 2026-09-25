@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner enable --help
-Enable a Scherzo Cloud runner registration
+Enable a runner registration
 
 Usage: scherzo-cloud runner enable [OPTIONS] <ORGANIZATION> <RUNNER>
 

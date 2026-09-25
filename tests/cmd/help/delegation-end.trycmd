@@ -5,7 +5,7 @@ End a delegation
 Usage: scherzo-cloud delegation end [OPTIONS] --yes <DELEGATION>
 
 Arguments:
-  <DELEGATION>  Exact delegation ID
+  <DELEGATION>  Delegation ID
 
 Options:
       --yes                            Confirm this action

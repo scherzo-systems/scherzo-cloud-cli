@@ -15,7 +15,7 @@ pub(super) type Command = super::RemoteArtifactCommand<Operation>;
 pub(super) struct Operation {
     #[arg(
         long,
-        value_name = "PATH",
+        value_name = "DIRECTORY",
         help = "Directory to create for the complete Artifact Set (must not already exist)"
     )]
     output: PathBuf,

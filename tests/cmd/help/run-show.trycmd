@@ -1,12 +1,12 @@
 ```console
 $ scherzo-cloud run show --help
-Show a Scherzo Cloud run
+Show a run
 
 Usage: scherzo-cloud run show [OPTIONS] <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Exact Run ID
+  <RUN>           Run ID
 
 Options:
       --wait                           Observe the run until it settles

@@ -27,9 +27,15 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum InputsCommand {
-    #[command(about = "Make retained input content logically unavailable and schedule cleanup")]
+    #[command(
+        about = "Delete retained input content and schedule cleanup",
+        after_help = "Deletion:\n  Retained input content becomes logically unavailable; cleanup is scheduled."
+    )]
     Delete(DeleteCommand),
-    #[command(about = "Download and verify retained input members atomically")]
+    #[command(
+        about = "Download and verify retained input members",
+        after_help = "Download:\n  Verified members are committed together; no partial result is left at the destination."
+    )]
     Download(DownloadCommand),
     #[command(about = "Show the retained input inventory for a run")]
     Show(ShowCommand),
@@ -52,7 +58,7 @@ struct DownloadCommand {
     #[arg(
         long,
         value_name = "DIRECTORY",
-        help = "New destination directory for logical input member paths"
+        help = "Directory to create for the complete input download (must not already exist)"
     )]
     output: PathBuf,
 

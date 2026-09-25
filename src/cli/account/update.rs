@@ -8,7 +8,7 @@ use scherzo_cloud_api::{PrincipalProfile, UpdateProfileError, UpdateProfileOutco
 
 use super::super::principal::PrincipalResult;
 
-pub(super) const ABOUT: &str = "Update your Scherzo Cloud account";
+pub(super) const ABOUT: &str = "Update your account";
 
 impl_authenticated_account_outcome!(UpdateProfileOutcome, UpdateProfileError);
 

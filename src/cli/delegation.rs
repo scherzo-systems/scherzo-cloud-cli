@@ -123,7 +123,7 @@ struct ProposeCommand {
     #[arg(
         value_name = "SERVICE_PRINCIPAL",
         value_parser = parse_principal_id,
-        help = "Exact service principal ID"
+        help = "Service principal ID"
     )]
     service_principal_id: String,
 
@@ -136,7 +136,7 @@ struct DelegationTarget {
     #[arg(
         value_name = "DELEGATION",
         value_parser = parse_delegation_id,
-        help = "Exact delegation ID"
+        help = "Delegation ID"
     )]
     delegation_id: String,
 }

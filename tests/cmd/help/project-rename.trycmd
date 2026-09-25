@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud project rename --help
-Rename a Scherzo Cloud project
+Rename a project
 
 Usage: scherzo-cloud project rename [OPTIONS] --name <NAME> <ORGANIZATION> <PROJECT>
 

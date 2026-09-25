@@ -19,11 +19,20 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum CredentialCommand {
-    #[command(about = "List non-secret runner credential metadata")]
+    #[command(
+        about = "List runner credential metadata",
+        after_help = "Privacy:\n  The list contains credential metadata, not secrets."
+    )]
     List(ListCommand),
-    #[command(about = "Schedule fixed-grace credential retirement")]
+    #[command(
+        about = "Schedule runner credential retirement",
+        after_help = "Retirement:\n  The credential retires after a fixed grace period."
+    )]
     Retire(MutationCommand),
-    #[command(about = "Revoke a runner credential immediately")]
+    #[command(
+        about = "Revoke a runner credential",
+        after_help = "Revocation:\n  The credential is revoked immediately."
+    )]
     Revoke(MutationCommand),
 }
 

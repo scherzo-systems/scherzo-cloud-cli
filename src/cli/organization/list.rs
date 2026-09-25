@@ -5,7 +5,7 @@ use scherzo_cloud_human_auth::Deployment;
 
 use super::LeafOptions;
 
-pub(super) const ABOUT: &str = "List your Scherzo Cloud organization memberships";
+pub(super) const ABOUT: &str = "List your organization memberships";
 const AFTER_HELP: &str = "Visibility:\n  Organization names and slugs appear only for active memberships in active\n  organizations. Historical rows retain organization IDs and lifecycle states.";
 
 #[derive(Debug, Args)]

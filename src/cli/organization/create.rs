@@ -7,11 +7,11 @@ use scherzo_cloud_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 
-pub(super) const ABOUT: &str = "Create a Scherzo Cloud organization";
+pub(super) const ABOUT: &str = "Create an organization";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    #[arg(long, help = "Set the organization display name")]
+    #[arg(long, value_name = "NAME", help = "Set the organization display name")]
     display_name: String,
 
     #[arg(long, help = "Request an exact organization slug")]

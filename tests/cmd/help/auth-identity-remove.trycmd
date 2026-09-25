@@ -5,7 +5,7 @@ Remove a linked sign-in identity
 Usage: scherzo-cloud auth identity remove [OPTIONS] --yes <IDENTITY_ID>
 
 Arguments:
-  <IDENTITY_ID>  Exact linked identity ID
+  <IDENTITY_ID>  Linked identity ID
 
 Options:
       --yes                            Confirm this action

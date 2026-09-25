@@ -1,15 +1,15 @@
 ```console
 $ scherzo-cloud publication create --help
-Create a Scherzo Cloud publication
+Create a publication
 
 Usage: scherzo-cloud publication create [OPTIONS] --export <NAME> <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Exact Run ID
+  <RUN>           Run ID
 
 Options:
-      --export <NAME>                  Exact available Git branch export name
+      --export <NAME>                  Git branch export name (must be available)
       --idempotency-key <KEY>          Opaque request identity (generated when omitted)
       --wait                           Wait for a terminal publication
       --timeout <DURATION>             Stop waiting after a positive duration (units: ms, s, m, or h)

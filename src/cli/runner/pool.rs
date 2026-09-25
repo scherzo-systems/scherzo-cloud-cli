@@ -17,15 +17,18 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum PoolCommand {
-    #[command(about = "Create a Scherzo Cloud runner pool")]
+    #[command(about = "Create a runner pool")]
     Create(CreateCommand),
-    #[command(about = "Delete an unused Scherzo Cloud runner pool")]
+    #[command(
+        about = "Delete a runner pool",
+        after_help = "Eligibility:\n  The runner pool must be unused before deletion."
+    )]
     Delete(DeleteCommand),
-    #[command(about = "List Scherzo Cloud runner pools")]
+    #[command(about = "List runner pools")]
     List(ListCommand),
-    #[command(about = "Rename a Scherzo Cloud runner pool")]
+    #[command(about = "Rename a runner pool")]
     Rename(RenameCommand),
-    #[command(about = "Show a Scherzo Cloud runner pool")]
+    #[command(about = "Show a runner pool")]
     Show(ShowCommand),
 }
 

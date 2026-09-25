@@ -5,7 +5,7 @@ Show a delegation
 Usage: scherzo-cloud delegation show [OPTIONS] <DELEGATION>
 
 Arguments:
-  <DELEGATION>  Exact delegation ID
+  <DELEGATION>  Delegation ID
 
 Options:
       --json                           Print the delegation result as JSON

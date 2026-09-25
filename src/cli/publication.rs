@@ -25,11 +25,11 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum PublicationCommand {
-    #[command(about = "Create a Scherzo Cloud publication")]
+    #[command(about = "Create a publication")]
     Create(CreateCommand),
-    #[command(about = "List Scherzo Cloud publications")]
+    #[command(about = "List publications")]
     List(ListCommand),
-    #[command(about = "Show a Scherzo Cloud publication")]
+    #[command(about = "Show a publication")]
     Show(ShowCommand),
 }
 
@@ -38,7 +38,7 @@ struct PublicationRunReference {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization: OrganizationArg,
 
-    #[arg(value_name = "RUN", value_parser = parse_run_id, help = "Exact Run ID")]
+    #[arg(value_name = "RUN", value_parser = parse_run_id, help = "Run ID")]
     run_id: String,
 }
 
@@ -68,7 +68,7 @@ struct CreateCommand {
         long,
         value_name = "NAME",
         value_parser = parse_export_name,
-        help = "Exact available Git branch export name"
+        help = "Git branch export name (must be available)"
     )]
     export: String,
 
@@ -95,7 +95,7 @@ struct PublicationReference {
     #[arg(
         value_name = "PUBLICATION",
         value_parser = parse_publication_id,
-        help = "Exact Publication ID"
+        help = "Publication ID"
     )]
     publication_id: String,
 }

@@ -6,7 +6,7 @@ Usage: scherzo-cloud connection linear authorization show [OPTIONS] <ORGANIZATIO
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <SESSION>       Exact Linear authorization session ID
+  <SESSION>       Linear authorization session ID
 
 Options:
       --json                           Emit newline-delimited JSON events

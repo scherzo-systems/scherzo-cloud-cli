@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud auth logout --help
-Sign out of Scherzo Cloud on this device
+Sign out on this device
 
 Usage: scherzo-cloud auth logout [OPTIONS]
 

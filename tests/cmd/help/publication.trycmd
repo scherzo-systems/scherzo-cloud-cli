@@ -5,9 +5,9 @@ Manage Scherzo Cloud publications
 Usage: scherzo-cloud publication [COMMAND]
 
 Commands:
-  create  Create a Scherzo Cloud publication
-  list    List Scherzo Cloud publications
-  show    Show a Scherzo Cloud publication
+  create  Create a publication
+  list    List publications
+  show    Show a publication
   help    Print this message or the help of the given subcommand(s)
 
 Options:

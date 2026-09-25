@@ -5,7 +5,7 @@ Accept an invitation
 Usage: scherzo-cloud invitation accept [OPTIONS] <INVITATION>
 
 Arguments:
-  <INVITATION>  Exact invitation ID
+  <INVITATION>  Invitation ID
 
 Options:
       --capability-file <PATH|->       Read an email invitation capability from a protected file or explicit stdin

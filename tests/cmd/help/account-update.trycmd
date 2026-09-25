@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud account update --help
-Update your Scherzo Cloud account
+Update your account
 
 Usage: scherzo-cloud account update [OPTIONS] <--display-name <NAME>|--clear-display-name>
 

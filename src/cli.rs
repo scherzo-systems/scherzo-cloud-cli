@@ -89,7 +89,7 @@ struct NamedInputArgs {
 
     #[arg(
         long,
-        value_names = ["NAME", "PATH"],
+        value_names = ["NAME", "PATH|-"],
         num_args = 2,
         action = clap::ArgAction::Append,
         help = "Supply one required named Text value from a regular file, or - for standard input"
@@ -107,7 +107,7 @@ struct NamedInputArgs {
 
     #[arg(
         long,
-        value_names = ["NAME", "PATH"],
+        value_names = ["NAME", "PATH|-"],
         num_args = 2,
         action = clap::ArgAction::Append,
         help = "Supply one required named JSON value from a regular file, or - for standard input"

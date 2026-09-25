@@ -1,12 +1,12 @@
 ```console
 $ scherzo-cloud run input delete --help
-Make retained input content logically unavailable and schedule cleanup
+Delete retained input content and schedule cleanup
 
 Usage: scherzo-cloud run input delete [OPTIONS] --yes <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <RUN>           Exact Run ID
+  <RUN>           Run ID
 
 Options:
       --yes                            Confirm this action
@@ -14,5 +14,8 @@ Options:
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                           Print help
+
+Deletion:
+  Retained input content becomes logically unavailable; cleanup is scheduled.
 
 ```

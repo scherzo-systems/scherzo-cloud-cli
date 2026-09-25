@@ -1,6 +1,6 @@
 ```console
 $ scherzo-cloud runner disable --help
-Disable a Scherzo Cloud runner registration
+Disable a runner registration
 
 Usage: scherzo-cloud runner disable [OPTIONS] <ORGANIZATION> <RUNNER>
 

@@ -1,11 +1,11 @@
 ```console
 $ scherzo-cloud organization create --help
-Create a Scherzo Cloud organization
+Create an organization
 
-Usage: scherzo-cloud organization create [OPTIONS] --display-name <DISPLAY_NAME>
+Usage: scherzo-cloud organization create [OPTIONS] --display-name <NAME>
 
 Options:
-      --display-name <DISPLAY_NAME>
+      --display-name <NAME>
           Set the organization display name
       --slug <SLUG>
           Request an exact organization slug

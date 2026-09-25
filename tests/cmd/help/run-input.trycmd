@@ -5,8 +5,8 @@ Manage retained run inputs
 Usage: scherzo-cloud run input [COMMAND]
 
 Commands:
-  delete    Make retained input content logically unavailable and schedule cleanup
-  download  Download and verify retained input members atomically
+  delete    Delete retained input content and schedule cleanup
+  download  Download and verify retained input members
   show      Show the retained input inventory for a run
   help      Print this message or the help of the given subcommand(s)
 

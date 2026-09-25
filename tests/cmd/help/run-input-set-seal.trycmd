@@ -1,17 +1,20 @@
 ```console
 $ scherzo-cloud run input-set seal --help
-Seal an uploaded Run Input Set
+Seal a Run Input Set
 
 Usage: scherzo-cloud run input-set seal [OPTIONS] <ORGANIZATION> <INPUT_SET>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
-  <INPUT_SET>     Exact Run Input Set ID
+  <INPUT_SET>     Run Input Set ID
 
 Options:
       --json                           Print the run result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
   -h, --help                           Print help
+
+Eligibility:
+  Upload the declared members to an open Run Input Set before sealing it.
 
 ```

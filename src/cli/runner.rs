@@ -35,29 +35,35 @@ enum RunnerCommand {
     Create(CreateCommand),
     #[command(about = credential::ABOUT)]
     Credential(credential::Command),
-    #[command(about = "Delete a quiescent Scherzo Cloud runner registration")]
+    #[command(
+        about = "Delete a runner registration",
+        after_help = "Eligibility:\n  The runner registration must be quiescent before deletion."
+    )]
     Delete(DeleteCommand),
-    #[command(about = "Disable a Scherzo Cloud runner registration")]
+    #[command(about = "Disable a runner registration")]
     Disable(ModeCommand),
     #[command(about = doctor::ABOUT)]
     Doctor(doctor::Command),
-    #[command(about = "Drain a Scherzo Cloud runner registration")]
+    #[command(about = "Drain a runner registration")]
     Drain(ModeCommand),
-    #[command(about = "Enable a Scherzo Cloud runner registration")]
+    #[command(about = "Enable a runner registration")]
     Enable(ModeCommand),
     #[command(about = enroll::ABOUT)]
     Enroll(enroll::Command),
-    #[command(about = "List Scherzo Cloud runner registrations")]
+    #[command(about = "List runner registrations")]
     List(ListCommand),
-    #[command(about = "Move a quiescent Scherzo Cloud runner registration")]
+    #[command(
+        about = "Move a runner registration",
+        after_help = "Eligibility:\n  The runner registration must be quiescent before moving it."
+    )]
     Move(MoveCommand),
     #[command(about = pool::ABOUT)]
     Pool(pool::Command),
-    #[command(about = "Rename a Scherzo Cloud runner registration")]
+    #[command(about = "Rename a runner registration")]
     Rename(RenameCommand),
     #[command(about = serve::ABOUT)]
     Serve(serve::Command),
-    #[command(about = "Show a Scherzo Cloud runner registration")]
+    #[command(about = "Show a runner registration")]
     Show(ShowCommand),
     #[command(about = status::ABOUT)]
     Status(status::Command),

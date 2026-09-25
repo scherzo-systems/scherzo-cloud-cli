@@ -10,7 +10,7 @@ use scherzo_cloud_human_auth::{AuthenticationState, AuthenticationStatus};
 
 use super::super::principal::PrincipalResult;
 
-pub(super) const ABOUT: &str = "Show your Scherzo Cloud sign-in status";
+pub(super) const ABOUT: &str = "Show your sign-in status";
 
 pub(super) type Command =
     super::super::CommonArgs<super::super::SignInJson, super::super::PrincipalAuthenticationArgs>;

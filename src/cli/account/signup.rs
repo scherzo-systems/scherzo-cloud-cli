@@ -8,7 +8,7 @@ use scherzo_cloud_api::{HumanPrincipal, SignupError, SignupOutcome};
 
 use super::super::principal::PrincipalResult;
 
-pub(super) const ABOUT: &str = "Create your Scherzo Cloud account";
+pub(super) const ABOUT: &str = "Create your account";
 
 impl_authenticated_account_outcome!(SignupOutcome, SignupError);
 
