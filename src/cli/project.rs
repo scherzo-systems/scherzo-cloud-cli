@@ -140,49 +140,12 @@ struct RepositoryCommand {
 enum RepositorySubcommand {
     #[command(about = "Detach a project's repository")]
     Detach(RepositoryDetachCommand),
-    #[command(about = "Work with GitHub installation bindings")]
-    Installation(InstallationCommand),
-    #[command(about = "List repositories selected for a GitHub installation")]
-    List(RepositoryListCommand),
     #[command(about = "Bind or replace a project's repository")]
     Set(RepositorySetCommand),
     #[command(about = "Show a project's repository binding")]
     Show(RepositoryShowCommand),
     #[command(about = "Change a project's configured default branch")]
     Update(RepositoryUpdateCommand),
-}
-
-#[derive(Debug, Args)]
-struct InstallationCommand {
-    #[command(subcommand)]
-    command: Option<InstallationSubcommand>,
-}
-
-#[derive(Debug, Subcommand)]
-enum InstallationSubcommand {
-    #[command(about = "List GitHub installation bindings")]
-    List(InstallationListCommand),
-}
-
-#[derive(Debug, Args)]
-struct InstallationListCommand {
-    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
-    organization: OrganizationArg,
-
-    #[command(flatten)]
-    options: Options,
-}
-
-#[derive(Debug, Args)]
-struct RepositoryListCommand {
-    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
-    organization: OrganizationArg,
-
-    #[arg(value_name = InstallationArg::VALUE_NAME, help = InstallationArg::HELP)]
-    installation_id: InstallationArg,
-
-    #[command(flatten)]
-    options: Options,
 }
 
 #[derive(Debug, Args)]
@@ -294,9 +257,6 @@ impl RepositoryCommand {
             return super::print_help(&[NAME, "repository"]);
         };
         match command {
-            RepositorySubcommand::List(command) => {
-                execute_leaf(command, RepositoryListCommand::execute)
-            }
             RepositorySubcommand::Show(command) => {
                 execute_leaf(command, RepositoryShowCommand::execute)
             }
@@ -308,20 +268,6 @@ impl RepositoryCommand {
             }
             RepositorySubcommand::Detach(command) => {
                 execute_leaf(command, RepositoryDetachCommand::execute)
-            }
-            RepositorySubcommand::Installation(command) => command.execute(),
-        }
-    }
-}
-
-impl InstallationCommand {
-    fn execute(self) -> super::CommandResult {
-        let Some(command) = self.command else {
-            return super::print_help(&[NAME, "repository", "installation"]);
-        };
-        match command {
-            InstallationSubcommand::List(command) => {
-                execute_leaf(command, InstallationListCommand::execute)
             }
         }
     }
@@ -486,40 +432,6 @@ impl RenameCommand {
     }
 }
 // jscpd:ignore-end
-
-impl InstallationListCommand {
-    fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(
-            deployment,
-            self.options.http.transport_policy(),
-            &self.options.authentication,
-            |api| api.list_installations(&self.organization),
-        )?;
-        output::write_installations(
-            deployment.fingerprint().api_url(),
-            result,
-            self.options.authentication.kind(),
-            self.options.json,
-        )
-    }
-}
-
-impl RepositoryListCommand {
-    fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let result = with_api(
-            deployment,
-            self.options.http.transport_policy(),
-            &self.options.authentication,
-            |api| api.list_repositories(&self.organization, &self.installation_id),
-        )?;
-        output::write_repositories(
-            deployment.fingerprint().api_url(),
-            result,
-            self.options.authentication.kind(),
-            self.options.json,
-        )
-    }
-}
 
 impl RepositoryShowCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {

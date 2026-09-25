@@ -246,10 +246,6 @@ fn violations(root: &Command) -> BTreeSet<String> {
 
 // A ratchet: entries must be unique, sorted, and observed. Each entry has one burn-down owner.
 const BASELINE: &[(&str, &str)] = &[
-    (
-        "description|github installation list|project repository installation list",
-        "LIV-2428",
-    ),
     ("leaf-token|github installation disconnect", "LIV-2426"),
     ("leaf-token|project repository detach", "LIV-2426"),
     (

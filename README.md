@@ -1192,10 +1192,10 @@ discovering those values:
 scherzo-cloud organization list
 
 # Discover active and retained GitHub installation bindings for one organization.
-scherzo-cloud project repository installation list acme-labs
+scherzo-cloud github installation list acme-labs
 
-# Discover the repositories currently selected for one installation.
-scherzo-cloud project repository list \
+# Discover the repositories currently authorized for one installation.
+scherzo-cloud github repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 

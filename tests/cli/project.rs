@@ -302,8 +302,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
 
     let installations = run_project(
         &[
-            "project",
-            "repository",
+            "github",
             "installation",
             "list",
             ORGANIZATION,
@@ -318,7 +317,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
 
     let repositories = run_project(
         &[
-            "project",
+            "github",
             "repository",
             "list",
             ORGANIZATION,

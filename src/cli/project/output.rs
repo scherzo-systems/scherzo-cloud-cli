@@ -5,11 +5,7 @@ use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use scherzo_cloud_api::{
-    Project, ProjectFailure, ProjectGitHubInstallation as GitHubInstallation,
-    ProjectGitHubInstallationList as GitHubInstallationList,
-    ProjectGitHubRepository as GitHubRepository,
-    ProjectGitHubRepositoryList as GitHubRepositoryList, ProjectList, ProjectReadinessBlocker,
-    ProjectRepository,
+    Project, ProjectFailure, ProjectList, ProjectReadinessBlocker, ProjectRepository,
 };
 
 pub(super) fn write_project(
@@ -126,83 +122,6 @@ pub(super) fn write_repository(
         }
         Err(failure) => write_failure(deployment, failure, authentication, json),
     }
-}
-
-pub(super) fn write_installations(
-    deployment: &str,
-    result: Result<GitHubInstallationList, ProjectFailure>,
-    authentication: super::super::PrincipalAuthenticationKind,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    match result {
-        Ok(list) => {
-            if json {
-                write_json(&InstallationListResult {
-                    schema_version: 1,
-                    deployment,
-                    outcome: "listed",
-                    items: &list.items,
-                })?;
-            } else {
-                let mut stdout = io::stdout().lock();
-                writeln!(stdout, "✓ GitHub installations listed.\n")?;
-                for installation in &list.items {
-                    writeln!(
-                        stdout,
-                        "installation: {} · account: {} · type: {} · state: {}",
-                        installation.id,
-                        installation.provider_account_id,
-                        enum_text(&installation.provider_account_type)?,
-                        enum_text(&installation.state)?
-                    )?;
-                }
-                write_list_footer(&mut stdout, !list.items.is_empty(), None, deployment)?;
-            }
-            Ok(ExitCode::Success)
-        }
-        Err(failure) => write_failure(deployment, failure, authentication, json),
-    }
-}
-
-pub(super) fn write_repositories(
-    deployment: &str,
-    result: Result<GitHubRepositoryList, ProjectFailure>,
-    authentication: super::super::PrincipalAuthenticationKind,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    match result {
-        Ok(list) => {
-            if json {
-                write_json(&RepositoryListResult {
-                    schema_version: 1,
-                    deployment,
-                    outcome: "listed",
-                    installation: &list.installation,
-                    items: &list.items,
-                })?;
-            } else {
-                let mut stdout = io::stdout().lock();
-                writeln!(stdout, "✓ GitHub repositories listed.\n")?;
-                writeln!(stdout, "installation: {}\n", list.installation.id)?;
-                for repository in &list.items {
-                    writeln!(
-                        stdout,
-                        "repository: {} · provider repository: {} · default branch: {}",
-                        repository.full_name,
-                        repository.provider_repository_id,
-                        repository.default_branch
-                    )?;
-                }
-                // Repository discovery has an installation-bearing envelope distinct from
-                // installation discovery even though both reports share a list footer.
-                // jscpd:ignore-start
-                write_list_footer(&mut stdout, !list.items.is_empty(), None, deployment)?;
-            }
-            Ok(ExitCode::Success)
-        }
-        Err(failure) => write_failure(deployment, failure, authentication, json),
-    }
-    // jscpd:ignore-end
 }
 
 fn write_paginated_list_json(
@@ -426,23 +345,4 @@ struct RepositoryResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     repository: &'a ProjectRepository,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InstallationListResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    items: &'a [GitHubInstallation],
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RepositoryListResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    installation: &'a GitHubInstallation,
-    items: &'a [GitHubRepository],
 }

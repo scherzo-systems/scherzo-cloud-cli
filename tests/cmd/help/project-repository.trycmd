@@ -5,13 +5,11 @@ Manage a project's repository binding
 Usage: scherzo-cloud project repository [COMMAND]
 
 Commands:
-  detach        Detach a project's repository
-  installation  Work with GitHub installation bindings
-  list          List repositories selected for a GitHub installation
-  set           Bind or replace a project's repository
-  show          Show a project's repository binding
-  update        Change a project's configured default branch
-  help          Print this message or the help of the given subcommand(s)
+  detach  Detach a project's repository
+  set     Bind or replace a project's repository
+  show    Show a project's repository binding
+  update  Change a project's configured default branch
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
