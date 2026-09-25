@@ -187,7 +187,7 @@ struct IssueCommand {
     organization: OrganizationArg,
 
     #[arg(
-        long = "principal",
+        long,
         value_name = "PRINCIPAL",
         value_parser = parse_principal_id,
         help = "Invite an exact active principal ID"

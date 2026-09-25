@@ -699,7 +699,7 @@ fn project_creation_resolves_an_exact_pool_name() {
             INSTALLATION_ID,
             "--repository-id",
             REPOSITORY_ID,
-            "--pool",
+            "--pool-id",
             "builders",
             "--json",
             "--allow-insecure-http",

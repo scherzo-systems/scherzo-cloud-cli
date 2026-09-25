@@ -16,7 +16,7 @@ Options:
           Provider repository ID
       --default-branch <DEFAULT_BRANCH>
           Set the configured default branch (the provider default when omitted)
-      --pool <POOL>
+      --pool-id <POOL>
           Runner pool ID or exact name
       --json
           Print the project result as JSON

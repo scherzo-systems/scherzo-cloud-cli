@@ -89,7 +89,7 @@ struct CreateCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization: OrganizationArg,
 
-    #[arg(long, value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    #[arg(long = "pool-id", value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
     pool: PoolArg,
 
     #[arg(long, help = "Set the exact runner name")]
@@ -151,7 +151,7 @@ struct MoveCommand {
     #[command(flatten)]
     target: RegistrationTarget,
 
-    #[arg(long, value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    #[arg(long = "pool-id", value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
     pool: PoolArg,
 
     #[command(flatten)]

@@ -17,7 +17,7 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         | "allow-insecure-http"
         | "cursor"
         | "organization"
-        | "pool"
+        | "pool-id"
         | "project-id"
         | "installation-id"
         | "repository-id"
@@ -308,6 +308,90 @@ fn cli_grammar_conforms_with_mapped_debt() {
         "{}",
         check_baseline(&observed, BASELINE).unwrap_err()
     );
+}
+
+#[test]
+fn entity_identifier_flags_match_the_command_tree_and_parser() {
+    let cases: &[(&[&str], &str, &str, &[&str])] = &[
+        (
+            &["project", "create"],
+            "pool-id",
+            "pool",
+            &[
+                "example",
+                "--name",
+                "widget",
+                "--installation-id",
+                "ins_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "--repository-id",
+                "repo-123",
+                "--pool-id",
+                "builders",
+            ],
+        ),
+        (
+            &["runner", "create"],
+            "pool-id",
+            "pool",
+            &["example", "--pool-id", "builders", "--activation-file", "-"],
+        ),
+        (
+            &["runner", "move"],
+            "pool-id",
+            "pool",
+            &["example", "builder-one", "--pool-id", "builders"],
+        ),
+        (
+            &["organization", "invitation", "issue"],
+            "principal-id",
+            "principal",
+            &[
+                "example",
+                "--principal-id",
+                "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            ],
+        ),
+    ];
+
+    for &(path, replacement, removed, arguments) in cases {
+        let mut command = Cli::command();
+        for segment in path {
+            command = command.find_subcommand(segment).unwrap().clone();
+        }
+        assert!(
+            command
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some(replacement)),
+            "{path:?}"
+        );
+        assert!(
+            !command
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some(removed)),
+            "{path:?}"
+        );
+
+        let input = std::iter::once("scherzo-cloud")
+            .chain(path.iter().copied())
+            .chain(arguments.iter().copied());
+        assert!(super::parse(input).is_ok(), "{path:?}");
+        let replacement_flag = format!("--{replacement}");
+        let old_flag = format!("--{removed}");
+        let old_arguments = arguments.iter().map(|arg| {
+            if *arg == replacement_flag {
+                old_flag.as_str()
+            } else {
+                *arg
+            }
+        });
+        let input = std::iter::once("scherzo-cloud")
+            .chain(path.iter().copied())
+            .chain(old_arguments);
+        assert!(
+            super::parse(input).is_err(),
+            "old flag accepted at {path:?}"
+        );
+    }
 }
 
 #[test]

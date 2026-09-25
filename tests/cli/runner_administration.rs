@@ -769,7 +769,7 @@ fn runner_create_refreshes_a_token_rejected_during_activation() {
             "runner",
             "create",
             ORGANIZATION,
-            "--pool",
+            "--pool-id",
             POOL_ID,
             "--activation-file",
             activation_path.to_str().unwrap(),
@@ -860,7 +860,7 @@ fn runner_create_preserves_registration_when_refresh_replay_fails_early() {
             "runner",
             "create",
             ORGANIZATION,
-            "--pool",
+            "--pool-id",
             POOL_ID,
             "--activation-file",
             activation_path.to_str().unwrap(),
@@ -890,8 +890,8 @@ fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
                 "runner",
                 "create",
                 ORGANIZATION,
-                "--pool",
-                POOL_ID,
+                "--pool-id",
+                "builders",
                 "--activation-file",
                 "-",
                 "--allow-insecure-http",
@@ -939,7 +939,7 @@ fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
         let mut responses = vec![json_http_response(
             "200 OK",
             if creates_runner {
-                pool_body()
+                pool_list_body()
             } else {
                 registration_body()
             },
@@ -962,6 +962,13 @@ fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
         let requests = server.finish();
         let mut expected_paths = Vec::new();
         if creates_runner {
+            assert!(requests[0].starts_with(&format!(
+                "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
+            )));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(request_body(&requests[1])).unwrap()["runnerPoolId"],
+                POOL_ID
+            );
             expected_paths.push(format!(
                 "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations HTTP/1.1\r\n"
             ));
@@ -1006,7 +1013,7 @@ fn runner_create_reports_activation_failure_with_the_created_registration() {
             "runner",
             "create",
             ORGANIZATION,
-            "--pool",
+            "--pool-id",
             POOL_ID,
             "--activation-file",
             activation_path.to_str().unwrap(),
@@ -1354,45 +1361,59 @@ fn runner_mode_commands_send_closed_targets_with_idempotency() {
 
 #[test]
 fn runner_move_resolves_the_destination_and_sends_only_its_id() {
-    let response = http_response_with_headers(
-        "200 OK",
-        Some("application/json"),
-        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
-        &serde_json::to_vec(&registration_body()).unwrap(),
-    );
-    let (server, _directory, credential_path) = prepared_runner(vec![
-        json_http_response("200 OK", registration_body()),
-        json_http_response("200 OK", pool_body()),
-        response,
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
+    for pool in [POOL_ID, "builders"] {
+        let response = http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+            &serde_json::to_vec(&registration_body()).unwrap(),
+        );
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", registration_body()),
+            json_http_response(
+                "200 OK",
+                if pool == POOL_ID {
+                    pool_body()
+                } else {
+                    pool_list_body()
+                },
+            ),
+            response,
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
 
-    let output = run_with_env(
-        &[
-            "runner",
-            "move",
-            ORGANIZATION,
-            RUNNER_ID,
-            "--pool",
-            POOL_ID,
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &environment,
-    );
+        let output = run_with_env(
+            &[
+                "runner",
+                "move",
+                ORGANIZATION,
+                RUNNER_ID,
+                "--pool-id",
+                pool,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
 
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["outcome"], "moved");
-    let requests = server.finish();
-    assert!(requests[2].starts_with(&format!(
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "moved");
+        let requests = server.finish();
+        if pool != POOL_ID {
+            assert!(requests[1].starts_with(&format!(
+                "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
+            )));
+        }
+        assert!(requests[2].starts_with(&format!(
         "PUT /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/pool HTTP/1.1\r\n"
     )));
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(request_body(&requests[2])).unwrap(),
-        serde_json::json!({"runnerPoolId": POOL_ID})
-    );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(request_body(&requests[2])).unwrap(),
+            serde_json::json!({"runnerPoolId": POOL_ID})
+        );
+    }
 }
 
 #[test]

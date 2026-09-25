@@ -2,14 +2,14 @@
 $ scherzo-cloud runner move --help
 Move a quiescent Scherzo Cloud runner registration
 
-Usage: scherzo-cloud runner move [OPTIONS] --pool <POOL> <ORGANIZATION> <RUNNER>
+Usage: scherzo-cloud runner move [OPTIONS] --pool-id <POOL> <ORGANIZATION> <RUNNER>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
   <RUNNER>        Runner ID or exact name
 
 Options:
-      --pool <POOL>                    Runner pool ID or exact name
+      --pool-id <POOL>                 Runner pool ID or exact name
       --json                           Print the runner result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections

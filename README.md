@@ -1013,7 +1013,7 @@ invitation history, and revoke an outstanding invitation:
 ```sh
 # Issue to exactly one target kind.
 scherzo-cloud organization invitation issue acme-labs \
-  --principal prn_01k0z6r1w8f4jy2m7q9v3x5abc
+  --principal-id prn_01k0z6r1w8f4jy2m7q9v3x5abc
 scherzo-cloud organization invitation issue acme-labs \
   --email teammate@example.com
 
@@ -1204,7 +1204,7 @@ scherzo-cloud runner pool list acme-labs
 ```
 
 Create a project from one discovered repository. Omit `--default-branch` to select the
-provider-observed default branch, and omit `--pool` to create a valid project
+provider-observed default branch, and omit `--pool-id` to create a valid project
 that reports `runner_pool_unassigned` until configured:
 
 ```sh
@@ -1213,7 +1213,7 @@ scherzo-cloud project create acme-labs \
   --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
   --repository-id 123456789 \
   --default-branch release \
-  --pool rpl_01k0z6r1w8f4jy2m7q9v3x5abc
+  --pool-id rpl_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Page projects and show one complete configuration and readiness projection.
 scherzo-cloud project list acme-labs --limit 50

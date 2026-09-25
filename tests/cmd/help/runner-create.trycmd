@@ -2,13 +2,13 @@
 $ scherzo-cloud runner create --help
 Create a runner registration and enrollment activation
 
-Usage: scherzo-cloud runner create [OPTIONS] --pool <POOL> --activation-file <PATH|-> <ORGANIZATION>
+Usage: scherzo-cloud runner create [OPTIONS] --pool-id <POOL> --activation-file <PATH|-> <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
 
 Options:
-      --pool <POOL>                    Runner pool ID or exact name
+      --pool-id <POOL>                 Runner pool ID or exact name
       --name <NAME>                    Set the exact runner name
       --activation-file <PATH|->       Create the protected artifact file, or write only the artifact to stdout
       --json                           Print the runner result as JSON

@@ -76,7 +76,7 @@ struct CreateCommand {
     #[command(flatten)]
     repository: RepositorySelectionArgs,
 
-    #[arg(long, value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
+    #[arg(long = "pool-id", value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
     pool: Option<PoolArg>,
 
     #[command(flatten)]

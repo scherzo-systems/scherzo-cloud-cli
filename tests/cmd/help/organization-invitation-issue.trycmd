@@ -2,13 +2,13 @@
 $ scherzo-cloud organization invitation issue --help
 Issue an organization invitation
 
-Usage: scherzo-cloud organization invitation issue [OPTIONS] <--principal <PRINCIPAL>|--email <EMAIL>> <ORGANIZATION>
+Usage: scherzo-cloud organization invitation issue [OPTIONS] <--principal-id <PRINCIPAL>|--email <EMAIL>> <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
 
 Options:
-      --principal <PRINCIPAL>          Invite an exact active principal ID
+      --principal-id <PRINCIPAL>       Invite an exact active principal ID
       --email <EMAIL>                  Invite one email address
       --json                           Print the invitation result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input

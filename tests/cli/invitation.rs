@@ -133,7 +133,7 @@ fn organization_invitation_issue_sends_target_and_idempotency_key() {
             "invitation",
             "issue",
             ORG_ID,
-            "--principal",
+            "--principal-id",
             PRINCIPAL_ID,
             "--json",
             "--allow-insecure-http",
