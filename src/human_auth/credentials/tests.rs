@@ -251,12 +251,13 @@ fn rotated_refresh_replacement_is_atomic_and_rejects_a_stale_overwrite() {
 
     let rotated = fixture
         .store
-        .replace_if_refresh_token_matches(
+        .replace_if_refresh_token_matches_until(
             &deployment,
             "first-refresh",
             "second-access",
             expiration,
             "second-refresh",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -265,12 +266,13 @@ fn rotated_refresh_replacement_is_atomic_and_rejects_a_stale_overwrite() {
 
     let retained = fixture
         .store
-        .replace_if_refresh_token_matches(
+        .replace_if_refresh_token_matches_until(
             &deployment,
             "first-refresh",
             "stale-access",
             expiration,
             "stale-refresh",
+            None,
         )
         .unwrap()
         .unwrap();

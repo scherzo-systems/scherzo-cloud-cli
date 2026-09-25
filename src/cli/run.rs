@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
@@ -8,12 +8,12 @@ use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::human_auth::deployment::Deployment;
-#[cfg(test)]
-use scherzo_cloud_api::HttpClient;
 use scherzo_cloud_api::{
-    CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunFailure,
-    RunObservation, RunRead, RunState,
+    CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunCancellationMode,
+    RunCancellationResolutionKind, RunFailure, RunObservation, RunState,
 };
+#[cfg(test)]
+use scherzo_cloud_api::{HttpClient, RunRead};
 use scherzo_cloud_execution::visible_text;
 
 use super::{OrganizationArg, ProjectArg};
@@ -21,6 +21,31 @@ use super::{OrganizationArg, ProjectArg};
 mod acquisition;
 mod input_set;
 mod inputs;
+mod observation;
+mod output;
+use output::{CloudOutput, CloudSnapshot};
+
+// Keep the closed envelope fields grouped at the rendering boundary, without
+// repeating its context at every signal, timeout and completion call site.
+macro_rules! write_cloud {
+    ($operation:expr, $deployment:expr, $organization:expr, $snapshot:expr,
+     $outcome:expr, $error:expr, $key:expr, $mode:expr, $json:expr, $exit:expr $(,)?) => {
+        output::write_cloud(
+            CloudOutput {
+                operation: $operation,
+                deployment: $deployment,
+                organization: $organization,
+                snapshot: $snapshot,
+                json: $json,
+            },
+            $outcome,
+            $error,
+            $key,
+            $mode,
+            $exit,
+        )
+    };
+}
 
 pub(super) const ABOUT: &str = "Work with Scherzo Cloud runs";
 const NAME: &str = "run";
@@ -33,6 +58,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum RunCommand {
+    #[command(about = "Request cancellation of a Scherzo Cloud run")]
+    Cancel(CancelCommand),
     #[command(about = "Create a Scherzo Cloud run")]
     Create(CreateCommand),
     #[command(about = inputs::ABOUT)]
@@ -41,8 +68,6 @@ enum RunCommand {
     InputSet(input_set::Command),
     #[command(about = "Show a Scherzo Cloud run")]
     Show(ShowCommand),
-    #[command(about = "Wait for a Scherzo Cloud run")]
-    Wait(WaitCommand),
 }
 
 type RunOptions = super::CommonArgs<super::RunJson, super::PrincipalAuthenticationArgs>;
@@ -108,7 +133,19 @@ struct CreateCommand {
     integration_context_file: Option<PathBuf>,
 
     #[command(flatten)]
+    wait: RunWaitArgs,
+
+    #[command(flatten)]
     options: RunOptions,
+}
+
+#[derive(Debug, Args)]
+struct RunWaitArgs {
+    #[arg(long, help = "Observe the run until it settles")]
+    wait: bool,
+    #[arg(long, requires = "wait", value_name = "DURATION", value_parser = super::parse_wait_timeout,
+        help = "Stop waiting after a positive duration (units: ms, s, m, or h)")]
+    timeout: Option<Duration>,
 }
 
 #[derive(Debug, Args)]
@@ -124,19 +161,26 @@ struct RunReference {
 struct ShowCommand {
     #[command(flatten)]
     run: RunReference,
-
+    #[command(flatten)]
+    wait: RunWaitArgs,
     #[command(flatten)]
     options: RunOptions,
 }
 
 #[derive(Debug, Args)]
-struct WaitCommand {
+struct CancelCommand {
     #[command(flatten)]
     run: RunReference,
-
+    #[arg(
+        long,
+        help = "Request immediate containment instead of graceful stopping"
+    )]
+    force: bool,
+    #[arg(long, value_name = "KEY", value_parser = super::publication::parse_idempotency_key,
+        help = "Reuse this key to reconcile an uncertain request")]
+    idempotency_key: Option<String>,
     #[command(flatten)]
-    wait: super::WaitTimeoutArgs,
-
+    wait: RunWaitArgs,
     #[command(flatten)]
     options: RunOptions,
 }
@@ -159,10 +203,10 @@ impl Command {
                 "configure Scherzo Cloud run access",
                 |command, deployment| command.execute(deployment.clone()),
             ),
-            Some(RunCommand::Wait(command)) => super::execute_deployment_command(
+            Some(RunCommand::Cancel(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud run observation",
+                "configure Scherzo Cloud run cancellation",
                 |command, deployment| command.execute(deployment.clone()),
             ),
         }
@@ -183,11 +227,12 @@ impl CreateInputSetOwnership {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum CreateRecoveryState {
     BeforeRunDispatch(Option<CreateInputSetOwnership>),
     InputSetAllocationDispatched,
-    RunDispatched(Option<CreateInputSetOwnership>),
+    RunDispatched(Option<CreateInputSetOwnership>, Option<String>),
+    Accepted(CloudSnapshot),
 }
 
 impl CreateRecoveryState {
@@ -210,31 +255,43 @@ impl CreateRecoveryState {
 
     fn run_dispatched(&self) -> Self {
         match self {
-            Self::BeforeRunDispatch(input_set) | Self::RunDispatched(input_set) => {
-                Self::RunDispatched(input_set.clone())
+            Self::BeforeRunDispatch(input_set) | Self::RunDispatched(input_set, _) => {
+                Self::RunDispatched(input_set.clone(), None)
             }
-            Self::InputSetAllocationDispatched => Self::RunDispatched(None),
+            Self::InputSetAllocationDispatched => Self::RunDispatched(None, None),
+            Self::Accepted(snapshot) => Self::Accepted(snapshot.clone()),
+        }
+    }
+
+    fn with_run_key(self, key: &str) -> Self {
+        match self {
+            Self::RunDispatched(input_set, _) => {
+                Self::RunDispatched(input_set, Some(key.to_owned()))
+            }
+            other => other,
         }
     }
 
     fn input_set_id(&self) -> Option<&str> {
         match self {
-            Self::BeforeRunDispatch(Some(input_set)) | Self::RunDispatched(Some(input_set)) => {
+            Self::BeforeRunDispatch(Some(input_set)) | Self::RunDispatched(Some(input_set), _) => {
                 Some(input_set.id())
             }
             Self::BeforeRunDispatch(None)
             | Self::InputSetAllocationDispatched
-            | Self::RunDispatched(None) => None,
+            | Self::RunDispatched(None, _)
+            | Self::Accepted(_) => None,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum CreateSignalRecovery {
     None,
     InputSetUnknown,
     InputSet(String),
-    Run(Option<String>),
+    Run(Option<String>, Option<String>),
+    Accepted(CloudSnapshot),
 }
 
 fn create_signal_recovery(
@@ -249,9 +306,10 @@ fn create_signal_recovery(
             input_set_id,
         ))) => CreateSignalRecovery::InputSet(input_set_id),
         CreateRecoveryState::BeforeRunDispatch(_) => CreateSignalRecovery::None,
-        CreateRecoveryState::RunDispatched(input_set) => {
-            CreateSignalRecovery::Run(input_set.map(|input_set| input_set.id().to_owned()))
+        CreateRecoveryState::RunDispatched(input_set, key) => {
+            CreateSignalRecovery::Run(input_set.map(|input_set| input_set.id().to_owned()), key)
         }
+        CreateRecoveryState::Accepted(snapshot) => CreateSignalRecovery::Accepted(snapshot),
     }
 }
 
@@ -260,6 +318,40 @@ fn finish_operation<R>(
     write_result: impl FnOnce() -> anyhow::Result<ExitCode>,
 ) -> super::CommandResult {
     super::complete_operation(control, || write_result().map_err(Into::into))
+}
+
+fn start_cloud_observation(
+    timeout_start: &super::DeferredObservationTimeoutStart,
+) -> (super::SystemObservationClock, std::time::Instant) {
+    timeout_start.start();
+    (
+        super::SystemObservationClock,
+        scherzo_cloud_support::monotonic_now(),
+    )
+}
+
+fn finish_accepted<R>(
+    control: &super::OperationControl<R>,
+    operation: &'static str,
+    deployment: &Deployment,
+    organization: &str,
+    snapshot: &CloudSnapshot,
+    json: bool,
+) -> super::CommandResult {
+    finish_operation(control, || {
+        write_cloud!(
+            operation,
+            deployment.fingerprint().api_url(),
+            organization,
+            snapshot,
+            "accepted",
+            None,
+            None,
+            None,
+            json,
+            ExitCode::Success,
+        )
+    })
 }
 
 fn write_api_outcome<T>(
@@ -276,65 +368,84 @@ fn write_api_outcome<T>(
     }
 }
 
-fn finish_create(
-    deployment: &Deployment,
-    organization: &str,
-    input_set_id: Option<&str>,
-    result: Result<scherzo_cloud_api::RunCreationAcceptance, RunFailure>,
-    authentication: super::PrincipalAuthenticationKind,
-    json: bool,
-    control: &super::OperationControl<CreateRecoveryState>,
-) -> super::CommandResult {
-    finish_operation(control, || {
-        write_create(
-            deployment.fingerprint().api_url(),
-            organization,
-            input_set_id,
-            result,
-            authentication,
-            json,
-        )
-    })
-}
-
 impl CreateCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         let recovery = CreateRecoveryState::new(self.input_set_id.as_deref());
         let signal_deployment = deployment.clone();
         let signal_organization = self.organization.clone();
         let signal_json = self.options.json;
-        super::execute_mutation_with_signals(
+        let timeout = self.wait.timeout.filter(|_| self.wait.wait);
+        let timeout_deployment = signal_deployment.clone();
+        let timeout_organization = signal_organization.clone();
+        super::execute_mutation_with_signals_and_deferred_timeout(
             "Cloud run creation",
             recovery,
-            move |control| self.execute_blocking(&deployment, control),
+            timeout,
+            move |control, timeout_start| {
+                self.execute_blocking(&deployment, control, timeout_start)
+            },
             move |signal, snapshot| match create_signal_recovery(snapshot) {
-                CreateSignalRecovery::Run(input_set_id) => write_create_unknown(
+                CreateSignalRecovery::Run(input_set_id, key) => write_create_unknown(
                     signal_deployment.fingerprint().api_url(),
                     &signal_organization,
                     input_set_id.as_deref(),
+                    key.as_deref(),
                     signal_json,
                     signal,
                 )
                 .map_err(Into::into),
-                CreateSignalRecovery::InputSetUnknown => write_resource_mutation_unknown(
-                    "Run Input Set creation",
+                recovery @ (CreateSignalRecovery::InputSet(_)
+                | CreateSignalRecovery::InputSetUnknown
+                | CreateSignalRecovery::None) => {
+                    if let CreateSignalRecovery::InputSet(input_set_id) = recovery {
+                        write_staging_recovery(&signal_organization, &input_set_id)?;
+                        if !signal_json {
+                            return Ok(signal);
+                        }
+                    }
+                    write_cloud!(
+                        "create",
+                        signal_deployment.fingerprint().api_url(),
+                        &signal_organization,
+                        &CloudSnapshot::default(),
+                        "acceptance_unknown",
+                        Some("acceptance_unknown"),
+                        None,
+                        None,
+                        signal_json,
+                        signal,
+                    )
+                    .map_err(Into::into)
+                }
+                CreateSignalRecovery::Accepted(snapshot) => write_cloud!(
+                    "create",
                     signal_deployment.fingerprint().api_url(),
                     &signal_organization,
-                    "input set",
+                    &snapshot,
+                    "observation_stopped",
+                    Some("observation_stopped"),
+                    None,
                     None,
                     signal_json,
                     signal,
                 )
                 .map_err(Into::into),
-                CreateSignalRecovery::InputSet(input_set_id) => write_input_set_recovery(
-                    signal_deployment.fingerprint().api_url(),
-                    &signal_organization,
-                    &input_set_id,
+            },
+            move |snapshot| match snapshot.recovery {
+                CreateRecoveryState::Accepted(snapshot) => write_cloud!(
+                    "create",
+                    timeout_deployment.fingerprint().api_url(),
+                    &timeout_organization,
+                    &snapshot,
+                    "timed_out",
+                    Some("wait_timed_out"),
+                    None,
+                    None,
                     signal_json,
-                    signal,
+                    ExitCode::GeneralFailure,
                 )
                 .map_err(Into::into),
-                CreateSignalRecovery::None => Ok(signal),
+                _ => Ok(ExitCode::GeneralFailure),
             },
         )
     }
@@ -343,6 +454,7 @@ impl CreateCommand {
         self,
         deployment: &Deployment,
         control: &super::OperationControl<CreateRecoveryState>,
+        timeout_start: &super::DeferredObservationTimeoutStart,
     ) -> super::CommandResult {
         if let Err(error) = acquisition::validate_standard_input_claims(
             &self.inputs,
@@ -397,7 +509,7 @@ impl CreateCommand {
         }
 
         let input_set_id = if let Some(acquired) = acquired.as_ref() {
-            let staged = input_set::stage_and_seal(
+            let staged = match input_set::stage_and_seal(
                 deployment,
                 self.options.http.transport_policy(),
                 &self.options.authentication,
@@ -405,20 +517,49 @@ impl CreateCommand {
                 &self.project_id,
                 acquired,
                 control,
-            )?;
+            ) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    let recovery = control.recovery();
+                    return finish_operation(control, || {
+                        writeln!(
+                            io::stderr().lock(),
+                            "error: stage Run Input Set: {}\n\nResolve this error before creating another run.",
+                            visible_text(&format!("{error:#}"))
+                        )?;
+                        if let Some(input_set_id) = recovery.input_set_id() {
+                            write_staging_guidance(&self.organization, input_set_id)?;
+                        }
+                        write_cloud!(
+                            "create",
+                            deployment.fingerprint().api_url(),
+                            &self.organization,
+                            &CloudSnapshot::default(),
+                            "error",
+                            Some("submission_failed"),
+                            None,
+                            None,
+                            self.options.json,
+                            ExitCode::GeneralFailure,
+                        )
+                    });
+                }
+            };
             match staged {
                 Ok(sealed) => sealed.id,
                 Err(failure) => {
                     let recovery = control.recovery();
-                    return finish_create(
-                        deployment,
-                        &self.organization,
-                        recovery.input_set_id(),
-                        Err(failure),
-                        self.options.authentication.kind(),
-                        self.options.json,
-                        control,
-                    );
+                    return finish_operation(control, || {
+                        write_create(
+                            deployment.fingerprint().api_url(),
+                            &self.organization,
+                            recovery.input_set_id(),
+                            (None, false),
+                            Err(failure),
+                            self.options.authentication.kind(),
+                            self.options.json,
+                        )
+                    });
                 }
             }
         } else {
@@ -429,7 +570,10 @@ impl CreateCommand {
             return Ok(ExitCode::GeneralFailure);
         }
 
-        let dispatch_recovery = control.recovery().run_dispatched();
+        let dispatch_recovery = control
+            .recovery()
+            .run_dispatched()
+            .with_run_key(&run_idempotency_key);
         // Run dispatch owns cancellation recovery and a run-specific request envelope; it stays
         // explicit rather than sharing project creation's superficially similar API call.
         // jscpd:ignore-start
@@ -452,70 +596,308 @@ impl CreateCommand {
                     || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
                 )
             },
-        )?;
+        );
         // jscpd:ignore-end
-        finish_create(
-            deployment,
-            &self.organization,
-            input_set_id.as_deref(),
-            result,
-            self.options.authentication.kind(),
-            self.options.json,
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let recovery = control.recovery();
+                let dispatched = matches!(recovery, CreateRecoveryState::RunDispatched(_, _));
+                return finish_operation(control, || {
+                    if let Some(input_set_id) = recovery.input_set_id() {
+                        write_staging_guidance(&self.organization, input_set_id)?;
+                    }
+                    write_cloud!(
+                        "create",
+                        deployment.fingerprint().api_url(),
+                        &self.organization,
+                        &CloudSnapshot::default(),
+                        if dispatched {
+                            "acceptance_unknown"
+                        } else {
+                            "error"
+                        },
+                        Some(if dispatched {
+                            "acceptance_unknown"
+                        } else {
+                            "submission_failed"
+                        }),
+                        dispatched.then_some(run_idempotency_key.as_str()),
+                        None,
+                        self.options.json,
+                        if dispatched {
+                            ExitCode::Unavailable
+                        } else {
+                            ExitCode::GeneralFailure
+                        },
+                    )
+                });
+            }
+        };
+        let acceptance = match result {
+            Ok(acceptance) => acceptance,
+            Err(failure) => {
+                return finish_operation(control, || {
+                    write_create(
+                        deployment.fingerprint().api_url(),
+                        &self.organization,
+                        input_set_id.as_deref(),
+                        (
+                            Some(&run_idempotency_key),
+                            matches!(control.recovery(), CreateRecoveryState::RunDispatched(_, _)),
+                        ),
+                        Err(failure),
+                        self.options.authentication.kind(),
+                        self.options.json,
+                    )
+                });
+            }
+        };
+        let mut snapshot = CloudSnapshot::for_run(acceptance.run_id);
+        snapshot.replayed = Some(acceptance.replayed);
+        if !control.update_recovery(CreateRecoveryState::Accepted(snapshot.clone())) {
+            return Ok(ExitCode::GeneralFailure);
+        }
+        if !self.wait.wait {
+            return finish_accepted(
+                control,
+                "create",
+                deployment,
+                &self.organization,
+                &snapshot,
+                self.options.json,
+            );
+        }
+        let (clock, started) = start_cloud_observation(timeout_start);
+        let result = observation::wait_run(
+            observation::ObservationContext {
+                deployment,
+                options: &self.options,
+                organization: &self.organization,
+                snapshot: &snapshot,
+                timeout: self.wait.timeout,
+                started,
+            },
             control,
+            &clock,
+            |latest| {
+                control.update_recovery(CreateRecoveryState::Accepted(latest));
+            },
+        );
+        finish_cloud_observation(
+            deployment.fingerprint().api_url(),
+            "create",
+            &self.organization,
+            result,
+            control,
+            || {
+                (
+                    match control.recovery() {
+                        CreateRecoveryState::Accepted(latest) => latest,
+                        _ => snapshot.clone(),
+                    },
+                    None,
+                    None,
+                )
+            },
+            self.options.json,
         )
     }
 }
 
 impl ShowCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
-        super::execute_read_only_with_signals("Cloud run show", move |control| {
-            self.execute_blocking(&deployment, control)
-        })
-    }
-
-    fn execute_blocking(
-        self,
-        deployment: &Deployment,
-        control: &super::OperationControl<()>,
-    ) -> super::CommandResult {
-        let result = with_api(
-            deployment,
-            self.options.http.transport_policy(),
-            &self.options.authentication,
-            |api| api.get(&self.run.organization, &self.run.run_id),
-        )?;
-        super::complete_read_only_output(control, || {
-            write_show(
-                deployment.fingerprint().api_url(),
-                &self.run.organization,
-                &self.run.run_id,
-                result,
-                self.options.authentication.kind(),
-                self.options.json,
-            )
-            .map_err(Into::into)
-        })
+        let initial = CloudSnapshot::for_run(self.run.run_id.clone());
+        let signal_deployment = deployment.clone();
+        let timeout_deployment = deployment.clone();
+        let organization = self.run.organization.clone();
+        let signal_organization = organization.clone();
+        let timeout_organization = organization.clone();
+        let json = self.options.json;
+        let timeout = self.wait.timeout.filter(|_| self.wait.wait);
+        super::execute_mutation_with_signals_and_deferred_timeout(
+            "Cloud run show",
+            initial,
+            timeout,
+            move |control, timeout_start| {
+                timeout_start.start();
+                let clock = super::SystemObservationClock;
+                let started = scherzo_cloud_support::monotonic_now();
+                let snapshot = control.recovery();
+                if self.wait.wait {
+                    let result = observation::wait_run(
+                        observation::ObservationContext {
+                            deployment: &deployment,
+                            options: &self.options,
+                            organization: &self.run.organization,
+                            snapshot: &snapshot,
+                            timeout: self.wait.timeout,
+                            started,
+                        },
+                        control,
+                        &clock,
+                        |latest| {
+                            control.update_recovery(latest);
+                        },
+                    );
+                    finish_cloud_observation(
+                        deployment.fingerprint().api_url(),
+                        "show",
+                        &self.run.organization,
+                        result,
+                        control,
+                        || (control.recovery(), None, None),
+                        self.options.json,
+                    )
+                } else {
+                    let result = observation::show_once(
+                        &deployment,
+                        &self.options,
+                        &self.run.organization,
+                        &self.run.run_id,
+                    );
+                    if let Ok(snapshot) = &result {
+                        control.update_recovery(snapshot.clone());
+                    }
+                    finish_operation(control, || match result {
+                        Ok(snapshot) => write_cloud!(
+                            "show",
+                            deployment.fingerprint().api_url(),
+                            &self.run.organization,
+                            &snapshot,
+                            if snapshot.run.is_some() {
+                                "found"
+                            } else {
+                                "accepted"
+                            },
+                            None,
+                            None,
+                            None,
+                            self.options.json,
+                            ExitCode::Success,
+                        ),
+                        Err(failure) => {
+                            let (code, exit) =
+                                failure_code(&failure, self.options.authentication.kind());
+                            write_cloud!(
+                                "show",
+                                deployment.fingerprint().api_url(),
+                                &self.run.organization,
+                                &CloudSnapshot::for_run(&self.run.run_id),
+                                "error",
+                                Some(code),
+                                None,
+                                None,
+                                self.options.json,
+                                exit,
+                            )
+                        }
+                    })
+                }
+            },
+            move |signal, snapshot| {
+                write_cloud!(
+                    "show",
+                    signal_deployment.fingerprint().api_url(),
+                    &signal_organization,
+                    &snapshot.recovery,
+                    "observation_stopped",
+                    Some("observation_stopped"),
+                    None,
+                    None,
+                    json,
+                    signal,
+                )
+                .map_err(Into::into)
+            },
+            move |snapshot| {
+                write_cloud!(
+                    "show",
+                    timeout_deployment.fingerprint().api_url(),
+                    &timeout_organization,
+                    &snapshot.recovery,
+                    "timed_out",
+                    Some("wait_timed_out"),
+                    None,
+                    None,
+                    json,
+                    ExitCode::GeneralFailure,
+                )
+                .map_err(Into::into)
+            },
+        )
     }
 }
 
-impl WaitCommand {
-    fn execute(self, deployment: Deployment) -> super::CommandResult {
-        let timeout = self.wait.timeout;
-        let timeout_deployment = deployment.fingerprint().api_url().to_owned();
-        let timeout_organization = self.run.organization.clone();
-        let timeout_run_id = self.run.run_id.clone();
-        let timeout_json = self.options.json;
+#[derive(Clone, Debug)]
+struct CancelRecovery {
+    key: String,
+    mode: &'static str,
+    accepted: bool,
+    snapshot: CloudSnapshot,
+}
 
-        super::execute_observation_with_signals_and_timeout(
-            "Cloud run wait",
+impl CancelCommand {
+    fn execute(self, deployment: Deployment) -> super::CommandResult {
+        let key = match self.idempotency_key.clone() {
+            Some(key) => key,
+            None => scherzo_cloud_support::generate_idempotency_key()
+                .context("generate Cloud cancellation request identity")?,
+        };
+        let mode = if self.force { "force" } else { "graceful" };
+        let recovery = CancelRecovery {
+            key,
+            mode,
+            accepted: false,
+            snapshot: CloudSnapshot::for_run(self.run.run_id.clone()),
+        };
+        let signal_deployment = deployment.clone();
+        let timeout_deployment = deployment.clone();
+        let signal_organization = self.run.organization.clone();
+        let timeout_organization = signal_organization.clone();
+        let json = self.options.json;
+        let timeout = self.wait.timeout.filter(|_| self.wait.wait);
+        super::execute_mutation_with_signals_and_deferred_timeout(
+            "Cloud run cancellation",
+            recovery,
             timeout,
-            move |control| self.execute_blocking(&deployment, control),
-            move || {
-                write_wait_timeout(
-                    &timeout_deployment,
+            move |control, timeout_start| {
+                self.execute_blocking(&deployment, control, timeout_start)
+            },
+            move |signal, snapshot| {
+                let recovery = snapshot.recovery;
+                let (outcome, code) = if recovery.accepted {
+                    ("observation_stopped", "observation_stopped")
+                } else {
+                    ("acceptance_unknown", "acceptance_unknown")
+                };
+                write_cloud!(
+                    "cancel",
+                    signal_deployment.fingerprint().api_url(),
+                    &signal_organization,
+                    &recovery.snapshot,
+                    outcome,
+                    Some(code),
+                    Some(&recovery.key),
+                    Some(recovery.mode),
+                    json,
+                    signal,
+                )
+                .map_err(Into::into)
+            },
+            move |snapshot| {
+                let recovery = snapshot.recovery;
+                write_cloud!(
+                    "cancel",
+                    timeout_deployment.fingerprint().api_url(),
                     &timeout_organization,
-                    &timeout_run_id,
-                    timeout_json,
+                    &recovery.snapshot,
+                    "timed_out",
+                    Some("wait_timed_out"),
+                    Some(&recovery.key),
+                    Some(recovery.mode),
+                    json,
+                    ExitCode::GeneralFailure,
                 )
                 .map_err(Into::into)
             },
@@ -525,58 +907,301 @@ impl WaitCommand {
     fn execute_blocking(
         self,
         deployment: &Deployment,
-        control: &super::BlockingObservationControl,
+        control: &super::OperationControl<CancelRecovery>,
+        timeout_start: &super::DeferredObservationTimeoutStart,
     ) -> super::CommandResult {
-        let clock = super::SystemObservationClock;
+        let recovery = control.recovery();
+        let mode = if self.force {
+            RunCancellationMode::Force
+        } else {
+            RunCancellationMode::Graceful
+        };
         let result = with_api(
             deployment,
             self.options.http.transport_policy(),
             &self.options.authentication,
             |api| {
-                wait_for_terminal_run(
-                    api,
+                api.cancel(
                     &self.run.organization,
                     &self.run.run_id,
-                    self.wait.timeout,
-                    control,
-                    &clock,
+                    &recovery.key,
+                    mode,
+                    || control.begin_dispatch(),
                 )
             },
-        )?;
-        if !control.begin_completion() {
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let dispatched = control.dispatched();
+                return finish_operation(control, || {
+                    write_cloud!(
+                        "cancel",
+                        deployment.fingerprint().api_url(),
+                        &self.run.organization,
+                        &recovery.snapshot,
+                        if dispatched {
+                            "acceptance_unknown"
+                        } else {
+                            "error"
+                        },
+                        Some(if dispatched {
+                            "acceptance_unknown"
+                        } else {
+                            "submission_failed"
+                        }),
+                        Some(&recovery.key),
+                        Some(recovery.mode),
+                        self.options.json,
+                        if dispatched {
+                            ExitCode::Unavailable
+                        } else {
+                            ExitCode::GeneralFailure
+                        },
+                    )
+                });
+            }
+        };
+        let envelope = match result {
+            Ok(envelope) => envelope,
+            Err(failure) => {
+                return finish_operation(control, || {
+                    write_cancel_failure(
+                        deployment.fingerprint().api_url(),
+                        &self.run.organization,
+                        &recovery,
+                        &failure,
+                        control.dispatched(),
+                        self.options.authentication.kind(),
+                        self.options.json,
+                    )
+                });
+            }
+        };
+        let mut snapshot = recovery.snapshot.clone();
+        snapshot.run = envelope.run;
+        snapshot.cancellation_request = Some(envelope.request);
+        let accepted = CancelRecovery {
+            accepted: true,
+            snapshot: snapshot.clone(),
+            ..recovery
+        };
+        if !control.update_recovery(accepted.clone()) {
             return Ok(ExitCode::GeneralFailure);
         }
-        match result {
-            Ok(WaitObservation::Terminal { resource, state }) => write_wait_terminal(
-                deployment.fingerprint().api_url(),
-                &resource,
-                state,
-                self.options.json,
-            ),
-            Ok(WaitObservation::TimedOut) => write_wait_timeout(
-                deployment.fingerprint().api_url(),
+        if !self.wait.wait {
+            return finish_accepted(
+                control,
+                "cancel",
+                deployment,
                 &self.run.organization,
-                &self.run.run_id,
+                &snapshot,
                 self.options.json,
-            ),
-            Ok(WaitObservation::Stopped) => Ok(ExitCode::GeneralFailure),
-            Err(failure) => write_failure(
-                deployment.fingerprint().api_url(),
-                &self.run.organization,
-                Some(&self.run.run_id),
-                &failure,
-                self.options.authentication.kind(),
-                self.options.json,
-            ),
+            );
         }
-        .map_err(Into::into)
+        let (clock, started) = start_cloud_observation(timeout_start);
+        let result = observation::wait_cancellation(
+            observation::ObservationContext {
+                deployment,
+                options: &self.options,
+                organization: &self.run.organization,
+                snapshot: &snapshot,
+                timeout: self.wait.timeout,
+                started,
+            },
+            control,
+            &clock,
+            |latest| {
+                control.update_recovery(CancelRecovery {
+                    snapshot: latest,
+                    ..accepted.clone()
+                });
+            },
+        );
+        finish_cloud_observation(
+            deployment.fingerprint().api_url(),
+            "cancel",
+            &self.run.organization,
+            result,
+            control,
+            || {
+                let recovery = control.recovery();
+                (recovery.snapshot, Some(recovery.key), Some(recovery.mode))
+            },
+            self.options.json,
+        )
     }
 }
 
+fn finish_cloud_observation<R, S>(
+    deployment: &str,
+    operation: &'static str,
+    organization: &str,
+    result: Result<super::TerminalObservation<CloudSnapshot, S>, RunFailure>,
+    control: &super::OperationControl<R>,
+    latest: impl Fn() -> (CloudSnapshot, Option<String>, Option<&'static str>),
+    json: bool,
+) -> super::CommandResult {
+    finish_operation(control, || match result {
+        Ok(super::TerminalObservation::Terminal { resource, .. }) => {
+            let rejected = operation == "cancel"
+                && resource
+                    .cancellation_request
+                    .as_deref()
+                    .and_then(|receipt| receipt.resolution.as_deref())
+                    .is_some_and(|resolution| {
+                        resolution.kind == RunCancellationResolutionKind::CreationRejected
+                    });
+            if rejected {
+                let (_, key, mode) = latest();
+                return write_cloud!(
+                    operation,
+                    deployment,
+                    organization,
+                    &resource,
+                    "error",
+                    Some("creation_rejected"),
+                    key.as_deref(),
+                    mode,
+                    json,
+                    ExitCode::GeneralFailure,
+                );
+            }
+            let exit = if operation == "create"
+                && resource.run.as_deref().is_some_and(|run| {
+                    run.state != RunState::Succeeded
+                        || run.publication.as_deref().is_some_and(|handoff| {
+                            handoff.state == scherzo_cloud_api::RunPublicationHandoffState::Failed
+                        })
+                        || resource.publication.as_deref().is_some_and(|publication| {
+                            publication.state != scherzo_cloud_api::PublicationState::Succeeded
+                        })
+                }) {
+                ExitCode::GeneralFailure
+            } else {
+                ExitCode::Success
+            };
+            write_cloud!(
+                operation,
+                deployment,
+                organization,
+                &resource,
+                "settled",
+                None,
+                None,
+                None,
+                json,
+                exit,
+            )
+        }
+        Ok(super::TerminalObservation::TimedOut) => {
+            let (snapshot, key, mode) = latest();
+            write_cloud!(
+                operation,
+                deployment,
+                organization,
+                &snapshot,
+                "timed_out",
+                Some("wait_timed_out"),
+                key.as_deref(),
+                mode,
+                json,
+                ExitCode::GeneralFailure
+            )
+        }
+        Ok(super::TerminalObservation::Stopped) => Ok(ExitCode::GeneralFailure),
+        Err(failure) => {
+            let (code, exit) =
+                failure_code(&failure, super::PrincipalAuthenticationKind::HumanSession);
+            let code = if matches!(failure, RunFailure::Unreachable(_)) {
+                "observation_failed"
+            } else {
+                code
+            };
+            let (snapshot, key, mode) = latest();
+            write_cloud!(
+                operation,
+                deployment,
+                organization,
+                &snapshot,
+                "error",
+                Some(code),
+                key.as_deref(),
+                mode,
+                json,
+                exit
+            )
+        }
+    })
+}
+
+fn failure_code(
+    failure: &RunFailure,
+    _authentication: super::PrincipalAuthenticationKind,
+) -> (&'static str, ExitCode) {
+    match failure {
+        RunFailure::Unauthenticated => {
+            ("authentication_required", ExitCode::AuthenticationRequired)
+        }
+        RunFailure::Forbidden => ("forbidden", ExitCode::GeneralFailure),
+        RunFailure::InvalidInput => ("invalid_input", ExitCode::GeneralFailure),
+        RunFailure::NotFound => ("not_found", ExitCode::GeneralFailure),
+        RunFailure::IdempotencyConflict => ("idempotency_conflict", ExitCode::GeneralFailure),
+        RunFailure::Conflict => ("submission_failed", ExitCode::GeneralFailure),
+        RunFailure::CreationRejected => ("creation_rejected", ExitCode::GeneralFailure),
+        RunFailure::Unreachable(_) => ("unavailable", ExitCode::Unavailable),
+        RunFailure::Protocol { .. } => ("protocol_error", ExitCode::GeneralFailure),
+        RunFailure::Gone | RunFailure::InputUploadRejected | RunFailure::InputDownloadRejected => {
+            ("submission_failed", ExitCode::GeneralFailure)
+        }
+        RunFailure::Interrupted => ("acceptance_unknown", ExitCode::Interrupted),
+    }
+}
+
+fn write_cancel_failure(
+    deployment: &str,
+    organization: &str,
+    recovery: &CancelRecovery,
+    failure: &RunFailure,
+    dispatched: bool,
+    authentication: super::PrincipalAuthenticationKind,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let (outcome, code, exit) = if dispatched
+        && (matches!(
+            failure,
+            RunFailure::Unreachable(category) if *category != scherzo_cloud_api::UnreachableCategory::RateLimited
+        ) || matches!(failure, RunFailure::Protocol { .. }))
+    {
+        (
+            "acceptance_unknown",
+            "acceptance_unknown",
+            ExitCode::Unavailable,
+        )
+    } else {
+        let (code, exit) = failure_code(failure, authentication);
+        ("error", code, exit)
+    };
+    write_cloud!(
+        "cancel",
+        deployment,
+        organization,
+        &recovery.snapshot,
+        outcome,
+        Some(code),
+        Some(&recovery.key),
+        Some(recovery.mode),
+        json,
+        exit,
+    )
+}
+
+#[cfg(test)]
 trait RunObservationApi {
     fn get_run(&self, organization: &str, run_id: &str) -> Result<RunRead, RunFailure>;
 }
 
+#[cfg(test)]
 impl<'a> RunObservationApi for RunApi<'a> {
     fn get_run(&self, organization: &str, run_id: &str) -> Result<RunRead, RunFailure> {
         self.get(organization, run_id)
@@ -592,39 +1217,10 @@ enum TerminalRunState {
     Rejected,
 }
 
-impl TerminalRunState {
-    const fn outcome(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Interrupted => "interrupted",
-            Self::Rejected => "rejected",
-        }
-    }
-
-    const fn heading(self) -> &'static str {
-        match self {
-            Self::Succeeded => "✓ Run succeeded.",
-            Self::Failed => "✗ Run failed.",
-            Self::Cancelled => "✗ Run cancelled.",
-            Self::Interrupted => "✗ Run interrupted.",
-            Self::Rejected => "✗ Run rejected.",
-        }
-    }
-
-    const fn exit_code(self) -> ExitCode {
-        match self {
-            Self::Succeeded => ExitCode::Success,
-            Self::Failed | Self::Cancelled | Self::Interrupted | Self::Rejected => {
-                ExitCode::GeneralFailure
-            }
-        }
-    }
-}
-
+#[cfg(test)]
 type WaitObservation = super::TerminalObservation<Run, TerminalRunState>;
 
+#[cfg(test)]
 fn wait_for_terminal_run(
     api: &impl RunObservationApi,
     organization: &str,
@@ -685,6 +1281,52 @@ fn parse_input_set_id(value: &str) -> Result<String, String> {
     }
 }
 
+fn run_api<'a>(
+    client: &'a scherzo_cloud_api::HttpClient,
+    deployment: &Deployment,
+    access_token: &str,
+    transport_policy: HttpTransportPolicy,
+) -> anyhow::Result<RunApi<'a>> {
+    RunApi::new(
+        deployment.fingerprint().api_url(),
+        access_token,
+        transport_policy,
+        client,
+    )
+    .map_err(|error| anyhow!(error))
+    .context("prepare Cloud run networking")
+}
+
+fn with_api_until<T>(
+    deployment: &Deployment,
+    transport_policy: HttpTransportPolicy,
+    authentication: &super::PrincipalAuthenticationArgs,
+    deadline: Option<Instant>,
+    mut operation: impl FnMut(&RunApi<'_>, Option<Duration>) -> Result<T, RunFailure>,
+) -> anyhow::Result<Result<T, RunFailure>> {
+    let client = super::human_session_client(transport_policy)?;
+    super::execute_selected_api_observation(
+        super::principal_api_context(
+            &client,
+            deployment,
+            authentication,
+            "acquire human session for Cloud run observation",
+        ),
+        |access_token, _remaining| {
+            let api = run_api(&client, deployment, access_token, transport_policy)?;
+            let remaining = match super::observation_http_budget(deadline) {
+                Ok(remaining) => remaining,
+                Err(category) => return Ok(Err(RunFailure::Unreachable(category))),
+            };
+            Ok(operation(&api, remaining))
+        },
+        RunFailure::credential_rejected,
+        || RunFailure::Unauthenticated,
+        RunFailure::Unreachable,
+        deadline,
+    )
+}
+
 fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
@@ -700,14 +1342,7 @@ fn with_api<T>(
             "acquire human session for Cloud run operation",
         ),
         |access_token| {
-            let api = RunApi::new(
-                deployment.fingerprint().api_url(),
-                access_token,
-                transport_policy,
-                &client,
-            )
-            .map_err(|error| anyhow!(error))
-            .context("prepare Cloud run networking")?;
+            let api = run_api(&client, deployment, access_token, transport_policy)?;
             Ok(operation(&api))
         },
         RunFailure::credential_rejected,
@@ -723,15 +1358,18 @@ fn write_input_acquisition_failure(
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     if json {
-        write_json(&FailureResult {
-            schema_version: 1,
+        return write_cloud!(
+            "create",
             deployment,
-            outcome: "invalid_input",
-            organization_ref: organization,
-            run_id: None,
-            input_set_id: None,
-            category: None,
-        })?;
+            organization,
+            &CloudSnapshot::default(),
+            "error",
+            Some("invalid_input"),
+            None,
+            None,
+            true,
+            ExitCode::GeneralFailure,
+        );
     } else {
         writeln!(
             io::stderr().lock(),
@@ -746,22 +1384,29 @@ fn write_create(
     deployment: &str,
     organization: &str,
     input_set_id: Option<&str>,
+    submission: (Option<&str>, bool),
     result: Result<scherzo_cloud_api::RunCreationAcceptance, RunFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
+    let (key, run_dispatched) = submission;
     match result {
         Ok(acceptance) => {
             if json {
-                write_json(&CreateResult {
-                    schema_version: 1,
+                let mut snapshot = CloudSnapshot::for_run(&acceptance.run_id);
+                snapshot.replayed = Some(acceptance.replayed);
+                return write_cloud!(
+                    "create",
                     deployment,
-                    outcome: "accepted",
-                    organization_ref: organization,
-                    run_id: &acceptance.run_id,
-                    input_set_id,
-                    replayed: acceptance.replayed,
-                })?;
+                    organization,
+                    &snapshot,
+                    "accepted",
+                    None,
+                    None,
+                    None,
+                    true,
+                    ExitCode::Success,
+                );
             } else {
                 let stdout = io::stdout();
                 let mut stdout = stdout.lock();
@@ -780,6 +1425,47 @@ fn write_create(
             }
             Ok(ExitCode::Success)
         }
+        Err(failure)
+            if json
+                || (run_dispatched
+                    && matches!(failure,
+                        RunFailure::Unreachable(category) if category != scherzo_cloud_api::UnreachableCategory::RateLimited
+                    ))
+                || (run_dispatched && matches!(failure, RunFailure::Protocol { .. })) =>
+        {
+            let (code, exit) = failure_code(&failure, authentication);
+            let uncertain = run_dispatched
+                && (matches!(failure,
+                RunFailure::Unreachable(category) if category != scherzo_cloud_api::UnreachableCategory::RateLimited)
+                    || matches!(failure, RunFailure::Protocol { .. }));
+            if let Some(input_set_id) = input_set_id {
+                write_staging_guidance(organization, input_set_id)?;
+            }
+            write_cloud!(
+                "create",
+                deployment,
+                organization,
+                &CloudSnapshot::default(),
+                if uncertain {
+                    "acceptance_unknown"
+                } else {
+                    "error"
+                },
+                Some(if uncertain {
+                    "acceptance_unknown"
+                } else {
+                    code
+                }),
+                key,
+                None,
+                json,
+                if uncertain {
+                    ExitCode::Unavailable
+                } else {
+                    exit
+                },
+            )
+        }
         Err(failure) => write_failure_with_input_set(
             deployment,
             organization,
@@ -787,80 +1473,9 @@ fn write_create(
             input_set_id,
             &failure,
             authentication,
-            json,
+            false,
         ),
     }
-}
-
-fn write_show(
-    deployment: &str,
-    organization: &str,
-    requested_run_id: &str,
-    result: Result<RunRead, RunFailure>,
-    authentication: super::PrincipalAuthenticationKind,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    match result {
-        Ok(RunRead::Materialized(run)) => {
-            if json {
-                write_json(&ShowResult {
-                    schema_version: 1,
-                    deployment,
-                    outcome: "found",
-                    run: run.as_ref(),
-                })?;
-            } else {
-                write_run_human(deployment, "✓ Run found.", run.as_ref())?;
-            }
-            Ok(ExitCode::Success)
-        }
-        Ok(RunRead::Pending(pending)) => {
-            if json {
-                write_json(&PendingShowResult {
-                    schema_version: 1,
-                    deployment,
-                    outcome: "pending",
-                    organization_ref: organization,
-                    run_id: &pending.run_id,
-                })?;
-            } else {
-                let stdout = io::stdout();
-                let mut stdout = stdout.lock();
-                writeln!(stdout, "✓ Run creation pending.\n")?;
-                writeln!(stdout, "run: {}", pending.run_id)?;
-                writeln!(stdout, "organization: {organization}")?;
-                writeln!(stdout, "deployment: {deployment}")?;
-            }
-            Ok(ExitCode::Success)
-        }
-        Err(failure) => write_failure(
-            deployment,
-            organization,
-            Some(requested_run_id),
-            &failure,
-            authentication,
-            json,
-        ),
-    }
-}
-
-fn write_wait_terminal(
-    deployment: &str,
-    run: &Run,
-    state: TerminalRunState,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    if json {
-        write_json(&WaitResult {
-            schema_version: 1,
-            deployment,
-            outcome: state.outcome(),
-            run,
-        })?;
-    } else {
-        write_run_human(deployment, state.heading(), run)?;
-    }
-    Ok(state.exit_code())
 }
 
 fn write_observation_human(
@@ -942,32 +1557,6 @@ fn write_observation_human(
         writeln!(out, "  none reported")?;
     }
     Ok(())
-}
-
-fn write_wait_timeout(
-    deployment: &str,
-    organization: &str,
-    run_id: &str,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    if json {
-        write_json(&super::ObservationResult {
-            schema_version: 1,
-            deployment,
-            outcome: "timed_out",
-            organization_ref: organization,
-            run_id,
-            publication_id: None,
-            idempotency_key: None,
-            category: None,
-        })?;
-    } else {
-        writeln!(
-            io::stderr().lock(),
-            "error: Cloud run wait reached its timeout\n\nrun: {run_id}\norganization: {organization}\n\nRun the command again with a longer --timeout, or omit --timeout."
-        )?;
-    }
-    Ok(ExitCode::GeneralFailure)
 }
 
 fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result<()> {
@@ -1102,6 +1691,23 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     } else {
         writeln!(stdout, "  none")?;
     }
+    writeln!(stdout, "\nautomatic publication handoff:")?;
+    if let Some(handoff) = run.publication.as_deref() {
+        writeln!(stdout, "  export: {}", visible_text(&handoff.export_name))?;
+        writeln!(stdout, "  state: {}", enum_text(&handoff.state)?)?;
+        writeln!(
+            stdout,
+            "  publication: {}",
+            handoff.publication_id.as_deref().unwrap_or("none")
+        )?;
+        if let Some(failure) = handoff.failure.as_deref() {
+            writeln!(stdout, "  failure: {}", enum_text(&failure.code)?)?;
+            writeln!(stdout, "  phase: {}", enum_text(&failure.phase)?)?;
+            writeln!(stdout, "  retryable: {}", failure.retryable)?;
+        }
+    } else {
+        writeln!(stdout, "  none")?;
+    }
     writeln!(stdout, "\ninterruption:")?;
     if let Some(interruption) = run.interruption.as_deref() {
         writeln!(stdout, "  phase: {}", enum_text(&interruption.phase)?)?;
@@ -1227,7 +1833,7 @@ fn write_failure_with_input_set(
             "error: Cloud run resource not found or unavailable\n\nCheck the organization and resource identifier, then try again.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
-        RunFailure::Conflict => (
+        RunFailure::Conflict | RunFailure::IdempotencyConflict => (
             "conflict",
             None,
             "error: Cloud run request conflicts with current state\n\nCheck the resource state and try again.".to_owned(),
@@ -1297,27 +1903,52 @@ fn write_failure_with_input_set(
     Ok(class.exit_code())
 }
 
+fn write_staging_guidance(organization: &str, input_set_id: &str) -> anyhow::Result<()> {
+    writeln!(
+        io::stderr().lock(),
+        "input set: {input_set_id}\norganization: {organization}\n\nInspect with `scherzo-cloud run input-set show`; if open, resume upload and sealing, or delete the set explicitly. Reconcile any uncertain run acceptance before creating another run."
+    )?;
+    Ok(())
+}
+
+fn write_staging_recovery(organization: &str, input_set_id: &str) -> anyhow::Result<()> {
+    writeln!(
+        io::stderr().lock(),
+        "error: Run Input Set preparation was interrupted"
+    )?;
+    write_staging_guidance(organization, input_set_id)
+}
+
 fn write_create_unknown(
     deployment: &str,
     organization: &str,
     input_set_id: Option<&str>,
+    key: Option<&str>,
     json: bool,
     exit_code: ExitCode,
 ) -> anyhow::Result<ExitCode> {
     if json {
-        write_json(&UnknownCreateResult {
-            schema_version: 1,
+        if let Some(input_set_id) = input_set_id {
+            write_staging_guidance(organization, input_set_id)?;
+        }
+        return write_cloud!(
+            "create",
             deployment,
-            outcome: "unknown",
-            organization_ref: organization,
-            input_set_id,
-            commitment: "unknown",
-        })?;
+            organization,
+            &CloudSnapshot::default(),
+            "acceptance_unknown",
+            Some("acceptance_unknown"),
+            key,
+            None,
+            true,
+            exit_code,
+        );
     } else {
         writeln!(
             io::stderr().lock(),
-            "error: run acceptance is unknown after interruption\n\norganization: {organization}\ninput set: {}\ncommitment: unknown\n\nThe CLI cannot safely determine whether the run was accepted. Inspect the deployment before creating another run.",
-            input_set_id.unwrap_or("none")
+            "error: run acceptance is unknown after interruption\n\norganization: {organization}\ninput set: {}\nidempotency key: {}\ncommitment: unknown\n\nReconcile this key with the deployment before creating another run.",
+            input_set_id.unwrap_or("none"),
+            key.unwrap_or("not established")
         )?;
     }
     Ok(exit_code)
@@ -1388,47 +2019,6 @@ fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    organization_ref: &'a str,
-    run_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_set_id: Option<&'a str>,
-    replayed: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ShowResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    run: &'a Run,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PendingShowResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    organization_ref: &'a str,
-    run_id: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WaitResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    run: &'a Run,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct FailureResult<'a> {
     schema_version: u8,
     deployment: &'a str,
@@ -1440,18 +2030,6 @@ struct FailureResult<'a> {
     input_set_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UnknownCreateResult<'a> {
-    schema_version: u8,
-    deployment: &'a str,
-    outcome: &'static str,
-    organization_ref: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_set_id: Option<&'a str>,
-    commitment: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1515,27 +2093,8 @@ mod tests {
         for identifier in ["runner-b", "pool-b", "assignment-b", "attempt-a", "build"] {
             assert!(output.contains(identifier), "missing {identifier}");
         }
-        let mut run = run(RunState::Running);
-        run.observation = Some(Box::new(observation));
-        let document = serde_json::to_value(ShowResult {
-            schema_version: 1,
-            deployment: "test",
-            outcome: "found",
-            run: &run,
-        })
-        .expect("serialize run show");
-        assert_eq!(
-            document["run"]["observation"]["assignment"]["runnerConnected"],
-            true
-        );
-        assert_eq!(
-            document["run"]["observation"]["assignment"]["leaseValid"],
-            false
-        );
-        assert_eq!(
-            document["run"]["observation"]["lastTransition"]["attemptId"],
-            "attempt-a"
-        );
+        // The public projection is serialized by the run-show command; the human
+        // rendering must keep placement separate from coordinator progress.
     }
 
     struct ScriptedObservationApi {
@@ -1708,20 +2267,21 @@ mod tests {
         let snapshot = explicit.claim_signal().unwrap();
         assert_eq!(
             snapshot.recovery,
-            CreateRecoveryState::RunDispatched(Some(CreateInputSetOwnership::Explicit(
-                "ris_explicit".to_owned()
-            )))
+            CreateRecoveryState::RunDispatched(
+                Some(CreateInputSetOwnership::Explicit("ris_explicit".to_owned())),
+                None
+            )
         );
         assert_eq!(
             create_signal_recovery(snapshot),
-            CreateSignalRecovery::Run(Some("ris_explicit".to_owned()))
+            CreateSignalRecovery::Run(Some("ris_explicit".to_owned()), None)
         );
 
         let inputless = super::super::OperationControl::new(CreateRecoveryState::new(None));
         assert!(inputless.begin_dispatch_with_recovery(inputless.recovery().run_dispatched()));
         assert_eq!(
             create_signal_recovery(inputless.claim_signal().unwrap()),
-            CreateSignalRecovery::Run(None)
+            CreateSignalRecovery::Run(None, None)
         );
     }
 
@@ -1846,7 +2406,7 @@ mod tests {
             let snapshot = control.claim_signal().unwrap();
             assert_eq!(
                 create_signal_recovery(snapshot),
-                CreateSignalRecovery::Run(Some("ris_explicit".to_owned()))
+                CreateSignalRecovery::Run(Some("ris_explicit".to_owned()), None)
             );
             release_retry.send(()).unwrap();
             assert_interrupted(worker.join().unwrap());
@@ -1855,6 +2415,88 @@ mod tests {
 
         listener.set_nonblocking(true).unwrap();
         assert_no_pending_request(&listener);
+    }
+
+    fn receipt(state: &str, run: Option<Run>) -> scherzo_cloud_api::RunCancellationEnvelope {
+        let resolution = if state == "resolved" {
+            serde_json::json!({"kind":"applied", "resolvedAt":"2026-08-10T12:05:00Z",
+                "effectiveRequestId":"cmd_01k0z6r1w8f4jy2m7q9v3x5abc", "runVersion":1})
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::from_value(serde_json::json!({
+            "request": {"id":"cmd_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "organizationId":"org_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "runId":"run_01k0z6r1w8f4jy2m7q9v3x5abc", "attemptId":null,
+                "mode":"graceful", "acceptedAt":"2026-08-10T12:00:00Z",
+                "state": state, "resolution": resolution},
+            "run": run
+        }))
+        .unwrap()
+    }
+
+    fn scripted_cancellation(
+        responses: impl IntoIterator<
+            Item = Result<scherzo_cloud_api::RunCancellationEnvelope, RunFailure>,
+        >,
+        mut record: impl FnMut(CloudSnapshot),
+    ) -> (
+        Result<super::super::TerminalObservation<CloudSnapshot, ()>, RunFailure>,
+        Vec<Duration>,
+        usize,
+    ) {
+        let mut snapshot = CloudSnapshot::for_run("run_01k0z6r1w8f4jy2m7q9v3x5abc");
+        snapshot.cancellation_request = Some(receipt("pending", None).request);
+        let responses = RefCell::new(responses.into_iter().collect::<VecDeque<_>>());
+        let clock = ControlledWaitClock::new(scherzo_cloud_support::monotonic_now());
+        let result = observation::wait_receipt_with(
+            |_| responses.borrow_mut().pop_front().unwrap(),
+            &snapshot,
+            None,
+            scherzo_cloud_support::monotonic_now(),
+            &super::super::BlockingObservationControl::new(),
+            &clock,
+            &mut record,
+        );
+        (result, clock.into_sleeps(), responses.into_inner().len())
+    }
+
+    #[test]
+    fn cancellation_observation_requires_both_resolved_receipt_and_terminal_run() {
+        let recorded = RefCell::new(Vec::new());
+        let (result, sleeps, remaining) = scripted_cancellation(
+            [
+                Ok(receipt("pending", Some(run(RunState::Succeeded)))),
+                Ok(receipt("resolved", Some(run(RunState::Running)))),
+                Ok(receipt("resolved", Some(run(RunState::Cancelled)))),
+            ],
+            |latest| recorded.borrow_mut().push(latest),
+        );
+        let result = result.unwrap();
+        assert!(
+            matches!(result, super::super::TerminalObservation::Terminal { resource, .. }
+            if resource.run.as_deref().is_some_and(|run| run.state == RunState::Cancelled))
+        );
+        assert_eq!(recorded.borrow().len(), 3);
+        assert_eq!(remaining, 0);
+        assert_eq!(sleeps, vec![Duration::from_secs(2); 2]);
+    }
+
+    #[test]
+    fn cancellation_observation_fails_on_second_consecutive_retryable_error() {
+        let (result, sleeps, remaining) = scripted_cancellation(
+            [
+                Err(RunFailure::Unreachable(UnreachableCategory::Server)),
+                Err(RunFailure::Unreachable(UnreachableCategory::Server)),
+            ],
+            |_| {},
+        );
+        assert!(matches!(
+            result,
+            Err(RunFailure::Unreachable(UnreachableCategory::Server))
+        ));
+        assert_eq!(remaining, 0);
+        assert_eq!(sleeps, vec![Duration::from_secs(2)]);
     }
 
     #[test]

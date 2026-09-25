@@ -561,7 +561,7 @@ enum Command {
     #[command(about = publication::ABOUT)]
     Publication(publication::Command),
     #[command(about = run::ABOUT)]
-    Run(run::Command),
+    Run(Box<run::Command>),
     #[command(about = runner::ABOUT)]
     Runner(runner::Command),
     #[command(about = service_principal::ABOUT)]
@@ -594,7 +594,7 @@ impl Cli {
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Project(command)) => command.execute(),
             Some(Command::Publication(command)) => command.execute(),
-            Some(Command::Run(command)) => command.execute(),
+            Some(Command::Run(command)) => (*command).execute(),
             Some(Command::Version(command)) => command.execute(),
             Some(Command::Runner(command)) => command.execute(),
             Some(Command::ServicePrincipal(command)) => command.execute(),
@@ -1064,7 +1064,26 @@ fn wait_for_terminal_observation<T, S, E>(
     control: &impl ObservationControl,
     clock: &impl ObservationClock,
 ) -> Result<TerminalObservation<T, S>, E> {
-    let started_at = clock.now();
+    wait_for_terminal_observation_bounded(
+        |_| observe(),
+        terminal_state,
+        retryable_failure,
+        timeout,
+        clock.now(),
+        control,
+        clock,
+    )
+}
+
+fn wait_for_terminal_observation_bounded<T, S, E>(
+    mut observe: impl FnMut(Option<Duration>) -> Result<T, E>,
+    terminal_state: impl Fn(&T) -> Option<S>,
+    retryable_failure: impl Fn(&E) -> bool,
+    timeout: Option<Duration>,
+    started_at: Instant,
+    control: &impl ObservationControl,
+    clock: &impl ObservationClock,
+) -> Result<TerminalObservation<T, S>, E> {
     let mut consecutive_failures = 0;
     loop {
         if control.is_stopped() {
@@ -1074,7 +1093,9 @@ fn wait_for_terminal_observation<T, S, E>(
             return Ok(TerminalObservation::TimedOut);
         }
 
-        match observe() {
+        match observe(
+            timeout.and_then(|_| remaining_observation_wait(timeout, started_at, clock.now())),
+        ) {
             Ok(resource) => {
                 consecutive_failures = 0;
                 if let Some(state) = terminal_state(&resource) {
@@ -1531,6 +1552,59 @@ fn execute_selected_api_operation<T, E>(
         unauthenticated,
         unreachable,
     )
+}
+
+// Observation uses one deadline for session acquisition, refresh and every read/retry.
+fn execute_selected_api_observation<T, E>(
+    context: PrincipalApiContext<'_>,
+    mut operation: impl FnMut(&str, Option<Duration>) -> anyhow::Result<Result<T, E>>,
+    credential_rejected: impl Fn(&E) -> bool,
+    unauthenticated: impl Fn() -> E,
+    unreachable: impl Fn(UnreachableCategory) -> E,
+    deadline: Option<Instant>,
+) -> anyhow::Result<Result<T, E>> {
+    if observation_http_budget(deadline).is_err() {
+        return Ok(Err(unreachable(UnreachableCategory::Timeout)));
+    }
+    if let Some(api_key) = context.authentication.service_api_key()? {
+        if let Ok(remaining) = observation_http_budget(deadline) {
+            operation(api_key.expose(), remaining)
+        } else {
+            Ok(Err(unreachable(UnreachableCategory::Timeout)))
+        }
+    } else {
+        match session::execute_required_until(
+            context.client,
+            context.deployment,
+            |access_token, budget| operation(access_token.expose(), budget),
+            |result| {
+                result
+                    .as_ref()
+                    .is_ok_and(|value| value.as_ref().is_err_and(&credential_rejected))
+            },
+            deadline,
+        ) {
+            Ok(RequiredOperation::Unauthenticated) => Ok(Err(unauthenticated())),
+            Ok(RequiredOperation::Completed(result)) => result,
+            Err(error) => match error.unreachable_category() {
+                Some(category) => Ok(Err(unreachable(category))),
+                None => Err(anyhow!(error).context(context.session_context)),
+            },
+        }
+    }
+}
+
+fn observation_http_budget(
+    deadline: Option<Instant>,
+) -> Result<Option<Duration>, UnreachableCategory> {
+    match deadline {
+        Some(end) => end
+            .checked_duration_since(scherzo_cloud_support::monotonic_now())
+            .filter(|duration| !duration.is_zero())
+            .map(Some)
+            .ok_or(UnreachableCategory::Timeout),
+        None => Ok(None),
+    }
 }
 
 fn execute_selected_api_operation_retrying_result<T, E>(
@@ -2179,6 +2253,7 @@ mod tests {
             "publication list",
             "publication show",
             "run",
+            "run cancel",
             "run create",
             "run input",
             "run input delete",
@@ -2191,7 +2266,6 @@ mod tests {
             "run input-set show",
             "run input-set upload",
             "run show",
-            "run wait",
             "runner",
             "runner activation",
             "runner activation create",

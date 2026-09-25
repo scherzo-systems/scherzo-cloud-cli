@@ -1312,11 +1312,13 @@ scherzo-cloud run show \
   acme-labs \
   run_01k0z6r1w8f4jy2m7q9v3x5abc
 
-# Wait up to 30 minutes for a terminal projection.
-scherzo-cloud run wait \
-  acme-labs \
-  run_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --timeout 30m
+# Observe settlement for up to 30 minutes without changing the run.
+scherzo-cloud run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --wait --timeout 30m
+
+# Request graceful cancellation; force is a separate explicit, separately keyed choice.
+scherzo-cloud run cancel acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --wait --timeout 30m
 ```
 
 Without an input flag, `run create` admits an inputless run. The mixed-input flags may be
@@ -1368,13 +1370,13 @@ content cleanup. Once a set is sealed, pass
 its exact ID to `run create --input-set-id`; this conflicts with every acquisition flag
 and never restages content.
 
-Create receipts report the accepted Run ID, the consumed input-set ID when present, and
-whether the deployment replayed the request. One invocation keeps each mutation's
-idempotency key through an ambiguous API transport retry and an access-token refresh;
-keys are not persisted for a later invocation. If preparation stops after allocation,
-JSON and human diagnostics retain the input-set ID so an operator can inspect, upload,
-seal, or delete that set explicitly. An interrupt after run dispatch reports an unknown
-acceptance commitment rather than claiming that no run was created.
+Create output reports the accepted Run ID and whether the deployment replayed the
+request. One invocation keeps each mutation's idempotency key through an ambiguous API
+transport retry and an access-token refresh; keys are not persisted for a later invocation.
+If preparation stops after input-set allocation, the CLI reports its ID and recovery
+steps on stderr even with `--json`; inspect or resume that set explicitly before
+allocating another. An interrupt after run dispatch reports unknown acceptance rather
+than claiming no run was created.
 
 Retained content is explicit run-scoped administration:
 
@@ -1405,18 +1407,31 @@ context. Both deletion commands require literal
 `--yes`, use fresh idempotency keys, and report an unknown commitment if interrupted
 after dispatch.
 
-Add `--json` for schema-version-1 output. A create receipt preserves `replayed` as a
-boolean and identifies the submitted `organizationRef`. Show and terminal wait results
-contain the complete public Run projection, including the current attempt, pinned
-workflow and workspace source, input summary, integration context, and timestamps.
+`run create`, `run show`, and `run cancel` accept `--wait` and optional
+`--timeout DURATION` (positive integral `ms`, `s`, `m`, `h`, or bare seconds).
+`--timeout` requires `--wait`. Create and cancel budgets begin after acceptance; show
+starts immediately. The remaining wait budget caps credential refresh, read retries,
+and each observation request; it does not bound the accepted mutation. Reads continue
+through admitted creation; create/show also observe
+automatic publication after succeeded execution, while cancel observes only its receipt
+and terminal Run. A cancellation receipt being accepted or resolved is not by itself
+proof of a stopped Run. Force requires explicit `--force`; to escalate use a new
+idempotency key. Reuse `--idempotency-key` with the same mode and Run to reconcile an
+uncertain response. Signals and timeouts stop only local observation.
 
-`run wait` polls through `queued`, `assigning`, `preparing`, `assigned`, and `running`.
-A `succeeded` projection exits zero; `failed`, `cancelled`, `interrupted`, and `rejected`
-projections exit nonzero. Omit `--timeout` to wait until a terminal projection or process
-signal. Timeout and SIGINT/SIGTERM stop only local observation; the command sends no Run
-mutation or cancellation request. JSON mode emits one document only after a terminal,
-timeout, or fatal observation result and emits nothing when a process signal stops the
-wait.
+With `--json`, each command emits one schema-version-1 object with `operation`,
+`deployment`, `organizationRef`, nullable `runId`, `outcome`, full nullable `run`,
+`publication`, `cancellationRequest`, nullable create `replayed`, and nullable `error`.
+The error includes `code`, `idempotencyKey`, `requestedMode`, and `requestId` (nullable).
+Progress goes to stderr. Human create/show results show the Run's automatic publication
+handoff and any observed Publication state, failure, and redacted confirmed pull-request
+URL separately from execution. On failure, inspect the existing publication or handoff
+and provider effects before creating another publication attempt. Human cancellation
+errors retain the requested mode, known receipt, Run state, interruption, and artifact
+delivery evidence for same-key reconciliation.
+Create-wait exits nonzero on failed execution/publication; show-wait and cancel-wait
+exit zero on observed settlement, regardless of the Run's execution result. Timeout
+exits 1; SIGINT/SIGTERM exit 130/143 without sending a new cancellation request.
 
 ### Agent named-input-to-artifact loop
 
@@ -1437,9 +1452,9 @@ scherzo-cloud run create "$organization" \
   --json > create.json
 run_id=$(jq -er 'select(.outcome == "accepted") | .runId' create.json)
 
-scherzo-cloud run wait "$organization" "$run_id" \
-  --timeout 30m --json > wait.json
-jq -e '.outcome == "succeeded"' wait.json >/dev/null
+scherzo-cloud run show "$organization" "$run_id" \
+  --wait --timeout 30m --json > observed.json
+jq -e '.outcome == "settled" and .run.state == "succeeded"' observed.json >/dev/null
 
 scherzo-cloud artifact download "$organization" "$run_id" \
   --output "$artifact_path" --json > download.json
@@ -1493,9 +1508,9 @@ scherzo-cloud run create "$organization" \
   --workflow-path workflows/publish.yaml \
   --json > run-create.json
 run_id=$(jq -er '.runId' run-create.json)
-scherzo-cloud run wait "$organization" "$run_id" \
-  --timeout 30m --json > run-wait.json
-jq -e '.outcome == "succeeded"' run-wait.json >/dev/null
+scherzo-cloud run show "$organization" "$run_id" \
+  --wait --timeout 30m --json > run-observed.json
+jq -e '.outcome == "settled" and .run.state == "succeeded"' run-observed.json >/dev/null
 
 scherzo-cloud publication create "$organization" "$run_id" \
   --export changes --wait --timeout 30m --json > publication.json

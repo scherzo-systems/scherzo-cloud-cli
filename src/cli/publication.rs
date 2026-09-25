@@ -701,7 +701,7 @@ fn parse_export_name(value: &str) -> Result<String, String> {
     }
 }
 
-fn parse_idempotency_key(value: &str) -> Result<String, String> {
+pub(super) fn parse_idempotency_key(value: &str) -> Result<String, String> {
     if (1..=255).contains(&value.len()) && value.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
         Ok(value.to_owned())
     } else {
@@ -1033,7 +1033,7 @@ fn write_publication_human(
     Ok(())
 }
 
-fn redacted_human_url(value: &str) -> anyhow::Result<String> {
+pub(super) fn redacted_human_url(value: &str) -> anyhow::Result<String> {
     let mut url = url::Url::parse(value).context("parse validated Cloud publication URL")?;
     url.set_password(None)
         .map_err(|()| anyhow!("redact Cloud publication URL password"))?;

@@ -146,8 +146,11 @@ pub use runners::{
     RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub use runs::{
-    CreateRunInput, Run, RunApi, RunArtifactDelivery, RunCancellation, RunCreationAcceptance,
-    RunCreationPending, RunFailure, RunInterruption, RunObservation, RunRead, RunState,
+    CreateRunInput, Run, RunApi, RunArtifactDelivery, RunCancellation,
+    RunCancellationEffectiveMode, RunCancellationEnvelope, RunCancellationMode,
+    RunCancellationReceipt, RunCancellationReceiptMode, RunCancellationReceiptState,
+    RunCancellationResolutionKind, RunCreationAcceptance, RunCreationPending, RunFailure,
+    RunInterruption, RunObservation, RunPublicationHandoffState, RunRead, RunState,
     valid_integration_context,
 };
 pub use service_principals::{

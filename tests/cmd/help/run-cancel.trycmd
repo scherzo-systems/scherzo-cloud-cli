@@ -1,14 +1,17 @@
 ```console
-$ scherzo-cloud run wait --help
-Wait for a Scherzo Cloud run
+$ scherzo-cloud run cancel --help
+Request cancellation of a Scherzo Cloud run
 
-Usage: scherzo-cloud run wait [OPTIONS] <ORGANIZATION> <RUN>
+Usage: scherzo-cloud run cancel [OPTIONS] <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
   <RUN>           Exact Run ID
 
 Options:
+      --force                          Request immediate containment instead of graceful stopping
+      --idempotency-key <KEY>          Reuse this key to reconcile an uncertain request
+      --wait                           Observe the run until it settles
       --timeout <DURATION>             Stop waiting after a positive duration (units: ms, s, m, or h)
       --json                           Print the run result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input

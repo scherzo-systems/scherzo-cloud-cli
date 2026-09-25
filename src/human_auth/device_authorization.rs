@@ -305,6 +305,20 @@ pub(super) fn post_form(
     post_form_with_timeout(client, endpoint, fields, REQUEST_TIMEOUT)
 }
 
+pub(super) fn post_form_with_budget(
+    client: &HttpClient,
+    endpoint: Url,
+    fields: &[(&str, &str)],
+    budget: Option<Duration>,
+) -> Result<RawResponse, AuthorizationError> {
+    post_form_with_timeout(
+        client,
+        endpoint,
+        fields,
+        budget.map_or(REQUEST_TIMEOUT, |budget| budget.min(REQUEST_TIMEOUT)),
+    )
+}
+
 fn post_form_with_timeout(
     client: &HttpClient,
     endpoint: Url,

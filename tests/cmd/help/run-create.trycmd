@@ -34,6 +34,10 @@ Options:
           Supply a present named attachment collection with no members
       --integration-context-file <PATH>
           Read private immutable integration context from a JSON file, or - for standard input
+      --wait
+          Observe the run until it settles
+      --timeout <DURATION>
+          Stop waiting after a positive duration (units: ms, s, m, or h)
       --json
           Print the run result as JSON
       --service-api-key-file <PATH|->

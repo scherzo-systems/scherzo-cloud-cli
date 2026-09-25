@@ -28,6 +28,14 @@ pub type RunCreationPending = models::RunCreationPending;
 pub type RunArtifactDelivery = models::RunArtifactDelivery;
 pub type RunCancellation = models::RunCancellation;
 pub type RunInterruption = models::RunInterruption;
+pub type RunCancellationEnvelope = models::RunCancellationEnvelope;
+pub type RunCancellationReceipt = models::RunCancellationReceipt;
+pub type RunCancellationMode = models::run_cancellation_request::Mode;
+pub type RunCancellationReceiptState = models::run_cancellation_receipt::State;
+pub type RunCancellationReceiptMode = models::run_cancellation_receipt::Mode;
+pub type RunCancellationEffectiveMode = models::run_cancellation::Mode;
+pub type RunCancellationResolutionKind = models::run_cancellation_resolution::Kind;
+pub type RunPublicationHandoffState = models::run_publication_handoff::State;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunRead {
@@ -119,6 +127,21 @@ impl<'a> RunApi<'a> {
         success_status: StatusCode,
         idempotency_key: Option<&str>,
         begin_dispatch: impl Fn() -> bool,
+        build: impl FnMut() -> reqwest::blocking::RequestBuilder,
+    ) -> Result<ReceivedResponse, RunFailure> {
+        self.send_api_request_with_statuses(
+            &[success_status],
+            idempotency_key,
+            begin_dispatch,
+            build,
+        )
+    }
+
+    fn send_api_request_with_statuses(
+        &self,
+        success_statuses: &[StatusCode],
+        idempotency_key: Option<&str>,
+        begin_dispatch: impl Fn() -> bool,
         mut build: impl FnMut() -> reqwest::blocking::RequestBuilder,
     ) -> Result<ReceivedResponse, RunFailure> {
         let attempts = if idempotency_key.is_some() {
@@ -150,7 +173,7 @@ impl<'a> RunApi<'a> {
                 }
             };
             let status = response.status();
-            if status == success_status
+            if success_statuses.contains(&status)
                 && let Some(idempotency_key) = idempotency_key
             {
                 require_exact_header(
@@ -164,7 +187,7 @@ impl<'a> RunApi<'a> {
                     return Err(RunFailure::protocol(status == StatusCode::UNAUTHORIZED));
                 }
                 Err(BoundedBodyError::Transport(error))
-                    if idempotency_key.is_some() && status == success_status =>
+                    if idempotency_key.is_some() && success_statuses.contains(&status) =>
                 {
                     let category = classify_reqwest_error(&error);
                     last_transport_failure = category;
@@ -189,34 +212,121 @@ impl<'a> RunApi<'a> {
         Err(RunFailure::Unreachable(last_transport_failure))
     }
 
+    pub fn cancel(
+        &self,
+        organization: &str,
+        run_id: &str,
+        key: &str,
+        mode: RunCancellationMode,
+        begin_dispatch: impl Fn() -> bool,
+    ) -> Result<RunCancellationEnvelope, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/cancellation-requests",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id)
+        );
+        let response = self.send_api_request_with_statuses(
+            &[StatusCode::OK, StatusCode::ACCEPTED],
+            Some(key),
+            begin_dispatch,
+            || {
+                self.request(Method::POST, &endpoint)
+                    .header("Idempotency-Key", key)
+                    .json(&models::RunCancellationRequest::new(mode))
+            },
+        )?;
+        let status = response.status;
+        if !matches!(status, StatusCode::OK | StatusCode::ACCEPTED) {
+            return Err(classify_failure(&response, RunOperation::Create));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.idempotency_keys.iter(), key)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let envelope: RunCancellationEnvelope =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        let expected_location = format!(
+            "/v1/organizations/{}/runs/{}/cancellation-requests/{}",
+            apis::urlencode(&envelope.request.organization_id),
+            apis::urlencode(run_id),
+            apis::urlencode(&envelope.request.id)
+        );
+        let envelope = validate_cancellation_envelope(envelope, run_id, Some(mode), Some(status))?;
+        require_exact_header(response.locations.iter(), &expected_location)?;
+        Ok(envelope)
+    }
+
+    pub fn get_cancellation(
+        &self,
+        organization: &str,
+        run_id: &str,
+        request_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RunCancellationEnvelope, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/cancellation-requests/{}",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id),
+            apis::urlencode(request_id)
+        );
+        let response = self.read_response(&endpoint, timeout)?;
+        if response.status != StatusCode::OK {
+            return Err(classify_failure(&response, RunOperation::Get));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let envelope =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        let envelope = validate_cancellation_envelope(envelope, run_id, None, None)?;
+        if envelope.request.id != request_id {
+            return Err(RunFailure::protocol(false));
+        }
+        Ok(envelope)
+    }
+
     pub fn get(&self, organization: &str, run_id: &str) -> Result<RunRead, RunFailure> {
+        self.get_with_timeout(organization, run_id, None)
+    }
+
+    pub fn get_with_timeout(
+        &self,
+        organization: &str,
+        run_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RunRead, RunFailure> {
         let endpoint = format!(
             "{}/{}",
             self.collection_endpoint(organization),
             apis::urlencode(run_id)
         );
-        let response = self
-            .request(Method::GET, &endpoint)
+        decode_get_response(self.read_response(&endpoint, timeout)?, run_id)
+    }
+
+    fn read_response(
+        &self,
+        endpoint: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ReceivedResponse, RunFailure> {
+        let mut request = self.request(Method::GET, endpoint);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request
             .send()
             .map_err(|error| RunFailure::Unreachable(classify_reqwest_error(&error)))?;
         let status = response.status();
-        let response =
-            http_util::buffer_blocking_response(response).map_err(|error| match error {
-                BoundedBodyError::TooLarge => {
-                    RunFailure::protocol(status == StatusCode::UNAUTHORIZED)
-                }
-                BoundedBodyError::Transport(_) if status == StatusCode::UNAUTHORIZED => {
-                    RunFailure::protocol(true)
-                }
-                BoundedBodyError::Transport(error) => {
-                    RunFailure::Unreachable(if status.is_server_error() {
-                        UnreachableCategory::Server
-                    } else {
-                        classify_reqwest_error(&error)
-                    })
-                }
-            })?;
-        decode_get_response(response, run_id)
+        http_util::buffer_blocking_response(response).map_err(|error| match error {
+            BoundedBodyError::TooLarge => RunFailure::protocol(status == StatusCode::UNAUTHORIZED),
+            BoundedBodyError::Transport(_) if status == StatusCode::UNAUTHORIZED => {
+                RunFailure::protocol(true)
+            }
+            BoundedBodyError::Transport(error) => {
+                RunFailure::Unreachable(if status.is_server_error() {
+                    UnreachableCategory::Server
+                } else {
+                    classify_reqwest_error(&error)
+                })
+            }
+        })
     }
 
     fn collection_endpoint(&self, organization: &str) -> String {
@@ -249,6 +359,7 @@ pub enum RunFailure {
     InvalidInput,
     NotFound,
     Conflict,
+    IdempotencyConflict,
     CreationRejected,
     Gone,
     Unreachable(UnreachableCategory),
@@ -365,7 +476,19 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
             validated_problem_failure(response, Some(NOT_FOUND), RunFailure::NotFound, false)
         }
         StatusCode::CONFLICT if matches!(operation, RunOperation::Create | RunOperation::Input) => {
-            validated_problem_failure(response, None, RunFailure::Conflict, false)
+            if require_media_type(response, PROBLEM_MEDIA_TYPE, false).is_err() {
+                return RunFailure::protocol(false);
+            }
+            match problem::decode(&response.body, response.status) {
+                Ok(problem)
+                    if problem.r#type
+                        == "https://api.scherzo.dev/problems/idempotency-conflict" =>
+                {
+                    RunFailure::IdempotencyConflict
+                }
+                Ok(_) => RunFailure::Conflict,
+                Err(_) => RunFailure::protocol(false),
+            }
         }
         StatusCode::GONE if matches!(operation, RunOperation::Create | RunOperation::Input) => {
             validated_problem_failure(response, None, RunFailure::Gone, false)
@@ -375,6 +498,7 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
         {
             validated_problem_failure(response, None, RunFailure::InvalidInput, false)
         }
+        StatusCode::TOO_MANY_REQUESTS => RunFailure::Unreachable(UnreachableCategory::RateLimited),
         status if status.is_server_error() => RunFailure::Unreachable(UnreachableCategory::Server),
         _ => RunFailure::protocol(false),
     }
@@ -407,6 +531,81 @@ fn validate_acceptance(
     );
     require_exact_header(locations.iter(), &expected_location)?;
     Ok(acceptance)
+}
+
+fn validate_cancellation_envelope(
+    envelope: RunCancellationEnvelope,
+    run_id: &str,
+    mode: Option<RunCancellationMode>,
+    status: Option<StatusCode>,
+) -> Result<RunCancellationEnvelope, RunFailure> {
+    use models::run_cancellation_receipt::State;
+    use models::run_cancellation_resolution::Kind;
+    let receipt = &envelope.request;
+    let resolution = receipt.resolution.as_deref();
+    let valid = scherzo_cloud_support::valid_typed_id(&receipt.id, "cmd_")
+        && scherzo_cloud_support::valid_typed_id(&receipt.organization_id, "org_")
+        && receipt.run_id == run_id
+        && receipt
+            .attempt_id
+            .as_deref()
+            .is_none_or(|id| scherzo_cloud_support::valid_typed_id(id, "atm_"))
+        && valid_timestamp(&receipt.accepted_at)
+        && mode.is_none_or(|expected| {
+            serde_json::to_value(expected).ok() == serde_json::to_value(receipt.mode).ok()
+        })
+        && (receipt.state == State::Pending) == resolution.is_none()
+        && resolution.is_none_or(|resolution| {
+            valid_timestamp(&resolution.resolved_at)
+                && resolution
+                    .effective_request_id
+                    .as_deref()
+                    .is_none_or(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+                && resolution.run_version.is_none_or(|version| version > 0)
+        })
+        && status.is_none_or(|status| match status {
+            StatusCode::OK => {
+                resolution.is_some_and(|r| r.kind == Kind::AlreadyTerminal)
+                    && envelope
+                        .run
+                        .as_deref()
+                        .is_some_and(|run| terminal_run(run.state))
+            }
+            // An admitted retry can retain the preceding terminal attempt's Run
+            // projection until the new attempt is projected.
+            StatusCode::ACCEPTED => receipt.state == State::Pending,
+            _ => false,
+        })
+        && envelope.run.as_deref().is_none_or(|run| {
+            run.organization_id == receipt.organization_id
+                && validate_run(run.clone(), run_id).is_ok()
+        })
+        && resolution.is_none_or(|resolution| {
+            if resolution.kind == Kind::CreationRejected {
+                return envelope.run.is_none();
+            }
+            envelope.run.as_deref().is_some_and(|run| {
+                resolution
+                    .run_version
+                    .is_none_or(|version| run.version >= version)
+            })
+        });
+    if valid {
+        Ok(envelope)
+    } else {
+        Err(RunFailure::protocol(false))
+    }
+}
+
+fn terminal_run(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Succeeded
+            | RunState::Failed
+            | RunState::Cancelled
+            | RunState::Interrupted
+            | RunState::Rejected
+    )
 }
 
 fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {

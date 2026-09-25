@@ -103,7 +103,15 @@ impl CredentialStore {
         &self,
         deployment: &DeploymentFingerprint,
     ) -> Result<Option<StoredCredential>, CredentialError> {
-        let _lock = self.acquire_lock()?;
+        self.selected_until(deployment, None)
+    }
+
+    pub(crate) fn selected_until(
+        &self,
+        deployment: &DeploymentFingerprint,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<StoredCredential>, CredentialError> {
+        let _lock = self.acquire_lock_until(deadline)?;
         let file = self.read_file()?;
         file.credentials
             .iter()
@@ -123,16 +131,17 @@ impl CredentialStore {
         self.replace_under_authority(deployment, access_token, expires_at, refresh_token)
     }
 
-    pub(crate) fn replace_if_refresh_token_matches(
+    pub(crate) fn replace_if_refresh_token_matches_until(
         &self,
         deployment: &DeploymentFingerprint,
         expected_refresh_token: &(impl TokenSource + ?Sized),
         access_token: &(impl TokenSource + ?Sized),
         expires_at: OffsetDateTime,
         refresh_token: &(impl TokenSource + ?Sized),
+        deadline: Option<std::time::Instant>,
     ) -> Result<Option<StoredCredential>, CredentialError> {
         let replacement = credential_entry(deployment, access_token, expires_at, refresh_token)?;
-        let _lock = self.acquire_lock()?;
+        let _lock = self.acquire_lock_until(deadline)?;
         let mut file = self.read_file()?;
         let Some(index) = credential_index(&file, deployment) else {
             return Ok(None);
@@ -158,9 +167,20 @@ impl CredentialStore {
         deployment: &DeploymentFingerprint,
         access_token: &(impl TokenSource + ?Sized),
     ) -> Result<bool, CredentialError> {
-        self.remove_matching(deployment, |credential| {
-            credential.access_token.expose() == access_token.expose()
-        })
+        self.remove_if_access_token_matches_until(deployment, access_token, None)
+    }
+
+    pub(crate) fn remove_if_access_token_matches_until(
+        &self,
+        deployment: &DeploymentFingerprint,
+        access_token: &(impl TokenSource + ?Sized),
+        deadline: Option<std::time::Instant>,
+    ) -> Result<bool, CredentialError> {
+        self.remove_matching_until(
+            deployment,
+            |credential| credential.access_token.expose() == access_token.expose(),
+            deadline,
+        )
     }
 
     pub(crate) fn remove_if_credential_matches_under_authority(
@@ -175,14 +195,17 @@ impl CredentialStore {
         })
     }
 
-    pub(crate) fn remove_if_refresh_token_matches_under_authority(
+    pub(crate) fn remove_if_refresh_token_matches_until(
         &self,
         deployment: &DeploymentFingerprint,
         refresh_token: &(impl TokenSource + ?Sized),
+        deadline: Option<std::time::Instant>,
     ) -> Result<bool, CredentialError> {
-        self.remove_matching(deployment, |credential| {
-            credential.refresh_token.expose() == refresh_token.expose()
-        })
+        self.remove_matching_until(
+            deployment,
+            |credential| credential.refresh_token.expose() == refresh_token.expose(),
+            deadline,
+        )
     }
 
     pub(crate) fn take_under_authority(
@@ -204,8 +227,16 @@ impl CredentialStore {
         &self,
         deployment: &DeploymentFingerprint,
     ) -> Result<RefreshAuthority, CredentialError> {
+        self.refresh_authority_until(deployment, None)
+    }
+
+    pub(crate) fn refresh_authority_until(
+        &self,
+        deployment: &DeploymentFingerprint,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<RefreshAuthority, CredentialError> {
         let path = self.refresh_lock_path(deployment)?;
-        self.acquire_lock_at(&path, self.refresh_lock_timeout, true)
+        self.acquire_lock_at_until(&path, self.refresh_lock_timeout, true, deadline)
             .map(|lock| RefreshAuthority { _lock: lock })
     }
 
@@ -234,7 +265,19 @@ impl CredentialStore {
     where
         F: Fn(&CredentialEntry) -> bool,
     {
-        let _lock = self.acquire_lock()?;
+        self.remove_matching_until(deployment, predicate, None)
+    }
+
+    fn remove_matching_until<F>(
+        &self,
+        deployment: &DeploymentFingerprint,
+        predicate: F,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<bool, CredentialError>
+    where
+        F: Fn(&CredentialEntry) -> bool,
+    {
+        let _lock = self.acquire_lock_until(deadline)?;
         let mut file = self.read_file()?;
         let original_len = file.credentials.len();
         file.credentials
@@ -290,11 +333,28 @@ impl CredentialStore {
         self.acquire_lock_at(&self.lock_path, self.lock_timeout, false)
     }
 
+    fn acquire_lock_until(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<CredentialLock, CredentialError> {
+        self.acquire_lock_at_until(&self.lock_path, self.lock_timeout, false, deadline)
+    }
+
     fn acquire_lock_at(
         &self,
         path: &Path,
         timeout: Duration,
         refresh: bool,
+    ) -> Result<CredentialLock, CredentialError> {
+        self.acquire_lock_at_until(path, timeout, refresh, None)
+    }
+
+    fn acquire_lock_at_until(
+        &self,
+        path: &Path,
+        timeout: Duration,
+        refresh: bool,
+        deadline: Option<std::time::Instant>,
     ) -> Result<CredentialLock, CredentialError> {
         let directory = self.directory()?;
         ensure_private_directory(directory)?;
@@ -302,20 +362,23 @@ impl CredentialStore {
         let start = scherzo_cloud_support::monotonic_now();
 
         loop {
+            let elapsed = scherzo_cloud_support::elapsed(start);
+            let remaining = timeout
+                .saturating_sub(elapsed)
+                .min(deadline.map_or(timeout, |end| {
+                    end.saturating_duration_since(scherzo_cloud_support::monotonic_now())
+                }));
+            if remaining.is_zero() {
+                return Err(if refresh {
+                    CredentialError::RefreshLockTimeout
+                } else {
+                    CredentialError::LockTimeout
+                });
+            }
             match FileExt::try_lock(&file) {
                 Ok(()) => return Ok(CredentialLock { file }),
                 Err(TryLockError::WouldBlock) => {
-                    let elapsed = scherzo_cloud_support::elapsed(start);
-                    if elapsed >= timeout {
-                        return Err(if refresh {
-                            CredentialError::RefreshLockTimeout
-                        } else {
-                            CredentialError::LockTimeout
-                        });
-                    }
-                    scherzo_cloud_support::sleep(
-                        LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(elapsed)),
-                    );
+                    scherzo_cloud_support::sleep(LOCK_RETRY_INTERVAL.min(remaining));
                 }
                 Err(TryLockError::Error(source)) => {
                     return Err(CredentialError::Io {

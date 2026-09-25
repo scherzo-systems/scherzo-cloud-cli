@@ -141,16 +141,26 @@ impl PublicationApi {
         run_id: &str,
         publication_id: &str,
     ) -> Result<Publication, PublicationFailure> {
+        self.get_with_timeout(organization, run_id, publication_id, None)
+    }
+
+    pub fn get_with_timeout(
+        &self,
+        organization: &str,
+        run_id: &str,
+        publication_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Publication, PublicationFailure> {
         let endpoint = format!(
             "{}/{}",
             self.collection_endpoint(organization, run_id),
             apis::urlencode(publication_id)
         );
-        let response = self.read_response(super::generated_api_request(
-            &self.configuration,
-            Method::GET,
-            &endpoint,
-        ))?;
+        let mut request = super::generated_api_request(&self.configuration, Method::GET, &endpoint);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = self.read_response(request)?;
         decode_get_response(response, run_id, publication_id)
     }
 

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -103,15 +104,16 @@ pub(crate) fn execute_optional<T, E>(
 pub(crate) fn execute_required<T, E>(
     client: &HttpClient,
     deployment: &Deployment,
-    operation: impl FnMut(&SecretToken) -> Result<T, E>,
+    mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
     credential_rejected: impl Fn(&Result<T, E>) -> bool,
 ) -> Result<RequiredOperation<T, E>, SessionError> {
-    match execute_required_with_binding(client, deployment, operation, credential_rejected)? {
-        RequiredOperationWithBinding::Completed { result, .. } => {
-            Ok(RequiredOperation::Completed(result))
-        }
-        RequiredOperationWithBinding::Unauthenticated => Ok(RequiredOperation::Unauthenticated),
-    }
+    execute_required_until(
+        client,
+        deployment,
+        |token, _| operation(token),
+        credential_rejected,
+        None,
+    )
 }
 
 pub(crate) fn execute_required_with_binding<T, E>(
@@ -120,12 +122,63 @@ pub(crate) fn execute_required_with_binding<T, E>(
     mut operation: impl FnMut(&SecretToken) -> Result<T, E>,
     credential_rejected: impl Fn(&Result<T, E>) -> bool,
 ) -> Result<RequiredOperationWithBinding<T, E>, SessionError> {
+    execute_required_with_binding_until(
+        client,
+        deployment,
+        |token, _| operation(token),
+        credential_rejected,
+        None,
+    )
+}
+
+pub(crate) fn execute_required_until<T, E>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    operation: impl FnMut(&SecretToken, Option<Duration>) -> Result<T, E>,
+    credential_rejected: impl Fn(&Result<T, E>) -> bool,
+    deadline: Option<Instant>,
+) -> Result<RequiredOperation<T, E>, SessionError> {
+    match execute_required_with_binding_until(
+        client,
+        deployment,
+        operation,
+        credential_rejected,
+        deadline,
+    )? {
+        RequiredOperationWithBinding::Completed { result, .. } => {
+            Ok(RequiredOperation::Completed(result))
+        }
+        RequiredOperationWithBinding::Unauthenticated => Ok(RequiredOperation::Unauthenticated),
+    }
+}
+
+fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, SessionError> {
+    match deadline {
+        Some(end) => end
+            .checked_duration_since(scherzo_cloud_support::monotonic_now())
+            .filter(|duration| !duration.is_zero())
+            .map(Some)
+            .ok_or(SessionError::RefreshUnreachable(
+                UnreachableCategory::Timeout,
+            )),
+        None => Ok(None),
+    }
+}
+
+fn execute_required_with_binding_until<T, E>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    mut operation: impl FnMut(&SecretToken, Option<Duration>) -> Result<T, E>,
+    credential_rejected: impl Fn(&Result<T, E>) -> bool,
+    deadline: Option<Instant>,
+) -> Result<RequiredOperationWithBinding<T, E>, SessionError> {
+    remaining(deadline)?;
     let store = CredentialStore::from_environment().map_err(SessionError::CredentialStore)?;
-    let Some(credential) = credential_for_use(&store, client, deployment)? else {
+    let Some(credential) = credential_for_use_until(&store, client, deployment, deadline)? else {
         return Ok(RequiredOperationWithBinding::Unauthenticated);
     };
 
-    let first = operation(credential.access_token());
+    let first = operation(credential.access_token(), remaining(deadline)?);
     if !credential_rejected(&first) {
         return Ok(RequiredOperationWithBinding::Completed {
             result: first,
@@ -133,14 +186,20 @@ pub(crate) fn execute_required_with_binding<T, E>(
         });
     }
 
-    let Some(credential) =
-        refresh_after_rejection(&store, client, deployment, credential.access_token())?
+    let Some(credential) = coordinated_refresh_until(
+        &store,
+        client,
+        deployment,
+        RefreshReason::Rejected(credential.access_token()),
+        deadline,
+    )?
     else {
         return Ok(RequiredOperationWithBinding::Unauthenticated);
     };
-    let second = operation(credential.access_token());
+    let second = operation(credential.access_token(), remaining(deadline)?);
     if credential_rejected(&second) {
-        remove_rejected_credential(&store, deployment, credential.access_token())?;
+        remaining(deadline)?;
+        remove_rejected_credential_until(&store, deployment, credential.access_token(), deadline)?;
     }
     Ok(RequiredOperationWithBinding::Completed {
         result: second,
@@ -271,12 +330,22 @@ fn credential_for_use(
     client: &HttpClient,
     deployment: &Deployment,
 ) -> Result<Option<StoredCredential>, SessionError> {
+    credential_for_use_until(store, client, deployment, None)
+}
+
+fn credential_for_use_until(
+    store: &CredentialStore,
+    client: &HttpClient,
+    deployment: &Deployment,
+    deadline: Option<Instant>,
+) -> Result<Option<StoredCredential>, SessionError> {
+    remaining(deadline)?;
     let credential = store
-        .selected(deployment.fingerprint())
-        .map_err(SessionError::CredentialStore)?;
+        .selected_until(deployment.fingerprint(), deadline)
+        .map_err(|error| deadline_store_error(error, deadline))?;
     match credential {
         Some(credential) if credential.needs_refresh(scherzo_cloud_support::utc_now()) => {
-            coordinated_refresh(store, client, deployment, RefreshReason::Expiring)
+            coordinated_refresh_until(store, client, deployment, RefreshReason::Expiring, deadline)
         }
         credential => Ok(credential),
     }
@@ -288,24 +357,31 @@ fn refresh_after_rejection(
     deployment: &Deployment,
     rejected_access_token: &SecretToken,
 ) -> Result<Option<StoredCredential>, SessionError> {
-    coordinated_refresh(
+    coordinated_refresh_until(
         store,
         client,
         deployment,
         RefreshReason::Rejected(rejected_access_token),
+        None,
     )
 }
 
-fn coordinated_refresh(
+// Keep the authority-acquiring entry distinct from the path used by a caller already
+// holding that authority; reacquiring the lock would deadlock.
+// jscpd:ignore-start
+fn coordinated_refresh_until(
     store: &CredentialStore,
     client: &HttpClient,
     deployment: &Deployment,
     reason: RefreshReason<'_>,
+    deadline: Option<Instant>,
 ) -> Result<Option<StoredCredential>, SessionError> {
+    remaining(deadline)?;
     let _authority = store
-        .refresh_authority(deployment.fingerprint())
-        .map_err(SessionError::CredentialStore)?;
-    coordinated_refresh_under_authority(store, client, deployment, reason)
+        .refresh_authority_until(deployment.fingerprint(), deadline)
+        .map_err(|error| deadline_store_error(error, deadline))?;
+    // jscpd:ignore-end
+    coordinated_refresh_under_authority_until(store, client, deployment, reason, deadline)
 }
 
 fn coordinated_refresh_under_authority(
@@ -314,9 +390,20 @@ fn coordinated_refresh_under_authority(
     deployment: &Deployment,
     reason: RefreshReason<'_>,
 ) -> Result<Option<StoredCredential>, SessionError> {
+    coordinated_refresh_under_authority_until(store, client, deployment, reason, None)
+}
+
+fn coordinated_refresh_under_authority_until(
+    store: &CredentialStore,
+    client: &HttpClient,
+    deployment: &Deployment,
+    reason: RefreshReason<'_>,
+    deadline: Option<Instant>,
+) -> Result<Option<StoredCredential>, SessionError> {
+    remaining(deadline)?;
     let Some(current) = store
-        .selected(deployment.fingerprint())
-        .map_err(SessionError::CredentialStore)?
+        .selected_until(deployment.fingerprint(), deadline)
+        .map_err(|error| deadline_store_error(error, deadline))?
     else {
         return Ok(None);
     };
@@ -333,40 +420,43 @@ fn coordinated_refresh_under_authority(
     }
 
     let expected_refresh_token = current.refresh_token().clone();
-    let issued = match exchange_refresh_token(client, deployment, &expected_refresh_token) {
-        Ok(issued) => issued,
-        Err(RefreshExchangeError::Terminal) => {
-            store
-                .remove_if_refresh_token_matches_under_authority(
-                    deployment.fingerprint(),
-                    &expected_refresh_token,
-                )
-                .map_err(SessionError::CredentialStore)?;
-            return Ok(None);
-        }
-        Err(RefreshExchangeError::Local(error)) => {
-            return Err(SessionError::RefreshLocal(error));
-        }
-        Err(RefreshExchangeError::Unreachable(category)) => {
-            return Err(SessionError::RefreshUnreachable(category));
-        }
-        Err(RefreshExchangeError::Protocol { reason }) => {
-            return Err(SessionError::RefreshProtocol { reason });
-        }
-    };
+    let issued =
+        match exchange_refresh_token_until(client, deployment, &expected_refresh_token, deadline) {
+            Ok(issued) => issued,
+            Err(RefreshExchangeError::Terminal) => {
+                store
+                    .remove_if_refresh_token_matches_until(
+                        deployment.fingerprint(),
+                        &expected_refresh_token,
+                        deadline,
+                    )
+                    .map_err(|error| deadline_store_error(error, deadline))?;
+                return Ok(None);
+            }
+            Err(RefreshExchangeError::Local(error)) => {
+                return Err(SessionError::RefreshLocal(error));
+            }
+            Err(RefreshExchangeError::Unreachable(category)) => {
+                return Err(SessionError::RefreshUnreachable(category));
+            }
+            Err(RefreshExchangeError::Protocol { reason }) => {
+                return Err(SessionError::RefreshProtocol { reason });
+            }
+        };
     let expires_at =
         expiration_after(issued.expires_in()).ok_or(SessionError::RefreshProtocol {
             reason: "the access-token expiration is out of range",
         })?;
     store
-        .replace_if_refresh_token_matches(
+        .replace_if_refresh_token_matches_until(
             deployment.fingerprint(),
             &expected_refresh_token,
             issued.access_token(),
             expires_at,
             issued.refresh_token(),
+            deadline,
         )
-        .map_err(SessionError::CredentialStore)
+        .map_err(|error| deadline_store_error(error, deadline))
 }
 
 fn remove_rejected_credential(
@@ -374,19 +464,38 @@ fn remove_rejected_credential(
     deployment: &Deployment,
     access_token: &SecretToken,
 ) -> Result<(), SessionError> {
+    remove_rejected_credential_until(store, deployment, access_token, None)
+}
+
+fn deadline_store_error(error: CredentialError, deadline: Option<Instant>) -> SessionError {
+    if deadline.is_some_and(|end| scherzo_cloud_support::monotonic_now() >= end) {
+        SessionError::RefreshUnreachable(UnreachableCategory::Timeout)
+    } else {
+        SessionError::CredentialStore(error)
+    }
+}
+
+fn remove_rejected_credential_until(
+    store: &CredentialStore,
+    deployment: &Deployment,
+    access_token: &SecretToken,
+    deadline: Option<Instant>,
+) -> Result<(), SessionError> {
+    remaining(deadline)?;
     let _authority = store
-        .refresh_authority(deployment.fingerprint())
-        .map_err(SessionError::CredentialStore)?;
+        .refresh_authority_until(deployment.fingerprint(), deadline)
+        .map_err(|error| deadline_store_error(error, deadline))?;
     store
-        .remove_if_access_token_matches_under_authority(deployment.fingerprint(), access_token)
-        .map_err(SessionError::CredentialStore)?;
+        .remove_if_access_token_matches_until(deployment.fingerprint(), access_token, deadline)
+        .map_err(|error| deadline_store_error(error, deadline))?;
     Ok(())
 }
 
-fn exchange_refresh_token(
+fn exchange_refresh_token_until(
     client: &HttpClient,
     deployment: &Deployment,
     refresh_token: &SecretToken,
+    deadline: Option<Instant>,
 ) -> Result<IssuedToken, RefreshExchangeError> {
     let endpoint = client
         .endpoint(deployment.fingerprint().issuer(), &TOKEN_PATH)
@@ -398,7 +507,20 @@ fn exchange_refresh_token(
     ];
 
     for attempt in 0..MAX_REFRESH_ATTEMPTS {
-        let response = match device_authorization::post_form(client, endpoint.clone(), &fields) {
+        let budget = match remaining(deadline) {
+            Ok(budget) => budget,
+            Err(_) => {
+                return Err(RefreshExchangeError::Unreachable(
+                    UnreachableCategory::Timeout,
+                ));
+            }
+        };
+        let response = match device_authorization::post_form_with_budget(
+            client,
+            endpoint.clone(),
+            &fields,
+            budget,
+        ) {
             Ok(response) => response,
             Err(AuthorizationError::Unreachable(category))
                 if attempt + 1 < MAX_REFRESH_ATTEMPTS
@@ -407,7 +529,16 @@ fn exchange_refresh_token(
                         UnreachableCategory::Connection | UnreachableCategory::Timeout
                     ) =>
             {
-                scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+                let delay = scherzo_cloud_support::short_retry_delay();
+                let budget = match remaining(deadline) {
+                    Ok(budget) => budget,
+                    Err(_) => {
+                        return Err(RefreshExchangeError::Unreachable(
+                            UnreachableCategory::Timeout,
+                        ));
+                    }
+                };
+                scherzo_cloud_support::sleep(budget.map_or(delay, |budget| delay.min(budget)));
                 continue;
             }
             Err(AuthorizationError::Unreachable(category)) => {
