@@ -112,12 +112,8 @@ struct Target {
 struct ConfirmationTarget {
     #[command(flatten)]
     target: Target,
-    #[arg(
-        long = "yes",
-        required = true,
-        help = "Confirm removal of the Linear connection credential or workspace binding"
-    )]
-    _yes: bool,
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
 }
 // Linear connection pagination has a separate output and authority contract from publication lists.
 // jscpd:ignore-start

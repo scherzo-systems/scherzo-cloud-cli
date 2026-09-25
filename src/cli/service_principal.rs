@@ -102,6 +102,9 @@ struct RevokeCommand {
     credential_id: String,
 
     #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
+
+    #[command(flatten)]
     options: RequiredServiceOptions,
 }
 

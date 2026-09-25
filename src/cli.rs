@@ -354,6 +354,12 @@ struct JsonArgs<F: JsonOutputKind> {
     output: PhantomData<F>,
 }
 
+#[derive(Debug, Args)]
+struct ConfirmationArgs {
+    #[arg(long, required = true, help = "Confirm this action")]
+    _yes: bool,
+}
+
 #[derive(Debug, Args, Default)]
 struct NoAuthenticationArgs {}
 

@@ -14,13 +14,8 @@ pub(super) struct Command {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization_ref: OrganizationArg,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm permanent organization departure"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
 
     // Self-leave keeps an operation-local Clap type because its terminal confirmation and
     // bodyless success projection differ from every read and targeted-member command.

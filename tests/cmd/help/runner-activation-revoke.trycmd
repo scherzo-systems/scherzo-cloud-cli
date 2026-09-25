@@ -2,7 +2,7 @@
 $ scherzo-cloud runner activation revoke --help
 Revoke a runner activation
 
-Usage: scherzo-cloud runner activation revoke [OPTIONS] <ORGANIZATION> <RUNNER> <ACTIVATION>
+Usage: scherzo-cloud runner activation revoke [OPTIONS] --yes <ORGANIZATION> <RUNNER> <ACTIVATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
@@ -10,6 +10,7 @@ Arguments:
   <ACTIVATION>    Runner activation ID
 
 Options:
+      --yes                            Confirm this action
       --json                           Print the runner result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections

@@ -12,7 +12,7 @@ Options:
       --json                           Emit newline-delimited JSON events
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections
-      --yes                            Confirm removal of the Linear connection credential or workspace binding
+      --yes                            Confirm this action
   -h, --help                           Print help
 
 ```

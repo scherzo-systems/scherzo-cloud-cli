@@ -232,11 +232,12 @@ separate entity family.
 - **Destructive confirmation:** a leaf requires `--yes` when its final token is
   `delete`, `decline`, `end`, `leave`, `remove`, `revoke`, or `retire`, or when
   its complete command identity is `account deletion request` or
-  `organization deletion request`. No other leaf has `--yes`. This mechanical
-  set covers permanent deletion, departure, delegation or invitation closure,
-  and operations that invalidate a binding, credential, or live access. The
-  current `remove`/`revoke`/`retire` leaves that do not yet require confirmation
-  are burn-down owned by LIV-2427. Reversible runner mode changes, including
+  `organization deletion request`. The existing `github installation disconnect`
+  and `project repository detach` paths also require confirmation until their
+  renames to `remove`; no other leaf has `--yes`. This set covers permanent
+  deletion, departure, delegation or invitation closure, and operations that
+  invalidate a binding, credential, or live access. Reversible
+  runner mode changes, including
   `runner disable` and `runner drain`, are not destructive and do not take
   `--yes`.
 - **Common flag order:** whenever they co-occur, common flags appear in this

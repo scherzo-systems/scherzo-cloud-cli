@@ -149,13 +149,8 @@ struct DeleteCommand {
     #[command(flatten)]
     input_set: InputSetReference,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm logical deletion and scheduled content cleanup"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
 
     #[command(flatten)]
     options: super::CloudInputOptions,
@@ -579,7 +574,6 @@ fn seal(
 
 impl DeleteCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
-        let _confirmation = self.yes;
         let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate Run Input Set deletion identity")?;
         let signal_deployment = deployment.clone();

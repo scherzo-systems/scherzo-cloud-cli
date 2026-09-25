@@ -210,13 +210,8 @@ struct RemoveCommand {
     #[command(flatten)]
     target: MembershipTarget,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm permanent membership removal"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
 
     #[command(flatten)]
     options: LeafOptions,
@@ -226,7 +221,7 @@ impl RemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let Self {
             target,
-            yes: _,
+            confirmation: _,
             options,
         } = self;
         options.execute_mutation(

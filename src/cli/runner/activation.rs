@@ -65,6 +65,8 @@ struct RevokeCommand {
     #[arg(value_name = "ACTIVATION", help = "Runner activation ID")]
     activation: String,
     #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
+    #[command(flatten)]
     options: CloudOptions,
 }
 

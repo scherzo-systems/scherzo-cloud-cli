@@ -52,7 +52,7 @@ struct InstallationCommand {
 #[derive(Debug, Subcommand)]
 enum InstallationLeaf {
     #[command(about = "Disconnect a GitHub installation binding")]
-    Disconnect(InstallationTarget),
+    Disconnect(InstallationDisconnectCommand),
     #[command(about = "List GitHub installation bindings")]
     List(OrganizationTarget),
 }
@@ -114,6 +114,15 @@ struct InstallationTarget {
     options: GitHubOptions,
 }
 
+#[derive(Debug, Args)]
+struct InstallationDisconnectCommand {
+    #[command(flatten)]
+    target: InstallationTarget,
+
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
+}
+
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
@@ -159,7 +168,7 @@ impl InstallationCommand {
                 command,
                 &[NAME],
                 ERROR_CONTEXT,
-                InstallationTarget::disconnect,
+                InstallationDisconnectCommand::disconnect,
             ),
         }
     }
@@ -244,21 +253,22 @@ impl OrganizationTarget {
     }
 }
 
-impl InstallationTarget {
+impl InstallationDisconnectCommand {
     fn disconnect(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        let target = self.target;
         let result = with_api(
             deployment,
-            self.options.http.transport_policy(),
-            &self.options.authentication,
-            |api| api.disconnect_installation(&self.organization, &self.installation),
+            target.options.http.transport_policy(),
+            &target.options.authentication,
+            |api| api.disconnect_installation(&target.organization, &target.installation),
         )?;
         output::write_installation(
             deployment.fingerprint().api_url(),
-            &self.organization,
+            &target.organization,
             &result,
             output::InstallationAction::Disconnected,
-            self.options.authentication.kind(),
-            self.options.json,
+            target.options.authentication.kind(),
+            target.options.json,
         )
     }
 }

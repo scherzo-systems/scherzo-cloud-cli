@@ -40,8 +40,9 @@ leaf.
 
 Require `--yes` for leaves ending in `delete`, `decline`, `end`, `leave`, `remove`,
 `revoke`, or `retire`, and for `account deletion request` and
-`organization deletion request`; no other leaf takes it. LIV-2427 owns the current
-confirmation burn-down for `remove`, `revoke`, and `retire`. Reversible modes such as
+`organization deletion request`; no other leaf takes it. The existing `github
+installation disconnect` and `project repository detach` paths also require `--yes`
+until their renames to `remove`. Reversible modes such as
 `runner disable` and `runner drain` do not take `--yes`. A command paginates when it
 returns one page and permits continuation: in that case expose `--limit` and `--cursor`
 together through `PaginationArgs`, which also supplies the exact `Pagination:`

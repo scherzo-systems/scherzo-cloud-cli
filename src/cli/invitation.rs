@@ -168,13 +168,8 @@ struct DeclineCommand {
     #[command(flatten)]
     access: InvitationAccess,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm invitation decline"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
 
     #[command(flatten)]
     options: InvitationOptions,
@@ -239,13 +234,8 @@ struct RevokeCommand {
     )]
     invitation_id: String,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm invitation revocation"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
 
     #[command(flatten)]
     options: InvitationOptions,

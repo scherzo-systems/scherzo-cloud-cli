@@ -226,7 +226,8 @@ scherzo-cloud service-principal credential issue \
 
 scherzo-cloud service-principal credential revoke \
   crd_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --service-api-key-file ./build-agent-next.key
+  --service-api-key-file ./build-agent-next.key \
+  --yes
 ```
 
 Input key files must be regular, non-symbolic-link files owned by the current user with
@@ -758,7 +759,7 @@ scherzo-cloud auth identity list --limit 50 --cursor "$NEXT_CURSOR"
 scherzo-cloud auth identity link
 
 # Remove a non-current identity by the opaque ID returned by list.
-scherzo-cloud auth identity remove idn_01k0z6r1w8f4jy2m7q9v3x5abc
+scherzo-cloud auth identity remove idn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 `auth identity link` keeps the session that passed preflight as the acting identity
@@ -1119,7 +1120,7 @@ Disconnect an installation from Scherzo Cloud with its stable binding ID:
 ```sh
 scherzo-cloud github installation disconnect \
   acme-labs \
-  ghi_01k0z6r1w8f4jy2m7q9v3x5abc
+  ghi_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Disconnection marks the binding and its repository connections unavailable for new
@@ -1242,14 +1243,14 @@ scherzo-cloud project repository update \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --default-branch stable
 scherzo-cloud project repository detach \
-  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Assign, replace, or remove the runner pool.
 scherzo-cloud project runner-pool set \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   rpl_01k0z6r1w8f4jy2m7q9v3x5abc
 scherzo-cloud project runner-pool remove \
-  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+  acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Human output always includes the complete project's `ready` or `blocked` verdict and its

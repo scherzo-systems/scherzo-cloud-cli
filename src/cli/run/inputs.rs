@@ -73,13 +73,8 @@ struct DeleteCommand {
     #[command(flatten)]
     run: super::RunReference,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm logical unavailability and scheduled content cleanup"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
 
     #[command(flatten)]
     options: super::CloudInputOptions,
@@ -493,7 +488,6 @@ fn sync_tree(root: &Path) -> io::Result<()> {
 
 impl DeleteCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
-        let _confirmation = self.yes;
         let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate retained input deletion identity")?;
         let signal_deployment = deployment.clone();

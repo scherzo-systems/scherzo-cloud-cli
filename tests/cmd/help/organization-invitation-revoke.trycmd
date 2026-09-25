@@ -9,7 +9,7 @@ Arguments:
   <INVITATION>    Exact invitation ID
 
 Options:
-      --yes                            Confirm invitation revocation
+      --yes                            Confirm this action
       --json                           Print the invitation result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections

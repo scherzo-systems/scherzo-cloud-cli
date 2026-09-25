@@ -228,6 +228,9 @@ struct RepositoryDetachCommand {
     project: ProjectReference,
 
     #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
+
+    #[command(flatten)]
     options: Options,
 }
 
@@ -261,6 +264,9 @@ struct RunnerPoolSetCommand {
 struct RunnerPoolRemoveCommand {
     #[command(flatten)]
     project: ProjectReference,
+
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
 
     #[command(flatten)]
     options: Options,

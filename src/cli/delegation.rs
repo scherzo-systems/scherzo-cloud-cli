@@ -164,13 +164,8 @@ struct EndCommand {
     #[command(flatten)]
     target: DelegationTarget,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm permanent delegation ending"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
 
     #[command(flatten)]
     options: DelegationOptions,

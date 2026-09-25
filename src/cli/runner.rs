@@ -178,13 +178,8 @@ struct DeleteCommand {
     #[command(flatten)]
     target: RegistrationTarget,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm permanent runner deletion"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
 
     #[command(flatten)]
     options: CloudOptions,

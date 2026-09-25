@@ -8,7 +8,7 @@ Arguments:
   <DELEGATION>  Exact delegation ID
 
 Options:
-      --yes                            Confirm permanent delegation ending
+      --yes                            Confirm this action
       --json                           Print the delegation result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections

@@ -52,6 +52,8 @@ struct MutationCommand {
     #[arg(value_name = "CREDENTIAL", help = "Runner credential ID")]
     credential: String,
     #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
+    #[command(flatten)]
     options: CloudOptions,
 }
 // jscpd:ignore-end

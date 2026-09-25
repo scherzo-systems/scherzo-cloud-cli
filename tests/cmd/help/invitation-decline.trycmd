@@ -9,7 +9,7 @@ Arguments:
 
 Options:
       --capability-file <PATH|->       Read an email invitation capability from a protected file or explicit stdin
-      --yes                            Confirm invitation decline
+      --yes                            Confirm this action
       --json                           Print the invitation result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections

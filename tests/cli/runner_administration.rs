@@ -1125,6 +1125,7 @@ fn credential_mutations_send_empty_bodies_and_idempotency_keys() {
                 ORGANIZATION,
                 RUNNER_ID,
                 CREDENTIAL_ID,
+                "--yes",
                 "--json",
                 "--allow-insecure-http",
             ],

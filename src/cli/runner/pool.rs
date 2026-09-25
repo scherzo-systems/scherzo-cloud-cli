@@ -92,13 +92,8 @@ struct DeleteCommand {
     #[arg(value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
     pool: PoolArg,
 
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm permanent runner pool deletion"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
 
     #[command(flatten)]
     options: CloudOptions,

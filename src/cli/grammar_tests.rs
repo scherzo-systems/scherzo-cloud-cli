@@ -12,15 +12,6 @@ const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
 fn semantic_class(path: &str, long: &str) -> Option<String> {
-    if long == "yes"
-        && matches!(
-            path,
-            "connection linear remove" | "connection linear delete"
-        )
-    {
-        // Both connection lifecycle operations use the same ConfirmationTarget.
-        return Some("yes:connection-lifecycle".to_owned());
-    }
     let shared = match long {
         "service-api-key-file"
         | "allow-insecure-http"
@@ -255,59 +246,12 @@ fn violations(root: &Command) -> BTreeSet<String> {
 
 // A ratchet: entries must be unique, sorted, and observed. Each entry has one burn-down owner.
 const BASELINE: &[(&str, &str)] = &[
-    ("confirmation|auth identity remove", "LIV-2427"),
-    ("confirmation|github installation disconnect", "LIV-2427"),
-    ("confirmation|project repository detach", "LIV-2427"),
-    ("confirmation|project runner-pool remove", "LIV-2427"),
-    ("confirmation|runner activation revoke", "LIV-2427"),
-    ("confirmation|runner credential retire", "LIV-2427"),
-    ("confirmation|runner credential revoke", "LIV-2427"),
-    (
-        "confirmation|service-principal credential revoke",
-        "LIV-2427",
-    ),
     (
         "description|github installation list|project repository installation list",
         "LIV-2428",
     ),
     ("leaf-token|github installation disconnect", "LIV-2426"),
     ("leaf-token|project repository detach", "LIV-2426"),
-    (
-        "option-help|yes|account deletion request|delegation end",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|invitation decline",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|organization invitation revoke",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|organization leave",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|organization member remove",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|run input delete",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|run input-set delete",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|runner delete",
-        "LIV-2427",
-    ),
-    (
-        "option-help|yes|account deletion request|runner pool delete",
-        "LIV-2427",
-    ),
     (
         "placeholder|--display-name|account update|organization create",
         "LIV-2422",
@@ -368,6 +312,72 @@ fn cli_grammar_conforms_with_mapped_debt() {
         "{}",
         check_baseline(&observed, BASELINE).unwrap_err()
     );
+}
+
+#[test]
+fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
+    let gated: &[&[&str]] = &[
+        &[
+            "service-principal",
+            "credential",
+            "revoke",
+            "crd_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--service-api-key-file",
+            "key",
+        ],
+        &[
+            "runner",
+            "credential",
+            "revoke",
+            "example",
+            "runner",
+            "credential",
+        ],
+        &[
+            "runner",
+            "credential",
+            "retire",
+            "example",
+            "runner",
+            "credential",
+        ],
+        &[
+            "runner",
+            "activation",
+            "revoke",
+            "example",
+            "runner",
+            "activation",
+        ],
+        &["auth", "identity", "remove", "identity"],
+        &[
+            "github",
+            "installation",
+            "disconnect",
+            "example",
+            "installation",
+        ],
+        &["project", "repository", "detach", "example", "project"],
+        &["project", "runner-pool", "remove", "example", "project"],
+    ];
+    for &args in gated {
+        let input = std::iter::once("scherzo-cloud").chain(args.iter().copied());
+        assert_eq!(
+            super::parse(input).unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{args:?}"
+        );
+        let input = std::iter::once("scherzo-cloud")
+            .chain(args.iter().copied())
+            .chain(std::iter::once("--yes"));
+        assert!(super::parse(input).is_ok(), "{args:?}");
+    }
+    for mode in ["disable", "drain"] {
+        assert!(
+            super::parse(["scherzo-cloud", "runner", mode, "example", "runner"]).is_ok(),
+            "{mode}"
+        );
+    }
 }
 
 #[test]

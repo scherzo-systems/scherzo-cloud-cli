@@ -18,6 +18,9 @@ pub(super) struct Command {
     identity_id: String,
 
     #[command(flatten)]
+    confirmation: super::super::super::ConfirmationArgs,
+
+    #[command(flatten)]
     options: OutputOptions,
 }
 

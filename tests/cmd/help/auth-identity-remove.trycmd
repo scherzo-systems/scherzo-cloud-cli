@@ -2,12 +2,13 @@
 $ scherzo-cloud auth identity remove --help
 Remove a linked sign-in identity
 
-Usage: scherzo-cloud auth identity remove [OPTIONS] <IDENTITY_ID>
+Usage: scherzo-cloud auth identity remove [OPTIONS] --yes <IDENTITY_ID>
 
 Arguments:
   <IDENTITY_ID>  Exact linked identity ID
 
 Options:
+      --yes                            Confirm this action
       --json                           Print the identity result as JSON
       --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
       --allow-insecure-http            Allow this command's Scherzo Cloud requests over insecure HTTP connections

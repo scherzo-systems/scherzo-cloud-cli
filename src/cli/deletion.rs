@@ -95,13 +95,8 @@ struct OrganizationCancelCommand {
 
 #[derive(Debug, Args)]
 struct RequestOptions<A: Args> {
-    #[arg(
-        long,
-        required = true,
-        action = clap::ArgAction::SetTrue,
-        help = "Confirm the deletion action described below"
-    )]
-    yes: bool,
+    #[command(flatten)]
+    confirmation: super::ConfirmationArgs,
 
     #[command(flatten)]
     common: super::CommonArgs<super::DeletionJson, A>,
