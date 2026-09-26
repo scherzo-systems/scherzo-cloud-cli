@@ -30,11 +30,11 @@ pub type RunnerPoolList = models::RunnerPoolList;
 pub type RunnerCurrentAssignment = models::RunnerCurrentAssignment;
 pub type RunnerRegistration = models::RunnerRegistration;
 pub type RunnerRegistrationList = models::RunnerRegistrationList;
-pub(crate) type RunnerActivation = models::RunnerActivation;
+pub type RunnerActivation = models::RunnerActivation;
 pub(crate) type RunnerActivationList = models::RunnerActivationList;
 pub type RunnerActivationState = models::runner_activation::State;
 pub type RunnerActivationIssuance = models::RunnerActivationIssuance;
-pub(crate) type RunnerCredential = models::RunnerCredential;
+pub type RunnerCredential = models::RunnerCredential;
 pub(crate) type RunnerCredentialList = models::RunnerCredentialList;
 pub type RunnerCredentialStoredState = models::runner_credential::StoredState;
 pub type RunnerCredentialEffectiveState = models::runner_credential::EffectiveState;
@@ -536,11 +536,13 @@ fn find_named_resource<T>(
     mut list_page: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), RunnerFailure>,
     name: impl Fn(&T) -> &str,
 ) -> Result<T, RunnerFailure> {
-    if resource_ref.starts_with(id_prefix) {
+    if scherzo_cloud_support::valid_typed_id(resource_ref, id_prefix) {
         return get_by_id();
     }
     let mut cursor = None;
-    loop {
+    // Bound name lookup like other human resource references: do not walk an
+    // unbounded deployment-wide collection for one interactive command.
+    for _ in 0..10 {
         let (items, next_cursor) = list_page(cursor.as_deref())?;
         if let Some(resource) = items
             .into_iter()
@@ -556,6 +558,7 @@ fn find_named_resource<T>(
         }
         cursor = Some(next);
     }
+    Err(RunnerFailure::LookupLimitReached)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -564,6 +567,7 @@ pub enum RunnerFailure {
     Forbidden,
     InvalidInput,
     NotFound,
+    LookupLimitReached,
     NameUnavailable,
     QuantityLimitReached,
     RateLimited,

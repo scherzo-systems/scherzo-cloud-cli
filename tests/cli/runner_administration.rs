@@ -984,6 +984,82 @@ fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
 }
 
 #[test]
+fn runner_creation_json_includes_deployment_without_exposing_the_artifact() {
+    for creates_runner in [true, false] {
+        let registration = http_response_with_headers(
+            "201 Created",
+            Some("application/json"),
+            &[
+                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+                (
+                    "Location",
+                    &format!("/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}"),
+                ),
+            ],
+            &serde_json::to_vec(&registration_body()).unwrap(),
+        );
+        let issuance = http_response_with_headers(
+            "201 Created",
+            Some("application/json"),
+            &[
+                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+                (
+                    "Location",
+                    &format!(
+                        "/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/activations/{ACTIVATION_ID}"
+                    ),
+                ),
+            ],
+            &serde_json::to_vec(&activation_issuance_body()).unwrap(),
+        );
+        let mut responses = vec![json_http_response(
+            "200 OK",
+            if creates_runner {
+                pool_list_body()
+            } else {
+                registration_body()
+            },
+        )];
+        if creates_runner {
+            responses.push(registration);
+        }
+        responses.push(issuance);
+        let (server, _credentials, credential_path) = prepared_runner(responses);
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_path = directory.path().join("activation.json");
+        let artifact_path = artifact_path.to_str().unwrap();
+        let mut args = if creates_runner {
+            vec!["runner", "create", ORGANIZATION, "--pool-id", "builders"]
+        } else {
+            vec!["runner", "activation", "issue", ORGANIZATION, RUNNER_ID]
+        };
+        args.extend([
+            "--activation-file",
+            artifact_path,
+            "--json",
+            "--allow-insecure-http",
+        ]);
+        let output = run_with_env(
+            &args,
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert!(output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["deployment"], server.api_url);
+        assert_eq!(
+            report["activation"],
+            activation_issuance_body()["activation"]
+        );
+        assert!(report.get("activationToken").is_none());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(artifact_path).unwrap()).unwrap(),
+            activation_issuance_body()["artifact"]
+        );
+        server.finish();
+    }
+}
+
+#[test]
 fn runner_create_reports_activation_failure_with_the_created_registration() {
     let registration = http_response_with_headers(
         "201 Created",
@@ -1065,6 +1141,58 @@ fn runner_create_reports_activation_failure_with_the_created_registration() {
 }
 
 #[test]
+fn activation_list_and_revoke_report_the_deployment() {
+    let activation = activation_issuance_body()["activation"].clone();
+    for revoke in [false, true] {
+        let body = if revoke {
+            let mut revoked = activation.clone();
+            revoked["state"] = serde_json::json!("revoked");
+            revoked
+        } else {
+            serde_json::json!({"items": [activation]})
+        };
+        let response = if revoke {
+            http_response_with_headers(
+                "200 OK",
+                Some("application/json"),
+                &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+                &serde_json::to_vec(&body).unwrap(),
+            )
+        } else {
+            json_http_response("200 OK", body.clone())
+        };
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", registration_body()),
+            response,
+        ]);
+        let mut args = vec![
+            "runner",
+            "activation",
+            if revoke { "revoke" } else { "list" },
+            ORGANIZATION,
+            RUNNER_ID,
+        ];
+        if revoke {
+            args.extend([ACTIVATION_ID, "--yes"]);
+        }
+        args.extend(["--json", "--allow-insecure-http"]);
+        let output = run_with_env(
+            &args,
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert!(output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["deployment"], server.api_url);
+        if revoke {
+            assert_eq!(report["activation"], body);
+        } else {
+            assert_eq!(report["items"], body["items"]);
+        }
+        server.finish();
+    }
+}
+
+#[test]
 fn credential_list_returns_only_lifecycle_metadata() {
     let credentials = serde_json::json!({
         "items": [credential_body("active")],
@@ -1095,6 +1223,7 @@ fn credential_list_returns_only_lifecycle_metadata() {
     assert!(output.stderr.is_empty());
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["outcome"], "listed");
+    assert_eq!(result["deployment"], server.api_url);
     assert_eq!(result["items"][0], credential_body("active"));
     let encoded = String::from_utf8(output.stdout).unwrap();
     assert!(!encoded.contains("verifier"));
@@ -1142,6 +1271,7 @@ fn credential_mutations_send_empty_bodies_and_idempotency_keys() {
         assert!(output.status.success());
         assert!(output.stderr.is_empty());
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["deployment"], server.api_url);
         assert_eq!(result["credential"], credential_body(state));
 
         let requests = server.finish();
@@ -1233,6 +1363,10 @@ fn enrollment_accepts_an_artifact_from_explicit_stdin() {
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["outcome"], "enrolled");
+    assert_eq!(
+        result["deployment"],
+        server.api_url.trim_end_matches("/api")
+    );
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     let secret = state["currentCredential"]["secret"].as_str().unwrap();
     assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
@@ -1302,6 +1436,7 @@ fn enrollment_gone_reports_that_the_commit_did_not_complete() {
         serde_json::json!({
             "schemaVersion": 1,
             "outcome": "gone",
+            "deployment": server.api_url.trim_end_matches("/api"),
             "activationId": ACTIVATION_ID
         })
     );

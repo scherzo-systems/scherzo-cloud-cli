@@ -342,13 +342,16 @@ pub enum EnrollmentOutcome {
     Enrolled {
         response: EnrollmentResponse,
         replacement: bool,
+        deployment: String,
     },
     ReplacementCredential {
         runner_id: String,
         credential_id: String,
+        deployment: String,
     },
     Gone {
         activation_id: String,
+        deployment: String,
     },
 }
 
@@ -446,6 +449,7 @@ pub fn enroll(
                     let outcome = EnrollmentOutcome::ReplacementCredential {
                         runner_id: state.runner_id.clone(),
                         credential_id: credential.id.clone(),
+                        deployment: enrollment_deployment(&artifact.activation_url)?,
                     };
                     drop(lock);
                     return Ok(outcome);
@@ -466,6 +470,7 @@ pub fn enroll(
         schema_version: 1,
         credential_secret_verifier: &journal.credential_secret_verifier,
     };
+    let deployment = enrollment_deployment(&journal.activation_artifact.activation_url)?;
     match send_enrollment(&journal, &request)? {
         EnrollmentHTTPOutcome::Success(response) => {
             validate_enrollment_response(
@@ -479,6 +484,7 @@ pub fn enroll(
             Ok(EnrollmentOutcome::Enrolled {
                 response,
                 replacement: journal.replace_credential,
+                deployment,
             })
         }
         EnrollmentHTTPOutcome::Gone => {
@@ -491,9 +497,20 @@ pub fn enroll(
             };
             atomic_write_json(&journal_path, &receipt)?;
             drop(lock);
-            Ok(EnrollmentOutcome::Gone { activation_id })
+            Ok(EnrollmentOutcome::Gone {
+                activation_id,
+                deployment,
+            })
         }
     }
+}
+
+// Validation requires the root-level /v1/runner-enrollments/.../activate path,
+// so this origin is the API base that actually received enrollment. The
+// caller's human-auth deployment may differ from the issued artifact's target.
+fn enrollment_deployment(activation_url: &str) -> Result<String, EnrollmentError> {
+    let url = Url::parse(activation_url).map_err(|_| EnrollmentError::InvalidJournal)?;
+    Ok(url.origin().ascii_serialization())
 }
 
 #[derive(Serialize)]

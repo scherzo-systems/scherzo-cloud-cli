@@ -1,4 +1,15 @@
 mod activation;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunnerCreationOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    runner: &'a scherzo_cloud_api::RunnerRegistration,
+    activation: &'a scherzo_cloud_api::RunnerActivation,
+    activation_file: &'a str,
+}
 mod cloud;
 mod credential;
 mod doctor;
@@ -350,13 +361,14 @@ impl CreateCommand {
         } else if self.options.json {
             serde_json::to_writer_pretty(
                 &mut io::stdout().lock(),
-                &serde_json::json!({
-                    "schemaVersion": 1,
-                    "outcome": "created",
-                    "runner": registration,
-                    "activation": issuance.activation,
-                    "activationFile": self.activation_file,
-                }),
+                &RunnerCreationOutput {
+                    schema_version: 1,
+                    deployment: deployment.fingerprint().api_url(),
+                    outcome: "created",
+                    runner: &registration,
+                    activation: &issuance.activation,
+                    activation_file: &self.activation_file,
+                },
             )?;
             writeln!(io::stdout().lock())?;
         } else {

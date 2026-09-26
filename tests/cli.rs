@@ -1975,6 +1975,7 @@ fn runner_doctor_reports_schema_one_json() {
         serde_json::json!({
             "schemaVersion": 1,
             "command": "scherzo-cloud runner doctor",
+            "deployment": null,
             "checks": [{
                 "id": "environment.command.git",
                 "title": "Git",

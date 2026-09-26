@@ -142,9 +142,10 @@ pub use run_inputs::{
     input_set_state_name, retained_manifest, transfer_capability_batch,
 };
 pub use runners::{
-    RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredentialEffectiveState,
-    RunnerCredentialStoredState, RunnerCurrentAssignment, RunnerDeletionBlocker, RunnerFailure,
-    RunnerPool, RunnerPoolList, RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
+    RunnerActivation, RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredential,
+    RunnerCredentialEffectiveState, RunnerCredentialStoredState, RunnerCurrentAssignment,
+    RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
+    RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub use runs::{
     CreateRunInput, Run, RunApi, RunArtifactDelivery, RunCancellation,

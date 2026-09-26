@@ -66,33 +66,48 @@ impl Command {
             EnrollmentOutcome::Enrolled {
                 response,
                 replacement: false,
+                deployment,
             } => {
-                write_initial_enrollment(&mut io::stdout().lock(), &response, self.output.json)?;
+                write_initial_enrollment(
+                    &mut io::stdout().lock(),
+                    &response,
+                    &deployment,
+                    self.output.json,
+                )?;
                 Ok(ExitCode::Success)
             }
             EnrollmentOutcome::Enrolled {
                 response,
                 replacement: true,
-            } => self.finish_replacement(ReplacementEnrollment::from_response(response)),
+                deployment,
+            } => {
+                self.finish_replacement(ReplacementEnrollment::from_response(response, deployment))
+            }
             EnrollmentOutcome::ReplacementCredential {
                 runner_id,
                 credential_id,
+                deployment,
             } => self.finish_replacement(ReplacementEnrollment {
+                deployment,
                 runner_id,
                 credential_id,
                 runner_name: None,
                 runner_pool_name: None,
                 cloud_outcome: "already_enrolled",
             }),
-            EnrollmentOutcome::Gone { activation_id } => {
+            EnrollmentOutcome::Gone {
+                activation_id,
+                deployment,
+            } => {
                 if self.output.json {
                     serde_json::to_writer_pretty(
                         &mut io::stdout().lock(),
-                        &serde_json::json!({
-                            "schemaVersion": 1,
-                            "outcome": "gone",
-                            "activationId": activation_id,
-                        }),
+                        &EnrollmentGoneOutput {
+                            schema_version: 1,
+                            deployment: &deployment,
+                            outcome: "gone",
+                            activation_id: &activation_id,
+                        },
                     )?;
                     writeln!(io::stdout().lock())?;
                 } else {
@@ -117,7 +132,57 @@ impl Command {
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollmentGoneOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    activation_id: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollmentOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    runner_id: &'a str,
+    runner_name: &'a str,
+    runner_pool_name: &'a str,
+    credential_id: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct OutcomeOutput<'a> {
+    outcome: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct PromotionOutput<'a> {
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplacementOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    runner_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_pool_name: Option<&'a str>,
+    credential_id: &'a str,
+    cloud_enrollment: OutcomeOutput<'a>,
+    live_promotion: PromotionOutput<'a>,
+}
+
 struct ReplacementEnrollment {
+    deployment: String,
     runner_id: String,
     credential_id: String,
     runner_name: Option<String>,
@@ -126,8 +191,9 @@ struct ReplacementEnrollment {
 }
 
 impl ReplacementEnrollment {
-    fn from_response(response: EnrollmentResponse) -> Self {
+    fn from_response(response: EnrollmentResponse, deployment: String) -> Self {
         Self {
+            deployment,
             runner_id: response.runner_id().to_owned(),
             credential_id: response.credential_id().to_owned(),
             runner_name: Some(response.runner_name().to_owned()),
@@ -256,19 +322,21 @@ fn promote_replacement(
 fn write_initial_enrollment(
     output: &mut impl Write,
     response: &EnrollmentResponse,
+    deployment: &str,
     json: bool,
 ) -> anyhow::Result<()> {
     if json {
         serde_json::to_writer_pretty(
             &mut *output,
-            &serde_json::json!({
-                "schemaVersion": 1,
-                "outcome": "enrolled",
-                "runnerId": response.runner_id(),
-                "runnerName": response.runner_name(),
-                "runnerPoolName": response.pool_name(),
-                "credentialId": response.credential_id(),
-            }),
+            &EnrollmentOutput {
+                schema_version: 1,
+                deployment,
+                outcome: "enrolled",
+                runner_id: response.runner_id(),
+                runner_name: response.runner_name(),
+                runner_pool_name: response.pool_name(),
+                credential_id: response.credential_id(),
+            },
         )?;
         writeln!(output)?;
     } else {
@@ -286,31 +354,32 @@ fn write_replacement_json(
     enrollment: &ReplacementEnrollment,
     promotion: PromotionOutcome,
 ) -> anyhow::Result<()> {
-    let live_promotion = match promotion {
-        PromotionOutcome::Promoted => serde_json::json!({"outcome": "promoted"}),
-        PromotionOutcome::Incomplete(failure) => serde_json::json!({
-            "outcome": "pending",
-            "error": failure.category(),
-        }),
-    };
-    let mut report = serde_json::json!({
-        "schemaVersion": 1,
-        "outcome": if promotion == PromotionOutcome::Promoted {
+    let report = ReplacementOutput {
+        schema_version: 1,
+        deployment: &enrollment.deployment,
+        outcome: if promotion == PromotionOutcome::Promoted {
             "rotation_completed"
         } else {
             "rotation_incomplete"
         },
-        "runnerId": enrollment.runner_id,
-        "credentialId": enrollment.credential_id,
-        "cloudEnrollment": {"outcome": enrollment.cloud_outcome},
-        "livePromotion": live_promotion,
-    });
-    if let Some(name) = &enrollment.runner_name {
-        report["runnerName"] = serde_json::Value::String(name.clone());
-    }
-    if let Some(name) = &enrollment.runner_pool_name {
-        report["runnerPoolName"] = serde_json::Value::String(name.clone());
-    }
+        runner_id: &enrollment.runner_id,
+        runner_name: enrollment.runner_name.as_deref(),
+        runner_pool_name: enrollment.runner_pool_name.as_deref(),
+        credential_id: &enrollment.credential_id,
+        cloud_enrollment: OutcomeOutput {
+            outcome: enrollment.cloud_outcome,
+        },
+        live_promotion: match promotion {
+            PromotionOutcome::Promoted => PromotionOutput {
+                outcome: "promoted",
+                error: None,
+            },
+            PromotionOutcome::Incomplete(failure) => PromotionOutput {
+                outcome: "pending",
+                error: Some(failure.category()),
+            },
+        },
+    };
     serde_json::to_writer_pretty(&mut *output, &report)?;
     writeln!(output)?;
     Ok(())
@@ -354,6 +423,7 @@ mod tests {
 
     fn replacement() -> ReplacementEnrollment {
         ReplacementEnrollment {
+            deployment: "https://example.test".to_owned(),
             runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             credential_id: "rrc_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
             runner_name: None,

@@ -14,6 +14,35 @@ use scherzo_cloud_support::generate_idempotency_key;
 pub(super) const ABOUT: &str = "Manage runner enrollment activations";
 const COMMAND_PATH: &[&str] = &["runner", "activation"];
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivationCreationOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    activation: &'a scherzo_cloud_api::RunnerActivation,
+    activation_file: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivationListOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    items: &'a [scherzo_cloud_api::RunnerActivation],
+    next_cursor: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivationRevocationOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    activation: &'a scherzo_cloud_api::RunnerActivation,
+}
+
 // Pool and activation namespaces keep concrete subcommand enums so Clap owns
 // each exact operator vocabulary without a metadata-driven command abstraction.
 // jscpd:ignore-start
@@ -136,12 +165,13 @@ impl IssueCommand {
             // jscpd:ignore-start
             serde_json::to_writer_pretty(
                 &mut io::stdout().lock(),
-                &serde_json::json!({
-                    "schemaVersion": 1,
-                    "outcome": "created",
-                    "activation": issuance.activation,
-                    "activationFile": self.activation_file,
-                }),
+                &ActivationCreationOutput {
+                    schema_version: 1,
+                    deployment: deployment.fingerprint().api_url(),
+                    outcome: "created",
+                    activation: &issuance.activation,
+                    activation_file: &self.activation_file,
+                },
             )?;
             writeln!(io::stdout().lock())?;
             // jscpd:ignore-end
@@ -183,12 +213,13 @@ impl ListCommand {
                 if self.options.json {
                     serde_json::to_writer_pretty(
                         &mut io::stdout().lock(),
-                        &serde_json::json!({
-                            "schemaVersion": 1,
-                            "outcome": "listed",
-                            "items": page.items,
-                            "nextCursor": page.next_cursor,
-                        }),
+                        &ActivationListOutput {
+                            schema_version: 1,
+                            deployment: deployment.fingerprint().api_url(),
+                            outcome: "listed",
+                            items: &page.items,
+                            next_cursor: page.next_cursor.as_deref(),
+                        },
                     )?;
                     writeln!(io::stdout().lock())?;
                 } else {
@@ -239,11 +270,12 @@ impl RevokeCommand {
                 if self.options.json {
                     serde_json::to_writer_pretty(
                         &mut io::stdout().lock(),
-                        &serde_json::json!({
-                            "schemaVersion": 1,
-                            "outcome": "revoked",
-                            "activation": activation,
-                        }),
+                        &ActivationRevocationOutput {
+                            schema_version: 1,
+                            deployment: deployment.fingerprint().api_url(),
+                            outcome: "revoked",
+                            activation: &activation,
+                        },
                     )?;
                     writeln!(io::stdout().lock())?;
                 } else {

@@ -50,7 +50,7 @@ fn write_status(output: &mut impl Write, status: &StatusSnapshot) -> io::Result<
     writeln!(
         output,
         "process:        {}",
-        enum_json(status.process_state)
+        enum_json(status.process_state)?
     )?;
     writeln!(output, "boot:           {}", status.boot_id)?;
     writeln!(
@@ -61,7 +61,7 @@ fn write_status(output: &mut impl Write, status: &StatusSnapshot) -> io::Result<
     writeln!(
         output,
         "connection:     {}",
-        enum_json(status.connection_state)
+        enum_json(status.connection_state)?
     )?;
     if let Some(last_connected_at) = &status.last_connected_at {
         writeln!(output, "last connected: {last_connected_at}")?;
@@ -75,19 +75,20 @@ fn write_status(output: &mut impl Write, status: &StatusSnapshot) -> io::Result<
     writeln!(
         output,
         "assignments:    {}",
-        format_assignments(status.assignment_counts)
+        format_assignments(status.assignment_counts)?
     )?;
     if let Some(failure) = status.last_connection_failure {
-        writeln!(output, "last failure:   {}", enum_json(failure))?;
+        writeln!(output, "last failure:   {}", enum_json(failure)?)?;
     }
     Ok(())
 }
 
-fn enum_json(value: impl serde::Serialize) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".to_owned())
+fn enum_json(value: impl serde::Serialize) -> io::Result<String> {
+    let value = serde_json::to_value(value)?;
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("Runner Serve control state is not a string"))
 }
 
 fn format_uptime(milliseconds: u64) -> String {
@@ -107,8 +108,10 @@ fn format_uptime(milliseconds: u64) -> String {
     }
 }
 
-fn format_assignments(counts: AssignmentCounts) -> String {
-    let total = counts.total().unwrap_or(u64::MAX);
+fn format_assignments(counts: AssignmentCounts) -> io::Result<String> {
+    let total = counts
+        .total()
+        .ok_or_else(|| io::Error::other("assignment count overflow"))?;
     let details = [
         ("preparing", counts.preparing),
         ("accepted", counts.accepted),
@@ -121,9 +124,9 @@ fn format_assignments(counts: AssignmentCounts) -> String {
     .map(|(state, count)| format!("{state}: {count}"))
     .collect::<Vec<_>>();
     if details.is_empty() {
-        format!("{total} total")
+        Ok(format!("{total} total"))
     } else {
-        format!("{total} total ({})", details.join(", "))
+        Ok(format!("{total} total ({})", details.join(", ")))
     }
 }
 
@@ -134,13 +137,44 @@ mod tests {
 
     #[test]
     fn renders_idle_and_nonzero_assignment_counts() {
-        assert_eq!(format_assignments(AssignmentCounts::default()), "0 total");
+        assert_eq!(
+            format_assignments(AssignmentCounts::default()).unwrap(),
+            "0 total"
+        );
         assert_eq!(
             format_assignments(AssignmentCounts {
                 running: 1,
                 ..AssignmentCounts::default()
-            }),
+            })
+            .unwrap(),
             "1 total (running: 1)"
+        );
+    }
+
+    #[test]
+    fn status_rejects_unrepresentable_counts_and_states() {
+        assert_eq!(
+            format_assignments(AssignmentCounts {
+                preparing: u64::MAX,
+                running: 1,
+                ..AssignmentCounts::default()
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Other
+        );
+        struct Unserializable;
+        impl serde::Serialize for Unserializable {
+            fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("invalid state"))
+            }
+        }
+        assert_eq!(
+            enum_json(Unserializable).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 

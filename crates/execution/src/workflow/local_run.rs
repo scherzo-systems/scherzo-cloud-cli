@@ -1785,8 +1785,12 @@ pub enum LocalStatusResult {
     PublicationFailed { phase: &'static str },
 }
 
+mod status_state;
+pub use status_state::LocalStatusStateView;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalRunStatusSnapshot {
+    pub status_state: LocalStatusStateView,
     pub run_directory: PathBuf,
     pub run: Value,
     pub state: Value,
@@ -6068,6 +6072,7 @@ fn status_snapshot(
         recovery,
         retry,
         continuation: retry,
+        status_state: LocalStatusStateView { state },
     })
 }
 

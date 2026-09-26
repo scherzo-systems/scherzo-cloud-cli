@@ -131,6 +131,7 @@ fn write_json_report(report: &Report) -> anyhow::Result<()> {
 struct JsonReport<'a> {
     schema_version: u8,
     command: &'static str,
+    deployment: Option<&'static str>,
     checks: Vec<JsonCheck<'a>>,
     summary: JsonSummary,
 }
@@ -141,6 +142,8 @@ impl<'a> JsonReport<'a> {
         Self {
             schema_version: 1,
             command: COMMAND_NAME,
+            // Local prerequisite checks do not load a Cloud deployment.
+            deployment: None,
             checks: report.results.iter().map(JsonCheck::from_result).collect(),
             summary: JsonSummary {
                 passed: summary.passed,

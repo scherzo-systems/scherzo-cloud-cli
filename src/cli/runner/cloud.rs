@@ -609,6 +609,12 @@ fn write_failure_with_context(
             "error: runner resource not found or unavailable\n\nCheck the organization and resource reference, then try again.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
+        RunnerFailure::LookupLimitReached => (
+            "lookup_limit_reached",
+            None,
+            "error: runner name lookup reached its page limit\n\nUse the resource ID instead.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
         RunnerFailure::NameUnavailable => (
             "name_unavailable",
             None,
@@ -843,7 +849,8 @@ mod tests {
 
     #[test]
     fn runner_show_keeps_cloud_projections_separate_from_advertised_metadata() {
-        let runner: RunnerRegistration = serde_json::from_value(serde_json::json!({
+        let runner: RunnerRegistration = serde_json::from_str(
+            r#"{
             "id": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
             "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
             "runnerPool": {
@@ -878,7 +885,8 @@ mod tests {
                 "runnerVersion": "1.2.3",
                 "protocolVersion": 1
             }
-        }))
+        }"#,
+        )
         .expect("runner fixture should match the generated API model");
 
         let page = RunnerRegistrationList {

@@ -186,11 +186,13 @@ fn successful_enrollment_commits_schema_valid_state_without_transmitting_secret(
     let EnrollmentOutcome::Enrolled {
         response,
         replacement,
+        deployment,
     } = outcome
     else {
         panic!("enrollment unexpectedly returned gone");
     };
     assert!(!replacement);
+    assert_eq!(deployment, server.api_url.trim_end_matches("/api/"));
     assert_eq!(response.credential_id(), CREDENTIAL_ID);
     assert!(!fixture.journal_path().exists());
 
@@ -313,6 +315,7 @@ fn replacement_enrollment_preserves_current_and_reuses_the_staged_pending_creden
         EnrollmentOutcome::ReplacementCredential {
             runner_id,
             credential_id,
+            ..
         } if runner_id == RUNNER_ID && credential_id == REPLACEMENT_CREDENTIAL_ID
     ));
     assert_eq!(
@@ -345,6 +348,7 @@ fn replacement_enrollment_preserves_current_and_reuses_the_staged_pending_creden
         EnrollmentOutcome::ReplacementCredential {
             runner_id,
             credential_id,
+            ..
         } if runner_id == RUNNER_ID && credential_id == REPLACEMENT_CREDENTIAL_ID
     ));
     assert_eq!(
@@ -423,7 +427,7 @@ fn enrollment_journal_and_terminal_receipt_match_schemas_across_retries() {
     let outcome = enroll(None, &fixture.config_path, false, true).expect("resolve gone journal");
     assert!(matches!(
         outcome,
-        EnrollmentOutcome::Gone { activation_id } if activation_id == ACTIVATION_ID
+        EnrollmentOutcome::Gone { activation_id, .. } if activation_id == ACTIVATION_ID
     ));
     let receipt_bytes = fs::read(&journal_path).expect("read terminal receipt");
     assert_json_matches_schema(

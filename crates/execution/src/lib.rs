@@ -201,6 +201,7 @@ pub use workflow::local_run::LocalRunCommitPort;
 pub use workflow::local_run::LocalRunDirectoryError;
 pub use workflow::local_run::LocalStatusAttempt;
 pub use workflow::local_run::LocalStatusErrorCode;
+pub use workflow::local_run::LocalStatusStateView;
 pub use workflow::local_run::OwnershipUnprovenReason;
 pub use workflow::local_run::PendingLocalRetry;
 pub use workflow::process_group::AuthenticatedSignalResult;

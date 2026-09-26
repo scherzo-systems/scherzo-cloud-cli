@@ -115,12 +115,13 @@ impl ListCommand {
                 if self.options.json {
                     serde_json::to_writer_pretty(
                         &mut io::stdout().lock(),
-                        &serde_json::json!({
-                            "schemaVersion": 1,
-                            "outcome": "listed",
-                            "items": page.items,
-                            "nextCursor": page.next_cursor,
-                        }),
+                        &CredentialListOutput {
+                            schema_version: 1,
+                            deployment: deployment.fingerprint().api_url(),
+                            outcome: "listed",
+                            items: &page.items,
+                            next_cursor: page.next_cursor.as_deref(),
+                        },
                     )?;
                     writeln!(io::stdout().lock())?;
                 } else {
@@ -203,11 +204,12 @@ impl MutationCommand {
                 if self.options.json {
                     serde_json::to_writer_pretty(
                         &mut io::stdout().lock(),
-                        &serde_json::json!({
-                            "schemaVersion": 1,
-                            "outcome": outcome,
-                            "credential": credential,
-                        }),
+                        &CredentialMutationOutput {
+                            schema_version: 1,
+                            deployment: deployment.fingerprint().api_url(),
+                            outcome,
+                            credential: &credential,
+                        },
                     )?;
                     writeln!(io::stdout().lock())?;
                 } else {
@@ -232,6 +234,25 @@ impl MutationCommand {
             Err(failure) => self.options.write_failure(deployment, &failure),
         }
     }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialListOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    items: &'a [scherzo_cloud_api::RunnerCredential],
+    next_cursor: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialMutationOutput<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    credential: &'a scherzo_cloud_api::RunnerCredential,
 }
 
 fn stored_state_label(state: scherzo_cloud_api::RunnerCredentialStoredState) -> &'static str {

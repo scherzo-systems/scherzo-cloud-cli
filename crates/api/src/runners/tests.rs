@@ -220,6 +220,45 @@ fn runner_deletion_accepts_only_ordered_resource_specific_blockers() {
 }
 
 #[test]
+fn id_prefixed_pool_name_resolves_through_the_list_not_the_id_endpoint() {
+    let pool = serde_json::json!({
+        "id": POOL_ID,
+        "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "name": "rpl_example",
+        "createdAt": "2026-08-09T12:00:00Z",
+        "updatedAt": "2026-08-09T12:01:00Z"
+    });
+    let body = serde_json::to_vec(&serde_json::json!({
+        "items": [pool], "nextCursor": null
+    }))
+    .unwrap();
+    let server = ScriptedHttpServer::respond(response("200 OK", &body));
+    let resolved = api(&server).get_pool(ORGANIZATION, "rpl_example").unwrap();
+    assert_eq!(resolved.id, POOL_ID);
+    let request = server.finish_one();
+    assert!(request.starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
+    )));
+}
+
+#[test]
+fn name_lookup_stops_after_ten_pages() {
+    let mut pages = 0;
+    let result = find_named_resource(
+        "rpl_example",
+        "rpl_",
+        || -> Result<(), RunnerFailure> { Err(RunnerFailure::Protocol) },
+        |_| {
+            pages += 1;
+            Ok((vec![], Some(pages.to_string())))
+        },
+        |_: &()| "",
+    );
+    assert_eq!(result, Err(RunnerFailure::LookupLimitReached));
+    assert_eq!(pages, 10);
+}
+
+#[test]
 fn runner_client_requires_contracted_problem_types() {
     let body = serde_json::to_vec(&serde_json::json!({
         "type": "https://api.scherzo.dev/problems/not-found",

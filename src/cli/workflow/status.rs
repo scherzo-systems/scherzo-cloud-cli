@@ -7,9 +7,9 @@ use serde_json::Value;
 
 use crate::exit_code::ExitCode;
 use scherzo_cloud_execution::{
-    ColorChoice, FailureDetail, LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot,
-    LocalStatusError, LocalStatusResult, NodeDetail, PresentationConfig, RequestedPresentationMode,
-    RetryIneligibilityReason, TerminalCapabilities, WorkflowResultV1, load_local_archived_attempt,
+    ColorChoice, LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot,
+    LocalStatusError, LocalStatusResult, PresentationConfig, RequestedPresentationMode,
+    RetryIneligibilityReason, TerminalCapabilities, load_local_archived_attempt,
     read_local_run_status, reconcile_current_result_publication, styled_terminal_text as styled,
 };
 
@@ -213,20 +213,7 @@ fn render_json(snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>) -> io
                 recovery: RecoveryOutput::from(&snapshot.recovery),
                 retry: snapshot.retry.into(),
                 continuation: snapshot.continuation.into(),
-                workspace_modified: snapshot.state["attempts"]
-                    .as_array()
-                    .and_then(|attempts| attempts.last())
-                    .and_then(|attempt| {
-                        attempt["continuation"]["workspace"]["modified"]
-                            .as_str()
-                            .map(|value| serde_json::json!(value))
-                            .or_else(|| {
-                                attempt["continuation"]["workspace"]["modified"]
-                                    .as_bool()
-                                    .map(|value| serde_json::json!(value))
-                            })
-                    })
-                    .unwrap_or_else(|| serde_json::json!("unknown")),
+                workspace_modified: snapshot.status_state.workspace_modified()?,
             })?;
             Ok(ExitCode::Success)
         }
@@ -304,12 +291,7 @@ fn write_plain_snapshot(
     writeln!(
         writer,
         "workspace modified: {}",
-        snapshot.state["attempts"]
-            .as_array()
-            .and_then(|attempts| attempts.last())
-            .map(|attempt| &attempt["continuation"]["workspace"]["modified"])
-            .filter(|value| !value.is_null())
-            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+        snapshot.status_state.workspace_modified()?
     )?;
     let archived_result = if matches!(
         &snapshot.current_result,
@@ -321,7 +303,9 @@ fn write_plain_snapshot(
     } else {
         None
     };
-    write_step_recovery(writer, &snapshot.state, archived_result.as_ref())?;
+    snapshot
+        .status_state
+        .write_recovery(writer, archived_result.as_ref())?;
     if let LocalRecoveryStatus::OwnershipUnproven { guard_ids, reason } = &snapshot.recovery {
         writeln!(writer, "ownership reason: {}", reason.as_str())?;
         writeln!(writer, "remedy: {}", reason.remedy())?;
@@ -340,208 +324,6 @@ fn write_plain_snapshot(
         )?;
     }
     Ok(())
-}
-
-fn write_step_recovery(
-    writer: &mut impl Write,
-    state: &Value,
-    archived_result: Option<&WorkflowResultV1>,
-) -> io::Result<()> {
-    let Some(attempt) = state
-        .get("attempts")
-        .and_then(Value::as_array)
-        .and_then(|attempts| attempts.last())
-    else {
-        return Ok(());
-    };
-    let Some(progress) = attempt.get("progress") else {
-        return Ok(());
-    };
-    if let Some(steps) = progress.get("steps").and_then(Value::as_array) {
-        for step in steps {
-            let Some(recovery) = step.get("recovery") else {
-                continue;
-            };
-            let id = step.get("id").and_then(Value::as_str).unwrap_or("unknown");
-            let archived_step =
-                archived_result.and_then(|result| result.steps.iter().find(|step| step.id == id));
-            let rounds = recovery
-                .get("rounds")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            let maximum = recovery
-                .get("configuredRetries")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let detail = recovery.get("active").map_or_else(
-                || {
-                    settled_recovery_detail(
-                        recovery,
-                        archived_step.and_then(|step| match step.detail.as_ref() {
-                            Some(NodeDetail::Failed(failure)) => Some(failure),
-                            _ => None,
-                        }),
-                    )
-                },
-                |active| {
-                    let role = active
-                        .get("role")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let ordinal = active
-                        .get("targetExecution")
-                        .or_else(|| active.get("recoveryRound"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let mut detail = if role == "target" {
-                        format!("target execution {ordinal}")
-                    } else if role == "recovery_handler" {
-                        let kind = recovery
-                            .get("handlerKind")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown");
-                        let state = active
-                            .get("handlerState")
-                            .and_then(Value::as_str)
-                            .unwrap_or("active");
-                        format!("recovery_handler {kind} {state} · round {ordinal}")
-                    } else {
-                        format!("{role} {ordinal}")
-                    };
-                    if let Some(decision) = active.get("decision").and_then(Value::as_str) {
-                        detail.push_str(" · decision ");
-                        detail.push_str(decision);
-                    }
-                    detail
-                },
-            );
-            writeln!(
-                writer,
-                "step recovery: {id} · {detail} · rounds {rounds}/{maximum}"
-            )?;
-        }
-    }
-    if let Some(accounting) = progress.get("accounting")
-        && accounting
-            .get("observedInvocations")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            != 0
-    {
-        writeln!(
-            writer,
-            "invocations: {} observed · {} settled · usage input {} output {}",
-            accounting
-                .get("observedInvocations")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            accounting
-                .get("settledInvocations")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            accounting
-                .get("inputTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            accounting
-                .get("outputTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        )?;
-    }
-    Ok(())
-}
-
-fn settled_recovery_detail(recovery: &Value, archived_failure: Option<&FailureDetail>) -> String {
-    let Some(termination) = recovery.get("termination") else {
-        return "incomplete".to_owned();
-    };
-    let kind = termination
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("incomplete");
-    let mut detail = kind.to_owned();
-    match kind {
-        "recovered" => {
-            if let Some(execution) = termination.get("executionNumber").and_then(Value::as_u64) {
-                detail.push_str(&format!(
-                    " · target execution {execution} · output owner target execution {execution}"
-                ));
-            }
-        }
-        "exhausted" => {
-            if let Some(execution) = termination.get("executionNumber").and_then(Value::as_u64) {
-                detail.push_str(&format!(" · target execution {execution}"));
-            }
-            detail.push_str(" · no output owner");
-        }
-        "gave_up" | "handler_failed" => {
-            if let Some(round) = termination.get("round").and_then(Value::as_u64) {
-                detail.push_str(&format!(" · round {round}"));
-            }
-            detail.push_str(" · no output owner");
-        }
-        "cancelled" => {
-            if let Some(role) = termination.get("activeRole").and_then(Value::as_str) {
-                detail.push_str(" · active role ");
-                detail.push_str(role);
-            }
-            if let Some(execution) = termination.get("executionNumber").and_then(Value::as_u64) {
-                detail.push_str(&format!(" · target execution {execution}"));
-            }
-            if let Some(round) = termination.get("round").and_then(Value::as_u64) {
-                detail.push_str(&format!(" · round {round}"));
-            }
-            detail.push_str(" · no output owner");
-        }
-        _ => {}
-    }
-
-    let latest_round = recovery
-        .get("rounds")
-        .and_then(Value::as_array)
-        .and_then(|rounds| rounds.last());
-    if let Some(outcome) = latest_round
-        .and_then(|round| round.get("handler"))
-        .and_then(|handler| handler.get("outcome"))
-        .and_then(Value::as_str)
-    {
-        if matches!(outcome, "recheck" | "gave_up") {
-            detail.push_str(" · decision ");
-        } else {
-            detail.push_str(" · handler outcome ");
-        }
-        detail.push_str(outcome);
-    }
-    let archived_failure = archived_failure.and_then(|failure| serde_json::to_value(failure).ok());
-    let failure = archived_failure.as_ref().or_else(|| {
-        latest_round
-            .and_then(|round| round.get("failedExecution"))
-            .and_then(|execution| execution.get("failure"))
-    });
-    if let Some(failure) = failure {
-        let phase = failure
-            .get("phase")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let cause = failure
-            .get("code")
-            .or_else(|| failure.get("cause").and_then(|cause| cause.get("code")))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        detail.push_str(" · latest target failure ");
-        detail.push_str(phase);
-        detail.push_str(" · ");
-        detail.push_str(cause);
-        if let Some(exit_code) = failure
-            .get("exitCode")
-            .or_else(|| failure.get("cause").and_then(|cause| cause.get("exitCode")))
-            .and_then(Value::as_i64)
-        {
-            detail.push_str(&format!(" · exit {exit_code}"));
-        }
-    }
-    detail
 }
 
 fn styled_state(state: &str, color: bool) -> String {
