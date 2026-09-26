@@ -137,6 +137,14 @@ struct CreateCommand {
     )]
     integration_context_file: Option<PathBuf>,
 
+    #[arg(
+        long,
+        value_name = "NAME",
+        value_parser = super::publication::parse_export_name,
+        help = "Request automatic publication of this exact Git branch export after success"
+    )]
+    publish_export: Option<String>,
+
     #[command(flatten)]
     wait: RunWaitArgs,
 
@@ -630,6 +638,7 @@ impl CreateCommand {
                         source_branch: self.source_branch.as_deref(),
                         display_name: self.display_name.as_deref(),
                         input_set_id: input_set_id.as_deref(),
+                        publish_export: self.publish_export.as_deref(),
                         integration_context: integration_context.as_ref(),
                     },
                     || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
@@ -1110,7 +1119,7 @@ fn finish_cloud_observation<R, S>(
                 && resource.run.as_deref().is_some_and(|run| {
                     run.state != RunState::Succeeded
                         || run.publication.as_deref().is_some_and(|handoff| {
-                            handoff.state == scherzo_cloud_api::RunPublicationHandoffState::Failed
+                            handoff.state != scherzo_cloud_api::RunPublicationHandoffState::Started
                         })
                         || resource.publication.as_deref().is_some_and(|publication| {
                             publication.state != scherzo_cloud_api::PublicationState::Succeeded
@@ -2242,6 +2251,71 @@ mod tests {
         .expect("run fixture should match the generated model")
     }
 
+    #[test]
+    fn publication_wait_uses_one_budget_across_run_handoff_and_linked_attempt() {
+        let started = scherzo_cloud_support::monotonic_now();
+        let clock = ControlledWaitClock::new(started);
+        let mut pending = serde_json::to_value(run(RunState::Succeeded)).unwrap();
+        pending["publication"] = serde_json::json!({
+            "exportName": "changes", "state": "pending", "publicationId": null,
+            "failure": null
+        });
+        let mut linked = pending.clone();
+        linked["publication"]["state"] = serde_json::json!("started");
+        linked["publication"]["publicationId"] =
+            serde_json::json!("pub_01k0z6r1w8f4jy2m7q9v3x5abc");
+        let pending: Run = serde_json::from_value(pending).unwrap();
+        let linked: Run = serde_json::from_value(linked).unwrap();
+        let mut reads = VecDeque::from([
+            (Duration::from_secs(7), run(RunState::Running)),
+            (Duration::from_secs(5), pending),
+            (Duration::from_secs(3), linked.clone()),
+        ]);
+        let initial = CloudSnapshot::for_run(&linked.id);
+        let mut latest = initial.clone();
+        let mut publication_reads = 0;
+        let result = observation::wait_run_with_reads(
+            observation::WaitRunContext {
+                snapshot: &initial,
+                timeout: Some(Duration::from_secs(7)),
+                started,
+            },
+            &super::super::BlockingObservationControl::new(),
+            &clock,
+            |snapshot| latest = snapshot,
+            |remaining| {
+                let (expected, run) = reads.pop_front().expect("no extra Run GET");
+                assert_eq!(remaining, Some(expected));
+                Ok(RunRead::Materialized(Box::new(run)))
+            },
+            |publication_id, remaining| {
+                publication_reads += 1;
+                assert_eq!(publication_id, "pub_01k0z6r1w8f4jy2m7q9v3x5abc");
+                assert_eq!(remaining, Some(Duration::from_secs(3)));
+                super::super::ObservationClock::sleep(&clock, Duration::from_secs(1));
+                Err(RunFailure::Unreachable(UnreachableCategory::Server))
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            super::super::TerminalObservation::TimedOut
+        ));
+        assert!(reads.is_empty());
+        assert_eq!(publication_reads, 1);
+        assert_eq!(latest.run.as_deref(), Some(&linked));
+        assert!(latest.publication.is_none());
+        assert_eq!(
+            clock.into_sleeps(),
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                Duration::from_secs(2)
+            ]
+        );
+    }
+
     fn dispatch_test_api<'a>(api_url: &str, client: &'a HttpClient) -> RunApi<'a> {
         RunApi::new(
             api_url,
@@ -2265,6 +2339,7 @@ mod tests {
                 source_branch: None,
                 display_name: None,
                 input_set_id: Some("ris_explicit"),
+                publish_export: None,
                 integration_context: None,
             },
             begin_dispatch,

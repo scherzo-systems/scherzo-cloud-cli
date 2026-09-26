@@ -151,14 +151,12 @@ fn record_then_read_publication<T, E>(
     started: Instant,
     control: &impl super::super::ObservationControl,
     clock: &impl super::super::ObservationClock,
-    read: impl FnOnce() -> Result<T, E>,
+    read: impl FnOnce(Option<Duration>) -> Result<T, E>,
 ) -> Result<Option<T>, E> {
     record();
-    if (timeout.is_none()
-        || super::super::remaining_observation_wait(timeout, started, clock.now()).is_some())
-        && control.admit_read()
-    {
-        read().map(Some)
+    let remaining = super::super::remaining_observation_wait(timeout, started, clock.now());
+    if (timeout.is_none() || remaining.is_some()) && control.admit_read() {
+        read(remaining).map(Some)
     } else {
         Ok(None)
     }
@@ -207,7 +205,7 @@ pub(super) fn wait_run(
     context: ObservationContext<'_>,
     control: &impl super::super::ObservationControl,
     clock: &impl super::super::ObservationClock,
-    mut record: impl FnMut(CloudSnapshot),
+    record: impl FnMut(CloudSnapshot),
 ) -> Result<super::super::TerminalObservation<CloudSnapshot, TerminalRunState>, RunFailure> {
     let ObservationContext {
         deployment,
@@ -219,10 +217,54 @@ pub(super) fn wait_run(
     } = context;
     let run_id = snapshot_run_id(snapshot)?;
     let deadline = timeout.map(|duration| started.checked_add(duration).unwrap_or(started));
+    wait_run_with_reads(
+        WaitRunContext {
+            snapshot,
+            timeout,
+            started,
+        },
+        control,
+        clock,
+        record,
+        |_| read_run(deployment, options, organization, run_id, deadline),
+        |publication_id, _| {
+            read_publication(
+                deployment,
+                options,
+                organization,
+                run_id,
+                publication_id,
+                deadline,
+            )
+        },
+    )
+}
+
+pub(super) struct WaitRunContext<'a> {
+    pub snapshot: &'a CloudSnapshot,
+    pub timeout: Option<Duration>,
+    pub started: Instant,
+}
+
+// The read functions are supplied by the same GET-only API boundary in production. Keeping
+// the polling policy here lets controlled clocks exercise transitions without wall-clock sleeps.
+pub(super) fn wait_run_with_reads(
+    context: WaitRunContext<'_>,
+    control: &impl super::super::ObservationControl,
+    clock: &impl super::super::ObservationClock,
+    mut record: impl FnMut(CloudSnapshot),
+    mut read_run: impl FnMut(Option<Duration>) -> Result<RunRead, RunFailure>,
+    mut read_publication: impl FnMut(&str, Option<Duration>) -> Result<Publication, RunFailure>,
+) -> Result<super::super::TerminalObservation<CloudSnapshot, TerminalRunState>, RunFailure> {
+    let WaitRunContext {
+        snapshot,
+        timeout,
+        started,
+    } = context;
     let mut current = snapshot.clone();
     super::super::wait_for_terminal_observation_bounded(
-        |_remaining| {
-            match read_run(deployment, options, organization, run_id, deadline)? {
+        |remaining| {
+            match read_run(remaining)? {
                 RunRead::Materialized(run) => {
                     current.run = Some(run);
                     current.publication = None;
@@ -242,16 +284,7 @@ pub(super) fn wait_run(
                             started,
                             control,
                             clock,
-                            || {
-                                read_publication(
-                                    deployment,
-                                    options,
-                                    organization,
-                                    run_id,
-                                    publication_id,
-                                    deadline,
-                                )
-                            },
+                            |remaining| read_publication(publication_id, remaining),
                         )?
                         .map(Box::new);
                     } else {
@@ -427,7 +460,7 @@ mod tests {
                     started,
                     &control,
                     &clock,
-                    || {
+                    |_| {
                         requests.push("publication GET");
                         Ok::<_, ()>(())
                     },
@@ -464,7 +497,7 @@ mod tests {
                     started,
                     &control,
                     &clock,
-                    || Ok::<_, ()>("publication GET"),
+                    |_| Ok::<_, ()>("publication GET"),
                 )
                 .unwrap(),
                 expected

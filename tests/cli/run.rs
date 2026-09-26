@@ -318,6 +318,77 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
     })
 }
 
+fn automatic_publication(outcome: &str) -> serde_json::Value {
+    let publication_id = "pub_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let pull_request = if outcome == "pull_request_already_merged" {
+        serde_json::json!({
+            "providerId": "123456", "number": 42,
+            "url": "https://example.test/review/42",
+            "disposition": "reused", "state": "merged"
+        })
+    } else if outcome == "pull_request_published" {
+        serde_json::json!({
+            "providerId": "123456", "number": 42,
+            "url": "https://example.test/review/42",
+            "disposition": "created", "state": "open"
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    let branch = if outcome == "no_changes" {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!({
+            "headOid": "89abcdef0123456789abcdef0123456789abcdef",
+            "disposition": if outcome == "pull_request_already_merged" { "reused" } else { "created" },
+            "url": "https://example.test/review/branch"
+        })
+    };
+    serde_json::json!({
+        "id": publication_id, "organizationId": ORGANIZATION_ID,
+        "projectId": PROJECT_ID, "runId": RUN_ID,
+        "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "exportName": "changes", "state": "succeeded", "version": 2,
+        "artifact": {
+            "artifactVersion": 1, "objectFormat": "sha1",
+            "baseOid": "0123456789abcdef0123456789abcdef01234567",
+            "headOid": "89abcdef0123456789abcdef0123456789abcdef",
+            "treeOid": "fedcba9876543210fedcba9876543210fedcba98",
+            "expiresAt": "2026-10-03T18:00:00Z"
+        },
+        "target": {
+            "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
+            "providerRepositoryId": "123456", "fullName": "example/repository",
+            "baseBranch": "main", "destinationBranch": format!("scherzo/{RUN_ID}/changes")
+        },
+        "pullRequestMetadata": {"title": "Review", "body": "Run publication"},
+        "branch": branch, "pullRequest": pull_request, "outcome": outcome,
+        "failure": null,
+        "actorPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "createdAt": "2026-09-03T18:00:00Z", "updatedAt": "2026-09-03T18:00:02Z",
+        "startedAt": "2026-09-03T18:00:01Z", "terminalAt": "2026-09-03T18:00:02Z"
+    })
+}
+
+fn automatic_handoff(state: &str) -> serde_json::Value {
+    serde_json::json!({
+        "exportName": "changes", "state": state,
+        "publicationId": if state == "started" {
+            serde_json::Value::String("pub_01k0z6r1w8f4jy2m7q9v3x5abc".into())
+        } else { serde_json::Value::Null },
+        "failure": null
+    })
+}
+
+fn publication_response(body: serde_json::Value) -> Vec<u8> {
+    http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&body).unwrap(),
+    )
+}
+
 fn run_response(body: serde_json::Value) -> Vec<u8> {
     http_response_with_headers(
         "200 OK",
@@ -757,6 +828,50 @@ fn cancellation_wait_requires_resolved_receipt_and_terminal_run() {
     assert!(requests[1].contains(&format!(
         "/cancellation-requests/{CANCELLATION_ID} HTTP/1.1"
     )));
+}
+
+#[test]
+fn cancellation_wait_does_not_observe_a_linked_publication() {
+    let key = "cancel-while-publication-started";
+    let mut succeeded = run_body_with_state("succeeded");
+    succeeded["publication"] = automatic_handoff("started");
+    let (server, _directory, credential_path) = prepared_run(vec![
+        cancellation_response(
+            "202 Accepted",
+            key,
+            cancellation_envelope("pending", "graceful", run_body()),
+        ),
+        http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Cache-Control", "private, no-store")],
+            &serde_json::to_vec(&cancellation_envelope("resolved", "graceful", succeeded)).unwrap(),
+        ),
+    ]);
+    let output = run_with_env(
+        &[
+            "run",
+            "cancel",
+            ORGANIZATION,
+            RUN_ID,
+            "--idempotency-key",
+            key,
+            "--wait",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "settled");
+    assert_eq!(result["run"]["state"], "succeeded");
+    assert_eq!(result["run"]["publication"]["state"], "started");
+    assert!(result["publication"].is_null());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST "));
+    assert!(requests[1].contains(&format!("/cancellation-requests/{CANCELLATION_ID} ")));
 }
 
 #[test]
@@ -1374,6 +1489,48 @@ fn cloud_run_wait_flags_require_explicit_observation_and_bare_wait_is_absent() {
 }
 
 #[test]
+fn create_selects_exact_export_once_and_omission_is_artifact_only() {
+    for selected in [Some("changes"), Some("review"), None] {
+        let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
+        let mut args = create_args(true);
+        if let Some(name) = selected {
+            args.splice(args.len() - 1..args.len() - 1, ["--publish-export", name]);
+        }
+        let output = run_with_env(
+            &args,
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "accepted");
+        assert_eq!(result["runId"], RUN_ID);
+        assert!(result["run"].is_null());
+        assert!(result["publication"].is_null());
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST "));
+        match selected {
+            Some(name) => assert_eq!(
+                request_body(&requests[0])["publication"],
+                serde_json::json!({"exportName": name})
+            ),
+            None => assert!(request_body(&requests[0]).get("publication").is_none()),
+        }
+    }
+    for names in [["changes", "review"], ["changes", "changes"]] {
+        let mut args = create_args(true);
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            ["--publish-export", names[0], "--publish-export", names[1]],
+        );
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
     for (operation, expected_exit, json) in [
         ("create", 1, true),
@@ -1602,6 +1759,190 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
     }
 }
 
+#[test]
+fn run_wait_tracks_automatic_attempt_through_handoff_and_publication() {
+    let mut pending = run_body_with_state("succeeded");
+    pending["publication"] = automatic_handoff("pending");
+    let mut started = pending.clone();
+    started["publication"] = automatic_handoff("started");
+    let mut queued = automatic_publication("no_changes");
+    queued["state"] = serde_json::json!("queued");
+    queued["outcome"] = serde_json::Value::Null;
+    queued["terminalAt"] = serde_json::Value::Null;
+    queued["startedAt"] = serde_json::Value::Null;
+    for (operation, outcome, state) in [
+        ("create", "no_changes", "succeeded"),
+        ("show", "pull_request_already_merged", "succeeded"),
+    ] {
+        let mut responses = Vec::new();
+        if operation == "create" {
+            responses.push(acceptance_response(true));
+        }
+        responses.extend([
+            run_response(pending.clone()),
+            run_response(started.clone()),
+            publication_response(queued.clone()),
+            run_response(started.clone()),
+            publication_response(automatic_publication(outcome)),
+        ]);
+        let (server, _directory, credential_path) = prepared_run(responses);
+        let mut args = if operation == "create" {
+            let mut args = create_args(true);
+            args.splice(
+                args.len() - 1..args.len() - 1,
+                ["--publish-export", "changes"],
+            );
+            args
+        } else {
+            vec![
+                "run",
+                "show",
+                ORGANIZATION,
+                RUN_ID,
+                "--json",
+                "--allow-insecure-http",
+            ]
+        };
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            ["--wait", "--timeout", "2m"],
+        );
+        let output = run_with_env(
+            &args,
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "settled");
+        assert_eq!(result["run"]["state"], state);
+        assert_eq!(
+            result["run"]["publication"]["publicationId"],
+            result["publication"]["id"]
+        );
+        assert_eq!(result["publication"]["outcome"], outcome);
+        assert_eq!(
+            result["replayed"],
+            if operation == "create" {
+                serde_json::json!(true)
+            } else {
+                serde_json::Value::Null
+            }
+        );
+        assert!(result["error"].is_null());
+        assert!(!output.stderr.is_empty());
+        let requests = server.finish();
+        assert_eq!(requests.len(), if operation == "create" { 6 } else { 5 });
+        if operation == "create" {
+            assert_eq!(
+                request_body(&requests[0])["publication"],
+                serde_json::json!({"exportName": "changes"})
+            );
+        }
+        for request in requests.iter().skip(usize::from(operation == "create")) {
+            assert!(
+                request.starts_with("GET "),
+                "unexpected mutation while waiting: {request}"
+            );
+            if request.contains("/publications/") {
+                assert!(request.contains("/publications/pub_01k0z6r1w8f4jy2m7q9v3x5abc "));
+            }
+        }
+    }
+}
+
+#[test]
+fn run_wait_keeps_successful_execution_separate_from_failed_publication() {
+    let mut run = run_body_with_state("succeeded");
+    run["publication"] = automatic_handoff("started");
+    let mut failed = automatic_publication("no_changes");
+    failed["state"] = serde_json::json!("failed");
+    failed["outcome"] = serde_json::Value::Null;
+    failed["failure"] = serde_json::json!({
+        "phase": "branch", "code": "provider_unavailable", "retryable": true
+    });
+    for (operation, exit) in [("create", 1), ("show", 0)] {
+        let mut responses = Vec::new();
+        if operation == "create" {
+            responses.push(acceptance_response(false));
+        }
+        responses.extend([
+            run_response(run.clone()),
+            publication_response(failed.clone()),
+        ]);
+        let (server, _directory, credential_path) = prepared_run(responses);
+        let mut args = if operation == "create" {
+            create_args(true)
+        } else {
+            vec![
+                "run",
+                "show",
+                ORGANIZATION,
+                RUN_ID,
+                "--json",
+                "--allow-insecure-http",
+            ]
+        };
+        args.insert(args.len() - 1, "--wait");
+        let output = run_with_env(
+            &args,
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(output.status.code(), Some(exit));
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["outcome"], "settled");
+        assert_eq!(document["run"]["state"], "succeeded");
+        assert_eq!(document["run"]["publication"]["state"], "started");
+        assert_eq!(document["publication"]["state"], "failed");
+        assert_eq!(
+            document["publication"]["failure"]["code"],
+            "provider_unavailable"
+        );
+        assert_eq!(document["error"], serde_json::Value::Null);
+        assert_eq!(
+            server.finish().len(),
+            if operation == "create" { 3 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn run_plain_publication_outcomes_do_not_invent_a_new_pull_request() {
+    for (outcome, pull_request) in [("no_changes", false), ("pull_request_already_merged", true)] {
+        let mut run = run_body_with_state("succeeded");
+        run["publication"] = automatic_handoff("started");
+        let (server, _directory, credential_path) = prepared_run(vec![
+            run_response(run),
+            publication_response(automatic_publication(outcome)),
+        ]);
+        let output = run_with_env(
+            &[
+                "run",
+                "show",
+                ORGANIZATION,
+                RUN_ID,
+                "--wait",
+                "--allow-insecure-http",
+            ],
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(output.status.code(), Some(0));
+        let report = String::from_utf8(output.stdout).unwrap();
+        assert!(report.contains(&format!("  outcome: {outcome}")));
+        assert_eq!(
+            report.contains("  pull request: 42 (reused, merged)"),
+            pull_request
+        );
+        assert_eq!(report.contains("  pull request url: "), pull_request);
+        assert!(!report.contains("(created, open)"));
+        assert_eq!(server.finish().len(), 2);
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn create_signal_after_acceptance_stops_only_observation_and_keeps_replay() {
@@ -1653,6 +1994,63 @@ fn create_signal_after_acceptance_stops_only_observation_and_keeps_replay() {
     assert_eq!(result["outcome"], "observation_stopped");
     assert_eq!(result["replayed"], true);
     assert_eq!(result["runId"], RUN_ID);
+    assert_eq!(result["error"]["code"], "observation_stopped");
+    assert_eq!(server.finish().len(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
+    let mut run = run_body_with_state("succeeded");
+    run["publication"] = automatic_handoff("started");
+    let mut server = ScriptedServer::respond_with_paused_last_response(vec![
+        acceptance_response(false),
+        run_response(run),
+        publication_response(automatic_publication("no_changes")),
+    ]);
+    let directory = private_credential_directory();
+    let path = directory.path().join("credentials.json");
+    write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
+    let environment = deployment_environment(&server.api_url, path.to_str().unwrap());
+    let mut args = create_args(true);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        ["--publish-export", "changes", "--wait"],
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(CREDENTIALS_FILE_VARIABLE);
+    for variable in DEPLOYMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let child = command.spawn().unwrap();
+    let submitted = server.wait_for_request();
+    assert!(submitted.starts_with("POST "));
+    let run_read = server.wait_for_request();
+    assert!(run_read.starts_with("GET "));
+    let publication_read = server.wait_for_request();
+    assert!(publication_read.starts_with("GET "));
+    assert!(publication_read.contains("/publications/pub_01k0z6r1w8f4jy2m7q9v3x5abc "));
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.release_paused_response();
+    assert_eq!(output.status.code(), Some(143));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "observation_stopped");
+    assert_eq!(result["runId"], RUN_ID);
+    assert_eq!(result["run"]["publication"]["state"], "started");
+    assert!(result["publication"].is_null());
     assert_eq!(result["error"]["code"], "observation_stopped");
     assert_eq!(server.finish().len(), 0);
 }

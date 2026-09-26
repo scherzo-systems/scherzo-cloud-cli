@@ -34,6 +34,8 @@ Options:
           Supply a present named attachment collection with no members
       --integration-context-file <PATH|->
           Read private immutable integration context from a JSON file, or - for standard input
+      --publish-export <NAME>
+          Request automatic publication of this exact Git branch export after success
       --wait
           Observe the run until it settles
       --timeout <DURATION>

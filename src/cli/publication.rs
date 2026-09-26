@@ -693,7 +693,7 @@ fn parse_publication_id(value: &str) -> Result<String, String> {
     }
 }
 
-fn parse_export_name(value: &str) -> Result<String, String> {
+pub(super) fn parse_export_name(value: &str) -> Result<String, String> {
     if scherzo_cloud_support::is_identifier(value) {
         Ok(value.to_owned())
     } else {

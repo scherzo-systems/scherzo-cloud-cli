@@ -1433,9 +1433,13 @@ after dispatch.
 `--timeout` requires `--wait`. Create and cancel budgets begin after acceptance; show
 starts immediately. The remaining wait budget caps credential refresh, read retries,
 and each observation request; it does not bound the accepted mutation. Reads continue
-through admitted creation; create/show also observe
-automatic publication after succeeded execution, while cancel observes only its receipt
-and terminal Run. A cancellation receipt being accepted or resolved is not by itself
+through admitted creation. `run create --publish-export NAME` selects exactly one
+`git_branch` workflow export for automatic publication after successful execution;
+omitting it remains artifact-only. Without `--wait`, create returns on durable run
+acceptance. With `--wait`, create/show observe execution, artifact attachment, the
+handoff, and the linked automatic Publication using one timeout budget. A successful
+Run with pending handoff is not settled; waiting never creates an attempt or switches
+to a later manual attempt. Cancel observes only its receipt and terminal Run. A cancellation receipt being accepted or resolved is not by itself
 proof of a stopped Run. Force requires explicit `--force`; to escalate use a new
 idempotency key. Reuse `--idempotency-key` with the same mode and Run to reconcile an
 uncertain response. Signals and timeouts stop only local observation.
@@ -1445,8 +1449,8 @@ With `--json`, each command emits one schema-version-1 object with `operation`,
 `publication`, `cancellationRequest`, nullable create `replayed`, and nullable `error`.
 The error includes `code`, `idempotencyKey`, `requestedMode`, and `requestId` (nullable).
 Progress goes to stderr. Human create/show results show the Run's automatic publication
-handoff and any observed Publication state, failure, and redacted confirmed pull-request
-URL separately from execution. On failure, inspect the existing publication or handoff
+handoff and any observed Publication state, outcome, receipt disposition, failure, and
+redacted confirmed pull-request URL separately from execution. On failure, inspect the existing publication or handoff
 and provider effects before creating another publication attempt. Human cancellation
 errors retain the requested mode, known receipt, Run state, interruption, and artifact
 delivery evidence for same-key reconciliation.
@@ -1492,8 +1496,9 @@ Set has been downloaded, verified, and committed at the requested destination.
 Publication commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when the operation permits a service actor. They turn one
 available `git_branch` export from a succeeded Cloud run into a ready-for-review pull
-request. Publication is always explicit: run success and export declaration do not
-publish anything automatically.
+request. Run success and export declaration alone do not publish anything automatically. A
+caller may select `run create --publish-export NAME` to request one automatic attempt;
+otherwise Publication commands create explicit post-run attempts.
 
 The complete Publication command surface is:
 
@@ -1516,8 +1521,8 @@ scherzo-cloud publication list \
   acme-labs "$run_id" --limit 50
 ```
 
-A complete explicit publication workflow first creates and waits for the run, then
-creates and waits for the selected Publication:
+For a run submitted without publication intent, an explicit publication workflow
+first creates and waits for the run, then creates and waits for the selected Publication:
 
 ```sh
 set -euo pipefail
@@ -1538,6 +1543,13 @@ scherzo-cloud publication create "$organization" "$run_id" \
 jq -e '.outcome == "succeeded"' publication.json >/dev/null
 publication_id=$(jq -er '.publication.id' publication.json)
 ```
+
+Alternatively, submit with `run create --publish-export changes --wait --json` and
+inspect `.run.state`, `.run.publication`, and `.publication` in its one final JSON
+object. Create-wait exits nonzero if execution, the handoff, or the automatic attempt
+fails; show-wait exits zero on a terminal failure but retains the failure fields.
+`no_changes` and `pull_request_already_merged` are successful Publication outcomes,
+not newly created pull requests. Neither timeout nor a signal cancels remote work.
 
 Without `--wait`, `publication create` returns after Cloud accepts the attempt. With
 `--wait`, it polls the accepted Publication and exits zero only for a succeeded outcome.

@@ -111,6 +111,30 @@ pub(super) fn write_cloud(
         )?;
         if operation == "cancel" {
             write_cancel_context(&mut stderr, snapshot, mode)?;
+        } else {
+            if let Some(run) = snapshot.run.as_deref() {
+                writeln!(
+                    stderr,
+                    "last observed run state: {}",
+                    super::enum_text(&run.state)?
+                )?;
+                if let Some(handoff) = run.publication.as_deref() {
+                    writeln!(
+                        stderr,
+                        "last observed handoff: {} · publication: {}",
+                        super::enum_text(&handoff.state)?,
+                        handoff.publication_id.as_deref().unwrap_or("none")
+                    )?;
+                }
+            }
+            if let Some(publication) = snapshot.publication.as_deref() {
+                writeln!(
+                    stderr,
+                    "last observed publication: {} · state: {}",
+                    publication.id,
+                    super::enum_text(&publication.state)?
+                )?;
+            }
         }
         writeln!(
             stderr,
@@ -157,7 +181,21 @@ pub(super) fn write_cloud(
                 "  state: {}",
                 super::enum_text(&publication.state)?
             )?;
+            if let Some(branch) = publication.branch.as_deref() {
+                writeln!(
+                    io::stdout().lock(),
+                    "  branch: {}",
+                    super::enum_text(&branch.disposition)?
+                )?;
+            }
             if let Some(pull_request) = publication.pull_request.as_deref() {
+                writeln!(
+                    io::stdout().lock(),
+                    "  pull request: {} ({}, {})",
+                    pull_request.number,
+                    super::enum_text(&pull_request.disposition)?,
+                    super::enum_text(&pull_request.state)?
+                )?;
                 let url = super::super::publication::redacted_human_url(&pull_request.url)?;
                 writeln!(
                     io::stdout().lock(),

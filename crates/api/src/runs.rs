@@ -54,6 +54,7 @@ pub struct CreateRunInput<'a> {
     pub source_branch: Option<&'a str>,
     pub display_name: Option<&'a str>,
     pub input_set_id: Option<&'a str>,
+    pub publish_export: Option<&'a str>,
     pub integration_context: Option<&'a BTreeMap<String, String>>,
 }
 
@@ -114,6 +115,9 @@ impl<'a> RunApi<'a> {
         request.source_branch = input.source_branch.map(str::to_owned);
         request.display_name = input.display_name.map(str::to_owned);
         request.input_set_id = input.input_set_id.map(|id| Some(id.to_owned()));
+        request.publication = input
+            .publish_export
+            .map(|name| Box::new(models::RunPublicationRequest::new(name.to_owned())));
         request.integration_context = input.integration_context.map(|context| {
             Some(
                 context
