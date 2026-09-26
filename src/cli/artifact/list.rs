@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::Context;
 use clap::Args;
+use scherzo_cloud_support::lowercase_hex;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
@@ -102,7 +103,7 @@ fn write_human(
         writeln!(output, "\nmember: {}", member.path)?;
         writeln!(output, "media type: {}", member.media_type.escape_default())?;
         writeln!(output, "bytes: {}", member.size_bytes)?;
-        writeln!(output, "sha256: {}", hex_sha256(&member.sha256))?;
+        writeln!(output, "sha256: {}", lowercase_hex(&member.sha256))?;
     }
     if let Some(cursor) = &page.next_cursor {
         writeln!(output, "\nnext cursor: {}", cursor.escape_default())?;
@@ -258,16 +259,6 @@ fn write_failure(
     Ok(class.exit_code())
 }
 
-fn hex_sha256(digest: &[u8; 32]) -> String {
-    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        encoded.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ListResult<'a> {
@@ -310,7 +301,7 @@ impl<'a> From<&'a ArtifactMember> for ArtifactMemberResult<'a> {
             size_bytes: member.size_bytes,
             digest: DigestResult {
                 algorithm: "sha256",
-                value: hex_sha256(&member.sha256),
+                value: lowercase_hex(&member.sha256),
             },
         }
     }

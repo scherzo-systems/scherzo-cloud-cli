@@ -12,6 +12,7 @@ use reqwest::header::{
     CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, IF_NONE_MATCH,
 };
 use ring::digest::{SHA256, digest};
+use scherzo_cloud_support::lowercase_hex;
 use tokio::sync::{mpsc, oneshot};
 
 use super::Sleeper;
@@ -118,7 +119,7 @@ impl ArtifactDeliverySpec {
             member: ArtifactMember::Result,
             media_type: "application/json".to_owned(),
             size_bytes: u64::try_from(result_json.len()).unwrap_or(u64::MAX),
-            sha256: hex_digest(digest(&SHA256, &result_json).as_ref()),
+            sha256: lowercase_hex(digest(&SHA256, &result_json).as_ref()),
             body: Arc::new(BytesArtifactUploadBody(result_json)),
         }
     }
@@ -1137,16 +1138,6 @@ fn validate_capability(
     Ok(())
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
 fn checksum_base64(sha256: &str) -> Result<String, ()> {
     if sha256.len() != 64 {
         return Err(());
@@ -1505,7 +1496,7 @@ mod tests {
     #[test]
     fn http_loopback_capability_requires_insecure_runner_connection() {
         let bytes = b"artifact bytes";
-        let sha256 = hex_digest(digest(&SHA256, bytes).as_ref());
+        let sha256 = lowercase_hex(digest(&SHA256, bytes).as_ref());
         let capability = ArtifactUploadCapability {
             url: "http://127.0.0.1:9000/artifact".to_owned(),
             content_length: bytes.len().to_string(),

@@ -25,14 +25,17 @@ use super::workspace::{
 };
 use crate::control_protocol::AssignmentCounts;
 use crate::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
+#[cfg(test)]
+use scherzo_cloud_execution::RUNNER_TERMINAL_FRAME_BYTES;
 use scherzo_cloud_execution::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationReason, CancellationSource, CaptureCancellation, CloudGitCaptureProjection,
-    EnvironmentSnapshot, ExecutionContext, MAXIMUM_CANCELLATION_GRACE, MAXIMUM_PARALLEL_STEPS,
-    MINIMUM_CANCELLATION_GRACE, OrdinaryCancellationRequestResult, RUNNER_TERMINAL_FRAME_BYTES,
-    ResolvedInputs, ResolvedWorkflow, SourceRevisionProvenance, ValidatedClaudeCodeInstallation,
-    ValidatedCodexInstallation, ValidatedPiInstallation, WorkflowCapacityBudget,
-    admit_runner_workflow, default_execution_policy_limits,
+    ConditionCapacityBounds, EnvironmentSnapshot, ExecutionContext, MAXIMUM_CANCELLATION_GRACE,
+    MAXIMUM_ENCODED_OUTBOX_BYTES, MAXIMUM_PARALLEL_STEPS, MINIMUM_CANCELLATION_GRACE,
+    OrdinaryCancellationRequestResult, ResolvedInputs, ResolvedWorkflow, SourceRevisionProvenance,
+    ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
+    WorkflowCapacityBudget, admit_runner_workflow, default_execution_policy_limits,
+    valid_condition_capacity,
 };
 use scherzo_cloud_runner_protocol::{
     AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ExecutionLeaseGrant,
@@ -47,19 +50,8 @@ use scherzo_cloud_runner_protocol::{
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
 pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
-pub(super) const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 1_024_720_896;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
 const MINIMUM_RENEWAL_HEADROOM: Duration = Duration::from_secs(30);
-
-fn encoded_outbox_reservation(selected_maximum_transitions: u64) -> Option<u64> {
-    selected_maximum_transitions
-        .checked_add(u64::try_from(OBSERVATION_RESERVE_BASE).ok()?)?
-        .checked_mul(u64::try_from(MAXIMUM_ORDINARY_FRAME_BYTES).ok()?)?
-        .checked_add(
-            RUNNER_TERMINAL_FRAME_BYTES
-                .checked_sub(u64::try_from(MAXIMUM_ORDINARY_FRAME_BYTES).ok()?)?,
-        )
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AssignmentOffer {
@@ -4637,50 +4629,24 @@ fn validate_execution_spec(
             .checked_add(capacity.native_session_retention_bytes)
             != Some(capacity.aggregate_retention_bytes)
         || capacity.aggregate_retention_bytes > 201_326_592
-        || !valid_condition_capacity(capacity)
+        || !valid_condition_capacity(ConditionCapacityBounds::from_parts(
+            capacity.selected_maximum_transitions,
+            (
+                capacity.condition_transition_count,
+                capacity.aggregate_condition_transition_bytes,
+            ),
+            (
+                capacity.terminal_result_structure_bytes,
+                capacity.portable_result_bytes,
+                capacity.encoded_outbox_bytes,
+            ),
+        ))
     {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::InvalidSourceProjection,
         ));
     }
     Ok(())
-}
-
-fn valid_condition_capacity(
-    capacity: &scherzo_cloud_runner_protocol::ExecutionCapacityV1RunnerProjection,
-) -> bool {
-    let Some(entries) = capacity.selected_maximum_transitions.checked_add(64) else {
-        return false;
-    };
-    if capacity.condition_transition_count == 0 {
-        return capacity.aggregate_condition_transition_bytes == 0
-            && capacity.terminal_result_structure_bytes == 67_108_864
-            && capacity.portable_result_bytes == 202_027_692
-            && encoded_outbox_reservation(capacity.selected_maximum_transitions)
-                == Some(capacity.encoded_outbox_bytes);
-    }
-    let Some(large_entries) = capacity.condition_transition_count.checked_add(1) else {
-        return false;
-    };
-    capacity.condition_transition_count <= 256
-        && entries >= large_entries
-        && (1..=268_435_456).contains(&capacity.aggregate_condition_transition_bytes)
-        && capacity.aggregate_condition_transition_bytes.checked_mul(2)
-            == Some(capacity.terminal_result_structure_bytes)
-        && capacity.terminal_result_structure_bytes <= 536_870_912
-        && capacity
-            .terminal_result_structure_bytes
-            .checked_add(364_209_496)
-            == Some(capacity.portable_result_bytes)
-        && capacity.portable_result_bytes <= 901_080_408
-        && (entries - large_entries)
-            .checked_mul(262_144)
-            .and_then(|ordinary| {
-                ordinary.checked_add(capacity.aggregate_condition_transition_bytes)
-            })
-            .and_then(|bytes| bytes.checked_add(capacity.terminal_result_structure_bytes))
-            == Some(capacity.encoded_outbox_bytes)
-        && capacity.encoded_outbox_bytes <= MAXIMUM_ENCODED_OUTBOX_BYTES
 }
 
 fn validate_source_identity_pair(

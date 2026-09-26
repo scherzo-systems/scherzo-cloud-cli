@@ -67,6 +67,43 @@ struct Expected {
 }
 
 #[test]
+fn condition_capacity_replay_and_runner_share_the_numerical_boundary() {
+    let ordinary = ConditionCapacityBounds {
+        selected_maximum_transitions: 7,
+        condition_transition_count: 0,
+        aggregate_condition_transition_bytes: 0,
+        terminal_result_structure_bytes: RUNNER_TERMINAL_FRAME_BYTES,
+        portable_result_bytes: ORDINARY_PORTABLE_RESULT_BYTES,
+        encoded_outbox_bytes: 85_458_944,
+    };
+    assert!(valid_condition_capacity(ordinary));
+    assert!(!valid_condition_capacity(ConditionCapacityBounds {
+        encoded_outbox_bytes: ordinary.encoded_outbox_bytes + 1,
+        ..ordinary
+    }));
+
+    let conditional = ConditionCapacityBounds {
+        condition_transition_count: 1,
+        aggregate_condition_transition_bytes: RUNNER_ORDINARY_FRAME_BYTES,
+        terminal_result_structure_bytes: 2 * RUNNER_ORDINARY_FRAME_BYTES,
+        portable_result_bytes: 2 * RUNNER_ORDINARY_FRAME_BYTES
+            + super::super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+            + super::super::result_metadata::MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES,
+        encoded_outbox_bytes: 72 * RUNNER_ORDINARY_FRAME_BYTES,
+        ..ordinary
+    };
+    assert!(valid_condition_capacity(conditional));
+    assert!(!valid_condition_capacity(ConditionCapacityBounds {
+        condition_transition_count: 257,
+        ..conditional
+    }));
+    assert!(!valid_condition_capacity(ConditionCapacityBounds {
+        selected_maximum_transitions: u64::MAX,
+        ..conditional
+    }));
+}
+
+#[test]
 fn shared_recovery_capacity_vectors_match_the_resolver_owned_calculation() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/workflow/v1/recovery-capacity-vectors.json");

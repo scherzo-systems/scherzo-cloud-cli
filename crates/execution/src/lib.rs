@@ -56,7 +56,10 @@ pub use workflow::archived_presentation::{
 };
 pub use workflow::artifact::{ArtifactStaging, CaptureCancellation, StagedCarrier};
 pub use workflow::cancellation::{MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE};
-pub use workflow::capacity::RUNNER_TERMINAL_FRAME_BYTES;
+pub use workflow::capacity::{
+    ConditionCapacityBounds, MAXIMUM_ENCODED_OUTBOX_BYTES, RUNNER_TERMINAL_FRAME_BYTES,
+    valid_condition_capacity,
+};
 pub use workflow::child_guard::{
     internal_worker_requested as child_guard_worker_requested,
     run_internal_worker as run_child_guard_worker,

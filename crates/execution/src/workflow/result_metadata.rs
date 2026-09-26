@@ -710,47 +710,21 @@ fn valid_cloud_capacity(
             .checked_add(capacity.native_session_retention_bytes)
             == Some(capacity.aggregate_retention_bytes)
         && capacity.aggregate_retention_bytes <= 201_326_592
-        && valid_condition_capacity(capacity)
+        && super::capacity::valid_condition_capacity(
+            super::capacity::ConditionCapacityBounds::from_parts(
+                capacity.selected_maximum_transitions,
+                (
+                    capacity.condition_transition_count,
+                    capacity.aggregate_condition_transition_bytes,
+                ),
+                (
+                    capacity.terminal_result_structure_bytes,
+                    capacity.portable_result_bytes,
+                    capacity.encoded_outbox_bytes,
+                ),
+            ),
+        )
 }
-
-// jscpd:ignore-start -- Portable-result replay and Runner admission independently validate this trust boundary.
-fn valid_condition_capacity(capacity: &super::publication::CloudExecutionCapacityV1) -> bool {
-    let Some(entries) = capacity.selected_maximum_transitions.checked_add(64) else {
-        return false;
-    };
-    if capacity.condition_transition_count == 0 {
-        return capacity.aggregate_condition_transition_bytes == 0
-            && capacity.terminal_result_structure_bytes == 67_108_864
-            && capacity.portable_result_bytes == 202_027_692
-            && entries
-                .checked_mul(262_144)
-                .and_then(|ordinary| ordinary.checked_add(67_108_864 - 262_144))
-                == Some(capacity.encoded_outbox_bytes);
-    }
-    let Some(large_entries) = capacity.condition_transition_count.checked_add(1) else {
-        return false;
-    };
-    capacity.condition_transition_count <= 256
-        && entries >= large_entries
-        && (1..=268_435_456).contains(&capacity.aggregate_condition_transition_bytes)
-        && capacity.aggregate_condition_transition_bytes.checked_mul(2)
-            == Some(capacity.terminal_result_structure_bytes)
-        && capacity.terminal_result_structure_bytes <= 536_870_912
-        && capacity
-            .terminal_result_structure_bytes
-            .checked_add(364_209_496)
-            == Some(capacity.portable_result_bytes)
-        && capacity.portable_result_bytes <= 901_080_408
-        && (entries - large_entries)
-            .checked_mul(262_144)
-            .and_then(|ordinary| {
-                ordinary.checked_add(capacity.aggregate_condition_transition_bytes)
-            })
-            .and_then(|bytes| bytes.checked_add(capacity.terminal_result_structure_bytes))
-            == Some(capacity.encoded_outbox_bytes)
-        && capacity.encoded_outbox_bytes <= 1_024_720_896
-}
-// jscpd:ignore-end
 
 fn validate_finalization(
     finalization: &super::publication::FinalizationV1,

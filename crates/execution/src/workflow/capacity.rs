@@ -9,6 +9,7 @@ pub(crate) const CLOUD_MAXIMUM_TRANSITIONS_WITH_FINALIZERS: u64 = 1_030;
 pub(crate) const RUNNER_OBSERVATION_RESERVE: u64 = 64;
 pub(crate) const RUNNER_ORDINARY_FRAME_BYTES: u64 = 262_144;
 pub const RUNNER_TERMINAL_FRAME_BYTES: u64 = 67_108_864;
+pub const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 1_024_720_896;
 pub(crate) const MAXIMUM_CONDITION_TRANSITION_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAXIMUM_PORTABLE_RESULT_BYTES: u64 = 901_080_408;
@@ -281,6 +282,65 @@ pub(crate) fn calculate_condition_evidence_capacity(
         terminal_result_structure_bytes,
         portable_result_bytes,
     })
+}
+
+/// The numerical capacity contract shared by portable-result replay and Runner admission.
+/// Both boundaries still validate their own projection before applying these bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConditionCapacityBounds {
+    pub selected_maximum_transitions: u64,
+    pub condition_transition_count: u64,
+    pub aggregate_condition_transition_bytes: u64,
+    pub terminal_result_structure_bytes: u64,
+    pub portable_result_bytes: u64,
+    pub encoded_outbox_bytes: u64,
+}
+
+impl ConditionCapacityBounds {
+    /// Adapts the condition evidence and result/outbox groups of either wire projection.
+    pub fn from_parts(
+        selected_maximum_transitions: u64,
+        condition: (u64, u64),
+        result: (u64, u64, u64),
+    ) -> Self {
+        Self {
+            selected_maximum_transitions,
+            condition_transition_count: condition.0,
+            aggregate_condition_transition_bytes: condition.1,
+            terminal_result_structure_bytes: result.0,
+            portable_result_bytes: result.1,
+            encoded_outbox_bytes: result.2,
+        }
+    }
+}
+
+pub fn valid_condition_capacity(capacity: ConditionCapacityBounds) -> bool {
+    let expected_outbox = calculate_condition_outbox_reservation(
+        capacity.selected_maximum_transitions,
+        capacity.condition_transition_count,
+        capacity.aggregate_condition_transition_bytes,
+        capacity.terminal_result_structure_bytes,
+    )
+    .ok();
+    if capacity.condition_transition_count == 0 {
+        return capacity.aggregate_condition_transition_bytes == 0
+            && capacity.terminal_result_structure_bytes == RUNNER_TERMINAL_FRAME_BYTES
+            && capacity.portable_result_bytes == ORDINARY_PORTABLE_RESULT_BYTES
+            && expected_outbox == Some(capacity.encoded_outbox_bytes);
+    }
+    capacity.condition_transition_count <= 256
+        && (1..=MAXIMUM_CONDITION_TRANSITION_BYTES)
+            .contains(&capacity.aggregate_condition_transition_bytes)
+        && capacity.aggregate_condition_transition_bytes.checked_mul(2)
+            == Some(capacity.terminal_result_structure_bytes)
+        && capacity.terminal_result_structure_bytes <= MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES
+        && capacity.terminal_result_structure_bytes.checked_add(
+            super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+                + super::result_metadata::MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES,
+        ) == Some(capacity.portable_result_bytes)
+        && capacity.portable_result_bytes <= MAXIMUM_PORTABLE_RESULT_BYTES
+        && expected_outbox == Some(capacity.encoded_outbox_bytes)
+        && capacity.encoded_outbox_bytes <= MAXIMUM_ENCODED_OUTBOX_BYTES
 }
 
 pub(crate) fn calculate_condition_outbox_reservation(
