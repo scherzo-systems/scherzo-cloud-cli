@@ -5,9 +5,9 @@ Manage GitHub installation bindings
 Usage: scherzo-cloud github installation [COMMAND]
 
 Commands:
-  disconnect  Disconnect a GitHub installation binding
-  list        List GitHub installation bindings
-  help        Print this message or the help of the given subcommand(s)
+  list    List GitHub installation bindings
+  remove  Remove a GitHub installation binding
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help

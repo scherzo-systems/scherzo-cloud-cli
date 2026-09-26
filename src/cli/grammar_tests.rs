@@ -137,10 +137,7 @@ fn violations(root: &Command) -> BTreeSet<String> {
                     "delete" | "decline" | "end" | "leave" | "remove" | "revoke" | "retire"
                 ) || matches!(
                     path,
-                    "account deletion request"
-                        | "organization deletion request"
-                        | "github installation disconnect"
-                        | "project repository detach"
+                    "account deletion request" | "organization deletion request"
                 );
                 let has = |long| node.get_arguments().any(|arg| arg.get_long() == Some(long));
                 if destructive
@@ -245,10 +242,7 @@ fn violations(root: &Command) -> BTreeSet<String> {
 }
 
 // A ratchet: entries must be unique, sorted, and observed. Each entry has one burn-down owner.
-const BASELINE: &[(&str, &str)] = &[
-    ("leaf-token|github installation disconnect", "LIV-2426"),
-    ("leaf-token|project repository detach", "LIV-2426"),
-];
+const BASELINE: &[(&str, &str)] = &[];
 
 fn check_baseline(observed: &BTreeSet<String>, baseline: &[(&str, &str)]) -> Result<(), String> {
     let mut allowed = BTreeSet::new();
@@ -417,11 +411,11 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
         &[
             "github",
             "installation",
-            "disconnect",
+            "remove",
             "example",
             "installation",
         ],
-        &["project", "repository", "detach", "example", "project"],
+        &["project", "repository", "remove", "example", "project"],
         &["project", "runner-pool", "remove", "example", "project"],
     ];
     for &args in gated {
@@ -442,6 +436,60 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
             "{mode}"
         );
     }
+}
+
+#[test]
+fn renamed_leaves_have_only_the_approved_verb_paths() {
+    let mut root = Cli::command();
+    root.build();
+    for (family, replacement, old) in [
+        (&["github", "installation"][..], "remove", "disconnect"),
+        (&["project", "repository"][..], "remove", "detach"),
+        (&["runner", "activation"][..], "issue", "create"),
+    ] {
+        let command = family.iter().fold(&root, |parent, token| {
+            parent.find_subcommand(token).unwrap()
+        });
+        assert!(command.find_subcommand(replacement).is_some(), "{family:?}");
+        assert!(command.find_subcommand(old).is_none(), "{family:?}");
+    }
+    for family in [
+        &["runner", "activation"][..],
+        &["organization", "invitation"][..],
+        &["service-principal", "credential"][..],
+    ] {
+        let command = family.iter().fold(&root, |parent, token| {
+            parent.find_subcommand(token).unwrap()
+        });
+        assert!(command.find_subcommand("issue").is_some(), "{family:?}");
+        assert!(command.find_subcommand("revoke").is_some(), "{family:?}");
+        assert!(command.find_subcommand("create").is_none(), "{family:?}");
+    }
+    for path in [
+        &["github", "installation", "disconnect"][..],
+        &["project", "repository", "detach"][..],
+        &["runner", "activation", "create"][..],
+    ] {
+        let input = std::iter::once("scherzo-cloud").chain(path.iter().copied());
+        assert_eq!(
+            super::parse(input).unwrap_err().kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "{path:?}"
+        );
+    }
+    assert!(
+        super::parse([
+            "scherzo-cloud",
+            "runner",
+            "activation",
+            "issue",
+            "example",
+            "runner",
+            "--activation-file",
+            "-",
+        ])
+        .is_ok()
+    );
 }
 
 #[test]

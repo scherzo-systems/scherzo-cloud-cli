@@ -310,7 +310,7 @@ fn github_successes_reject_mismatched_response_subjects() {
         vec![
             "github",
             "installation",
-            "disconnect",
+            "remove",
             ORGANIZATION,
             INSTALLATION,
             "--yes",
@@ -377,7 +377,7 @@ fn replayable_connection_mutations_retry_one_ambiguous_transport_failure() {
             &[
                 "github",
                 "installation",
-                "disconnect",
+                "remove",
                 ORGANIZATION,
                 INSTALLATION,
                 "--yes",
@@ -578,7 +578,7 @@ fn malformed_success_is_a_redacted_protocol_failure() {
         &[
             "github",
             "installation",
-            "disconnect",
+            "remove",
             ORGANIZATION,
             INSTALLATION,
             "--yes",

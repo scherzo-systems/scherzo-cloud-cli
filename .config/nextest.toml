@@ -18,6 +18,13 @@ filter = "package(scherzo-cloud-execution) & test(workflow::pi_json_v1::adapter_
 test-group = "external-process"
 
 [[profile.default.overrides]]
+# The maximum-size Artifact Set fixture syncs 4097 individual files. Reserve the
+# whole test pool while it runs so concurrent disk-heavy tests cannot starve its
+# existing 60-second backstop; keep the real assembly and validation assertions.
+filter = "package(scherzo-cloud) & test(maximum_set_assembles_across_forty_one_capability_batches)"
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
 # Integration tests orchestrate external processes and receive a 120-second backstop.
 filter = "kind(test)"
 test-group = "external-process"

@@ -1115,10 +1115,10 @@ scherzo-cloud github repository list \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
-Disconnect an installation from Scherzo Cloud with its stable binding ID:
+Remove an installation binding from Scherzo Cloud with its stable binding ID:
 
 ```sh
-scherzo-cloud github installation disconnect \
+scherzo-cloud github installation remove \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
@@ -1129,7 +1129,7 @@ still-valid disconnected installation can be reactivated only through a new veri
 browser setup session. A revoked provider installation is terminal.
 
 Add `--json` to any GitHub leaf for one schema-version-1 result. Setup begin returns
-`pending` and the session, setup complete returns `completed`, installation disconnect
+`pending` and the session, setup complete returns `completed`, installation remove
 returns `disconnected`, and both list commands return `listed`. Expected failures use a
 closed outcome without copying provider responses or API problem prose. Setup completion
 and disconnection retry one ambiguous transport failure with the same session or binding
@@ -1232,7 +1232,7 @@ Repository and runner-pool settings are independent. `set` assigns or atomically
 replaces the current value. Repeated removals are API-defined no-ops:
 
 ```sh
-# Read, replace, update, or detach the repository binding.
+# Read, replace, update, or remove the repository binding.
 scherzo-cloud project repository show \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
 scherzo-cloud project repository set \
@@ -1242,7 +1242,7 @@ scherzo-cloud project repository set \
 scherzo-cloud project repository update \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --default-branch stable
-scherzo-cloud project repository detach \
+scherzo-cloud project repository remove \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Assign, replace, or remove the runner pool.

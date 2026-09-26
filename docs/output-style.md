@@ -214,9 +214,7 @@ separate entity family.
   attributes is exactly `{name}`. Use `update` when two or more entity
   attributes are mutable. A family does not expose both verbs.
 - **Unbinding:** a leaf whose operation severs an existing binding is named
-  `remove`. `detach` and `disconnect` remain prohibited command verbs; renaming
-  the established leaves that still use them is owned by LIV-2426 and does not
-  expand the lexicon.
+  `remove`. `detach` and `disconnect` are prohibited command verbs.
 
 ### Groups and flags
 
@@ -232,14 +230,11 @@ separate entity family.
 - **Destructive confirmation:** a leaf requires `--yes` when its final token is
   `delete`, `decline`, `end`, `leave`, `remove`, `revoke`, or `retire`, or when
   its complete command identity is `account deletion request` or
-  `organization deletion request`. The existing `github installation disconnect`
-  and `project repository detach` paths also require confirmation until their
-  renames to `remove`; no other leaf has `--yes`. This set covers permanent
-  deletion, departure, delegation or invitation closure, and operations that
-  invalidate a binding, credential, or live access. Reversible
-  runner mode changes, including
-  `runner disable` and `runner drain`, are not destructive and do not take
-  `--yes`.
+  `organization deletion request`; no other leaf has `--yes`. This set covers
+  permanent deletion, departure, delegation or invitation closure, and
+  operations that invalidate a binding, credential, or live access. Reversible
+  runner mode changes, including `runner disable` and `runner drain`, are not
+  destructive and do not take `--yes`.
 - **Common flag order:** whenever they co-occur, common flags appear in this
   relative order: `--json`, then `--service-api-key-file`, then
   `--allow-insecure-http`. Other arguments and flags do not affect this

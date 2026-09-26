@@ -139,8 +139,8 @@ struct RepositoryCommand {
 
 #[derive(Debug, Subcommand)]
 enum RepositorySubcommand {
-    #[command(about = "Detach a project's repository")]
-    Detach(RepositoryDetachCommand),
+    #[command(about = "Remove a project's repository binding")]
+    Remove(RepositoryRemoveCommand),
     #[command(about = "Bind or replace a project's repository")]
     Set(RepositorySetCommand),
     #[command(about = "Show a project's repository binding")]
@@ -188,7 +188,7 @@ struct RepositoryUpdateCommand {
 }
 
 #[derive(Debug, Args)]
-struct RepositoryDetachCommand {
+struct RepositoryRemoveCommand {
     #[command(flatten)]
     project: ProjectReference,
 
@@ -268,8 +268,8 @@ impl RepositoryCommand {
             RepositorySubcommand::Update(command) => {
                 execute_leaf(command, RepositoryUpdateCommand::execute)
             }
-            RepositorySubcommand::Detach(command) => {
-                execute_leaf(command, RepositoryDetachCommand::execute)
+            RepositorySubcommand::Remove(command) => {
+                execute_leaf(command, RepositoryRemoveCommand::execute)
             }
         }
     }
@@ -510,7 +510,7 @@ impl RepositoryUpdateCommand {
     }
 }
 
-impl RepositoryDetachCommand {
+impl RepositoryRemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let key = scherzo_cloud_support::generate_idempotency_key()
             .context("generate project repository detachment request identity")?;

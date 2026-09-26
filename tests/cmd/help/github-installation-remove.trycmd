@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud github installation disconnect --help
-Disconnect a GitHub installation binding
+$ scherzo-cloud github installation remove --help
+Remove a GitHub installation binding
 
-Usage: scherzo-cloud github installation disconnect [OPTIONS] --yes <ORGANIZATION> <INSTALLATION>
+Usage: scherzo-cloud github installation remove [OPTIONS] --yes <ORGANIZATION> <INSTALLATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

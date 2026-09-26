@@ -110,7 +110,15 @@ cleanup() {
       status=1
     fi
   fi
-  rm -rf "$suite_temporary_root"
+  # Some nested workflow fixtures deliberately seal their retained input
+  # directories read-only. Restore traversal and removal rights only within
+  # this suite-owned temporary tree; find does not follow its TMPDIR alias.
+  if ! find "$suite_temporary_root" -type d -exec chmod u+rwx {} +; then
+    status=1
+  fi
+  if ! rm -rf "$suite_temporary_root"; then
+    status=1
+  fi
   exit "$status"
 }
 trap cleanup EXIT

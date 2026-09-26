@@ -51,10 +51,10 @@ struct InstallationCommand {
 
 #[derive(Debug, Subcommand)]
 enum InstallationLeaf {
-    #[command(about = "Disconnect a GitHub installation binding")]
-    Disconnect(InstallationDisconnectCommand),
     #[command(about = "List GitHub installation bindings")]
     List(OrganizationTarget),
+    #[command(about = "Remove a GitHub installation binding")]
+    Remove(InstallationRemoveCommand),
 }
 
 #[derive(Debug, Args)]
@@ -115,7 +115,7 @@ struct InstallationTarget {
 }
 
 #[derive(Debug, Args)]
-struct InstallationDisconnectCommand {
+struct InstallationRemoveCommand {
     #[command(flatten)]
     target: InstallationTarget,
 
@@ -164,11 +164,11 @@ impl InstallationCommand {
                 ERROR_CONTEXT,
                 OrganizationTarget::list_installations,
             ),
-            Some(InstallationLeaf::Disconnect(command)) => super::execute_deployment_leaf(
+            Some(InstallationLeaf::Remove(command)) => super::execute_deployment_leaf(
                 command,
                 &[NAME],
                 ERROR_CONTEXT,
-                InstallationDisconnectCommand::disconnect,
+                InstallationRemoveCommand::remove,
             ),
         }
     }
@@ -253,8 +253,8 @@ impl OrganizationTarget {
     }
 }
 
-impl InstallationDisconnectCommand {
-    fn disconnect(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+impl InstallationRemoveCommand {
+    fn remove(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let target = self.target;
         let result = with_api(
             deployment,

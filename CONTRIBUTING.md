@@ -20,7 +20,7 @@ the common choices:
 
 | Decision | Rule |
 |---|---|
-| Available leaf verb | Use only `accept`, `begin`, `cancel`, `complete`, `create`, `decline`, `delete`, `disable`, `doctor`, `download`, `drain`, `enable`, `end`, `enroll`, `history`, `issue`, `leave`, `link`, `list`, `login`, `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`, `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`, `set`, `show`, `signup`, `status`, `update`, `upload`, `validate`, `version`, `view`, or `wait`. Amend the style guide before introducing another verb; an existing command is not precedent. `detach` and `disconnect` remain prohibited; LIV-2426 owns their established rename debt. |
+| Available leaf verb | Use only `accept`, `begin`, `cancel`, `complete`, `create`, `decline`, `delete`, `disable`, `doctor`, `download`, `drain`, `enable`, `end`, `enroll`, `history`, `issue`, `leave`, `link`, `list`, `login`, `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`, `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`, `set`, `show`, `signup`, `status`, `update`, `upload`, `validate`, `version`, `view`, or `wait`. Amend the style guide before introducing another verb; an existing command is not precedent. `detach` and `disconnect` are prohibited command verbs. |
 | Print one / print many / interact | Use `show` / `list` / `view`. Use `validate`, `run`, and `retry` for those literal operations. |
 | Mint an entity | Use `issue` when the immediate sibling family contains `revoke`; otherwise use `create`. |
 | Change attributes | Use `rename` only when the complete mutable set is `{name}`; use `update` when two or more attributes are mutable. Never offer both in one family. |
@@ -40,9 +40,7 @@ leaf.
 
 Require `--yes` for leaves ending in `delete`, `decline`, `end`, `leave`, `remove`,
 `revoke`, or `retire`, and for `account deletion request` and
-`organization deletion request`; no other leaf takes it. The existing `github
-installation disconnect` and `project repository detach` paths also require `--yes`
-until their renames to `remove`. Reversible modes such as
+`organization deletion request`; no other leaf takes it. Reversible modes such as
 `runner disable` and `runner drain` do not take `--yes`. A command paginates when it
 returns one page and permits continuation: in that case expose `--limit` and `--cursor`
 together through `PaginationArgs`, which also supplies the exact `Pagination:`

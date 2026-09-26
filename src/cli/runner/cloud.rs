@@ -721,7 +721,7 @@ fn write_failure_with_context(
         if let Some(created) = created {
             writeln!(
                 stderr,
-                "\nRunner {} was created without an activation. Issue one without creating another runner:\n  scherzo-cloud runner activation create {} {} --activation-file <PATH>",
+                "\nRunner {} was created without an activation. Issue one without creating another runner:\n  scherzo-cloud runner activation issue {} {} --activation-file <PATH>",
                 created.runner_id, created.organization, created.runner_id
             )?;
         }

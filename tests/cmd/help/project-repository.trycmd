@@ -5,7 +5,7 @@ Manage a project's repository binding
 Usage: scherzo-cloud project repository [COMMAND]
 
 Commands:
-  detach  Detach a project's repository
+  remove  Remove a project's repository binding
   set     Bind or replace a project's repository
   show    Show a project's repository binding
   update  Change a project's configured default branch

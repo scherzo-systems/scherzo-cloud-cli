@@ -26,10 +26,10 @@ pub(super) struct Command {
 #[derive(Debug, Subcommand)]
 enum ActivationCommand {
     #[command(
-        about = "Create a runner activation",
+        about = "Issue a runner activation",
         after_help = "Activation:\n  Each activation can be used only once."
     )]
-    Create(CreateCommand),
+    Issue(IssueCommand),
     #[command(about = "List runner activations")]
     List(ListCommand),
     #[command(about = "Revoke a runner activation")]
@@ -38,13 +38,13 @@ enum ActivationCommand {
 // jscpd:ignore-end
 
 #[derive(Debug, Args)]
-struct CreateCommand {
+struct IssueCommand {
     #[command(flatten)]
     target: RegistrationTarget,
     #[arg(
         long,
         value_name = "PATH|-",
-        help = "Create the protected artifact file, or write only the artifact to stdout"
+        help = "Write the issued activation to a protected artifact file, or only the artifact to stdout"
     )]
     activation_file: String,
     #[command(flatten)]
@@ -89,14 +89,14 @@ impl Command {
 impl ActivationCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         match self {
-            Self::Create(command) => command.execute(deployment),
+            Self::Issue(command) => command.execute(deployment),
             Self::List(command) => command.execute(deployment),
             Self::Revoke(command) => command.execute(deployment),
         }
     }
 }
 
-impl CreateCommand {
+impl IssueCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         validate_activation_destination(&self.activation_file, self.options.json)?;
         let key = generate_idempotency_key().context("generate activation request identity")?;
@@ -127,7 +127,7 @@ impl CreateCommand {
         if self.activation_file == "-" {
             writeln!(
                 io::stderr().lock(),
-                "✓ Runner activation created for {}.",
+                "✓ Runner activation issued for {}.",
                 artifact.runner_id()
             )?;
         } else if self.options.json {
@@ -148,7 +148,7 @@ impl CreateCommand {
         } else {
             write_activation_summary(
                 &mut io::stdout().lock(),
-                "✓ Runner activation created.",
+                "✓ Runner activation issued.",
                 artifact.runner_id(),
                 None,
                 &self.activation_file,

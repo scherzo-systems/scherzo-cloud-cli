@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud project repository detach --help
-Detach a project's repository
+$ scherzo-cloud project repository remove --help
+Remove a project's repository binding
 
-Usage: scherzo-cloud project repository detach [OPTIONS] --yes <ORGANIZATION> <PROJECT>
+Usage: scherzo-cloud project repository remove [OPTIONS] --yes <ORGANIZATION> <PROJECT>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

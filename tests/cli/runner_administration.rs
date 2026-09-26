@@ -902,7 +902,7 @@ fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
             vec![
                 "runner",
                 "activation",
-                "create",
+                "issue",
                 ORGANIZATION,
                 RUNNER_ID,
                 "--activation-file",
@@ -1044,7 +1044,7 @@ fn runner_create_reports_activation_failure_with_the_created_registration() {
         &[
             "runner",
             "activation",
-            "create",
+            "issue",
             ORGANIZATION,
             RUNNER_ID,
             "--activation-file",

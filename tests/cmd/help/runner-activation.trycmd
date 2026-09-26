@@ -5,7 +5,7 @@ Manage runner enrollment activations
 Usage: scherzo-cloud runner activation [COMMAND]
 
 Commands:
-  create  Create a runner activation
+  issue   Issue a runner activation
   list    List runner activations
   revoke  Revoke a runner activation
   help    Print this message or the help of the given subcommand(s)

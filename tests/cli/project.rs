@@ -497,7 +497,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
         &[
             "project",
             "repository",
-            "detach",
+            "remove",
             ORGANIZATION,
             PROJECT_ID,
             "--yes",
