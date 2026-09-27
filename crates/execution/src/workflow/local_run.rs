@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -113,7 +113,7 @@ const QUIESCENCE_POLL_ATTEMPTS: usize =
     (MAXIMUM_CANCELLATION_GRACE.as_millis() / QUIESCENCE_POLL_INTERVAL.as_millis()) as usize;
 const SHA256_ALGORITHM: &str = "sha256";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum LocalRunDirectoryError {
     InvalidPath,
     ParentUnavailable,
@@ -125,20 +125,247 @@ pub enum LocalRunDirectoryError {
     HostIdentityUnavailable,
     SerializationUnavailable,
     StateInvalid,
+    DocumentFramingInvalid,
+    DocumentNullInvalid,
     RecoverySchemaUnsupported,
     StateConflict,
     StateWriteUnavailable,
-    AtomicCommitUnavailable,
     PublicationUnavailable,
+    File {
+        path: PathBuf,
+        operation: &'static str,
+        source: io::Error,
+    },
+    StateFile {
+        path: PathBuf,
+        operation: &'static str,
+        source: Box<Self>,
+    },
+    Json {
+        operation: &'static str,
+        source: serde_json::Error,
+    },
+    Artifact {
+        path: PathBuf,
+        operation: &'static str,
+        source: super::artifact::ArtifactReadFailure,
+    },
+    AttemptNumberInvalid,
+    AttemptTriggerInvalid,
+    AttemptIdentityInvalid,
+    AttemptExecutionRootInvalid,
+    AttemptCreatedAtInvalid,
+    AttemptStartedAtInvalid,
+    AttemptSettledAtInvalid,
+    AttemptSettlementInvalid,
+    AttemptDefinitionInvalid,
+    AttemptSnapshotInvalid,
+    AttemptOwnerInvalid,
+    AttemptStepsEmpty,
+    AttemptStartInvalid,
+    AttemptCancellationRecordInvalid,
+    AttemptForceAbortInvalid,
+    AttemptCancellationMissing,
+    AttemptCancellationConfirmationInvalid,
+    AttemptInterruptionCancellationInvalid,
+    AttemptInterruptionInvalid,
+    AttemptRejectionInvalid,
+    AttemptStepIdInvalid,
+    AttemptStepRoleInvalid,
+    AttemptStepDuplicate,
+    AttemptStepDetailInvalid,
+    AttemptStepOutputsInvalid,
+    AttemptStepRecoveryInvalid,
+    AttemptStepCancellationInvalid,
+    AttemptActionIdInvalid,
+    AttemptActionTargetInvalid,
+    AttemptActionNodeInvalid,
+    AttemptActionInvocationInvalid,
+    AttemptTerminalActionsInvalid,
+    AttemptGuardIdInvalid,
+    AttemptGuardActionInvalid,
+    AttemptGuardStepInvalid,
+    AttemptGuardHostInvalid,
+    AttemptGuardProcessInvalid,
+    AttemptContinuationInvalid,
+    AttemptInheritedStepInvalid,
+    AttemptInheritedOutputInvalid,
+    AttemptRecoveryAccountingInvalid,
+    AttemptRecoveryInvocationInvalid,
+    AttemptRecoveryDiagnosticInvalid,
+    AttemptRecoveryRoundInvalid,
+    AttemptRecoveryActiveInvalid,
+    AttemptFinalizationForceAbortInvalid,
+    AttemptFinalizationProgressInvalid,
+    AttemptFinalizationCompleteInvalid,
+    AttemptFinalizationIssuesInvalid,
+    AttemptFinalizationInterruptionInvalid,
+    AttemptResultInvalid,
+    ManifestDigestInvalid,
+    RegularFileInvalid,
+    FileSizeInvalid,
+    CarrierInvalid,
+    StateSchemaInvalid,
+    StateIdentityInvalid,
+    StateRevisionInvalid,
+    StateCurrentAttemptInvalid,
+    StateAttemptsEmpty,
+    StateAttemptIndexInvalid,
+    StateDiagnosticsLimitInvalid,
 }
 
-impl fmt::Display for LocalRunDirectoryError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "local run directory failure: {self:?}")
+impl PartialEq for LocalRunDirectoryError {
+    fn eq(&self, other: &Self) -> bool {
+        use LocalRunDirectoryError::{Artifact, File, Json, StateFile};
+        match (self, other) {
+            (
+                File {
+                    path: a,
+                    operation: op_a,
+                    source: a_source,
+                },
+                File {
+                    path: b,
+                    operation: op_b,
+                    source: b_source,
+                },
+            ) => {
+                a == b
+                    && op_a == op_b
+                    && a_source.kind() == b_source.kind()
+                    && a_source.raw_os_error() == b_source.raw_os_error()
+            }
+            (
+                StateFile {
+                    path: a,
+                    operation: op_a,
+                    source: a_source,
+                },
+                StateFile {
+                    path: b,
+                    operation: op_b,
+                    source: b_source,
+                },
+            ) => a == b && op_a == op_b && a_source == b_source,
+            (
+                Artifact {
+                    path: a,
+                    operation: op_a,
+                    source: a_source,
+                },
+                Artifact {
+                    path: b,
+                    operation: op_b,
+                    source: b_source,
+                },
+            ) => a == b && op_a == op_b && a_source == b_source,
+            (
+                Json {
+                    operation: op_a,
+                    source: a,
+                },
+                Json {
+                    operation: op_b,
+                    source: b,
+                },
+            ) => {
+                op_a == op_b
+                    && a.classify() == b.classify()
+                    && a.line() == b.line()
+                    && a.column() == b.column()
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
     }
 }
 
-impl std::error::Error for LocalRunDirectoryError {}
+impl Eq for LocalRunDirectoryError {}
+
+impl fmt::Display for LocalRunDirectoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File {
+                path,
+                operation,
+                source,
+            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::StateFile {
+                path,
+                operation,
+                source,
+            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::Json { operation, source } => write!(formatter, "{operation}: {source}"),
+            Self::Artifact {
+                path,
+                operation,
+                source,
+            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            // Variant names are stable, narrow invariant identifiers; split words for CLI prose.
+            other => {
+                let name = format!("{other:?}");
+                let mut previous_lowercase = false;
+                for character in name.chars() {
+                    if character.is_uppercase() && previous_lowercase {
+                        write!(formatter, " ")?;
+                    }
+                    write!(formatter, "{}", character.to_ascii_lowercase())?;
+                    previous_lowercase = character.is_lowercase();
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LocalRunDirectoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::File { source, .. } => Some(source),
+            Self::StateFile { source, .. } => Some(source),
+            Self::Json { source, .. } => Some(source),
+            Self::Artifact { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn file_locator(parent: &OwnedFd, name: impl AsRef<std::ffi::OsStr>) -> PathBuf {
+    // Descriptor-relative operations remain bound to the opened directory even if
+    // the requested pathname is replaced. Resolve the descriptor, not the request.
+    #[cfg(target_os = "macos")]
+    let resolved = rustix::fs::getpath(parent).ok().map(|path| {
+        use std::os::unix::ffi::OsStringExt as _;
+        PathBuf::from(std::ffi::OsString::from_vec(path.into_bytes()))
+    });
+    #[cfg(not(target_os = "macos"))]
+    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+        .or_else(|_| std::fs::read_link(format!("/dev/fd/{}", parent.as_raw_fd())))
+        .ok();
+    resolved
+        .unwrap_or_else(|| PathBuf::from(format!("directory fd {}", parent.as_raw_fd())))
+        .join(Path::new(name.as_ref()))
+}
+
+fn file_error(
+    parent: &OwnedFd,
+    name: impl AsRef<std::ffi::OsStr>,
+    operation: &'static str,
+    source: impl Into<io::Error>,
+) -> LocalRunDirectoryError {
+    path_error(file_locator(parent, name), operation, source)
+}
+
+fn path_error(
+    path: PathBuf,
+    operation: &'static str,
+    source: impl Into<io::Error>,
+) -> LocalRunDirectoryError {
+    LocalRunDirectoryError::File {
+        path,
+        operation,
+        source: source.into(),
+    }
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2507,7 +2734,7 @@ fn create_with_observer(
 
     let lock = create_file(&run_staging, LOCK_FILE, Mode::RUSR | Mode::WUSR)?;
     fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| LocalRunDirectoryError::LockUnavailable)?;
+        .map_err(|source| file_error(&run_staging, LOCK_FILE, "lock", source))?;
 
     mkdir(&run_staging, WORKFLOW_DIRECTORY)?;
     let workflow_directory = open_directory_at(&run_staging, WORKFLOW_DIRECTORY)?;
@@ -2623,14 +2850,16 @@ impl RunDirectoryTarget {
             requested.to_owned()
         } else {
             std::env::current_dir()
-                .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?
+                .map_err(|source| {
+                    path_error(requested.to_owned(), "resolve run directory", source)
+                })?
                 .join(requested)
         };
         let (supplied_parent, suffix) = nearest_existing_parent(&requested)?;
         let canonical_parent = std::fs::canonicalize(&supplied_parent)
-            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+            .map_err(|source| path_error(supplied_parent.clone(), "resolve run parent", source))?;
         let parent = open_directory_path(&canonical_parent)
-            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+            .map_err(|source| path_error(canonical_parent.clone(), "open run parent", source))?;
         let name = suffix
             .first()
             .ok_or(LocalRunDirectoryError::DestinationExists)?
@@ -3181,19 +3410,23 @@ fn retain_staged_carrier(
             let mut destination = create_file(directory, name, Mode::RUSR | Mode::WUSR)?;
             let copied = artifacts
                 .copy_to(staged.handle(), &mut destination)
-                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+                .map_err(|source| LocalRunDirectoryError::Artifact {
+                    path: file_locator(directory, name),
+                    operation: "copy staged carrier",
+                    source,
+                })?;
             if copied != staged.size() {
                 return Err(LocalRunDirectoryError::StateWriteUnavailable);
             }
             destination
                 .flush()
                 .and_then(|()| destination.sync_all())
-                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+                .map_err(|source| file_error(directory, name, "sync staged carrier", source))?;
             fchmod(destination.as_fd(), Mode::RUSR)
-                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+                .map_err(|source| file_error(directory, name, "set carrier permissions", source))?;
             destination
                 .sync_all()
-                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+                .map_err(|source| file_error(directory, name, "sync staged carrier", source))?;
         }
         Ok(metadata) if FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile => {}
         Ok(_) | Err(_) => return Err(LocalRunDirectoryError::StateConflict),
@@ -3231,17 +3464,22 @@ fn verify_retained_carrier_with_sync(
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    let opened = fstat(&descriptor).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    .map_err(|source| file_error(directory, name, "open carrier", source))?;
+    let opened =
+        fstat(&descriptor).map_err(|source| file_error(directory, name, "stat carrier", source))?;
     if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
         || u64::try_from(opened.st_size) != Ok(carrier.size_bytes)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::StateFile {
+            path: file_locator(directory, name),
+            operation: "verify carrier",
+            source: Box::new(LocalRunDirectoryError::CarrierInvalid),
+        });
     }
     let mut file = File::from(descriptor);
     if synchronize {
         file.sync_all()
-            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            .map_err(|source| file_error(directory, name, "sync carrier", source))?;
     }
     let mut context = DigestContext::new(&SHA256);
     let mut observed = 0_u64;
@@ -3249,7 +3487,7 @@ fn verify_retained_carrier_with_sync(
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+            .map_err(|source| file_error(directory, name, "read carrier", source))?;
         if read == 0 {
             break;
         }
@@ -3259,9 +3497,10 @@ fn verify_retained_carrier_with_sync(
             .ok_or(LocalRunDirectoryError::StateInvalid)?;
         context.update(&buffer[..read]);
     }
-    let after = fstat(&file).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let after =
+        fstat(&file).map_err(|source| file_error(directory, name, "stat carrier", source))?;
     let named = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        .map_err(|source| file_error(directory, name, "stat carrier", source))?;
     if observed != carrier.size_bytes
         || lowercase_hex(context.finish().as_ref()) != carrier.digest.value
         || opened.st_dev != after.st_dev
@@ -3271,7 +3510,11 @@ fn verify_retained_carrier_with_sync(
         || opened.st_ino != named.st_ino
         || FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::StateFile {
+            path: file_locator(directory, name),
+            operation: "verify carrier",
+            source: Box::new(LocalRunDirectoryError::CarrierInvalid),
+        });
     }
     Ok(())
 }
@@ -4286,16 +4529,16 @@ fn replace_state(
     };
     observer
         .write_temporary(&mut temporary, &bytes)
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+        .map_err(|source| file_error(private, &temporary_name, "write temporary state", source))?;
     temporary
         .flush()
         .and_then(|()| temporary.sync_all())
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+        .map_err(|source| file_error(private, &temporary_name, "sync temporary state", source))?;
     drop(temporary);
     observer.temporary_complete()?;
     observer
         .exchange(private, &temporary_name, root)
-        .map_err(|_| LocalRunDirectoryError::AtomicCommitUnavailable)?;
+        .map_err(|source| file_error(root, STATE_FILE, "exchange state", source))?;
     // An error after exchange cannot undo the commit. Keep memory aligned with
     // the visible snapshot even when directory sync or the observer fails.
     *current = next;
@@ -4359,7 +4602,7 @@ fn create_state_temporary(parent: &OwnedFd) -> Result<(String, File), LocalRunDi
         ) {
             Ok(file) => return Ok((name, File::from(file))),
             Err(Errno::EXIST) => {}
-            Err(_) => return Err(LocalRunDirectoryError::StateWriteUnavailable),
+            Err(source) => return Err(file_error(parent, &name, "create temporary state", source)),
         }
     }
     Err(LocalRunDirectoryError::StateWriteUnavailable)
@@ -4387,7 +4630,14 @@ fn read_run(root: &OwnedFd) -> Result<LocalRunV1, LocalRunDirectoryError> {
 fn read_run_with_size(root: &OwnedFd) -> Result<(LocalRunV1, u64), LocalRunDirectoryError> {
     let bytes = read_regular_file(root, RUN_FILE)?;
     let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    Ok((decode_run(&bytes)?, size))
+    Ok((
+        decode_run(&bytes).map_err(|source| LocalRunDirectoryError::StateFile {
+            path: file_locator(root, RUN_FILE),
+            operation: "validate",
+            source: Box::new(source),
+        })?,
+        size,
+    ))
 }
 
 fn read_state(root: &OwnedFd) -> Result<LocalRunStateV1, LocalRunDirectoryError> {
@@ -4397,22 +4647,29 @@ fn read_state(root: &OwnedFd) -> Result<LocalRunStateV1, LocalRunDirectoryError>
 fn read_state_with_size(root: &OwnedFd) -> Result<(LocalRunStateV1, u64), LocalRunDirectoryError> {
     let bytes = read_regular_file(root, STATE_FILE)?;
     let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    Ok((decode_state(&bytes)?, size))
+    Ok((
+        decode_state(&bytes).map_err(|source| LocalRunDirectoryError::StateFile {
+            path: file_locator(root, STATE_FILE),
+            operation: "validate",
+            source: Box::new(source),
+        })?,
+        size,
+    ))
 }
 
 pub(super) fn mark_validated_result_published(
     requested: &Path,
     attempt_number: u64,
 ) -> Result<bool, LocalRunDirectoryError> {
-    let normalized =
-        std::fs::canonicalize(requested).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
-    let root =
-        open_directory_path(&normalized).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+    let normalized = std::fs::canonicalize(requested)
+        .map_err(|source| path_error(requested.to_owned(), "resolve run directory", source))?;
+    let root = open_directory_path(&normalized)
+        .map_err(|source| path_error(normalized.clone(), "open run directory", source))?;
     let lock = open_retry_lock(&root)?;
     match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {}
         Err(Errno::AGAIN | Errno::ACCESS) => return Ok(false),
-        Err(_) => return Err(LocalRunDirectoryError::LockUnavailable),
+        Err(source) => return Err(file_error(&root, LOCK_FILE, "lock", source)),
     }
     verify_retry_lock_identity(&root, &lock)?;
     verify_existing_run_layout(&root)?;
@@ -4473,12 +4730,12 @@ pub(super) fn mark_validated_result_published(
 pub fn acquire_local_retry(requested: &Path) -> Result<LocalRetryOpen, LocalRunDirectoryError> {
     for _ in 0..STATUS_SNAPSHOT_ATTEMPTS {
         let normalized = std::fs::canonicalize(requested)
-            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+            .map_err(|source| path_error(requested.to_owned(), "resolve run directory", source))?;
         if normalized.to_str().is_none() {
             return Err(LocalRunDirectoryError::InvalidPath);
         }
         let root = open_directory_path(&normalized)
-            .map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+            .map_err(|source| path_error(normalized.clone(), "open run directory", source))?;
         let lock = open_retry_lock(&root)?;
         match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {
@@ -4497,7 +4754,7 @@ pub fn acquire_local_retry(requested: &Path) -> Result<LocalRetryOpen, LocalRunD
                     )));
                 }
             }
-            Err(_) => return Err(LocalRunDirectoryError::LockUnavailable),
+            Err(source) => return Err(file_error(&root, LOCK_FILE, "lock", source)),
         }
     }
     Err(LocalRunDirectoryError::StateConflict)
@@ -4507,13 +4764,11 @@ pub fn acquire_local_continuation(
     requested: &Path,
 ) -> Result<LocalContinuationOpen, LocalRunDirectoryError> {
     // Unlike retry's status-retry loop, continuation fails closed on lock contention.
-    // jscpd:ignore-start
-    let normalized =
-        std::fs::canonicalize(requested).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
-    let root =
-        open_directory_path(&normalized).map_err(|_| LocalRunDirectoryError::ParentUnavailable)?;
+    let normalized = std::fs::canonicalize(requested)
+        .map_err(|source| path_error(requested.to_owned(), "resolve run directory", source))?;
+    let root = open_directory_path(&normalized)
+        .map_err(|source| path_error(normalized.clone(), "open run directory", source))?;
     let lock = open_retry_lock(&root)?;
-    // jscpd:ignore-end
     match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {}
         Err(Errno::AGAIN | Errno::ACCESS) => {
@@ -4523,7 +4778,7 @@ pub fn acquire_local_continuation(
                 retry_rejection_from_snapshot(&snapshot, RetryIneligibilityReason::RunLocked),
             ));
         }
-        Err(_) => return Err(LocalRunDirectoryError::LockUnavailable),
+        Err(source) => return Err(file_error(&root, LOCK_FILE, "lock", source)),
     }
     verify_retry_lock_identity(&root, &lock)?;
     verify_existing_run_layout(&root)?;
@@ -4622,7 +4877,7 @@ fn open_retry_lock(root: &OwnedFd) -> Result<File, LocalRunDirectoryError> {
         Mode::empty(),
     )
     .map(File::from)
-    .map_err(|_| LocalRunDirectoryError::LockUnavailable)?;
+    .map_err(|source| file_error(root, LOCK_FILE, "open", source))?;
     verify_retry_lock_identity(root, &lock)?;
     Ok(lock)
 }
@@ -5050,14 +5305,14 @@ impl<'a> LocalRunStateIndex<'a> {
             let expected_number = u64::try_from(index)
                 .ok()
                 .and_then(|index| index.checked_add(1))
-                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                .ok_or(LocalRunDirectoryError::AttemptNumberInvalid)?;
             if attempt.attempt_number != expected_number {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptNumberInvalid);
             }
             let mut attempt_steps = BTreeMap::new();
             for step in &attempt.progress.steps {
                 if attempt_steps.insert(step.id.as_str(), step).is_some() {
-                    return Err(LocalRunDirectoryError::StateInvalid);
+                    return Err(LocalRunDirectoryError::AttemptStepDuplicate);
                 }
             }
             let mut attempt_dispositions = BTreeMap::new();
@@ -5067,11 +5322,11 @@ impl<'a> LocalRunStateIndex<'a> {
                     AttemptStepStateV1::Skipped => Some(InheritedDisposition::Skipped),
                     AttemptStepStateV1::Inherited => {
                         let Some(NodeDetail::Inherited(detail)) = &step.detail else {
-                            return Err(LocalRunDirectoryError::StateInvalid);
+                            return Err(LocalRunDirectoryError::AttemptInheritedStepInvalid);
                         };
                         let prior_index = state_attempt_index(detail.prior_attempt_number)
                             .filter(|prior_index| *prior_index < index)
-                            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                            .ok_or(LocalRunDirectoryError::AttemptInheritedStepInvalid)?;
                         Some(
                             dispositions
                                 .get(prior_index)
@@ -5079,7 +5334,7 @@ impl<'a> LocalRunStateIndex<'a> {
                                     prior.get(step.id.as_str())
                                 })
                                 .copied()
-                                .ok_or(LocalRunDirectoryError::StateInvalid)?,
+                                .ok_or(LocalRunDirectoryError::AttemptInheritedStepInvalid)?,
                         )
                     }
                     AttemptStepStateV1::Pending
@@ -5509,8 +5764,29 @@ fn verify_retained_output(
 }
 
 fn verify_existing_run_layout(root: &OwnedFd) -> Result<(), LocalRunDirectoryError> {
-    if directory_entries(root)? != run_root_entries() {
-        return Err(LocalRunDirectoryError::StateInvalid);
+    let entries = directory_entries(root)?;
+    for name in [
+        RUN_FILE,
+        STATE_FILE,
+        LOCK_FILE,
+        WORKFLOW_DIRECTORY,
+        ATTEMPTS_DIRECTORY,
+        PRIVATE_DIRECTORY,
+    ] {
+        if !entries.contains(name.as_bytes()) {
+            return Err(LocalRunDirectoryError::StateFile {
+                path: file_locator(root, name),
+                operation: "validate layout",
+                source: Box::new(LocalRunDirectoryError::StateInvalid),
+            });
+        }
+    }
+    if entries != run_root_entries() {
+        return Err(LocalRunDirectoryError::StateFile {
+            path: file_locator(root, "."),
+            operation: "validate layout",
+            source: Box::new(LocalRunDirectoryError::StateInvalid),
+        });
     }
     open_directory_at(root, ATTEMPTS_DIRECTORY)?;
     Ok(())
@@ -5628,7 +5904,11 @@ fn load_retained_execution_directory(
     let manifest_bytes = read_regular_file(&workflow_directory, WORKFLOW_MANIFEST_FILE)?;
     budget.account(&manifest_bytes)?;
     if DigestV1::sha256(&manifest_bytes) != *expected_manifest_digest {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::StateFile {
+            path: file_locator(&workflow_directory, WORKFLOW_MANIFEST_FILE),
+            operation: "validate manifest",
+            source: Box::new(LocalRunDirectoryError::ManifestDigestInvalid),
+        });
     }
     let manifest: WorkflowManifestV1 = decode_schema_one(&manifest_bytes)?;
     validate_manifest(&manifest).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
@@ -5964,8 +6244,12 @@ fn status_state_error(
     error: LocalRunDirectoryError,
     run_directory: &Option<PathBuf>,
 ) -> LocalStatusError {
+    let mut cause = &error;
+    while let LocalRunDirectoryError::StateFile { source, .. } = cause {
+        cause = source;
+    }
     LocalStatusError {
-        code: if error == LocalRunDirectoryError::RecoverySchemaUnsupported {
+        code: if *cause == LocalRunDirectoryError::RecoverySchemaUnsupported {
             LocalStatusErrorCode::RecoverySchemaUnsupported
         } else {
             LocalStatusErrorCode::RunDirectoryInvalid
@@ -6726,7 +7010,10 @@ fn decode_state(bytes: &[u8]) -> Result<LocalRunStateV1, LocalRunDirectoryError>
     let document = decode_schema_one_value(bytes)?;
     dispatch_durable_recovery_versions(&document)?;
     let state =
-        serde_json::from_value(document).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        serde_json::from_value(document).map_err(|source| LocalRunDirectoryError::Json {
+            operation: "decode state",
+            source,
+        })?;
     validate_state(&state)?;
     Ok(state)
 }
@@ -6767,25 +7054,34 @@ fn decode_schema_one<Document>(bytes: &[u8]) -> Result<Document, LocalRunDirecto
 where
     Document: for<'de> Deserialize<'de>,
 {
-    serde_json::from_value(decode_schema_one_value(bytes)?)
-        .map_err(|_| LocalRunDirectoryError::StateInvalid)
+    serde_json::from_value(decode_schema_one_value(bytes)?).map_err(|source| {
+        LocalRunDirectoryError::Json {
+            operation: "decode document",
+            source,
+        }
+    })
 }
 
 fn decode_schema_one_value(bytes: &[u8]) -> Result<Value, LocalRunDirectoryError> {
     if bytes.starts_with(&[0xef, 0xbb, 0xbf]) || !bytes.ends_with(b"\n") {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::DocumentFramingInvalid);
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = DuplicateFreeValue::deserialize(&mut deserializer)
         .and_then(|value| deserializer.end().map(|()| value.0))
-        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    if contains_null(&value)
-        || value
-            .get("schemaVersion")
-            .and_then(Value::as_u64)
-            .is_none_or(|version| version != 1)
+        .map_err(|source| LocalRunDirectoryError::Json {
+            operation: "decode document",
+            source,
+        })?;
+    if contains_null(&value) {
+        return Err(LocalRunDirectoryError::DocumentNullInvalid);
+    }
+    if value
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .is_none_or(|version| version != 1)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::StateSchemaInvalid);
     }
     Ok(value)
 }
@@ -7046,16 +7342,28 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
 }
 
 fn validate_state(state: &LocalRunStateV1) -> Result<(), LocalRunDirectoryError> {
-    if state.schema_version != 1
-        || !is_canonical_uuid(&state.local_run_id)
-        || state.revision == 0
-        || state.current_attempt_number == 0
-        || state.attempts.is_empty()
-        || state.attempts.last().map(|attempt| attempt.attempt_number)
-            != Some(state.current_attempt_number)
-        || state.diagnostics.len() > MAXIMUM_DIAGNOSTICS
+    if state.schema_version != 1 {
+        return Err(LocalRunDirectoryError::StateSchemaInvalid);
+    }
+    if !is_canonical_uuid(&state.local_run_id) {
+        return Err(LocalRunDirectoryError::StateIdentityInvalid);
+    }
+    if state.revision == 0 {
+        return Err(LocalRunDirectoryError::StateRevisionInvalid);
+    }
+    if state.current_attempt_number == 0 {
+        return Err(LocalRunDirectoryError::StateCurrentAttemptInvalid);
+    }
+    if state.attempts.is_empty() {
+        return Err(LocalRunDirectoryError::StateAttemptsEmpty);
+    }
+    if state.attempts.last().map(|attempt| attempt.attempt_number)
+        != Some(state.current_attempt_number)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::StateAttemptIndexInvalid);
+    }
+    if state.diagnostics.len() > MAXIMUM_DIAGNOSTICS {
+        return Err(LocalRunDirectoryError::StateDiagnosticsLimitInvalid);
     }
     let state_index = LocalRunStateIndex::new(state)?;
     for (index, attempt) in state.attempts.iter().enumerate() {
@@ -7084,59 +7392,93 @@ fn validate_state(state: &LocalRunStateV1) -> Result<(), LocalRunDirectoryError>
     Ok(())
 }
 
-fn validate_attempt(
-    state_index: &LocalRunStateIndex<'_>,
+fn validate_attempt_identity(
     attempt: &LocalAttemptV1,
     expected_number: u64,
 ) -> Result<(), LocalRunDirectoryError> {
-    let terminal = attempt.state.is_terminal();
+    if attempt.attempt_number != expected_number {
+        return Err(LocalRunDirectoryError::AttemptNumberInvalid);
+    }
     let valid_trigger = match attempt.trigger {
-        AttemptTriggerV1::Initial => {
-            attempt.attempt_number == 1 && attempt.prior_attempt_number.is_none()
-        }
+        AttemptTriggerV1::Initial => expected_number == 1 && attempt.prior_attempt_number.is_none(),
         AttemptTriggerV1::ExplicitRetry | AttemptTriggerV1::Continuation => {
             attempt.prior_attempt_number == Some(expected_number - 1)
         }
     };
-    if attempt.attempt_number != expected_number
-        || !valid_trigger
-        || !is_canonical_uuid(&attempt.attempt_id)
-        || !is_canonical_absolute_path(&attempt.execution_root)
-        || !valid_timestamp(&attempt.created_at)
-        || attempt
-            .started_at
-            .as_deref()
-            .is_some_and(|value| !valid_timestamp(value))
-        || attempt
-            .settled_at
-            .as_deref()
-            .is_some_and(|value| !valid_timestamp(value))
-        || terminal != attempt.settled_at.is_some()
-        || attempt.definition.as_ref().is_some_and(|definition| {
-            !definition.digest.validate()
-                || !definition.manifest_digest.validate()
-                || match definition.locator {
-                    AttemptDefinitionLocatorV1::Run => false,
-                    AttemptDefinitionLocatorV1::Attempt { attempt_number } => {
-                        attempt_number == 0 || attempt_number > attempt.attempt_number
-                    }
-                    AttemptDefinitionLocatorV1::PriorAttempt { attempt_number } => {
-                        attempt_number == 0 || attempt_number >= attempt.attempt_number
-                    }
-                }
-        })
-        || attempt
-            .settlement_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !terminal || !snapshot.validate(true))
-        || (attempt.definition.is_some() && terminal && attempt.settlement_snapshot.is_none())
-        || !validate_owner(&attempt.owner)
-        || attempt.progress.steps.is_empty()
-    {
-        return Err(LocalRunDirectoryError::StateInvalid);
+    if !valid_trigger {
+        return Err(LocalRunDirectoryError::AttemptTriggerInvalid);
     }
+    if !is_canonical_uuid(&attempt.attempt_id) {
+        return Err(LocalRunDirectoryError::AttemptIdentityInvalid);
+    }
+    if !is_canonical_absolute_path(&attempt.execution_root) {
+        return Err(LocalRunDirectoryError::AttemptExecutionRootInvalid);
+    }
+    Ok(())
+}
+
+fn validate_attempt_timeline(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
+    if !valid_timestamp(&attempt.created_at) {
+        return Err(LocalRunDirectoryError::AttemptCreatedAtInvalid);
+    }
+    if attempt
+        .started_at
+        .as_deref()
+        .is_some_and(|value| !valid_timestamp(value))
+    {
+        return Err(LocalRunDirectoryError::AttemptStartedAtInvalid);
+    }
+    if attempt
+        .settled_at
+        .as_deref()
+        .is_some_and(|value| !valid_timestamp(value))
+    {
+        return Err(LocalRunDirectoryError::AttemptSettledAtInvalid);
+    }
+    if attempt.state.is_terminal() != attempt.settled_at.is_some() {
+        return Err(LocalRunDirectoryError::AttemptSettlementInvalid);
+    }
+    Ok(())
+}
+
+fn validate_attempt_definition(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
+    if attempt.definition.as_ref().is_some_and(|definition| {
+        !definition.digest.validate()
+            || !definition.manifest_digest.validate()
+            || match definition.locator {
+                AttemptDefinitionLocatorV1::Run => false,
+                AttemptDefinitionLocatorV1::Attempt { attempt_number } => {
+                    attempt_number == 0 || attempt_number > attempt.attempt_number
+                }
+                AttemptDefinitionLocatorV1::PriorAttempt { attempt_number } => {
+                    attempt_number == 0 || attempt_number >= attempt.attempt_number
+                }
+            }
+    }) {
+        return Err(LocalRunDirectoryError::AttemptDefinitionInvalid);
+    }
+    if attempt
+        .settlement_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| !attempt.state.is_terminal() || !snapshot.validate(true))
+        || (attempt.definition.is_some()
+            && attempt.state.is_terminal()
+            && attempt.settlement_snapshot.is_none())
+    {
+        return Err(LocalRunDirectoryError::AttemptSnapshotInvalid);
+    }
+    if !validate_owner(&attempt.owner) {
+        return Err(LocalRunDirectoryError::AttemptOwnerInvalid);
+    }
+    if attempt.progress.steps.is_empty() {
+        return Err(LocalRunDirectoryError::AttemptStepsEmpty);
+    }
+    Ok(())
+}
+
+fn validate_attempt_start(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
     if matches!(attempt.state, AttemptStateV1::Created) && attempt.started_at.is_some() {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptStartInvalid);
     }
     if !matches!(
         attempt.state,
@@ -7150,8 +7492,87 @@ fn validate_attempt(
             })
         )
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptStartInvalid);
     }
+    Ok(())
+}
+
+fn validate_attempt(
+    state_index: &LocalRunStateIndex<'_>,
+    attempt: &LocalAttemptV1,
+    expected_number: u64,
+) -> Result<(), LocalRunDirectoryError> {
+    validate_attempt_identity(attempt, expected_number)?;
+    validate_attempt_timeline(attempt)?;
+    validate_attempt_definition(attempt)?;
+    validate_attempt_start(attempt)?;
+    validate_attempt_cancellation(attempt)?;
+    validate_attempt_outcome(attempt)?;
+    let mut step_ids = BTreeSet::new();
+    for step in &attempt.progress.steps {
+        validate_attempt_step(attempt, step, &mut step_ids)?;
+    }
+    validate_attempt_continuation(state_index, attempt)?;
+    validate_attempt_recovery(attempt, &step_ids)?;
+    validate_attempt_finalization(attempt, &mut step_ids)?;
+    validate_attempt_actions(attempt)?;
+    validate_attempt_guards(attempt, &step_ids)?;
+    validate_attempt_result(attempt)
+}
+
+fn validate_attempt_step<'a>(
+    attempt: &LocalAttemptV1,
+    step: &'a AttemptStepV1,
+    step_ids: &mut BTreeSet<&'a str>,
+) -> Result<(), LocalRunDirectoryError> {
+    if step.id.is_empty() {
+        return Err(LocalRunDirectoryError::AttemptStepIdInvalid);
+    }
+    if step.role != AttemptNodeRoleV1::Step {
+        return Err(LocalRunDirectoryError::AttemptStepRoleInvalid);
+    }
+    if !step_ids.insert(step.id.as_str()) {
+        return Err(LocalRunDirectoryError::AttemptStepDuplicate);
+    }
+    if !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref()) {
+        return Err(LocalRunDirectoryError::AttemptStepDetailInvalid);
+    }
+    if !retained_output_set_valid(
+        step.role,
+        &step.id,
+        step.state,
+        step.outputs.as_deref(),
+        attempt.definition.is_some(),
+    ) {
+        return Err(LocalRunDirectoryError::AttemptStepOutputsInvalid);
+    }
+    if step.state == AttemptStepStateV1::Inherited && step.recovery.is_some() {
+        return Err(LocalRunDirectoryError::AttemptStepRecoveryInvalid);
+    }
+    let ordinary_cancellation = attempt
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation.reason);
+    let first_force_abort_phase = attempt
+        .force_abort
+        .map(|force_abort| force_abort.phase.into());
+    if step.detail.as_ref().is_some_and(|detail| {
+        let NodeDetail::Cancellation(detail) = detail else {
+            return false;
+        };
+        !ordinary_node_cancellation_matches(
+            cancellation_reason(detail.code),
+            ordinary_cancellation,
+            CancellationReasonV1::ForceAbort,
+            first_force_abort_phase,
+        )
+    }) {
+        return Err(LocalRunDirectoryError::AttemptStepCancellationInvalid);
+    }
+    Ok(())
+}
+
+fn validate_attempt_cancellation(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
     let finalization_cancelled =
         attempt
             .finalization
@@ -7160,14 +7581,14 @@ fn validate_attempt(
                 AttemptFinalizationV1::Progress(progress) => progress.cancellation.is_some(),
                 AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
             });
-    let first_force_abort_phase = attempt
-        .force_abort
-        .map(|force_abort| force_abort.phase.into());
     if attempt.cancellation.as_ref().is_some_and(|cancellation| {
         cancellation.reason == CancellationReasonV1::ForceAbort
             || !valid_timestamp(&cancellation.requested_at)
             || !valid_timestamp(&cancellation.force_stop_deadline)
-    }) || attempt.force_abort.is_some_and(|force_abort| {
+    }) {
+        return Err(LocalRunDirectoryError::AttemptCancellationRecordInvalid);
+    }
+    if attempt.force_abort.is_some_and(|force_abort| {
         force_abort.reason != CancellationReason::ForceAbort
             || matches!(
                 attempt.state,
@@ -7175,68 +7596,45 @@ fn validate_attempt(
             )
             || (force_abort.phase == super::runtime::RunCancellationPhase::Finalization
                 && attempt.finalization.is_none())
-    }) || matches!(
+    }) {
+        return Err(LocalRunDirectoryError::AttemptForceAbortInvalid);
+    }
+    if matches!(
         attempt.state,
         AttemptStateV1::Cancelling | AttemptStateV1::Cancelled
     ) && attempt.cancellation.is_none()
         && attempt.force_abort.is_none()
         && !finalization_cancelled
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptCancellationMissing);
     }
     if attempt.cancellation.as_ref().is_some_and(|cancellation| {
         cancellation.workflow_confirmed != matches!(attempt.state, AttemptStateV1::Cancelled)
-    }) || attempt.interruption.as_ref().is_some_and(|interruption| {
+    }) {
+        return Err(LocalRunDirectoryError::AttemptCancellationConfirmationInvalid);
+    }
+    if attempt.interruption.as_ref().is_some_and(|interruption| {
         interruption.cancellation_requested
             != (attempt.cancellation.is_some()
                 || attempt.force_abort.is_some()
                 || finalization_cancelled)
     }) {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptInterruptionCancellationInvalid);
     }
-    if matches!(attempt.state, AttemptStateV1::Interrupted) != attempt.interruption.is_some()
-        || matches!(attempt.state, AttemptStateV1::Rejected) != attempt.rejection.is_some()
-        || (!matches!(attempt.state, AttemptStateV1::Interrupted) && attempt.interruption.is_some())
-        || (!matches!(attempt.state, AttemptStateV1::Rejected) && attempt.rejection.is_some())
-    {
-        return Err(LocalRunDirectoryError::StateInvalid);
+    Ok(())
+}
+
+fn validate_attempt_outcome(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
+    if matches!(attempt.state, AttemptStateV1::Interrupted) != attempt.interruption.is_some() {
+        return Err(LocalRunDirectoryError::AttemptInterruptionInvalid);
     }
-    let ordinary_cancellation = attempt
-        .cancellation
-        .as_ref()
-        .map(|cancellation| cancellation.reason);
-    let mut step_ids = BTreeSet::new();
-    for step in &attempt.progress.steps {
-        if step.id.is_empty()
-            || step.role != AttemptNodeRoleV1::Step
-            || !step_ids.insert(step.id.as_str())
-            || !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref())
-            || !retained_output_set_valid(
-                step.role,
-                &step.id,
-                step.state,
-                step.outputs.as_deref(),
-                attempt.definition.is_some(),
-            )
-            || (step.state == AttemptStepStateV1::Inherited && step.recovery.is_some())
-            || step.detail.as_ref().is_some_and(|detail| {
-                let NodeDetail::Cancellation(detail) = detail else {
-                    return false;
-                };
-                !ordinary_node_cancellation_matches(
-                    cancellation_reason(detail.code),
-                    ordinary_cancellation,
-                    CancellationReasonV1::ForceAbort,
-                    first_force_abort_phase,
-                )
-            })
-        {
-            return Err(LocalRunDirectoryError::StateInvalid);
-        }
+    if matches!(attempt.state, AttemptStateV1::Rejected) != attempt.rejection.is_some() {
+        return Err(LocalRunDirectoryError::AttemptRejectionInvalid);
     }
-    validate_attempt_continuation(state_index, attempt)?;
-    validate_attempt_recovery(attempt, &step_ids)?;
-    validate_attempt_finalization(attempt, &mut step_ids)?;
+    Ok(())
+}
+
+fn validate_attempt_actions(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
     let mut action_ids = BTreeSet::new();
     let mut prior_action_id = 0;
     for action in &attempt.progress.outstanding_actions {
@@ -7244,14 +7642,21 @@ fn validate_attempt(
         if action.action_id == 0
             || action.action_id <= prior_action_id
             || !action_ids.insert(action.action_id)
-            || requires_step != action.step_id.is_some()
-            || requires_step != action.node_role.is_some()
-            || action
-                .step_id
-                .as_deref()
-                .is_some_and(|id| attempt_node_role(attempt, id) != action.node_role)
-            || (requires_step
-                && (action.target_execution.is_some() == action.recovery_round.is_some()))
+        {
+            return Err(LocalRunDirectoryError::AttemptActionIdInvalid);
+        }
+        if requires_step != action.step_id.is_some() || requires_step != action.node_role.is_some()
+        {
+            return Err(LocalRunDirectoryError::AttemptActionTargetInvalid);
+        }
+        if action
+            .step_id
+            .as_deref()
+            .is_some_and(|id| attempt_node_role(attempt, id) != action.node_role)
+        {
+            return Err(LocalRunDirectoryError::AttemptActionNodeInvalid);
+        }
+        if (requires_step && action.target_execution.is_some() == action.recovery_round.is_some())
             || (!requires_step
                 && (action.target_execution.is_some() || action.recovery_round.is_some()))
             || (matches!(action.kind, OutstandingActionKindV1::StartRecoveryHandler)
@@ -7259,29 +7664,44 @@ fn validate_attempt(
             || (matches!(action.kind, OutstandingActionKindV1::StartStep)
                 && action.target_execution.is_none())
         {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptActionInvocationInvalid);
         }
         prior_action_id = action.action_id;
     }
-    if terminal && !attempt.progress.outstanding_actions.is_empty() {
-        return Err(LocalRunDirectoryError::StateInvalid);
+    if attempt.state.is_terminal() && !attempt.progress.outstanding_actions.is_empty() {
+        return Err(LocalRunDirectoryError::AttemptTerminalActionsInvalid);
     }
+    Ok(())
+}
+
+fn validate_attempt_guards(
+    attempt: &LocalAttemptV1,
+    step_ids: &BTreeSet<&str>,
+) -> Result<(), LocalRunDirectoryError> {
     let mut guard_ids = BTreeSet::new();
     for guard in &attempt.process_guards {
-        if !is_canonical_uuid(&guard.guard_id)
-            || !guard_ids.insert(guard.guard_id.as_str())
-            || guard.action_id == 0
-            || !step_ids.contains(guard.step_id.as_str())
+        if !is_canonical_uuid(&guard.guard_id) || !guard_ids.insert(guard.guard_id.as_str()) {
+            return Err(LocalRunDirectoryError::AttemptGuardIdInvalid);
+        }
+        if guard.action_id == 0 {
+            return Err(LocalRunDirectoryError::AttemptGuardActionInvalid);
+        }
+        if !step_ids.contains(guard.step_id.as_str())
             || attempt_node_role(attempt, &guard.step_id) != Some(guard.node_role)
-            || !validate_execution_host(&guard.execution_host)
-            || guard.process_group_id <= 0
+        {
+            return Err(LocalRunDirectoryError::AttemptGuardStepInvalid);
+        }
+        if !validate_execution_host(&guard.execution_host) {
+            return Err(LocalRunDirectoryError::AttemptGuardHostInvalid);
+        }
+        if guard.process_group_id <= 0
             || guard.liveness.value.is_empty()
             || guard.liveness.value.len() > 256
         {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptGuardProcessInvalid);
         }
     }
-    validate_attempt_result(attempt)
+    Ok(())
 }
 
 fn validate_attempt_continuation(
@@ -7297,7 +7717,7 @@ fn validate_attempt_continuation(
     let Some(continuation) = &attempt.continuation else {
         return (attempt.trigger != AttemptTriggerV1::Continuation && inherited.is_empty())
             .then_some(())
-            .ok_or(LocalRunDirectoryError::StateInvalid);
+            .ok_or(LocalRunDirectoryError::AttemptContinuationInvalid);
     };
     let reexecuted = attempt
         .progress
@@ -7322,15 +7742,15 @@ fn validate_attempt_continuation(
             .zip(&inherited)
             .any(|(record, step)| record.id != step.id)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptContinuationInvalid);
     }
     let prior = state_index
         .attempt(
             attempt
                 .prior_attempt_number
-                .ok_or(LocalRunDirectoryError::StateInvalid)?,
+                .ok_or(LocalRunDirectoryError::AttemptContinuationInvalid)?,
         )
-        .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        .ok_or(LocalRunDirectoryError::AttemptContinuationInvalid)?;
     let requested_execution_root = continuation
         .request
         .execution_root
@@ -7340,18 +7760,18 @@ fn validate_attempt_continuation(
         || continuation.workspace.prior_execution_root != prior.execution_root
         || continuation.workspace.prior_settlement_snapshot != prior.settlement_snapshot
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptContinuationInvalid);
     }
     for (record, step) in continuation.inherited_steps.iter().zip(inherited) {
         let Some(NodeDetail::Inherited(detail)) = &step.detail else {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptInheritedStepInvalid);
         };
         let disposition = state_index
             .disposition(attempt.attempt_number, &step.id)
-            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            .ok_or(LocalRunDirectoryError::AttemptInheritedStepInvalid)?;
         let prior_step = state_index
             .step(prior.attempt_number, &step.id)
-            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            .ok_or(LocalRunDirectoryError::AttemptInheritedStepInvalid)?;
         let prior_state = match prior_step.state {
             AttemptStepStateV1::Succeeded => super::evidence::InheritedPriorState::Succeeded,
             AttemptStepStateV1::Skipped => super::evidence::InheritedPriorState::Skipped,
@@ -7365,17 +7785,17 @@ fn validate_attempt_continuation(
             | AttemptStepStateV1::NotRun
             | AttemptStepStateV1::Cancelling
             | AttemptStepStateV1::Cancelled => {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptInheritedStepInvalid);
             }
         };
         let outputs = step
             .outputs
             .as_deref()
-            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            .ok_or(LocalRunDirectoryError::AttemptInheritedStepInvalid)?;
         let prior_outputs = prior_step
             .outputs
             .as_deref()
-            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            .ok_or(LocalRunDirectoryError::AttemptInheritedStepInvalid)?;
         if detail.prior_attempt_id != prior.attempt_id
             || detail.prior_attempt_number != prior.attempt_number
             || detail.prior_state != prior_state
@@ -7384,13 +7804,13 @@ fn validate_attempt_continuation(
             || outputs.len() != prior_outputs.len()
             || (disposition == InheritedDisposition::Skipped && !outputs.is_empty())
         {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptInheritedStepInvalid);
         }
         for output in outputs {
             let prior_output = prior_outputs
                 .iter()
                 .find(|candidate| candidate.name() == output.name())
-                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                .ok_or(LocalRunDirectoryError::AttemptInheritedOutputInvalid)?;
             let expected_producer = match prior_step.state {
                 AttemptStepStateV1::Succeeded => super::runtime::OutputProducer {
                     attempt_id: prior.attempt_id.clone(),
@@ -7401,7 +7821,7 @@ fn validate_attempt_continuation(
                 AttemptStepStateV1::Inherited => prior_output
                     .producer()
                     .cloned()
-                    .ok_or(LocalRunDirectoryError::StateInvalid)?,
+                    .ok_or(LocalRunDirectoryError::AttemptInheritedOutputInvalid)?,
                 AttemptStepStateV1::Skipped
                 | AttemptStepStateV1::Pending
                 | AttemptStepStateV1::Starting
@@ -7412,18 +7832,18 @@ fn validate_attempt_continuation(
                 | AttemptStepStateV1::NotRun
                 | AttemptStepStateV1::Cancelling
                 | AttemptStepStateV1::Cancelled => {
-                    return Err(LocalRunDirectoryError::StateInvalid);
+                    return Err(LocalRunDirectoryError::AttemptInheritedOutputInvalid);
                 }
             };
             if output.producer() != Some(&expected_producer)
                 || !retained_output_payload_matches(prior_output, output, &expected_producer)
             {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptInheritedOutputInvalid);
             }
             let producer_attempt = state_index
                 .attempt(expected_producer.attempt_number)
                 .filter(|candidate| candidate.attempt_id == expected_producer.attempt_id)
-                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                .ok_or(LocalRunDirectoryError::AttemptInheritedOutputInvalid)?;
             let source = state_index
                 .step(producer_attempt.attempt_number, &step.id)
                 .filter(|candidate| candidate.state == AttemptStepStateV1::Succeeded)
@@ -7433,9 +7853,9 @@ fn validate_attempt_continuation(
                         .iter()
                         .find(|candidate| candidate.name() == output.name())
                 })
-                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+                .ok_or(LocalRunDirectoryError::AttemptInheritedOutputInvalid)?;
             if !retained_output_payload_matches(source, output, &expected_producer) {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptInheritedOutputInvalid);
             }
         }
     }
@@ -7453,7 +7873,7 @@ fn validate_attempt_continuation(
                     || producer.output != output.name()
             })
         }) {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptContinuationInvalid);
         }
     }
     Ok(())
@@ -7480,7 +7900,7 @@ fn validate_attempt_recovery(
             .ok()
             .is_none_or(|count| count > attempt.progress.accounting.maximum_invocations)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptRecoveryAccountingInvalid);
     }
     let mut invocation_ids = BTreeSet::new();
     let mut previous_invocation_id = 0_u64;
@@ -7507,13 +7927,13 @@ fn validate_attempt_recovery(
                     !is_canonical_relative_path(path) || path.split('/').any(str::is_empty)
                 })
         {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptRecoveryInvocationInvalid);
         }
         for diagnostic in &invocation.diagnostics {
             if !is_canonical_relative_path(&diagnostic.reference)
                 || diagnostic.truncated != (diagnostic.discarded_bytes != 0)
             {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptRecoveryDiagnosticInvalid);
             }
         }
         previous_invocation_id = invocation.invocation_id;
@@ -7525,12 +7945,12 @@ fn validate_attempt_recovery(
             .iter()
             .any(|invocation| invocation.state == DurableInvocationStateV1::Active)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptRecoveryInvocationInvalid);
     }
     let mut projected = attempt.progress.clone();
     recalculate_invocation_accounting(&mut projected)?;
     if projected.accounting != attempt.progress.accounting {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptRecoveryAccountingInvalid);
     }
     for step in &attempt.progress.steps {
         let Some(recovery) = &step.recovery else {
@@ -7553,7 +7973,7 @@ fn validate_attempt_recovery(
                         | AttemptStepStateV1::Cancelled
                 )
         {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptRecoveryRoundInvalid);
         }
         if let Some(active) = &recovery.active
             && !attempt.progress.invocations.iter().any(|invocation| {
@@ -7565,7 +7985,7 @@ fn validate_attempt_recovery(
                     && invocation.state == DurableInvocationStateV1::Active
             })
         {
-            return Err(LocalRunDirectoryError::StateInvalid);
+            return Err(LocalRunDirectoryError::AttemptRecoveryActiveInvalid);
         }
     }
     Ok(())
@@ -7583,7 +8003,7 @@ fn validate_attempt_finalization<'a>(
         AttemptFinalizationV1::Complete(complete) => complete.force_abort,
     };
     if force_abort != attempt.force_abort.is_some() {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(LocalRunDirectoryError::AttemptFinalizationForceAbortInvalid);
     }
     match finalization {
         AttemptFinalizationV1::Progress(progress) => {
@@ -7612,13 +8032,13 @@ fn validate_attempt_finalization<'a>(
                         )
                 })
             {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptFinalizationProgressInvalid);
             }
             if matches!(
                 attempt.state,
                 AttemptStateV1::Created | AttemptStateV1::Rejected
             ) {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptFinalizationProgressInvalid);
             }
             if !valid_finalization_interruption(
                 progress.cancellation.as_ref(),
@@ -7627,7 +8047,7 @@ fn validate_attempt_finalization<'a>(
                     .force_abort
                     .map(|force_abort| force_abort.phase.into()),
             ) {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptFinalizationInterruptionInvalid);
             }
             if matches!(
                 attempt.state,
@@ -7635,7 +8055,7 @@ fn validate_attempt_finalization<'a>(
                     | AttemptStateV1::WorkflowFailed
                     | AttemptStateV1::Cancelled
             ) {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptFinalizationProgressInvalid);
             }
         }
         AttemptFinalizationV1::Complete(complete) => {
@@ -7670,7 +8090,7 @@ fn validate_attempt_finalization<'a>(
                 })
             // jscpd:ignore-end
             {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptFinalizationCompleteInvalid);
             }
             let expected_issues = complete
                 .finalizers
@@ -7690,7 +8110,7 @@ fn validate_attempt_finalization<'a>(
                     .zip(expected_issues)
                     .any(|(issue, (id, impact))| issue.finalizer_id != id || issue.impact != impact)
             {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptFinalizationIssuesInvalid);
             }
             if !valid_finalization_interruption(
                 complete.cancellation.as_ref(),
@@ -7699,7 +8119,7 @@ fn validate_attempt_finalization<'a>(
                     .force_abort
                     .map(|force_abort| force_abort.phase.into()),
             ) {
-                return Err(LocalRunDirectoryError::StateInvalid);
+                return Err(LocalRunDirectoryError::AttemptFinalizationInterruptionInvalid);
             }
         }
     }
@@ -8126,7 +8546,7 @@ fn validate_attempt_result(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirec
     if valid {
         Ok(())
     } else {
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptResultInvalid)
     }
 }
 
@@ -8153,29 +8573,43 @@ fn read_regular_file_bounded(
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    let metadata = fstat(&file).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
-        || metadata.st_size < 0
+    .map_err(|source| file_error(parent, name, "open", source))?;
+    let metadata = fstat(&file).map_err(|source| file_error(parent, name, "stat", source))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        return Err(LocalRunDirectoryError::StateFile {
+            path: file_locator(parent, name),
+            operation: "validate",
+            source: Box::new(LocalRunDirectoryError::RegularFileInvalid),
+        });
+    }
+    if metadata.st_size < 0
         || u64::try_from(metadata.st_size)
             .ok()
             .is_none_or(|size| size > maximum_bytes)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(invalid_file_size(parent, name));
     }
     let mut file = File::from(file);
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(maximum_bytes + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        .map_err(|source| file_error(parent, name, "read", source))?;
     if u64::try_from(bytes.len())
         .ok()
         .is_none_or(|size| size > maximum_bytes)
     {
-        return Err(LocalRunDirectoryError::StateInvalid);
+        return Err(invalid_file_size(parent, name));
     }
     Ok(bytes)
+}
+
+fn invalid_file_size(parent: &OwnedFd, name: &str) -> LocalRunDirectoryError {
+    LocalRunDirectoryError::StateFile {
+        path: file_locator(parent, name),
+        operation: "validate",
+        source: Box::new(LocalRunDirectoryError::FileSizeInvalid),
+    }
 }
 
 fn encode_json(document: &impl Serialize) -> Result<Vec<u8>, LocalRunDirectoryError> {
@@ -8194,10 +8628,11 @@ fn write_new_immutable_file(
     file.write_all(bytes)
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
-    fchmod(file.as_fd(), Mode::RUSR).map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+        .map_err(|source| file_error(parent, name, "write and sync", source))?;
+    fchmod(file.as_fd(), Mode::RUSR)
+        .map_err(|source| file_error(parent, name, "set permissions", source))?;
     file.sync_all()
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)
+        .map_err(|source| file_error(parent, name, "sync", source))
 }
 
 fn write_new_state_file(parent: &OwnedFd, bytes: &[u8]) -> Result<(), LocalRunDirectoryError> {
@@ -8205,7 +8640,7 @@ fn write_new_state_file(parent: &OwnedFd, bytes: &[u8]) -> Result<(), LocalRunDi
     file.write_all(bytes)
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)
+        .map_err(|source| file_error(parent, STATE_FILE, "write and sync", source))
 }
 
 fn create_file(parent: &OwnedFd, name: &str, mode: Mode) -> Result<File, LocalRunDirectoryError> {
@@ -8216,31 +8651,38 @@ fn create_file(parent: &OwnedFd, name: &str, mode: Mode) -> Result<File, LocalRu
         mode,
     )
     .map(File::from)
-    .map_err(|_| LocalRunDirectoryError::StagingUnavailable)
+    .map_err(|source| file_error(parent, name, "create", source))
 }
 
-fn mkdir(parent: &OwnedFd, name: impl rustix::path::Arg) -> Result<(), LocalRunDirectoryError> {
-    mkdirat(parent, name, Mode::RWXU).map_err(|_| LocalRunDirectoryError::StagingUnavailable)
+fn mkdir(
+    parent: &OwnedFd,
+    name: impl AsRef<std::ffi::OsStr>,
+) -> Result<(), LocalRunDirectoryError> {
+    let name = name.as_ref();
+    mkdirat(parent, name, Mode::RWXU)
+        .map_err(|source| file_error(parent, name, "create directory", source))
 }
 
 pub(super) fn open_directory_at(
     parent: &OwnedFd,
-    name: impl rustix::path::Arg,
+    name: impl AsRef<std::ffi::OsStr>,
 ) -> Result<OwnedFd, LocalRunDirectoryError> {
+    let name = name.as_ref();
     openat(
         parent,
         name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| LocalRunDirectoryError::StagingUnavailable)
+    .map_err(|source| file_error(parent, name, "open directory", source))
 }
 
 fn sync_directory(directory: &OwnedFd) -> Result<(), LocalRunDirectoryError> {
-    let duplicate = dup(directory).map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    let duplicate = dup(directory)
+        .map_err(|source| file_error(directory, ".", "duplicate directory", source))?;
     File::from(duplicate)
         .sync_all()
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)
+        .map_err(|source| file_error(directory, ".", "sync directory", source))
 }
 
 fn ensure_absent(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<(), LocalRunDirectoryError> {
@@ -8268,7 +8710,8 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 }
 
 fn directory_entries(directory: &OwnedFd) -> Result<BTreeSet<Vec<u8>>, LocalRunDirectoryError> {
-    directory_entry_names(directory).map_err(|_| LocalRunDirectoryError::StateInvalid)
+    directory_entry_names(directory)
+        .map_err(|source| file_error(directory, ".", "list directory", source))
 }
 
 fn timestamp(value: OffsetDateTime) -> Result<String, LocalRunDirectoryError> {

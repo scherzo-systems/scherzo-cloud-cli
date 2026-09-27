@@ -570,48 +570,134 @@ fn closed_durable_documents_reject_versions_fields_nulls_and_corruption() {
     value["schemaVersion"] = Value::from(2);
     assert_eq!(
         decode_run(&json_bytes(value)).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
+        LocalRunDirectoryError::StateSchemaInvalid
     );
     let mut value = serde_json::to_value(&run_document).unwrap();
     value["unknown"] = Value::Bool(true);
-    assert_eq!(
-        decode_run(&json_bytes(value)).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
-    );
+    assert!(matches!(
+        decode_run(&json_bytes(value)),
+        Err(LocalRunDirectoryError::Json { .. })
+    ));
 
     let mut value = serde_json::to_value(&state).unwrap();
     value["schemaVersion"] = Value::from(99);
+    let corrupt_state = json_bytes(value);
     assert_eq!(
-        decode_state(&json_bytes(value)).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
+        decode_state(&corrupt_state).unwrap_err(),
+        LocalRunDirectoryError::StateSchemaInvalid
     );
+    let state_path = run.run_directory().join(STATE_FILE);
+    fs::write(&state_path, corrupt_state).unwrap();
+    let error = read_state(run.root_handle()).unwrap_err();
+    assert!(
+        matches!(&error, LocalRunDirectoryError::StateFile { path, operation: "validate", source }
+        if path == &state_path && **source == LocalRunDirectoryError::StateSchemaInvalid)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&state_path.display().to_string())
+    );
+    assert!(error.to_string().contains("state schema invalid"));
     let mut value = serde_json::to_value(&state).unwrap();
     value["attempts"][0]["owner"]["unknown"] = Value::Bool(true);
-    assert_eq!(
-        decode_state(&json_bytes(value)).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
-    );
+    assert!(matches!(
+        decode_state(&json_bytes(value)),
+        Err(LocalRunDirectoryError::Json { .. })
+    ));
     let mut value = serde_json::to_value(&state).unwrap();
     value["attempts"][0]["startedAt"] = Value::Null;
     assert_eq!(
         decode_state(&json_bytes(value)).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
+        LocalRunDirectoryError::DocumentNullInvalid
     );
     let mut value = serde_json::to_value(&state).unwrap();
     value["attempts"][0]["executionRoot"] = Value::String("/tmp/../tmp".to_owned());
     assert_eq!(
-        decode_state(&json_bytes(value)).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
+        decode_state(&json_bytes(value)),
+        Err(LocalRunDirectoryError::AttemptExecutionRootInvalid)
     );
     let mut value = serde_json::to_value(&state).unwrap();
     value["attempts"][0]["state"] = Value::String("future_state".to_owned());
+    assert!(matches!(
+        decode_state(&json_bytes(value)),
+        Err(LocalRunDirectoryError::Json { .. })
+    ));
     assert_eq!(
-        decode_state(&json_bytes(value)).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
+        decode_state(b"{\"schemaVersion\":1"),
+        Err(LocalRunDirectoryError::DocumentFramingInvalid)
     );
+    let mut bom = vec![0xef, 0xbb, 0xbf];
+    bom.extend(json_bytes(serde_json::to_value(&state).unwrap()));
     assert_eq!(
-        decode_state(b"{\"schemaVersion\":1").unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
+        decode_state(&bom),
+        Err(LocalRunDirectoryError::DocumentFramingInvalid)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn file_locator_uses_the_open_directory_on_macos() {
+    let fixture = AdmittedFixture::new();
+    let run =
+        InitialLocalRun::create(&fixture.run_path("macos-locator"), &fixture.admitted).unwrap();
+    assert_eq!(
+        file_locator(run.root_handle(), STATE_FILE),
+        run.run_directory().join(STATE_FILE)
+    );
+}
+
+#[test]
+fn state_index_rejects_corrupt_attempt_number_and_duplicate_step_with_specific_errors() {
+    let fixture = AdmittedFixture::new();
+    let run =
+        InitialLocalRun::create(&fixture.run_path("index-corruption"), &fixture.admitted).unwrap();
+    let state = read_state(run.root_handle()).unwrap();
+    let mut document = serde_json::to_value(&state).unwrap();
+    document["currentAttemptNumber"] = json!(2);
+    let mut second = document["attempts"][0].clone();
+    second["attemptNumber"] = json!(2);
+    document["attempts"].as_array_mut().unwrap().push(second);
+    document["attempts"][0]["attemptNumber"] = json!(0);
+    assert_eq!(
+        decode_state(&json_bytes(document)),
+        Err(LocalRunDirectoryError::AttemptNumberInvalid)
+    );
+
+    let mut document = serde_json::to_value(&state).unwrap();
+    let step = document["attempts"][0]["progress"]["steps"][0].clone();
+    document["attempts"][0]["progress"]["steps"]
+        .as_array_mut()
+        .unwrap()
+        .push(step);
+    assert_eq!(
+        decode_state(&json_bytes(document.clone())),
+        Err(LocalRunDirectoryError::AttemptStepDuplicate)
+    );
+    fs::write(run.run_directory().join(STATE_FILE), json_bytes(document)).unwrap();
+    assert!(
+        matches!(read_state(run.root_handle()), Err(LocalRunDirectoryError::StateFile { path, source, .. })
+        if path == run.run_directory().join(STATE_FILE) && *source == LocalRunDirectoryError::AttemptStepDuplicate)
+    );
+}
+
+#[test]
+fn attempt_recovery_and_result_corruption_report_distinct_invariants() {
+    let fixture = AdmittedFixture::new();
+    let run = InitialLocalRun::create(&fixture.run_path("attempt-predicates"), &fixture.admitted)
+        .unwrap();
+    let state = read_state(run.root_handle()).unwrap();
+    let mut document = serde_json::to_value(&state).unwrap();
+    document["attempts"][0]["progress"]["accounting"]["maximumInvocations"] = json!(0);
+    assert_eq!(
+        decode_state(&json_bytes(document)),
+        Err(LocalRunDirectoryError::AttemptRecoveryAccountingInvalid)
+    );
+    let mut document = serde_json::to_value(&state).unwrap();
+    document["attempts"][0]["result"] = json!({"status": "not_published", "reason": "rejected"});
+    assert_eq!(
+        decode_state(&json_bytes(document)),
+        Err(LocalRunDirectoryError::AttemptResultInvalid)
     );
 }
 
@@ -692,7 +778,11 @@ fn atomic_state_crash_boundaries_expose_only_complete_snapshots() {
         .state
         .update_with_observer(mutate, &mut PartialTemporaryWrite)
         .unwrap_err();
-    assert_eq!(failure, LocalRunDirectoryError::StateWriteUnavailable);
+    assert!(
+        matches!(failure, LocalRunDirectoryError::File { path, operation: "write temporary state", source }
+        if path.parent() == Some(run.run_directory().join(PRIVATE_DIRECTORY).as_path())
+            && source.kind() == io::ErrorKind::Other)
+    );
     assert_eq!(read_state(run.root_handle()).unwrap(), before);
 
     let failure = run
@@ -719,9 +809,69 @@ fn atomic_state_crash_boundaries_expose_only_complete_snapshots() {
     )
     .unwrap();
     fs::write(run.run_directory().join(STATE_FILE), b"{partial").unwrap();
-    assert_eq!(
-        read_state(run.root_handle()).unwrap_err(),
-        LocalRunDirectoryError::StateInvalid
+    assert!(matches!(
+        read_state(run.root_handle()),
+        Err(LocalRunDirectoryError::StateFile { path, source, .. })
+            if path == run.run_directory().join(STATE_FILE) && matches!(*source, LocalRunDirectoryError::DocumentFramingInvalid)
+    ));
+}
+
+#[test]
+fn retry_reports_state_path_and_failed_attempt_invariant() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("invalid-attempt-root");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    let mut document = serde_json::to_value(read_state(run.root_handle()).unwrap()).unwrap();
+    drop(run);
+    document["attempts"][0]["executionRoot"] = json!("/tmp/../tmp");
+    fs::write(run_path.join(STATE_FILE), json_bytes(document)).unwrap();
+    let state_path = fs::canonicalize(&run_path).unwrap().join(STATE_FILE);
+
+    let Err(error) = acquire_local_retry(&run_path) else {
+        panic!("corrupt state accepted");
+    };
+    assert!(
+        matches!(&error, LocalRunDirectoryError::StateFile { path, source, .. }
+        if path == &state_path
+            && matches!(**source, LocalRunDirectoryError::AttemptExecutionRootInvalid))
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&state_path.display().to_string())
+    );
+    assert!(error.to_string().contains("attempt execution root invalid"));
+}
+
+#[test]
+fn status_preserves_unsupported_recovery_schema_through_state_file_context() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("unsupported-recovery");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    let mut document = serde_json::to_value(read_state(run.root_handle()).unwrap()).unwrap();
+    drop(run);
+    document["attempts"][0]["progress"]["steps"][0]["recovery"] = json!({ "schemaVersion": 2 });
+    fs::write(run_path.join(STATE_FILE), json_bytes(document)).unwrap();
+    let error = read_local_run_status(&run_path).unwrap_err();
+    assert_eq!(error.code, LocalStatusErrorCode::RecoverySchemaUnsupported);
+}
+
+#[test]
+fn retry_preserves_missing_state_file_io_cause() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("missing-state");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    drop(run);
+    fs::remove_file(run_path.join(STATE_FILE)).unwrap();
+    let state_path = fs::canonicalize(&run_path).unwrap().join(STATE_FILE);
+    let root = open_directory_path(&run_path).unwrap();
+    assert!(
+        matches!(read_state(&root), Err(LocalRunDirectoryError::File { path, operation: "open", source })
+        if path == state_path && source.kind() == io::ErrorKind::NotFound)
+    );
+    assert!(
+        matches!(acquire_local_retry(&run_path), Err(LocalRunDirectoryError::StateFile { path, .. })
+        if path == state_path)
     );
 }
 
@@ -786,17 +936,14 @@ fn unsupported_atomic_exchange_leaves_the_last_snapshot_authoritative() {
     let fixture = AdmittedFixture::new();
     let run = InitialLocalRun::create(&fixture.run_path("no-exchange"), &fixture.admitted).unwrap();
     let before = read_state(run.root_handle()).unwrap();
-    assert_eq!(
+    assert!(matches!(
         run.state.update_with_observer(
-            |state| append_diagnostic(
-                state,
-                INITIAL_ATTEMPT_NUMBER,
-                DiagnosticCodeV1::StaleOccurrence
-            ),
+            |state| append_diagnostic(state, INITIAL_ATTEMPT_NUMBER, DiagnosticCodeV1::StaleOccurrence),
             &mut NoExchange,
         ),
-        Err(LocalRunDirectoryError::AtomicCommitUnavailable)
-    );
+        Err(LocalRunDirectoryError::File { path, operation: "exchange state", source })
+            if path == run.run_directory().join(STATE_FILE) && source.raw_os_error() == Some(Errno::OPNOTSUPP.raw_os_error())
+    ));
     assert_eq!(read_state(run.root_handle()).unwrap(), before);
     assert_eq!(*lock_state(&run.state.current).unwrap(), before);
 }
@@ -1109,7 +1256,11 @@ fn retained_output_carriers_are_verified_and_orphans_are_removed() {
     permissions.set_mode(0o600);
     fs::set_permissions(&carrier_path, permissions).unwrap();
     fs::write(&carrier_path, b"tampered\n").unwrap();
-    assert!(verify_retained_output_evidence(run.root_handle(), &state, 1).is_err());
+    assert!(matches!(
+        verify_retained_output_evidence(run.root_handle(), &state, 1),
+        Err(LocalRunDirectoryError::StateFile { path, source, .. })
+            if path == carrier_path && matches!(*source, LocalRunDirectoryError::CarrierInvalid)
+    ));
 }
 
 #[test]
@@ -1470,7 +1621,7 @@ steps:
     current.progress.steps[0].outputs = None;
     assert_eq!(
         validate_state(&missing_full_reexecution_record),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptStepOutputsInvalid)
     );
 
     let mut explicit_request_root = state.clone();
@@ -1501,7 +1652,7 @@ steps:
         .execution_root = Some("/different-execution-root".to_owned());
     assert_eq!(
         validate_state(&mismatched_request_root),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptContinuationInvalid)
     );
 
     let mut mismatched_prior_workspace = state.clone();
@@ -1516,7 +1667,7 @@ steps:
         .prior_execution_root = "/different-prior-root".to_owned();
     assert_eq!(
         validate_state(&mismatched_prior_workspace),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptContinuationInvalid)
     );
 
     let mut missing_prior_snapshot = state.clone();
@@ -1531,7 +1682,7 @@ steps:
         .prior_settlement_snapshot = None;
     assert_eq!(
         validate_state(&missing_prior_snapshot),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptContinuationInvalid)
     );
 
     let mut mismatched_prior_state = state.clone();
@@ -1544,7 +1695,7 @@ steps:
         crate::workflow::evidence::InheritedPriorState::Succeeded;
     assert_eq!(
         validate_state(&mismatched_prior_state),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptInheritedStepInvalid)
     );
 
     let mut impossible_skipped_output = state.clone();
@@ -1558,7 +1709,7 @@ steps:
     impossible_skipped_output.attempts[2].progress.steps[0].outputs = Some(vec![inherited]);
     assert_eq!(
         validate_state(&impossible_skipped_output),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptInheritedStepInvalid)
     );
 
     let mut flattened_chain = state.clone();
@@ -1613,7 +1764,7 @@ steps:
         });
     assert_eq!(
         validate_state(&false_flattening),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptInheritedOutputInvalid)
     );
 
     let mut direct_prior_producer = state;
@@ -1650,7 +1801,7 @@ steps:
         });
     assert_eq!(
         validate_state(&stale_producer),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptInheritedOutputInvalid)
     );
 }
 
@@ -1674,10 +1825,11 @@ fn retained_output_verification_rejects_a_fifo_without_waiting_for_a_writer() {
     )
     .unwrap();
 
-    assert_eq!(
+    assert!(matches!(
         verify_retained_output_evidence(run.root_handle(), &state, 1),
-        Err(LocalRunDirectoryError::StateInvalid)
-    );
+        Err(LocalRunDirectoryError::StateFile { path, source, .. })
+            if path == carrier && matches!(*source, LocalRunDirectoryError::CarrierInvalid)
+    ));
 }
 
 #[test]
@@ -2069,7 +2221,21 @@ fn corrupted_retained_definition_after_quiescence_still_settles_abandonment() {
     drop(original);
     fs::remove_file(path.join("workflow/manifest.json")).unwrap();
     fs::write(path.join("workflow/manifest.json"), b"corrupt manifest").unwrap();
-    assert!(acquire_local_continuation(&path).is_err());
+    let manifest_path = fs::canonicalize(&path)
+        .unwrap()
+        .join("workflow/manifest.json");
+    let Err(error) = acquire_local_continuation(&path) else {
+        panic!("corrupted retained definition accepted");
+    };
+    assert!(
+        matches!(
+            &error,
+            LocalRunDirectoryError::StateFile { path: file, source, operation: "validate manifest" }
+                if file == &manifest_path
+                    && **source == LocalRunDirectoryError::ManifestDigestInvalid
+        ),
+        "{error:?}"
+    );
     let state = read_state(&open_directory_path(&path).unwrap()).unwrap();
     assert_eq!(state.attempts.len(), 1);
     assert_eq!(state.attempts[0].state, AttemptStateV1::Interrupted);
@@ -3052,7 +3218,7 @@ fn retained_attempt_rejects_force_evidence_on_success() {
         json!({ "reason": "force_abort", "phase": "ordinary" });
     assert_eq!(
         decode_state(&json_bytes(fabricated_force)),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptForceAbortInvalid)
     );
 }
 
@@ -3080,7 +3246,7 @@ fn retained_attempt_rejects_phase_impossible_force_evidence() {
     });
     assert_eq!(
         decode_state(&json_bytes(graceful_finalization)),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptFinalizationInterruptionInvalid)
     );
 
     let finalization_fixture = AdmittedFixture::from_source(workflow);
@@ -3100,7 +3266,7 @@ fn retained_attempt_rejects_phase_impossible_force_evidence() {
         json!({ "code": "force_abort" });
     assert_eq!(
         decode_state(&json_bytes(rewritten_ordinary)),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptStepCancellationInvalid)
     );
 }
 
@@ -3565,7 +3731,7 @@ fn publication_failure_persists_only_the_closed_result_invariant() {
     };
     assert_eq!(
         decode_state(&encode_json(&inconsistent).unwrap()),
-        Err(LocalRunDirectoryError::StateInvalid)
+        Err(LocalRunDirectoryError::AttemptResultInvalid)
     );
 }
 
