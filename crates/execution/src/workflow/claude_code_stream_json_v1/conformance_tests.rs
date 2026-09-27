@@ -354,6 +354,10 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         assert!(request.used_placeholder_key());
         assert_eq!(request.body()["model"], MODEL);
         assert_eq!(request.body()["stream"], true);
+        assert!(contains_string_fragment(
+            request.body(),
+            "Operate only on the deterministic synthetic conformance request."
+        ));
         assert!(contains_exact_string(request.body(), message));
         for marker in [
             NATIVE_INSTRUCTION_MARKER,
@@ -907,7 +911,7 @@ async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_befor
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.280 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.283 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.
