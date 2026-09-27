@@ -17,32 +17,57 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LinearTriggerSource {
+pub struct LinearIntegrationContextSourceOneOf1 {
     #[serde(rename = "type")]
     pub r#type: Type,
-    #[serde(rename = "connectionId")]
-    pub connection_id: String,
-    #[serde(rename = "includeSelfEvents", skip_serializing_if = "Option::is_none")]
-    pub include_self_events: Option<bool>,
+    #[serde(rename = "field")]
+    pub field: Field,
 }
 
-impl LinearTriggerSource {
-    pub fn new(r#type: Type, connection_id: String) -> LinearTriggerSource {
-        LinearTriggerSource {
-            r#type,
-            connection_id,
-            include_self_events: None,
-        }
+impl LinearIntegrationContextSourceOneOf1 {
+    pub fn new(r#type: Type, field: Field) -> LinearIntegrationContextSourceOneOf1 {
+        LinearIntegrationContextSourceOneOf1 { r#type, field }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Type {
-    #[serde(rename = "linear")]
-    Linear,
+    #[serde(rename = "field")]
+    Field,
 }
 
 impl Default for Type {
     fn default() -> Type {
-        Self::Linear
+        Self::Field
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Field {
+    #[serde(rename = "event.action")]
+    EventAction,
+    #[serde(rename = "event.actorId")]
+    EventActorId,
+    #[serde(rename = "event.stateFromId")]
+    EventStateFromId,
+    #[serde(rename = "event.stateToId")]
+    EventStateToId,
+    #[serde(rename = "event.eventId")]
+    EventEventId,
+    #[serde(rename = "event.workspaceId")]
+    EventWorkspaceId,
+    #[serde(rename = "event.issueId")]
+    EventIssueId,
+    #[serde(rename = "event.createdAt")]
+    EventCreatedAt,
+    #[serde(rename = "event.issueUpdatedAt")]
+    EventIssueUpdatedAt,
+    #[serde(rename = "event.webhookId")]
+    EventWebhookId,
+    #[serde(rename = "event.actorType")]
+    EventActorType,
+}
+
+impl Default for Field {
+    fn default() -> Field {
+        Self::EventAction
     }
 }

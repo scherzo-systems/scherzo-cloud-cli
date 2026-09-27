@@ -16,27 +16,31 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LinearEventCondition {
-    #[serde(rename = "field")]
-    pub field: Field,
-    #[serde(rename = "operator")]
-    pub operator: Operator,
-    #[serde(rename = "value")]
-    pub value: Box<models::LinearEventConditionValue>,
+/// LinearIntegrationContextSource : A string-producing literal or retained event field; no coercion or defaults.
+/// A string-producing literal or retained event field; no coercion or defaults.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LinearIntegrationContextSource {
+    LinearIntegrationContextSourceOneOf(Box<models::LinearIntegrationContextSourceOneOf>),
+    LinearIntegrationContextSourceOneOf1(Box<models::LinearIntegrationContextSourceOneOf1>),
 }
 
-impl LinearEventCondition {
-    pub fn new(
-        field: Field,
-        operator: Operator,
-        value: models::LinearEventConditionValue,
-    ) -> LinearEventCondition {
-        LinearEventCondition {
-            field,
-            operator,
-            value: Box::new(value),
-        }
+impl Default for LinearIntegrationContextSource {
+    fn default() -> Self {
+        Self::LinearIntegrationContextSourceOneOf(Default::default())
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Type {
+    #[serde(rename = "literal")]
+    Literal,
+    #[serde(rename = "field")]
+    Field,
+}
+
+impl Default for Type {
+    fn default() -> Type {
+        Self::Literal
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -49,29 +53,24 @@ pub enum Field {
     EventStateFromId,
     #[serde(rename = "event.stateToId")]
     EventStateToId,
-    #[serde(rename = "event.addedLabelIds")]
-    EventAddedLabelIds,
-    #[serde(rename = "event.removedLabelIds")]
-    EventRemovedLabelIds,
+    #[serde(rename = "event.eventId")]
+    EventEventId,
+    #[serde(rename = "event.workspaceId")]
+    EventWorkspaceId,
+    #[serde(rename = "event.issueId")]
+    EventIssueId,
+    #[serde(rename = "event.createdAt")]
+    EventCreatedAt,
+    #[serde(rename = "event.issueUpdatedAt")]
+    EventIssueUpdatedAt,
+    #[serde(rename = "event.webhookId")]
+    EventWebhookId,
+    #[serde(rename = "event.actorType")]
+    EventActorType,
 }
 
 impl Default for Field {
     fn default() -> Field {
         Self::EventAction
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Operator {
-    #[serde(rename = "eq")]
-    Eq,
-    #[serde(rename = "in")]
-    In,
-    #[serde(rename = "contains")]
-    Contains,
-}
-
-impl Default for Operator {
-    fn default() -> Operator {
-        Self::Eq
     }
 }

@@ -17,29 +17,26 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EmailInvitationTarget {
-    /// Selects a normalized email target.
-    #[serde(rename = "kind")]
-    pub kind: Kind,
-    /// A single bare mailbox normalized before matching and storage.
-    #[serde(rename = "email")]
-    pub email: String,
+pub struct LinearIntegrationContextSourceOneOf {
+    #[serde(rename = "type")]
+    pub r#type: Type,
+    #[serde(rename = "value")]
+    pub value: String,
 }
 
-impl EmailInvitationTarget {
-    pub fn new(kind: Kind, email: String) -> EmailInvitationTarget {
-        EmailInvitationTarget { kind, email }
+impl LinearIntegrationContextSourceOneOf {
+    pub fn new(r#type: Type, value: String) -> LinearIntegrationContextSourceOneOf {
+        LinearIntegrationContextSourceOneOf { r#type, value }
     }
 }
-/// Selects a normalized email target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Kind {
-    #[serde(rename = "email")]
-    Email,
+pub enum Type {
+    #[serde(rename = "literal")]
+    Literal,
 }
 
-impl Default for Kind {
-    fn default() -> Kind {
-        Self::Email
+impl Default for Type {
+    fn default() -> Type {
+        Self::Literal
     }
 }
