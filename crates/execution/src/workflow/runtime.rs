@@ -973,11 +973,6 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
         action: ActionId,
         cause: Cause,
     },
-    #[cfg(test)]
-    CancellationRequested {
-        reason: CancellationReason,
-        deadline: Deadline,
-    },
     CancellationOperationRequested {
         operation: CancellationOperationId,
         reason: CancellationReason,
@@ -1520,13 +1515,6 @@ where
                 RecoveryHandlerFailurePhase::Execution,
                 cause,
             );
-        }
-        #[cfg(test)]
-        Occurrence::CancellationRequested { reason, deadline } => {
-            if reason == CancellationReason::ForceAbort {
-                return false;
-            }
-            return apply_cancellation(reduction, CancellationRequest { reason, deadline }, None);
         }
         Occurrence::CancellationOperationRequested {
             operation,

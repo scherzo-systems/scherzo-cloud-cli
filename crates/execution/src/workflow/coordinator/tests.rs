@@ -12,9 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::*;
 use crate::workflow::admission::{
-    CancellationPendingPollBarrier, CancellationPolicy, CancellationReason, CancellationSource,
-    CaptureLimits, EnvironmentSnapshot, ExecutionContext, ExecutionPolicyLimits, InputLimits,
-    ResolvedInputs, admit_workflow,
+    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
+    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,
 };
 use crate::workflow::resolution;
 use crate::workflow::runtime::{
@@ -239,8 +238,10 @@ struct ScheduleTranscript {
 }
 
 async fn run_cancellation_schedule() -> ScheduleTranscript {
-    let pending_poll = CancellationPendingPollBarrier::new();
-    let cancellation = CancellationSource::with_pending_poll_barrier(pending_poll.clone());
+    let pending_poll = crate::workflow::test_support::SynchronousGate::new();
+    let poll_gate = pending_poll.clone();
+    let cancellation =
+        CancellationSource::with_pending_poll_observer(move || poll_gate.block_until_resumed());
     let fixture = admitted_fixture(cancellation.clone(), Duration::from_secs(7));
     let cancellation_request = cancellation.clone();
     let requester = std::thread::spawn(move || {

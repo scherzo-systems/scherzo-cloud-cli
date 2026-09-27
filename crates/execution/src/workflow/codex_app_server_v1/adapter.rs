@@ -58,8 +58,7 @@ pub(crate) struct CodexAppServerV1Adapter<Clock, Observer, Worker = ProcessResul
     observer: Observer,
     validation_worker: Worker,
     client_version: Arc<str>,
-    #[cfg(test)]
-    synthetic_model_provider: Option<Arc<str>>,
+    model_provider_override: Option<Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>>,
 }
 
 impl<Clock, Observer> CodexAppServerV1Adapter<Clock, Observer, ProcessResultValidationWorker> {
@@ -80,8 +79,7 @@ impl<Clock, Observer> CodexAppServerV1Adapter<Clock, Observer, ProcessResultVali
             observer,
             validation_worker: ProcessResultValidationWorker::for_current_executable()?,
             client_version,
-            #[cfg(test)]
-            synthetic_model_provider: None,
+            model_provider_override: None,
         })
     }
     // jscpd:ignore-end
@@ -108,24 +106,22 @@ impl<Clock, Observer, Worker> CodexAppServerV1Adapter<Clock, Observer, Worker> {
             observer,
             validation_worker,
             client_version,
-            synthetic_model_provider,
+            model_provider_override: synthetic_model_provider.map(|provider| {
+                Arc::new(move || Some(Arc::clone(&provider)))
+                    as Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>
+            }),
         }
     }
 
     fn selected_model_provider(&self) -> Option<Arc<str>> {
-        #[cfg(test)]
-        {
-            self.synthetic_model_provider.clone()
-        }
-        #[cfg(not(test))]
-        {
-            None
-        }
+        self.model_provider_override
+            .as_ref()
+            .and_then(|provide| provide())
     }
 }
 // jscpd:ignore-end
 
-// Clone keeps Codex's test-only provider state private instead of adding that concern to
+// Clone keeps Codex's optional provider override private instead of adding that concern to
 // the shared adapter contract.
 // jscpd:ignore-start
 impl<Clock, Observer, Worker> Clone for CodexAppServerV1Adapter<Clock, Observer, Worker>
@@ -142,8 +138,7 @@ where
             observer: self.observer.clone(),
             validation_worker: self.validation_worker.clone(),
             client_version: Arc::clone(&self.client_version),
-            #[cfg(test)]
-            synthetic_model_provider: self.synthetic_model_provider.clone(),
+            model_provider_override: self.model_provider_override.clone(),
         }
     }
 }

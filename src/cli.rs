@@ -2076,24 +2076,31 @@ mod tests {
 
     #[test]
     fn nested_workflow_result_and_staging_survive_delivery_failure() {
-        let fixture_arguments = std::iter::once(
+        // The workflow command has an isolated environment. Supply the worker
+        // contract to the nested fixture explicitly rather than relying on
+        // the test runner's environment surviving the command boundary.
+        let worker = std::env::var("SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE")
+            .expect("test worker executable must be supplied by the test runner");
+        assert!(
+            Path::new(&worker).is_file(),
+            "test worker executable is unavailable: {worker}"
+        );
+        let fixture_arguments = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "export SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE=\"$1\"; shift; exec \"$@\"".to_owned(),
+            "sh".to_owned(),
+            worker,
             std::env::current_exe()
                 .unwrap()
                 .to_str()
                 .unwrap()
                 .to_owned(),
-        )
-        .chain(
-            [
-                "--ignored",
-                "--exact",
-                "cli::tests::nested_workflow_fixture_process",
-                "--nocapture",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        )
-        .collect::<Vec<_>>();
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "cli::tests::nested_workflow_fixture_process".to_owned(),
+            "--nocapture".to_owned(),
+        ];
         scherzo_cloud_runner::run_nested_workflow_delivery_failure_fixture(&fixture_arguments)
             .unwrap();
     }

@@ -194,8 +194,6 @@ where
             digest.write_tag(10);
             write_step_action(&mut digest, step, *action);
         }
-        #[cfg(test)]
-        Occurrence::CancellationRequested { deadline, .. } => match *deadline {},
         Occurrence::CancellationOperationRequested { deadline, .. }
         | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
         | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
@@ -448,8 +446,6 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 cause,
             },
             Occurrence::StepQuiesced { step, action } => Occurrence::StepQuiesced { step, action },
-            #[cfg(test)]
-            Occurrence::CancellationRequested { deadline, .. } => match deadline {},
             Occurrence::CancellationOperationRequested {
                 operation: _,
                 deadline,
@@ -534,8 +530,6 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
             Occurrence::StepQuiesced { action, .. } => {
                 (*action, DriverOccurrenceKind::StepQuiesced, None)
             }
-            #[cfg(test)]
-            Occurrence::CancellationRequested { deadline, .. } => match *deadline {},
             Occurrence::CancellationOperationRequested { deadline, .. }
             | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
             | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},

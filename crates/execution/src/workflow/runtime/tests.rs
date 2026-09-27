@@ -1087,7 +1087,8 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
         &mut state,
         &mut ordinal,
         10,
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason,
             deadline: deadline(7_777),
         },
@@ -1138,7 +1139,8 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
         &state,
         &mut ordinal,
         11,
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason: CancellationReason::UserRequest,
             deadline: deadline(9_999),
         },
@@ -1270,7 +1272,8 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
             step: "cCapturing".to_owned(),
             action: action_id(10),
         },
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason: CancellationReason::UserRequest,
             deadline: deadline(12_345),
         },
@@ -1644,7 +1647,8 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
         &state,
         &mut last_ordinal,
         4,
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason: CancellationReason::UserRequest,
             deadline: deadline(4_444),
         },
@@ -1851,7 +1855,8 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
         &mut state,
         &mut ordinal,
         7,
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason,
             deadline: deadline(8_888),
         },
@@ -1964,7 +1969,8 @@ fn cancellation_first_makes_a_later_failure_stale() {
         &mut state,
         &mut ordinal,
         3,
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason,
             deadline: deadline(9_001),
         },
@@ -2081,7 +2087,8 @@ fn committed_success_survives_later_cancellation() {
         &mut state,
         &mut ordinal,
         4,
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason,
             deadline: deadline(22_222),
         },
@@ -4735,7 +4742,8 @@ fn recovery_trace_cancellation_preempts_all_five_active_phases() {
         assert_eq!(state.steps["verify"].current_action, Some(active_action));
         let cancelled = reduce_and_advance(
             &mut state,
-            Occurrence::CancellationRequested {
+            Occurrence::CancellationOperationRequested {
+                operation: CancellationOperationId::fixture(1),
                 reason: CancellationReason::UserRequest,
                 deadline: deadline(90),
             },

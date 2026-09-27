@@ -198,8 +198,6 @@ where
         let deadline = clock.now().add(self.deadline.get());
         let request = ValidationWorkerRequest {
             schema: self.schema.clone(),
-            #[cfg(test)]
-            candidate: Arc::clone(&candidate),
             canonical_json: Arc::clone(&canonical_json),
             maximum_feedback_bytes: self.maximum_feedback_bytes,
         };
@@ -308,8 +306,6 @@ pub(crate) trait RunningResultValidation: Send + 'static {
 #[derive(Clone)]
 pub(crate) struct ValidationWorkerRequest {
     schema: RetainedJsonSchema,
-    #[cfg(test)]
-    candidate: Arc<Value>,
     canonical_json: Arc<[u8]>,
     maximum_feedback_bytes: NonZeroU64,
 }
@@ -317,11 +313,8 @@ pub(crate) struct ValidationWorkerRequest {
 impl ValidationWorkerRequest {
     #[cfg(test)]
     pub(crate) fn evaluate(self) -> Result<ValidationWorkerDecision, ()> {
-        evaluate_candidate(
-            &self.schema,
-            &self.candidate,
-            self.maximum_feedback_bytes.get(),
-        )
+        let candidate = serde_json::from_slice(&self.canonical_json).map_err(|_| ())?;
+        evaluate_candidate(&self.schema, &candidate, self.maximum_feedback_bytes.get())
     }
 }
 

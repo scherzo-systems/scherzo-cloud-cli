@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -10,6 +10,18 @@ fn pointer(authored: &str) -> JsonPointer {
 
 fn captured_json(source: &str) -> CapturedJson {
     CapturedJson::fixture(Arc::new(serde_json::from_str(source).unwrap()))
+}
+
+fn tracking_accesses<'a>() -> (ConditionValues<'a>, Arc<Mutex<Vec<Arc<str>>>>) {
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&recorder);
+    let values = ConditionValues {
+        on_access: Some(Arc::new(move |reference| {
+            observed.lock().unwrap().push(Arc::clone(reference));
+        })),
+        ..ConditionValues::default()
+    };
+    (values, recorder)
 }
 
 fn node(id: &str) -> WorkflowNode {
@@ -150,7 +162,7 @@ fn condition_equality_preserves_text_and_json_value_semantics() {
 fn condition_evaluation_is_left_to_right_and_completion_ordered() {
     let text = CapturedText::new(Arc::from("yes"));
     let json = captured_json(r#"{"n":1}"#);
-    let mut values = ConditionValues::default();
+    let (mut values, accesses) = tracking_accesses();
     values.insert_text("inputs.request", &text);
     values.insert_json("outputs.plan.result", &json);
     let verify = node("verify");
@@ -210,8 +222,9 @@ fn condition_evaluation_is_left_to_right_and_completion_ordered() {
         ]
     );
     assert_eq!(
-        values
-            .accessed_references()
+        accesses
+            .lock()
+            .unwrap()
             .iter()
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),
@@ -226,7 +239,7 @@ fn condition_evaluation_is_left_to_right_and_completion_ordered() {
 #[test]
 fn condition_evaluation_short_circuits_without_retaining_a_true_trace() {
     let text = CapturedText::new(Arc::from("yes"));
-    let mut values = ConditionValues::default();
+    let (mut values, accesses) = tracking_accesses();
     values.insert_text("inputs.request", &text);
     let predicate = ResolvedPredicate::Any(
         vec![
@@ -247,8 +260,9 @@ fn condition_evaluation_short_circuits_without_retaining_a_true_trace() {
         ConditionEvaluation::Passed
     );
     assert_eq!(
-        values
-            .accessed_references()
+        accesses
+            .lock()
+            .unwrap()
             .iter()
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),
@@ -259,7 +273,7 @@ fn condition_evaluation_short_circuits_without_retaining_a_true_trace() {
 #[test]
 fn condition_evaluation_missing_pointer_and_unavailable_source_are_distinct() {
     let json = captured_json(r#"{"present":null}"#);
-    let mut values = ConditionValues::default();
+    let (mut values, accesses) = tracking_accesses();
     values.insert_json("outputs.plan.result", &json);
 
     let missing = ResolvedPredicate::Equals([
@@ -274,8 +288,9 @@ fn condition_evaluation_missing_pointer_and_unavailable_source_are_distinct() {
         }
     );
     assert_eq!(
-        values
-            .accessed_references()
+        accesses
+            .lock()
+            .unwrap()
             .iter()
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),

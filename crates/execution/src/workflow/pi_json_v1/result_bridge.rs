@@ -580,14 +580,10 @@ fn update_identity_component(
 
 #[derive(Debug)]
 struct TransportSchema {
-    #[cfg(test)]
-    complete_wrapper: Value,
     native_parameters: Value,
-    #[cfg(test)]
-    resource_id: String,
 }
 
-fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchema, ()> {
+fn derive_complete_wrapper(schema: &RetainedJsonSchema) -> Result<(Value, String), ()> {
     let synthetic_resource_id = || {
         format!(
             "{RESOURCE_ID_PREFIX}{}",
@@ -615,7 +611,11 @@ fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchem
         "additionalProperties": false
     });
     validate_transport_schema(&complete_wrapper)?;
+    Ok((complete_wrapper, resource_id))
+}
 
+fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchema, ()> {
+    let _ = derive_complete_wrapper(schema)?;
     let native_parameters = json!({
         "type": "object",
         "properties": {"result": derive_model_result_schema(schema.document())?},
@@ -623,13 +623,7 @@ fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchem
         "additionalProperties": false
     });
     validate_transport_schema(&native_parameters)?;
-    Ok(TransportSchema {
-        #[cfg(test)]
-        complete_wrapper,
-        native_parameters,
-        #[cfg(test)]
-        resource_id,
-    })
+    Ok(TransportSchema { native_parameters })
 }
 
 fn derive_model_result_schema(schema: &Value) -> Result<Value, ()> {
@@ -1192,7 +1186,6 @@ pub(super) fn validate_result_endpoint_directory(directory: &Path) -> Result<(),
 
 fn socket_alias_directory(tool_name: &str) -> Result<PathBuf, ()> {
     let identity = tool_name.strip_prefix(TOOL_NAME_PREFIX).ok_or(())?;
-    #[cfg(test)]
     let identity = format!("{identity}-{}", std::process::id());
     Ok(Path::new(SOCKET_ALIAS_ROOT).join(format!(".szp-{identity}")))
 }

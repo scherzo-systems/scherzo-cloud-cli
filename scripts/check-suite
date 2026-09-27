@@ -169,6 +169,10 @@ cargo fmt --all -- --check
 "$public_root/scripts/check-msrv"
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
+# --all-targets builds the example as a test harness, not as a worker.
+# Build the ordinary executable before exporting its explicit test contract.
+cargo build --locked -p scherzo-cloud-execution --example internal-worker
+export SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE="$cargo_target_dir/debug/examples/internal-worker"
 cargo nextest run --locked --workspace --all-targets --all-features
 
 # The packaging checks exercise archive layout, embedded authoring assets, and

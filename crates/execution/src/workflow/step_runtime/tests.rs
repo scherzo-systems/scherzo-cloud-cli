@@ -22,9 +22,9 @@ use tokio::sync::{mpsc, watch};
 
 use super::*;
 use crate::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedAttachment, ResolvedInput,
-    ResolvedInputs, admit_workflow,
+    CancellationOperationId, CancellationPolicy, CancellationReason, CancellationSource,
+    CaptureLimits, EnvironmentSnapshot, ExecutionContext, ExecutionPolicyLimits, InputLimits,
+    ResolvedAttachment, ResolvedInput, ResolvedInputs, admit_workflow,
 };
 use crate::workflow::agent::{AgentProcessDirective, agent_process_control_channel};
 use crate::workflow::artifact::{
@@ -37,7 +37,6 @@ use crate::workflow::coordinator::{
 };
 use crate::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
 use crate::workflow::evidence::FailureCode;
-use crate::workflow::execution_root::ExecutionRootPrelaunchBoundary;
 use crate::workflow::input::InputStaging;
 use crate::workflow::process_group::ProcessGuardStoreError;
 use crate::workflow::resolution;
@@ -45,6 +44,7 @@ use crate::workflow::runtime::{
     self, Action, ActiveStepInvocation, ExportValue, Occurrence, RequestedAction, StepState,
     TargetExecutionNumber, TransitionSequence, WorkflowState,
 };
+use crate::workflow::test_support::SynchronousGate;
 use crate::workflow::test_support::{
     process_fixture_interrupt_handler, run_with_stalled_child_guard, wait_for_stalled_child_guard,
 };
@@ -1211,7 +1211,8 @@ async fn semantic_outputs_capture_cancellation_discards_stale_delivery() {
     let cancelled =
         runtime::reduce::<ProvisionalStepOutputs, StepFailureCause, CapturedValue, TestInstant>(
             &capture_requested.state,
-            Occurrence::CancellationRequested {
+            Occurrence::CancellationOperationRequested {
+                operation: CancellationOperationId::fixture(1),
                 reason: CancellationReason::UserRequest,
                 deadline: TestInstant(Duration::from_secs(1)),
             },
@@ -1297,7 +1298,8 @@ steps:
             TestInstant,
         >(
             &capturing,
-            Occurrence::CancellationRequested {
+            Occurrence::CancellationOperationRequested {
+                operation: CancellationOperationId::fixture(1),
                 reason: CancellationReason::UserRequest,
                 deadline: TestInstant(Duration::from_secs(1)),
             },
@@ -1390,7 +1392,8 @@ steps:
             TestInstant,
         >(
             &capturing,
-            Occurrence::CancellationRequested {
+            Occurrence::CancellationOperationRequested {
+                operation: CancellationOperationId::fixture(1),
                 reason: CancellationReason::UserRequest,
                 deadline: TestInstant(Duration::from_secs(1)),
             },
@@ -1514,7 +1517,8 @@ exports:
                     TestInstant,
                 >(
                     &capturing,
-                    Occurrence::CancellationRequested {
+                    Occurrence::CancellationOperationRequested {
+                        operation: CancellationOperationId::fixture(1),
                         reason: CancellationReason::UserRequest,
                         deadline: TestInstant(Duration::from_secs(1)),
                     },
@@ -1553,7 +1557,8 @@ exports:
                     TestInstant,
                 >(
                     &committed.state,
-                    Occurrence::CancellationRequested {
+                    Occurrence::CancellationOperationRequested {
+                        operation: CancellationOperationId::fixture(1),
                         reason: CancellationReason::UserRequest,
                         deadline: TestInstant(Duration::from_secs(1)),
                     },
@@ -1633,7 +1638,8 @@ steps:
             TestInstant,
         >(
             &capturing,
-            Occurrence::CancellationRequested {
+            Occurrence::CancellationOperationRequested {
+                operation: CancellationOperationId::fixture(1),
                 reason: CancellationReason::UserRequest,
                 deadline: TestInstant(Duration::from_secs(1)),
             },
@@ -2601,11 +2607,12 @@ async fn assert_execution_root_rebinding_fails_before_spawn(command: RebindingCo
         let source = workflow_source(&[("task", None, &argv)]);
         let admitted = admit_fixture(temporary.path(), &execution_root, &source, environment, 1);
         let artifacts = test_artifacts(&admitted);
-        let boundary = ExecutionRootPrelaunchBoundary::new();
+        let boundary = SynchronousGate::new();
+        let launch_gate = boundary.clone();
         admitted
             .execution()
             .root_identity()
-            .set_prelaunch_boundary(boundary.clone());
+            .set_prelaunch_boundary(move || launch_gate.block_until_resumed());
         let action = start_actions(&admitted)["task"];
         let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
         let runtime = StepRuntime::new(
@@ -4081,7 +4088,8 @@ fn running_cancellation_actions(
         );
     let cancelled = runtime::reduce(
         &started.state,
-        Occurrence::CancellationRequested {
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
             reason: CancellationReason::UserRequest,
             deadline,
         },

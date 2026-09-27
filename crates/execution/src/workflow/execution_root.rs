@@ -5,14 +5,10 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::Mutex;
 
 use rustix::fs::{Access, AtFlags, FileType, Mode, OFlags, accessat, fstat, open, openat, statat};
 use rustix::io::{Errno, dup};
-
-#[cfg(test)]
-use super::test_support::SynchronousGate;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ExecutionRootAdmissionFailure {
@@ -50,8 +46,7 @@ struct AdmittedExecutionRootInner {
     provenance_path: PathBuf,
     directory: OwnedFd,
     identity: DirectoryIdentity,
-    #[cfg(test)]
-    prelaunch_boundary: Mutex<Option<ExecutionRootPrelaunchBoundary>>,
+    prelaunch_boundary: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl fmt::Debug for AdmittedExecutionRoot {
@@ -82,7 +77,6 @@ impl AdmittedExecutionRoot {
                 provenance_path,
                 directory,
                 identity,
-                #[cfg(test)]
                 prelaunch_boundary: Mutex::new(None),
             }),
         })
@@ -144,7 +138,6 @@ impl AdmittedExecutionRoot {
             return Err(WorkingDirectorySelectionFailure::EscapesExecutionRoot);
         }
 
-        #[cfg(test)]
         self.wait_at_prelaunch_boundary();
 
         Ok(AdmittedWorkingDirectory {
@@ -171,15 +164,14 @@ impl AdmittedExecutionRoot {
     }
 
     #[cfg(test)]
-    pub(super) fn set_prelaunch_boundary(&self, boundary: ExecutionRootPrelaunchBoundary) {
+    pub(super) fn set_prelaunch_boundary(&self, boundary: impl FnOnce() + Send + 'static) {
         *self
             .inner
             .prelaunch_boundary
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(boundary);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(boundary));
     }
 
-    #[cfg(test)]
     fn wait_at_prelaunch_boundary(&self) {
         let boundary = self
             .inner
@@ -188,7 +180,7 @@ impl AdmittedExecutionRoot {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(boundary) = boundary {
-            boundary.block_until_resumed();
+            boundary();
         }
     }
 }
@@ -329,6 +321,3 @@ fn directory_identity(directory: &OwnedFd) -> Result<DirectoryIdentity, Errno> {
         inode: metadata.st_ino,
     })
 }
-
-#[cfg(test)]
-pub(super) type ExecutionRootPrelaunchBoundary = SynchronousGate;

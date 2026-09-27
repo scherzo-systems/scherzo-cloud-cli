@@ -32,7 +32,6 @@ use super::execution_root::{AdmittedExecutionRoot, open_directory};
 use super::invocation_accounting::InvocationAccountingLog;
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
-#[cfg(test)]
 use super::private_staging::CleanupBlocker;
 use super::private_staging::{
     StagingDropPolicy, StagingLifecycle, cleanup_staging, create_staging_root, finish_payload_file,
@@ -246,9 +245,7 @@ struct AgentInputStagingInner {
     lifecycle: RwLock<StagingLifecycle>,
     drop_policy: StagingDropPolicy,
     active_views: Mutex<BTreeSet<Arc<str>>>,
-    #[cfg(test)]
     observer: Option<Arc<dyn AgentMaterializationBoundaryObserver>>,
-    #[cfg(test)]
     cleanup_blocker: CleanupBlocker,
 }
 
@@ -329,14 +326,12 @@ where
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgentMaterializationBoundary {
     BeforeAttachment { index: usize },
     Ready,
 }
 
-#[cfg(test)]
 pub(crate) trait AgentMaterializationBoundaryObserver: Send + Sync {
     fn reached(&self, boundary: AgentMaterializationBoundary);
 }
@@ -352,8 +347,7 @@ impl AgentInputStaging {
     fn create_with_observer(
         execution: &AdmittedExecutionContext,
         staging_parent: &Path,
-        #[cfg(test)] observer: Option<Arc<dyn AgentMaterializationBoundaryObserver>>,
-        #[cfg(not(test))] _observer: Option<()>,
+        observer: Option<Arc<dyn AgentMaterializationBoundaryObserver>>,
     ) -> Result<Self, AgentInputStagingFailure> {
         if !execution.root_identity().pathname_is_bound() {
             return Err(AgentInputStagingFailure::ExecutionRootUnavailable);
@@ -379,9 +373,7 @@ impl AgentInputStaging {
                 lifecycle: RwLock::new(StagingLifecycle::Active),
                 drop_policy: StagingDropPolicy::cleanup(),
                 active_views: Mutex::new(BTreeSet::new()),
-                #[cfg(test)]
                 observer,
-                #[cfg(test)]
                 cleanup_blocker: CleanupBlocker::default(),
             }),
         })
@@ -484,14 +476,6 @@ impl AgentInputStaging {
         boundary: AgentMaterializationBoundaryInternal,
         cancellation: &CancellationSource,
     ) -> Result<(), AgentInputMaterializationError> {
-        #[cfg(not(test))]
-        match boundary {
-            AgentMaterializationBoundaryInternal::BeforeAttachment { index } => {
-                let _ = index;
-            }
-            AgentMaterializationBoundaryInternal::Ready => {}
-        }
-        #[cfg(test)]
         if let Some(observer) = &self.inner.observer {
             observer.reached(match boundary {
                 AgentMaterializationBoundaryInternal::BeforeAttachment { index } => {
@@ -531,7 +515,6 @@ impl AgentInputStagingInner {
         ) {
             return true;
         }
-        #[cfg(test)]
         if self.cleanup_blocker.is_blocked() {
             drop(lifecycle);
             mark_cleanup_failed(&self.lifecycle);
@@ -557,7 +540,6 @@ impl AgentInputStagingInner {
     }
 
     fn cleanup_active(&self) -> Result<(), AgentInputStagingReleaseFailure> {
-        #[cfg(test)]
         if self.cleanup_blocker.is_blocked() {
             return Err(AgentInputStagingReleaseFailure::CleanupUnavailable);
         }

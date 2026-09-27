@@ -24,14 +24,13 @@ use crate::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 pub(crate) enum ScriptedAgentValue {
     Response(Arc<str>),
     Result(Arc<Value>),
-    RawResult(Arc<[u8]>),
 }
 
 impl ScriptedAgentValue {
     fn kind(&self) -> AgentValueKind {
         match self {
             Self::Response(_) => AgentValueKind::Response,
-            Self::Result(_) | Self::RawResult(_) => AgentValueKind::Result,
+            Self::Result(_) => AgentValueKind::Result,
         }
     }
 }
@@ -522,16 +521,6 @@ where
         ScriptedAgentValue::Result(value) => {
             CompletedAgentInvocation::Result(captured_json(invocation, value)?)
         }
-        ScriptedAgentValue::RawResult(bytes) => {
-            if u64::try_from(bytes.len()).map_or(true, |bytes| {
-                bytes > invocation.limits().maximum_result_bytes().get()
-            }) {
-                return Err(ScriptedAgentError::ValueTooLarge);
-            }
-            serde_json::from_slice::<Value>(&bytes)
-                .map_err(|_| ScriptedAgentError::WrongValueMode)?;
-            CompletedAgentInvocation::RawResult(bytes)
-        }
     };
     *provisional = Some(completed);
     Ok(())
@@ -570,8 +559,7 @@ where
     match (invocation.value_mode().kind(), provisional) {
         (AgentValueKind::None, None) => AgentOutcome::Completed(CompletedAgentInvocation::NoValue),
         (AgentValueKind::Response, Some(completed @ CompletedAgentInvocation::Response(_)))
-        | (AgentValueKind::Result, Some(completed @ CompletedAgentInvocation::Result(_)))
-        | (AgentValueKind::Result, Some(completed @ CompletedAgentInvocation::RawResult(_))) => {
+        | (AgentValueKind::Result, Some(completed @ CompletedAgentInvocation::Result(_))) => {
             AgentOutcome::Completed(completed)
         }
         (AgentValueKind::Response, None) => {

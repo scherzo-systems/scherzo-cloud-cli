@@ -12,50 +12,25 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const PRODUCTION_EXECUTABLE_NAME: &str = "scherzo-cloud";
-const TEST_WORKER_EXECUTABLE_NAME: &str = "internal-worker";
+const TEST_WORKER_EXECUTABLE: &str = "SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE";
 
 pub(crate) fn internal_worker_executable() -> io::Result<PathBuf> {
-    resolve_internal_worker_executable(
-        env::current_exe()?,
-        cfg!(any(test, feature = "test-fixtures")),
-    )
-}
-
-fn resolve_internal_worker_executable(
-    current: PathBuf,
-    test_target_resolution_enabled: bool,
-) -> io::Result<PathBuf> {
-    let production_executable_name =
-        format!("{PRODUCTION_EXECUTABLE_NAME}{}", env::consts::EXE_SUFFIX);
-    let in_test_harness = test_target_resolution_enabled
-        && current.file_name() != Some(OsStr::new(&production_executable_name))
-        && current
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "deps");
-    if !in_test_harness {
-        return Ok(current);
+    // Test binaries (including cross-crate callers with test-fixtures enabled)
+    // supply the ordinary worker explicitly. Shipped binaries use themselves.
+    if cfg!(any(test, feature = "test-fixtures")) {
+        if let Some(path) = env::var_os(TEST_WORKER_EXECUTABLE) {
+            let path = PathBuf::from(path);
+            return path.is_file().then_some(path).ok_or_else(|| {
+                io::Error::other("supplied test internal-worker executable unavailable")
+            });
+        }
+        if cfg!(test) {
+            return Err(io::Error::other(
+                "test internal-worker executable not supplied",
+            ));
+        }
     }
-    let target_directory = current
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| io::Error::other("test internal-worker target directory unavailable"))?;
-    let test_worker = target_directory.join("examples").join(format!(
-        "{TEST_WORKER_EXECUTABLE_NAME}{}",
-        env::consts::EXE_SUFFIX
-    ));
-    if test_worker.is_file() {
-        return Ok(test_worker);
-    }
-    let production_worker = target_directory.join(format!(
-        "{PRODUCTION_EXECUTABLE_NAME}{}",
-        env::consts::EXE_SUFFIX
-    ));
-    production_worker
-        .is_file()
-        .then_some(production_worker)
-        .ok_or_else(|| io::Error::other("test internal-worker executable unavailable"))
+    env::current_exe()
 }
 
 pub struct ManagedProcessGroup {
@@ -328,7 +303,7 @@ fn drain(mut reader: impl Read) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
 
     use nix::sys::stat::Mode;
@@ -337,16 +312,6 @@ mod tests {
     use super::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
 
     const FIXTURE_STDOUT_LIMIT: usize = 8 * 1024;
-
-    #[test]
-    fn production_worker_path_does_not_depend_on_parent_directory_name() {
-        let current = PathBuf::from("/opt/scherzo/deps/scherzo-cloud");
-
-        assert_eq!(
-            super::resolve_internal_worker_executable(current.clone(), true).unwrap(),
-            current
-        );
-    }
 
     #[cfg(unix)]
     #[test]

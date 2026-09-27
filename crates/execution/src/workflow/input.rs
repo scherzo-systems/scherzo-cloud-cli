@@ -14,7 +14,6 @@ use serde::Serialize;
 use super::admission::{AdmittedExecutionContext, ResolvedAttachment, ResolvedFile};
 use super::artifact::{ArtifactReadFailure, ArtifactStaging};
 use super::execution_root::{AdmittedExecutionRoot, open_directory};
-#[cfg(test)]
 use super::private_staging::CleanupBlocker;
 use super::private_staging::{
     StagingDropPolicy, StagingLifecycle, cleanup_staging, create_payload_file, create_staging_root,
@@ -165,7 +164,6 @@ struct InputStagingInner {
     lifecycle: RwLock<StagingLifecycle>,
     drop_policy: StagingDropPolicy,
     reservations: Mutex<ReservationLedger>,
-    #[cfg(test)]
     cleanup_blocker: CleanupBlocker,
 }
 
@@ -297,7 +295,6 @@ impl InputStaging {
                 lifecycle: RwLock::new(StagingLifecycle::Active),
                 drop_policy: StagingDropPolicy::cleanup(),
                 reservations: Mutex::new(ReservationLedger::default()),
-                #[cfg(test)]
                 cleanup_blocker: CleanupBlocker::default(),
             }),
         })
@@ -637,7 +634,6 @@ impl InputStagingInner {
     // jscpd:ignore-end
 
     fn remove_view_entry(&self, identity: &str) -> bool {
-        #[cfg(test)]
         if self.cleanup_blocker.is_blocked() {
             return false;
         }
@@ -657,7 +653,6 @@ impl InputStagingInner {
     }
 
     fn cleanup_active(&self) -> Result<(), InputStagingReleaseFailure> {
-        #[cfg(test)]
         if self.cleanup_blocker.is_blocked() {
             return Err(InputStagingReleaseFailure::CleanupUnavailable);
         }

@@ -584,7 +584,7 @@ fn semantic_outputs_text_source_equivalence() {
     assert_eq!(path_json.value_type(), WorkflowValueType::Json);
     assert_eq!(path_json.value(), json_value.as_ref());
     assert_eq!(path_json.carrier(), br#"{"a":1,"z":2}"#);
-    assert_eq!(path_json.schema(), &schema);
+    assert!(schema.is_valid(path_json.value()));
     assert_eq!(
         fixture.store.budget_usage(),
         (

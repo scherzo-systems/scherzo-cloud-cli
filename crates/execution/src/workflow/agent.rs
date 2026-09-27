@@ -794,8 +794,6 @@ pub(crate) enum CompletedAgentInvocation {
     NoResponse,
     Response(BoundedAgentResponse),
     Result(CapturedJson),
-    #[cfg(test)]
-    RawResult(Arc<[u8]>),
 }
 
 impl CompletedAgentInvocation {
@@ -804,8 +802,6 @@ impl CompletedAgentInvocation {
             Self::NoValue => AgentValueKind::None,
             Self::NoResponse | Self::Response(_) => AgentValueKind::Response,
             Self::Result(_) => AgentValueKind::Result,
-            #[cfg(test)]
-            Self::RawResult(_) => AgentValueKind::Result,
         }
     }
 }

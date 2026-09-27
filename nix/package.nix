@@ -56,6 +56,12 @@ let
     // {
       cargoExtraArgs = "--locked --workspace --all-targets --all-features";
       doInstallCargoArtifacts = false;
+      # --all-targets builds the example as a test harness. Tests that spawn
+      # internal workers need the ordinary executable supplied explicitly.
+      preBuild = ''
+        cargo build --locked -p scherzo-cloud-execution --example internal-worker
+        export SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/examples/internal-worker")"
+      '';
     }
   );
 in

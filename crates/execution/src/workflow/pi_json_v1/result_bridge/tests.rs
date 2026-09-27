@@ -165,7 +165,8 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
         let schema = retained(&retained_bytes);
         let retained_document = schema.document().clone();
         let transport = derive_transport_schema(&schema).unwrap();
-        let validator = wrapper_validator(&transport.complete_wrapper);
+        let (complete_wrapper, resource_id) = derive_complete_wrapper(&schema).unwrap();
+        let validator = wrapper_validator(&complete_wrapper);
         let native_validator = wrapper_validator(&transport.native_parameters);
 
         assert!(validator.is_valid(&valid));
@@ -177,24 +178,18 @@ fn resource_wrappers_preserve_fragment_roots_and_retained_bytes() {
         let expected_resource_id = document
             .get("$id")
             .cloned()
-            .unwrap_or_else(|| Value::String(transport.resource_id.clone()));
+            .unwrap_or_else(|| Value::String(resource_id.clone()));
         assert_eq!(
-            transport.complete_wrapper["$defs"]["workflowResult"]["$id"],
+            complete_wrapper["$defs"]["workflowResult"]["$id"],
             expected_resource_id
         );
         assert_eq!(
-            transport.complete_wrapper["properties"]["result"]["$ref"],
+            complete_wrapper["properties"]["result"]["$ref"],
             expected_resource_id
         );
-        assert_eq!(
-            Value::String(transport.resource_id.clone()),
-            expected_resource_id
-        );
+        assert_eq!(Value::String(resource_id.clone()), expected_resource_id);
         if document.get("$id").is_some() {
-            assert_eq!(
-                transport.complete_wrapper["$defs"]["workflowResult"],
-                document
-            );
+            assert_eq!(complete_wrapper["$defs"]["workflowResult"], document);
         }
         let native_result = &transport.native_parameters["properties"]["result"];
         assert_eq!(native_result["type"], expected_native_type);
@@ -370,6 +365,7 @@ fn regex_constraints_project_to_nested_structural_guidance() {
     });
     let schema = retained(&serde_json::to_vec(&document).unwrap());
     let transport = derive_transport_schema(&schema).unwrap();
+    let (complete_wrapper, _) = derive_complete_wrapper(&schema).unwrap();
 
     assert_eq!(
         transport.native_parameters["properties"]["result"],
@@ -410,7 +406,7 @@ fn regex_constraints_project_to_nested_structural_guidance() {
         })
     );
     assert!(
-        transport.complete_wrapper["$defs"]["workflowResult"]["properties"]["report"]
+        complete_wrapper["$defs"]["workflowResult"]["properties"]["report"]
             .get("patternProperties")
             .is_some()
     );
@@ -460,7 +456,8 @@ fn compatibility_shape_does_not_replace_reference_and_regex_authority() {
     let retained_bytes = serde_json::to_vec_pretty(&document).unwrap();
     let schema = retained(&retained_bytes);
     let transport = derive_transport_schema(&schema).unwrap();
-    let validator = wrapper_validator(&transport.complete_wrapper);
+    let (complete_wrapper, _) = derive_complete_wrapper(&schema).unwrap();
+    let validator = wrapper_validator(&complete_wrapper);
     let conforming = json!({"result": {"code": "ok-12"}});
     let encoded_string = json!({"result": r#"{"code":"ok-12"}"#});
     let regex_invalid = json!({"result": {"code": "not-ok"}});
@@ -488,10 +485,7 @@ fn compatibility_shape_does_not_replace_reference_and_regex_authority() {
     assert!(schema.is_valid(&conforming["result"]));
     assert!(!schema.is_valid(&encoded_string["result"]));
     assert!(!schema.is_valid(&regex_invalid["result"]));
-    assert_eq!(
-        transport.complete_wrapper["$defs"]["workflowResult"],
-        document
-    );
+    assert_eq!(complete_wrapper["$defs"]["workflowResult"], document);
     assert_eq!(schema.bytes(), retained_bytes);
 }
 
@@ -874,8 +868,8 @@ fn fragment_only_authored_root_id_preserves_standalone_semantics() {
     let retained_bytes = serde_json::to_vec(&document).unwrap();
     let schema = retained(&retained_bytes);
     let standalone = wrapper_validator(schema.document());
-    let transport = derive_transport_schema(&schema).unwrap();
-    let wrapped = wrapper_validator(&transport.complete_wrapper);
+    let (complete_wrapper, _) = derive_complete_wrapper(&schema).unwrap();
+    let wrapped = wrapper_validator(&complete_wrapper);
 
     assert!(standalone.is_valid(&json!(1)));
     assert_eq!(

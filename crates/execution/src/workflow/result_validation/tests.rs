@@ -62,16 +62,8 @@ impl ResultValidationWorker for InlineWorker {
 
     fn start(&self, request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&request.canonical_json).unwrap(),
-            *request.candidate
-        );
         Ok(ReadyValidation {
-            decision: Some(evaluate_candidate(
-                &request.schema,
-                &request.candidate,
-                request.maximum_feedback_bytes.get(),
-            )),
+            decision: Some(request.evaluate()),
         })
     }
 }

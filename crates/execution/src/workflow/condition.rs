@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -266,11 +264,12 @@ enum CapturedConditionValue<'a> {
     Json(&'a Value),
 }
 
+type AccessObserver = Arc<dyn Fn(&Arc<str>) + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct ConditionValues<'a> {
     values: BTreeMap<Arc<str>, CapturedConditionValue<'a>>,
-    #[cfg(test)]
-    accesses: RefCell<Vec<Arc<str>>>,
+    on_access: Option<AccessObserver>,
 }
 
 impl<'a> ConditionValues<'a> {
@@ -307,14 +306,10 @@ impl<'a> ConditionValues<'a> {
     }
 
     fn get(&self, canonical_ref: &Arc<str>) -> Option<CapturedConditionValue<'a>> {
-        #[cfg(test)]
-        self.accesses.borrow_mut().push(Arc::clone(canonical_ref));
+        if let Some(on_access) = &self.on_access {
+            on_access(canonical_ref);
+        }
         self.values.get(canonical_ref).copied()
-    }
-
-    #[cfg(test)]
-    fn accessed_references(&self) -> Vec<Arc<str>> {
-        self.accesses.borrow().clone()
     }
 }
 

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-#[cfg(test)]
 use std::future::{Future as _, poll_fn};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -26,8 +25,6 @@ use super::git_capture::{
 use super::pi::PiConfig;
 use super::pi_json_v1::PiJsonV1ProtocolLimits;
 use super::resolution::ResolvedWorkflow;
-#[cfg(test)]
-use super::test_support::SynchronousGate;
 use super::validated::{ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep};
 use crate::claude_code::{ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation};
 use crate::codex::{CodexCompatibilityProfile, ValidatedCodexInstallation};
@@ -139,16 +136,22 @@ impl Default for CancellationOperationState {
     }
 }
 
-#[cfg(test)]
-pub(super) type CancellationPendingPollBarrier = SynchronousGate;
+type PendingPollObserver = Arc<dyn Fn() + Send + Sync>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CancellationSource {
     reason: watch::Sender<Option<CancellationReason>>,
     operation_version: watch::Sender<u64>,
     operations: Arc<Mutex<CancellationOperationState>>,
-    #[cfg(test)]
-    pending_poll_barrier: Option<CancellationPendingPollBarrier>,
+    pending_poll_observer: Option<PendingPollObserver>,
+}
+
+impl fmt::Debug for CancellationSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CancellationSource")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for CancellationSource {
@@ -165,17 +168,14 @@ impl CancellationSource {
             reason,
             operation_version,
             operations: Arc::new(Mutex::new(CancellationOperationState::default())),
-            #[cfg(test)]
-            pending_poll_barrier: None,
+            pending_poll_observer: None,
         }
     }
 
     #[cfg(test)]
-    pub(super) fn with_pending_poll_barrier(
-        pending_poll_barrier: CancellationPendingPollBarrier,
-    ) -> Self {
+    pub(super) fn with_pending_poll_observer(observer: impl Fn() + Send + Sync + 'static) -> Self {
         let mut source = Self::new();
-        source.pending_poll_barrier = Some(pending_poll_barrier);
+        source.pending_poll_observer = Some(Arc::new(observer));
         source
     }
 
@@ -305,8 +305,7 @@ impl CancellationSource {
     pub(super) fn subscribe(&self) -> CancellationSubscription {
         CancellationSubscription {
             receiver: self.reason.subscribe(),
-            #[cfg(test)]
-            pending_poll_barrier: self.pending_poll_barrier.clone(),
+            pending_poll_observer: self.pending_poll_observer.clone(),
         }
     }
 
@@ -315,8 +314,7 @@ impl CancellationSource {
             source: self.clone(),
             receiver: self.operation_version.subscribe(),
             next_index: 0,
-            #[cfg(test)]
-            pending_poll_barrier: self.pending_poll_barrier.clone(),
+            pending_poll_observer: self.pending_poll_observer.clone(),
         }
     }
 
@@ -401,18 +399,12 @@ fn lock_cancellation_operations(
 
 pub(super) struct CancellationSubscription {
     receiver: watch::Receiver<Option<CancellationReason>>,
-    #[cfg(test)]
-    pending_poll_barrier: Option<CancellationPendingPollBarrier>,
+    pending_poll_observer: Option<PendingPollObserver>,
 }
 
 impl CancellationSubscription {
     pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
-        wait_for_watch_change(
-            &mut self.receiver,
-            #[cfg(test)]
-            &mut self.pending_poll_barrier,
-        )
-        .await
+        wait_for_watch_change(&mut self.receiver, &mut self.pending_poll_observer).await
     }
 
     pub(super) fn borrow_and_update(&mut self) -> watch::Ref<'_, Option<CancellationReason>> {
@@ -429,8 +421,7 @@ pub(super) struct CancellationOperationSubscription {
     source: CancellationSource,
     receiver: watch::Receiver<u64>,
     next_index: usize,
-    #[cfg(test)]
-    pending_poll_barrier: Option<CancellationPendingPollBarrier>,
+    pending_poll_observer: Option<PendingPollObserver>,
 }
 
 impl CancellationOperationSubscription {
@@ -450,12 +441,7 @@ impl CancellationOperationSubscription {
         if self.next_operation_available() {
             return Ok(());
         }
-        wait_for_watch_change(
-            &mut self.receiver,
-            #[cfg(test)]
-            &mut self.pending_poll_barrier,
-        )
-        .await
+        wait_for_watch_change(&mut self.receiver, &mut self.pending_poll_observer).await
     }
 
     fn next_operation_available(&self) -> bool {
@@ -468,32 +454,17 @@ impl CancellationOperationSubscription {
 
 async fn wait_for_watch_change<T: Clone>(
     receiver: &mut watch::Receiver<T>,
-    #[cfg(test)] pending_poll_barrier: &mut Option<CancellationPendingPollBarrier>,
+    pending_poll_observer: &mut Option<PendingPollObserver>,
 ) -> Result<(), watch::error::RecvError> {
-    #[cfg(not(test))]
-    {
-        receiver.changed().await
-    }
-    #[cfg(test)]
-    {
-        poll_watch_change(receiver, pending_poll_barrier).await
-    }
-}
-
-#[cfg(test)]
-async fn poll_watch_change<T: Clone>(
-    receiver: &mut watch::Receiver<T>,
-    pending_poll_barrier: &mut Option<CancellationPendingPollBarrier>,
-) -> Result<(), watch::error::RecvError> {
-    let mut barrier = pending_poll_barrier.take();
+    let mut observer = pending_poll_observer.take();
     let changed = receiver.changed();
     tokio::pin!(changed);
     poll_fn(|context| {
         let result = changed.as_mut().poll(context);
         if result.is_pending()
-            && let Some(barrier) = barrier.take()
+            && let Some(observer) = observer.take()
         {
-            barrier.block_until_resumed();
+            observer();
         }
         result
     })

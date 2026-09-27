@@ -28,7 +28,6 @@ use super::agent_input::{
     AgentInputStartFailure, ClosedAgentInvocation, MaterializedAgentInvocation,
     materialize_agent_invocation, materialize_recovery_agent_invocation,
 };
-#[cfg(test)]
 use super::artifact::CaptureBoundaryObserver;
 use super::artifact::{
     ArtifactStaging, CaptureAttemptFailure, CaptureCancellation, CaptureCandidateSet,
@@ -463,6 +462,8 @@ impl OwnedTasks {
     }
 }
 
+type StepTaskBoundary = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct StepRuntime<
     Clock,
@@ -486,8 +487,7 @@ pub(crate) struct StepRuntime<
     capture_requests: mpsc::UnboundedSender<CaptureWorkerMessage>,
     tasks: OwnedTasks,
     process_guards: ProcessGuardRegistry,
-    #[cfg(test)]
-    panicking_step_tasks: Arc<Mutex<BTreeSet<String>>>,
+    step_task_boundary: Arc<Mutex<Option<StepTaskBoundary>>>,
 }
 
 struct CaptureRequest {
@@ -656,8 +656,7 @@ where
             capture_requests,
             tasks,
             process_guards,
-            #[cfg(test)]
-            panicking_step_tasks: Arc::new(Mutex::new(BTreeSet::new())),
+            step_task_boundary: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -742,13 +741,19 @@ where
 
     #[cfg(test)]
     fn inject_step_task_panic(&self, step: &str) {
-        lock_registry(&self.panicking_step_tasks).insert(step.to_owned());
+        let pending = Arc::new(Mutex::new(Some(step.to_owned())));
+        *lock_registry(&self.step_task_boundary) = Some(Arc::new(move |name| {
+            if lock_registry(&pending).as_deref() == Some(name) {
+                *lock_registry(&pending) = None;
+                panic!("injected step task panic");
+            }
+        }));
     }
 
-    #[cfg(test)]
-    fn panic_if_step_task_injected(&self, step: &str) {
-        if lock_registry(&self.panicking_step_tasks).remove(step) {
-            panic!("injected step task panic");
+    fn reach_step_task_boundary(&self, step: &str) {
+        let callback = lock_registry(&self.step_task_boundary).clone();
+        if let Some(callback) = callback {
+            callback(step);
         }
     }
 
@@ -1276,10 +1281,6 @@ where
             AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) => {
                 parse_recovery_decision(result.canonical_json())
                     .map_err(RecoveryHandlerFailure::AgentResultInvalid)
-            }
-            #[cfg(test)]
-            AgentOutcome::Completed(CompletedAgentInvocation::RawResult(result)) => {
-                parse_recovery_decision(&result).map_err(RecoveryHandlerFailure::AgentResultInvalid)
             }
             AgentOutcome::Completed(
                 CompletedAgentInvocation::NoValue
@@ -2470,7 +2471,6 @@ struct CaptureWorkRegistry {
     known_cancellations: BTreeSet<ActionId>,
     active_by_step: BTreeMap<String, ActionId>,
     active: BTreeMap<ActionId, CaptureWork>,
-    #[cfg(test)]
     observer: Option<Arc<dyn CaptureBoundaryObserver>>,
 }
 
@@ -2481,7 +2481,6 @@ impl CaptureWorkRegistry {
             known_cancellations: BTreeSet::new(),
             active_by_step: BTreeMap::new(),
             active: BTreeMap::new(),
-            #[cfg(test)]
             observer: None,
         }
     }
@@ -2491,15 +2490,12 @@ impl CaptureWorkRegistry {
             return false;
         }
         self.active_by_step.insert(step.clone(), action);
-        #[cfg(test)]
         let cancellation = self
             .observer
             .as_ref()
             .map_or_else(CaptureCancellation::default, |observer| {
                 CaptureCancellation::with_observer(Arc::clone(observer))
             });
-        #[cfg(not(test))]
-        let cancellation = CaptureCancellation::default();
         self.active.insert(
             action,
             CaptureWork {
@@ -3106,8 +3102,7 @@ where
                         requested.id,
                         SpawnedStepTask::Step,
                         async move {
-                            #[cfg(test)]
-                            execution.panic_if_step_task_injected(&step);
+                            execution.reach_step_task_boundary(&step);
                             execution
                                 .execute_registered_step(step, requested.id, inputs, cancellation)
                                 .await
@@ -3133,8 +3128,7 @@ where
                         requested.id,
                         SpawnedStepTask::RecoveryHandler { round },
                         async move {
-                            #[cfg(test)]
-                            execution.panic_if_step_task_injected(&step);
+                            execution.reach_step_task_boundary(&step);
                             execution
                                 .execute_recovery_handler(
                                     step,
@@ -3493,10 +3487,6 @@ fn completed_agent_outputs(
         }
         (Some(output), CompletedAgentInvocation::Result(result)) => {
             (output, CapturedValue::json(result))
-        }
-        #[cfg(test)]
-        (_, CompletedAgentInvocation::RawResult(_)) => {
-            return Err(AgentFailureCause::HarnessProtocolFailed);
         }
         (
             None,

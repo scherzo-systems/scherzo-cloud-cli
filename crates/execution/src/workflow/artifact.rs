@@ -70,7 +70,6 @@ impl CaptureCancellation {
         self.check()
     }
 
-    #[cfg(test)]
     pub(crate) fn with_observer(observer: Arc<dyn CaptureBoundaryObserver>) -> Self {
         Self {
             cancelled: CancellationFlag::default(),

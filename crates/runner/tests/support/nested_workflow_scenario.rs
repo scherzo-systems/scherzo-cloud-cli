@@ -106,7 +106,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     prepare_current(&mut manager, &offered).await?;
     spawn_execution(&mut manager, &offered)?;
 
-    let pending = wait_for_carrier_registration(&mut manager).await;
+    let pending = wait_for_carrier_registration(&mut manager).await?;
     let expected_sha256 = digest(&SHA256, EXPECTED_RESULT)
         .as_ref()
         .iter()
@@ -452,6 +452,8 @@ async fn wait_for_observation(
     loop {
         let notified = notification.notified();
         tokio::pin!(notified);
+        // The outbox calls notify_waiters, which can lose a wakeup before registration.
+        notified.as_mut().enable();
         if let Some(observation) = manager
             .pending_observations(&BTreeSet::new(), 100)
             .into_iter()
@@ -471,6 +473,7 @@ async fn wait_for_manager_state(
     loop {
         let notified = notification.notified();
         tokio::pin!(notified);
+        notified.as_mut().enable();
         if reached(manager) {
             return;
         }
@@ -480,11 +483,12 @@ async fn wait_for_manager_state(
 
 async fn wait_for_carrier_registration(
     manager: &mut AssignmentManager,
-) -> Vec<PendingAssignmentObservation> {
+) -> anyhow::Result<Vec<PendingAssignmentObservation>> {
     let notification = manager.notification();
     loop {
         let notified = notification.notified();
         tokio::pin!(notified);
+        notified.as_mut().enable();
         let pending = manager.pending_observations(&BTreeSet::new(), 100);
         if pending.iter().any(|entry| {
             matches!(
@@ -495,7 +499,13 @@ async fn wait_for_carrier_registration(
                 }
             )
         }) {
-            return pending;
+            return Ok(pending);
+        }
+        if let Some(terminal) = pending.iter().find(|entry| entry.observation.is_terminal()) {
+            anyhow::bail!(
+                "nested workflow assignment ended before carrier registration: {:?}",
+                terminal.observation
+            );
         }
         notified.await;
     }
@@ -549,6 +559,7 @@ async fn wait_for_terminal(
     loop {
         let notified = notification.notified();
         tokio::pin!(notified);
+        notified.as_mut().enable();
         let pending = manager.pending_observations(&BTreeSet::new(), 100);
         if fail_pending_artifact_registrations(manager, &pending)? {
             continue;

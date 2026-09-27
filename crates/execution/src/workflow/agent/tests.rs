@@ -294,7 +294,6 @@ async fn scripted_adapter_completes_each_value_mode_with_its_typed_value() {
     assert_eq!(result.value_type(), WorkflowValueType::Json);
     assert_eq!(result.value()["verdict"], "accepted");
     assert_eq!(result.canonical_json(), br#"{"verdict":"accepted"}"#);
-    assert_eq!(result.schema().document()["type"], "object");
 }
 
 async fn run_success(

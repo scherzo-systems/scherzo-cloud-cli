@@ -110,8 +110,6 @@ pub struct CapturedJson {
 struct CapturedJsonInner {
     value: Arc<Value>,
     carrier: Arc<[u8]>,
-    #[cfg(test)]
-    schema: RetainedJsonSchema,
     capture_lease: Option<CaptureLease>,
 }
 
@@ -119,16 +117,12 @@ impl CapturedJson {
     pub(super) fn from_validated(
         value: Arc<Value>,
         carrier: Arc<[u8]>,
-        schema: RetainedJsonSchema,
+        _schema: RetainedJsonSchema,
     ) -> Self {
-        #[cfg(not(test))]
-        drop(schema);
         Self {
             inner: Arc::new(CapturedJsonInner {
                 value,
                 carrier,
-                #[cfg(test)]
-                schema,
                 capture_lease: None,
             }),
         }
@@ -137,20 +131,16 @@ impl CapturedJson {
     pub(super) fn from_bounded_carrier(
         value: Arc<Value>,
         carrier: Arc<[u8]>,
-        schema: RetainedJsonSchema,
+        _schema: RetainedJsonSchema,
         capture_lease: CaptureLease,
     ) -> Result<Self, SemanticCarrierError> {
         if !canonical_carrier_matches(&value, &carrier) {
             return Err(SemanticCarrierError::InvalidCanonicalJson);
         }
-        #[cfg(not(test))]
-        drop(schema);
         Ok(Self {
             inner: Arc::new(CapturedJsonInner {
                 value,
                 carrier,
-                #[cfg(test)]
-                schema,
                 capture_lease: Some(capture_lease),
             }),
         })
@@ -166,11 +156,6 @@ impl CapturedJson {
 
     pub(crate) fn canonical_json(&self) -> &[u8] {
         self.carrier()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn schema(&self) -> &RetainedJsonSchema {
-        &self.inner.schema
     }
 
     pub(crate) const fn value_type(&self) -> WorkflowValueType {

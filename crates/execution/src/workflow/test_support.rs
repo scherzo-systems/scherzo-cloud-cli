@@ -65,11 +65,7 @@ pub(super) async fn run_with_stalled_child_guard(
     worker_pid_variable: &str,
 ) -> ExitStatus {
     let current_executable = std::env::current_exe().unwrap();
-    let isolated = tempfile::tempdir_in(current_executable.parent().unwrap()).unwrap();
-    let dependency_directory = isolated.path().join("deps");
-    fs::create_dir(&dependency_directory).unwrap();
-    let fixture_executable = dependency_directory.join(current_executable.file_name().unwrap());
-    fs::hard_link(&current_executable, &fixture_executable).unwrap();
+    let isolated = tempfile::tempdir().unwrap();
     let pid_path = isolated.path().join("stalled-worker.pid");
     let guard_executable = isolated
         .path()
@@ -81,9 +77,10 @@ pub(super) async fn run_with_stalled_child_guard(
     .unwrap();
     fs::set_permissions(&guard_executable, fs::Permissions::from_mode(0o755)).unwrap();
 
-    tokio::process::Command::new(fixture_executable)
+    tokio::process::Command::new(current_executable)
         .args(["--exact", test, "--ignored"])
         .env(worker_pid_variable, pid_path)
+        .env("SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE", guard_executable)
         .kill_on_drop(true)
         .status()
         .await

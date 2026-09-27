@@ -157,21 +157,35 @@ fn directory_open_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-#[cfg(test)]
-#[derive(Default)]
-pub(super) struct CleanupBlocker(AtomicBool);
+pub(super) struct CleanupBlocker(std::sync::Mutex<Box<dyn Fn() -> bool + Send + Sync>>);
 
-#[cfg(test)]
+impl Default for CleanupBlocker {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(Box::new(|| false)))
+    }
+}
+
 impl CleanupBlocker {
+    #[cfg(test)]
     pub(super) fn block(&self) {
-        self.0.store(true, Ordering::Release);
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Box::new(|| true);
     }
 
+    #[cfg(test)]
     pub(super) fn unblock(&self) {
-        self.0.store(false, Ordering::Release);
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Box::new(|| false);
     }
 
     pub(super) fn is_blocked(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        (self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))()
     }
 }

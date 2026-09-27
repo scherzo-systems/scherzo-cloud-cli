@@ -1228,6 +1228,12 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_child_can_receive_streaming_standard_input() {
+        let supplied_worker = std::env::var_os("SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE")
+            .expect("test worker executable must be supplied by the test runner");
+        assert_eq!(
+            child_guard_worker_executable().unwrap().as_os_str(),
+            supplied_worker
+        );
         let arguments = [
             OsString::from("-c"),
             OsString::from("IFS= read -r line; printf 'received:%s\\n' \"$line\""),
