@@ -2007,14 +2007,23 @@ where
         .notification();
 
     loop {
-        let (lease_clock_failed, failure_report) = {
+        // Register before inspecting manager state so a deferred failure cannot
+        // notify between the check and our wait without waking this iteration.
+        let notified = assignment_notification.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let (lease_clock_failed, failure_report, deferred_offer_failure) = {
             let mut assignments = assignment_manager
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let failure = assignments.take_deferred_offer_failure();
             let failed = assignments.lease_clock_has_failed();
             let report = assignments.pending_lease_clock_failure_report();
-            (failed, report)
+            (failed, report, failure)
         };
+        if let Some(failure) = deferred_offer_failure {
+            return Err(manager_failure_error(progress, failure));
+        }
         if lease_clock_failed {
             if let Some(effect) = buffered_effect.take() {
                 active_effect_event.finish(
@@ -2070,6 +2079,14 @@ where
                 .pending_observations(&in_flight_ids, available);
             if !pending.is_empty() {
                 for observation in pending {
+                    if !assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .claim_observation_for_send(observation.id)
+                    {
+                        // A manager event fenced this entry after batch selection.
+                        continue;
+                    }
                     let pending = send_assignment_observation(
                         &mut writer,
                         sleeper,
@@ -2102,8 +2119,6 @@ where
             ));
         }
 
-        let notified = assignment_notification.notified();
-        tokio::pin!(notified);
         let message = if let Some(timer) = inbound_silence_timer.as_mut() {
             tokio::select! {
                 biased;
@@ -2828,8 +2843,8 @@ mod tests {
         test_support::{gated_unavailable_source_broker, unavailable_source_broker},
     };
     use crate::service::test_support::{
-        ConfigFixture, DeterminismTranscript, ScriptedInbound, SleepRelease, accept_fixture_socket,
-        accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
+        ConfigFixture, DeterminismTranscript, ScriptedInbound, ScriptedReader, SleepRelease,
+        accept_fixture_socket, accept_opened_fixture_socket, assignment_offer, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, expect_close_frame,
         expect_opening_hello, fixture_lease_clock, fixture_listener, fixture_sleeper,
         observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
@@ -2879,6 +2894,33 @@ mod tests {
         assignment_manager: Mutex<AssignmentManager>,
         sleep_requests: Option<mpsc::UnboundedReceiver<(Duration, SleepRelease)>>,
         opening: Vec<u8>,
+    }
+
+    struct DeferredFailureOnIdle<'a> {
+        reader: ScriptedReader,
+        assignments: &'a Mutex<AssignmentManager>,
+        injected: bool,
+    }
+
+    impl Stream for DeferredFailureOnIdle<'_> {
+        type Item = Result<Message, WebSocketError>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            let poll = Pin::new(&mut self.reader).poll_next(context);
+            if poll.is_pending() && !self.injected {
+                self.injected = true;
+                self.assignments
+                    .lock()
+                    .unwrap()
+                    .record_deferred_offer_failure(
+                        super::AssignmentManagerFailure::DecisionCapacity,
+                    );
+            }
+            poll
+        }
     }
 
     impl EstablishedTestContext {
@@ -2964,6 +3006,36 @@ mod tests {
             writer,
         );
         (inbound, outbound, established)
+    }
+
+    #[tokio::test]
+    async fn deferred_offer_failure_wakes_connection_after_idle_state_check() {
+        let context = EstablishedTestContext::new();
+        let (inbound, reader, writer, _outbound) =
+            scripted_duplex(DeterminismTranscript::default());
+        inbound.send(welcome());
+        inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+        let reader = DeferredFailureOnIdle {
+            reader,
+            assignments: &context.assignment_manager,
+            injected: false,
+        };
+        let mut next_sequence = 2;
+        let error = with_watchdog(run_established(
+            context.dependencies(),
+            context.opening(),
+            &mut next_sequence,
+            reader,
+            writer,
+        ))
+        .await
+        .expect("deferred failure did not wake the idle connection")
+        .expect_err("deferred decision capacity failure unexpectedly succeeded");
+        assert_eq!(error.kind(), FailureKind::Retryable);
+        assert_eq!(
+            error.connection_cause(),
+            ConnectionCause::AssignmentDecisionCapacity
+        );
     }
 
     fn full_observation_window_context() -> EstablishedTestContext {

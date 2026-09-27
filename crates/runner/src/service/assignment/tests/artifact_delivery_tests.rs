@@ -1,10 +1,109 @@
 use super::*;
+use crate::service::artifact_delivery::{ArtifactDeliveryOutcome, ArtifactDeliverySpec};
 use base64::Engine as _;
 use scherzo_cloud_runner_protocol::{
     ArtifactConfirmationOutcome, ArtifactConfirmationResponse, ArtifactResultConfirmationOutcome,
     ArtifactResultConfirmationResponse, ArtifactUploadCapability,
 };
 use scherzo_cloud_test_support::ScriptedHttpServer;
+
+#[tokio::test]
+async fn fenced_artifact_send_keeps_its_late_response_until_transport_retires_it() {
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let offered = offer("bg");
+    let completion = manager
+        .artifact_delivery
+        .start(ArtifactDeliverySpec::result(
+            offered.assignment_id.clone(),
+            offered.attempt_id,
+            Arc::from(&b"{}"[..]),
+        ))
+        .unwrap();
+    let pending = manager.pending_observations(&BTreeSet::new(), 1);
+    let (observation_id, delivery_id) = match &pending[0].observation {
+        AssignmentObservation::Artifact { delivery_id, .. } => (pending[0].id, *delivery_id),
+        _ => panic!("expected artifact registration"),
+    };
+
+    assert!(manager.claim_observation_for_send(observation_id));
+    manager.retire_assignment_observations(&offered.assignment_id);
+    assert!(manager.outbox.contains(observation_id));
+    assert!(manager.pending_observations(&BTreeSet::new(), 1).is_empty());
+    manager
+        .handle_artifact_response(
+            observation_id,
+            delivery_id,
+            ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
+                request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                outcome: ArtifactResultRegistrationOutcome::Retryable,
+            }),
+        )
+        .unwrap();
+    assert!(!manager.outbox.contains(observation_id));
+    assert!(matches!(
+        completion.await.unwrap(),
+        ArtifactDeliveryOutcome::AuthorityLost
+    ));
+
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let offered = offer("bh");
+    let _completion = manager
+        .artifact_delivery
+        .start(ArtifactDeliverySpec::result(
+            offered.assignment_id.clone(),
+            offered.attempt_id,
+            Arc::from(&b"{}"[..]),
+        ))
+        .unwrap();
+    let stale = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
+    manager.retire_assignment_observations(&offered.assignment_id);
+    assert!(!manager.claim_observation_for_send(stale));
+}
+
+#[tokio::test]
+async fn unknown_artifact_observation_acknowledgement_does_not_consume_delivery() {
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let offered = offer("bg");
+    let completion = manager
+        .artifact_delivery
+        .start(ArtifactDeliverySpec::result(
+            offered.assignment_id,
+            offered.attempt_id,
+            Arc::from(&b"{}"[..]),
+        ))
+        .unwrap();
+    let pending = manager.pending_observations(&BTreeSet::new(), 1);
+    let (observation_id, delivery_id) = match &pending[0].observation {
+        AssignmentObservation::Artifact { delivery_id, .. } => (pending[0].id, *delivery_id),
+        _ => panic!("expected artifact registration"),
+    };
+    let failed_registration = || {
+        ArtifactCloudResponse::ResultRegistration(ArtifactResultRegistrationResponse {
+            request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            outcome: ArtifactResultRegistrationOutcome::Failed {
+                code: "storage_quota_exceeded".to_owned(),
+            },
+        })
+    };
+    manager
+        .event_sender
+        .send(ManagerEvent::LeaseClockFailed)
+        .unwrap();
+    assert_eq!(
+        manager.handle_artifact_response(observation_id + 1, delivery_id, failed_registration()),
+        Err(ArtifactDeliveryProtocolFailure)
+    );
+    assert!(manager.lease_clock_failed);
+    assert!(manager.outbox.contains(observation_id));
+    manager
+        .handle_artifact_response(observation_id, delivery_id, failed_registration())
+        .unwrap();
+    assert!(!manager.outbox.contains(observation_id));
+    assert!(matches!(
+        completion.await.unwrap(),
+        ArtifactDeliveryOutcome::Failed(_)
+    ));
+}
 
 #[tokio::test]
 async fn decoded_v2_assignment_delivers_multiple_carriers_before_the_result() {

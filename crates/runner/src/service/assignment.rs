@@ -761,6 +761,7 @@ struct ObservationEntry {
     encoded_bytes: usize,
     replayable: bool,
     encoded: bool,
+    transport_owned: bool,
     retained_frame: Option<RetainedObservationFrame>,
 }
 
@@ -866,6 +867,7 @@ impl ObservationOutbox {
             encoded_bytes,
             replayable: true,
             encoded: false,
+            transport_owned: false,
             retained_frame: None,
         });
         drop(state);
@@ -881,7 +883,12 @@ impl ObservationOutbox {
         self.lock()
             .entries
             .iter()
-            .filter(|entry| entry.replayable && !entry.encoded && !in_flight.contains(&entry.id))
+            .filter(|entry| {
+                entry.replayable
+                    && !entry.encoded
+                    && !entry.transport_owned
+                    && !in_flight.contains(&entry.id)
+            })
             .take(limit)
             .map(|entry| PendingAssignmentObservation {
                 id: entry.id,
@@ -895,6 +902,18 @@ impl ObservationOutbox {
         let mut state = self.lock();
         let index = state.entries.iter().position(|entry| entry.id == id)?;
         state.entries.remove(index).map(|entry| entry.observation)
+    }
+
+    fn claim_for_transport(&self, id: u64) -> bool {
+        let mut state = self.lock();
+        let Some(entry) = state.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        if !entry.replayable || entry.encoded || entry.transport_owned {
+            return false;
+        }
+        entry.transport_owned = true;
+        true
     }
 
     fn retain_frame(&self, id: u64, retained_frame: RetainedObservationFrame) {
@@ -925,7 +944,7 @@ impl ObservationOutbox {
         }
         state
             .entries
-            .retain(|entry| entry.replayable || entry.encoded);
+            .retain(|entry| entry.replayable || entry.encoded || entry.transport_owned);
     }
 
     fn fence_assignment(&self, assignment_id: &str) {
@@ -937,7 +956,7 @@ impl ObservationOutbox {
         }
         state
             .entries
-            .retain(|entry| entry.replayable || entry.encoded);
+            .retain(|entry| entry.replayable || entry.encoded || entry.transport_owned);
     }
 
     fn finish_transport(&self) -> BTreeSet<u64> {
@@ -951,6 +970,7 @@ impl ObservationOutbox {
         state.entries.retain(|entry| entry.replayable);
         for entry in &mut state.entries {
             entry.encoded = false;
+            entry.transport_owned = false;
         }
         removed
     }
@@ -1342,6 +1362,14 @@ struct FinishingAssignment {
     workspace_disposition: WorkspaceDisposition,
 }
 
+// A successor has fenced the predecessor's terminal report, but its grace timer
+// may still deliver an event. Keep these obligations separate from the successor slot.
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct FencedFinalGrace {
+    assignment_id: String,
+    final_observation_id: u64,
+}
+
 enum ReleaseAfter {
     Idle,
     Reporting(Box<AssignmentIdentity>),
@@ -1622,6 +1650,8 @@ pub(super) struct AssignmentManager {
     lease_clock_failure_report: Option<u64>,
     cleanup_failed: bool,
     deferred_successor: Option<AssignmentOffer>,
+    deferred_offer_failure: Option<AssignmentManagerFailure>,
+    fenced_final_graces: BTreeSet<FencedFinalGrace>,
     guard_processes: bool,
 }
 
@@ -1682,6 +1712,8 @@ impl AssignmentManager {
             lease_clock_failure_report: None,
             cleanup_failed: false,
             deferred_successor: None,
+            deferred_offer_failure: None,
+            fenced_final_graces: BTreeSet::new(),
             guard_processes,
         }
     }
@@ -1801,6 +1833,12 @@ impl AssignmentManager {
                 );
                 return Ok(());
             }
+            // The root is already released. Admission may proceed, but the old
+            // grace event must not restore reporting after successor fencing.
+            self.fenced_final_graces.insert(FencedFinalGrace {
+                assignment_id: finishing.identity.assignment_id,
+                final_observation_id: finishing.final_observation_id,
+            });
         }
 
         if self.shutting_down {
@@ -3022,6 +3060,10 @@ impl AssignmentManager {
         self.outbox.retain_frame(id, retained_frame);
     }
 
+    pub(super) fn claim_observation_for_send(&self, id: u64) -> bool {
+        self.outbox.claim_for_transport(id)
+    }
+
     pub(super) fn mark_observation_encoded(&self, id: u64) {
         self.outbox.mark_encoded(id);
         self.outbox.wake();
@@ -3033,13 +3075,20 @@ impl AssignmentManager {
         delivery_id: u64,
         response: ArtifactCloudResponse,
     ) -> Result<(), ArtifactDeliveryProtocolFailure> {
+        self.drain_events();
+        if !self.outbox.contains(observation_id) {
+            return Err(ArtifactDeliveryProtocolFailure);
+        }
         self.artifact_delivery
             .handle_response(delivery_id, response)?;
-        self.outbox.acknowledge(observation_id);
+        self.outbox
+            .acknowledge(observation_id)
+            .ok_or(ArtifactDeliveryProtocolFailure)?;
         Ok(())
     }
 
     pub(super) fn finish_transport(&mut self) {
+        self.drain_events();
         let removed = self.outbox.finish_transport();
         for decision in &mut self.decisions {
             if decision
@@ -3234,7 +3283,7 @@ impl AssignmentManager {
                 if let Some(successor) = self.deferred_successor.take()
                     && let Err(failure) = self.handle_offer_after_drain(successor)
                 {
-                    self.lease_clock_failed |= failure == AssignmentManagerFailure::LeaseClock;
+                    self.record_deferred_offer_failure(failure);
                 }
             }
             CleanupResult::Quarantined(_) | CleanupResult::Preempted => {
@@ -3242,12 +3291,26 @@ impl AssignmentManager {
                 if let Some(successor) = self.deferred_successor.take() {
                     let response = rejected(&successor, environment_unavailable());
                     if let Err(failure) = self.retain_decision(successor, response) {
-                        self.lease_clock_failed |= failure == AssignmentManagerFailure::LeaseClock;
+                        self.record_deferred_offer_failure(failure);
                     }
                 }
             }
         }
         self.outbox.wake();
+    }
+
+    pub(super) fn record_deferred_offer_failure(&mut self, failure: AssignmentManagerFailure) {
+        if failure == AssignmentManagerFailure::LeaseClock {
+            self.lease_clock_failed = true;
+        } else {
+            self.deferred_offer_failure = Some(failure);
+        }
+        self.outbox.wake();
+    }
+
+    pub(super) fn take_deferred_offer_failure(&mut self) -> Option<AssignmentManagerFailure> {
+        self.drain_events();
+        self.deferred_offer_failure.take()
     }
 
     fn complete_pre_execution_cancellation(&mut self, identity: AssignmentIdentity) {
@@ -3746,6 +3809,14 @@ impl AssignmentManager {
                     final_observation_id,
                     continue_reporting,
                 } => {
+                    if self.fenced_final_graces.remove(&FencedFinalGrace {
+                        assignment_id: assignment_id.clone(),
+                        final_observation_id,
+                    }) {
+                        // The terminal report was fenced on successor admission;
+                        // this timer cannot resume predecessor reporting.
+                        continue;
+                    }
                     let finishing = match self.slot.take() {
                         Some(LocalSlot::Finishing(finishing)) => finishing,
                         slot => {
@@ -10169,6 +10240,79 @@ steps:
     }
 
     #[tokio::test]
+    async fn transport_finish_drains_worker_events() {
+        let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+        manager
+            .event_sender
+            .send(ManagerEvent::LeaseClockFailed)
+            .unwrap();
+        manager.finish_transport();
+        assert!(manager.lease_clock_failed);
+    }
+
+    #[tokio::test]
+    async fn deferred_offer_outbox_exhaustion_is_reported_in_both_cleanup_outcomes() {
+        for result in [CleanupResult::Released, CleanupResult::Preempted] {
+            let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+            let predecessor = offer("bg");
+            let successor = offer("bh");
+            manager.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
+                assignment_id: predecessor.assignment_id.clone(),
+                after: ReleaseAfter::Idle,
+            }));
+            manager.deferred_successor = Some(successor);
+            // Both replay paths must enqueue a rejection even during shutdown.
+            manager.shutting_down = true;
+            manager.outbox.maximum_encoded_bytes = 0;
+            manager
+                .event_sender
+                .send(ManagerEvent::CleanupFinished {
+                    assignment_id: predecessor.assignment_id,
+                    result,
+                })
+                .unwrap();
+            assert_eq!(
+                manager.take_deferred_offer_failure(),
+                Some(AssignmentManagerFailure::DecisionCapacity)
+            );
+            assert!(manager.deferred_successor.is_none());
+            assert!(manager.pending_observations(&BTreeSet::new(), 1).is_empty());
+            assert_eq!(manager.take_deferred_offer_failure(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_deferred_successor_is_reported_after_cleanup() {
+        let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+        let predecessor = offer("bg");
+        let successor = offer("bh");
+        let mut conflict = successor.clone();
+        conflict.attempt_number += 1;
+        manager
+            .retain_decision(
+                conflict.clone(),
+                rejected(&conflict, AssignmentDecline::CapacityUnavailable),
+            )
+            .unwrap();
+        manager.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
+            assignment_id: predecessor.assignment_id.clone(),
+            after: ReleaseAfter::Idle,
+        }));
+        manager.deferred_successor = Some(successor);
+        manager
+            .event_sender
+            .send(ManagerEvent::CleanupFinished {
+                assignment_id: predecessor.assignment_id,
+                result: CleanupResult::Released,
+            })
+            .unwrap();
+        assert_eq!(
+            manager.take_deferred_offer_failure(),
+            Some(AssignmentManagerFailure::ConflictingOffer)
+        );
+    }
+
+    #[tokio::test]
     async fn final_grace_acknowledgement_and_successor_fence_cleanup_state() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
@@ -10178,6 +10322,16 @@ steps:
             LocalSlot::Accepted(accepted) => accepted.identity.clone(),
             _ => panic!("offer must be accepted"),
         };
+        let send_grace = |manager: &AssignmentManager, final_observation_id| {
+            manager
+                .event_sender
+                .send(ManagerEvent::FinalGraceElapsed {
+                    assignment_id: identity.assignment_id.clone(),
+                    final_observation_id,
+                    continue_reporting: true,
+                })
+                .unwrap();
+        };
         let final_observation_id = enqueue_finished(&manager, &identity);
         manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
             identity: identity.clone(),
@@ -10185,14 +10339,7 @@ steps:
             root: None,
             workspace_disposition: WorkspaceDisposition::Remove,
         })));
-        manager
-            .event_sender
-            .send(ManagerEvent::FinalGraceElapsed {
-                assignment_id: identity.assignment_id.clone(),
-                final_observation_id,
-                continue_reporting: true,
-            })
-            .unwrap();
+        send_grace(&manager, final_observation_id);
         manager.pending_observations(&BTreeSet::new(), 100);
         assert!(manager.slot.is_none());
         assert_eq!(manager.reporting, Some(identity.clone()));
@@ -10202,13 +10349,26 @@ steps:
         let final_observation_id = enqueue_finished(&manager, &identity);
         manager.mark_observation_encoded(final_observation_id);
         manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-            identity,
+            identity: identity.clone(),
             final_observation_id,
             root: None,
             workspace_disposition: WorkspaceDisposition::Remove,
         })));
-        manager.handle_offer(offer("bh")).unwrap();
+        let successor = offer("bh");
+        manager.handle_offer(successor.clone()).unwrap();
+        assert!(manager.fenced_final_graces.contains(&FencedFinalGrace {
+            assignment_id: identity.assignment_id.clone(),
+            final_observation_id,
+        }));
         wait_for_offer_preparation(&mut manager).await;
+        send_grace(&manager, final_observation_id);
+        manager.pending_observations(&BTreeSet::new(), 100);
+        assert!(manager.fenced_final_graces.is_empty());
+        assert!(manager.reporting.is_none());
+        assert!(
+            matches!(&manager.slot, Some(LocalSlot::Preparing(preparing))
+            if preparing.offer.assignment_id == successor.assignment_id)
+        );
         assert_eq!(manager.outbox.lock().entries.len(), 2);
         assert_eq!(manager.pending_observations(&BTreeSet::new(), 100).len(), 1);
         manager.finish_transport();
