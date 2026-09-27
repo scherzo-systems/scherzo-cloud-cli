@@ -311,31 +311,21 @@ where
     load_local_archived_attempt_with(
         requested,
         requested_attempt,
-        &mut CallbackArchiveReadObserver {
-            snapshot_acquired,
-            result_file_opened,
-        },
+        &mut (snapshot_acquired, result_file_opened),
     )
 }
 
-#[cfg(test)]
-struct CallbackArchiveReadObserver<Snapshot, ResultFile> {
-    snapshot_acquired: Snapshot,
-    result_file_opened: ResultFile,
-}
-
-#[cfg(test)]
-impl<Snapshot, ResultFile> ArchiveReadObserver for CallbackArchiveReadObserver<Snapshot, ResultFile>
+impl<Snapshot, ResultFile> ArchiveReadObserver for (Snapshot, ResultFile)
 where
     Snapshot: FnMut(&Path),
     ResultFile: FnMut(&Path),
 {
     fn stable_snapshot_acquired(&mut self, run_directory: &Path) {
-        (self.snapshot_acquired)(run_directory);
+        (self.0)(run_directory);
     }
 
     fn result_file_opened(&mut self, result_directory: &Path) {
-        (self.result_file_opened)(result_directory);
+        (self.1)(result_directory);
     }
 }
 

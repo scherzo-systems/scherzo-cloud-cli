@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use super::*;
@@ -96,7 +96,10 @@ impl CaptureFixture {
     }
 
     fn staging_path(&self) -> PathBuf {
-        self.store.inner.staging_path.clone()
+        self._temporary
+            .path()
+            .join("staging")
+            .join(self.store.inner.store_identity.as_ref())
     }
 }
 

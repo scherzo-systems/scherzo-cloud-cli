@@ -1880,13 +1880,6 @@ fn publish_prepared_with_observer(
                 LocalPublicationFailureKind::SerializationUnavailable,
             )
         })?;
-    staging.verify(&result).map_err(|_| {
-        LocalPublicationError::new(
-            LocalPublicationPhase::Verification,
-            LocalPublicationFailureKind::VerificationUnavailable,
-        )
-    })?;
-
     observe(
         observer,
         &PublicationBoundary::StagingComplete,

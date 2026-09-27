@@ -36,10 +36,10 @@ impl Command {
     async fn execute_async(self) -> super::super::CommandResult {
         let presentation_config = super::run::presentation_config(&self.presentation);
         let cancellation = CancellationSource::new();
-        let signal_task = match super::run::start_signal_observation(cancellation.clone()) {
-            Ok(task) => task,
-            Err(error) => return Err(error.into()),
-        };
+        let signal_task = super::run::start_signal_observation(
+            cancellation.clone(),
+            super::run::UnixSignals::new()?,
+        );
         let run_directory = self.run.run_dir.clone();
         let opened = match tokio::task::spawn_blocking(move || {
             reconcile_current_result_publication(&run_directory);

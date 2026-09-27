@@ -4,7 +4,6 @@ mod dag_layout;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -15,6 +14,7 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use futures_util::StreamExt as _;
 use ratatui::backend::CrosstermBackend;
+pub use ratatui::layout::Rect as TerminalRect;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -74,8 +74,6 @@ const LOG_SEPARATOR_WIDTH: usize = 3;
 const LOG_SOURCE_GUTTER_WIDTH: usize = LOG_SOURCE_WIDTH + LOG_SEPARATOR_WIDTH;
 const LOG_TIMESTAMPED_GUTTER_WIDTH: usize = LOG_TIMESTAMP_WIDTH + 1 + LOG_SOURCE_GUTTER_WIDTH;
 const MINIMUM_TIMESTAMPED_LOG_CONTENT_WIDTH: usize = 12;
-const TERMINAL_LIFECYCLE_HANDSHAKE_ENVIRONMENT: &str =
-    "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
 
 pub struct WorkflowTerminalHost {
     activation: Option<oneshot::Sender<()>>,
@@ -103,7 +101,7 @@ impl WorkflowTerminalHost {
         Self::start_with_boundary(view, cancellation, color, SystemTerminalBoundary::new())
     }
 
-    fn start_with_boundary<Clock, Boundary>(
+    pub fn start_with_boundary<Clock, Boundary>(
         view: WorkflowRunViewModel<Clock>,
         cancellation: CancellationSource,
         color: bool,
@@ -234,12 +232,12 @@ impl WorkflowTerminalHost {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalLifecycleEvent {
+pub enum TerminalLifecycleEvent {
     HelpOpened,
     QuitEligible,
 }
 
-trait TerminalBoundary: Send + 'static {
+pub trait TerminalBoundary: Send + 'static {
     fn setup(&mut self) -> io::Result<Rect>;
 
     fn next_event(&mut self) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send;
@@ -248,12 +246,13 @@ trait TerminalBoundary: Send + 'static {
 
     fn restore(&mut self) -> io::Result<()>;
 
+    // Called on the render loop: implementations must not wait for an external consumer.
     fn notify_lifecycle(&mut self, _event: TerminalLifecycleEvent) -> io::Result<()> {
         Ok(())
     }
 }
 
-trait WorkflowTerminalBoundary: TerminalBoundary {
+pub trait WorkflowTerminalBoundary: TerminalBoundary {
     fn draw_workflow(
         &mut self,
         snapshot: &WorkflowRunViewSnapshot,
@@ -522,8 +521,6 @@ struct SystemTerminalBoundary {
     surface: Option<TerminalSurface>,
     input: TerminalInput,
     restore: Option<TerminalRestore>,
-    lifecycle_handshake: Option<UnixStream>,
-    quit_eligibility_reported: bool,
 }
 
 impl SystemTerminalBoundary {
@@ -532,8 +529,6 @@ impl SystemTerminalBoundary {
             surface: None,
             input: TerminalInput::new(),
             restore: None,
-            lifecycle_handshake: None,
-            quit_eligibility_reported: false,
         }
     }
 
@@ -549,10 +544,6 @@ impl SystemTerminalBoundary {
 
 impl TerminalBoundary for SystemTerminalBoundary {
     fn setup(&mut self) -> io::Result<Rect> {
-        self.lifecycle_handshake = std::env::var_os(TERMINAL_LIFECYCLE_HANDSHAKE_ENVIRONMENT)
-            .map(std::path::PathBuf::from)
-            .map(UnixStream::connect)
-            .transpose()?;
         self.restore = Some(TerminalRestore::enter_raw_mode()?);
         let area = selected_output_area()?;
         let mut output = io::stdout();
@@ -585,23 +576,6 @@ impl TerminalBoundary for SystemTerminalBoundary {
         self.restore
             .as_mut()
             .map_or(Ok(()), TerminalRestore::restore)
-    }
-
-    fn notify_lifecycle(&mut self, event: TerminalLifecycleEvent) -> io::Result<()> {
-        if event == TerminalLifecycleEvent::QuitEligible && self.quit_eligibility_reported {
-            return Ok(());
-        }
-        let Some(handshake) = &mut self.lifecycle_handshake else {
-            self.quit_eligibility_reported |= event == TerminalLifecycleEvent::QuitEligible;
-            return Ok(());
-        };
-        let message = match event {
-            TerminalLifecycleEvent::HelpOpened => b"help-open\n".as_slice(),
-            TerminalLifecycleEvent::QuitEligible => b"quit-eligible\n".as_slice(),
-        };
-        handshake.write_all(message)?;
-        self.quit_eligibility_reported |= event == TerminalLifecycleEvent::QuitEligible;
-        Ok(())
     }
 }
 
@@ -668,7 +642,7 @@ impl TerminalInput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalInputEvent {
+pub enum TerminalInputEvent {
     Up,
     Down,
     PageUp,
@@ -1013,7 +987,7 @@ impl<'a> FilteredLog<'a> {
 }
 
 #[derive(Default)]
-struct HostInteraction {
+pub struct HostInteraction {
     selected: usize,
     surface: HostSurface,
     help_visible: bool,
@@ -4539,6 +4513,7 @@ mod tests {
         Draw(Rect),
         Input(TerminalInputEvent),
         InputFailure,
+        Lifecycle(TerminalLifecycleEvent),
         Resize(Rect),
         Restore,
     }
@@ -4640,6 +4615,11 @@ mod tests {
             }
             self.record(BoundaryAction::Resize(self.area));
             Ok(self.area)
+        }
+
+        fn notify_lifecycle(&mut self, event: TerminalLifecycleEvent) -> io::Result<()> {
+            self.record(BoundaryAction::Lifecycle(event));
+            Ok(())
         }
 
         fn restore(&mut self) -> io::Result<()> {
@@ -5870,7 +5850,6 @@ mod tests {
         input
             .send(ScriptedInput::Event(TerminalInputEvent::Quit))
             .unwrap();
-
         assert_eq!(host.wait().await.unwrap(), TerminalHostExit::Quit);
         wait_for_action(&mut actions, BoundaryAction::Restore).await;
         assert_eq!(

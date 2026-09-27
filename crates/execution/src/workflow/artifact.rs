@@ -9,9 +9,6 @@ use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, Weak};
 
-#[cfg(test)]
-use std::path::PathBuf;
-
 use ring::digest::{Context as DigestContext, SHA256};
 use rustix::fs::{
     AtFlags, FileType, Mode, OFlags, fchmod, fstat, linkat, mkdirat, openat, statat, unlinkat,
@@ -39,7 +36,6 @@ const IDENTITY_ATTEMPTS: usize = 16;
 #[derive(Clone, Default)]
 pub struct CaptureCancellation {
     cancelled: CancellationFlag,
-    #[cfg(test)]
     observer: Option<Arc<dyn CaptureBoundaryObserver>>,
 }
 
@@ -65,9 +61,6 @@ impl CaptureCancellation {
         output_identity: &Arc<str>,
         kind: CaptureBoundaryKind,
     ) -> Result<(), CaptureAttemptFailure> {
-        #[cfg(not(test))]
-        let _ = (output_identity, kind);
-        #[cfg(test)]
         if let Some(observer) = &self.observer {
             observer.reached(CaptureBoundary {
                 output_identity: Arc::clone(output_identity),
@@ -95,14 +88,12 @@ pub(crate) enum CaptureBoundaryKind {
     BeforeGitRecheck,
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CaptureBoundary {
     pub(crate) output_identity: Arc<str>,
     pub(crate) kind: CaptureBoundaryKind,
 }
 
-#[cfg(test)]
 pub(crate) trait CaptureBoundaryObserver: Send + Sync {
     fn reached(&self, boundary: CaptureBoundary);
 }
@@ -897,12 +888,73 @@ pub struct ArtifactStaging {
     inner: Arc<ArtifactStagingInner>,
 }
 
+trait ArtifactFilesystem: Send + Sync {
+    fn link(
+        &self,
+        source: &OwnedFd,
+        name: &str,
+        destination: &OwnedFd,
+        target: &OsStr,
+    ) -> Result<(), Errno>;
+    fn unlink(&self, directory: &OwnedFd, name: &str) -> Result<(), Errno>;
+}
+
+struct SystemArtifactFilesystem;
+
+impl ArtifactFilesystem for SystemArtifactFilesystem {
+    fn link(
+        &self,
+        source: &OwnedFd,
+        name: &str,
+        destination: &OwnedFd,
+        target: &OsStr,
+    ) -> Result<(), Errno> {
+        linkat(source, name, destination, target, AtFlags::empty())
+    }
+
+    fn unlink(&self, directory: &OwnedFd, name: &str) -> Result<(), Errno> {
+        unlinkat(directory, name, AtFlags::empty())
+    }
+}
+
+#[cfg(test)]
+struct BlockedArtifactFilesystem {
+    unlink: bool,
+}
+
+#[cfg(test)]
+impl ArtifactFilesystem for BlockedArtifactFilesystem {
+    // The test adapter must use the same filesystem signature while selectively
+    // rejecting an operation; keeping it separate makes the injected failure explicit.
+    // jscpd:ignore-start
+    fn link(
+        &self,
+        source: &OwnedFd,
+        name: &str,
+        destination: &OwnedFd,
+        target: &OsStr,
+    ) -> Result<(), Errno> {
+        if self.unlink {
+            SystemArtifactFilesystem.link(source, name, destination, target)
+        } else {
+            Err(Errno::PERM)
+        }
+    }
+    // jscpd:ignore-end
+
+    fn unlink(&self, directory: &OwnedFd, name: &str) -> Result<(), Errno> {
+        if self.unlink {
+            Err(Errno::PERM)
+        } else {
+            SystemArtifactFilesystem.unlink(directory, name)
+        }
+    }
+}
+
 struct ArtifactStagingInner {
     execution_root: AdmittedExecutionRoot,
     staging_parent: OwnedFd,
     staging_root: OwnedFd,
-    #[cfg(test)]
-    staging_path: PathBuf,
     store_identity: Arc<str>,
     file_limits: CarrierLimits,
     git_limits: CarrierLimits,
@@ -912,10 +964,7 @@ struct ArtifactStagingInner {
     identity_guards: Mutex<BTreeMap<Arc<str>, Arc<str>>>,
     budget: Mutex<CaptureBudgetLedger>,
     capture_serial: Mutex<()>,
-    #[cfg(test)]
-    artifact_unlinks_blocked: AtomicBool,
-    #[cfg(test)]
-    artifact_links_blocked: AtomicBool,
+    filesystem: RwLock<Arc<dyn ArtifactFilesystem>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1045,16 +1094,11 @@ impl ArtifactStaging {
             return Err(ArtifactStagingFailure::StagingParentUnavailable);
         }
         let (store_identity, staging_root) = create_staging_root(&staging_parent_handle)?;
-        #[cfg(test)]
-        let staging_path = canonical_staging_parent.join(store_identity.as_ref());
-
         Ok(Self {
             inner: Arc::new(ArtifactStagingInner {
                 execution_root,
                 staging_parent: staging_parent_handle,
                 staging_root,
-                #[cfg(test)]
-                staging_path,
                 store_identity,
                 file_limits,
                 git_limits,
@@ -1064,10 +1108,7 @@ impl ArtifactStaging {
                 identity_guards: Mutex::new(BTreeMap::new()),
                 budget: Mutex::new(CaptureBudgetLedger::default()),
                 capture_serial: Mutex::new(()),
-                #[cfg(test)]
-                artifact_unlinks_blocked: AtomicBool::new(false),
-                #[cfg(test)]
-                artifact_links_blocked: AtomicBool::new(false),
+                filesystem: RwLock::new(Arc::new(SystemArtifactFilesystem)),
             }),
         })
     }
@@ -1509,21 +1550,20 @@ impl ArtifactStaging {
         {
             return Err(ArtifactExposeFailure::Unavailable);
         }
-        #[cfg(test)]
-        if self.inner.artifact_links_blocked.load(Ordering::Acquire) {
-            return Err(ArtifactExposeFailure::Unavailable);
-        }
-        linkat(
-            &self.inner.staging_root,
-            carrier.handle.artifact_identity.as_ref(),
-            destination,
-            destination_name,
-            AtFlags::empty(),
-        )
-        .map_err(|failure| match failure {
-            Errno::EXIST => ArtifactExposeFailure::DestinationExists,
-            _ => ArtifactExposeFailure::Unavailable,
-        })?;
+        self.inner
+            .filesystem
+            .read()
+            .map_err(|_| ArtifactExposeFailure::Unavailable)?
+            .link(
+                &self.inner.staging_root,
+                carrier.handle.artifact_identity.as_ref(),
+                destination,
+                destination_name,
+            )
+            .map_err(|failure| match failure {
+                Errno::EXIST => ArtifactExposeFailure::DestinationExists,
+                _ => ArtifactExposeFailure::Unavailable,
+            })?;
         let exposed = statat(destination, destination_name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ArtifactExposeFailure::Unavailable)?;
         let expected = carrier.handle.lease.file_identity;
@@ -1609,16 +1649,14 @@ impl ArtifactStaging {
 
     #[cfg(test)]
     pub(crate) fn block_artifact_unlinks(&self) {
-        self.inner
-            .artifact_unlinks_blocked
-            .store(true, Ordering::Release);
+        *self.inner.filesystem.write().unwrap() =
+            Arc::new(BlockedArtifactFilesystem { unlink: true });
     }
 
     #[cfg(test)]
     pub(crate) fn block_artifact_links(&self) {
-        self.inner
-            .artifact_links_blocked
-            .store(true, Ordering::Release);
+        *self.inner.filesystem.write().unwrap() =
+            Arc::new(BlockedArtifactFilesystem { unlink: false });
     }
 
     fn rollback_capture_set(
@@ -2286,10 +2324,9 @@ impl ArtifactStagingInner {
     // jscpd:ignore-end
 
     fn remove_artifact_while_active(&self, artifact_identity: &str) -> bool {
-        #[cfg(test)]
-        if self.artifact_unlinks_blocked.load(Ordering::Acquire) {
+        let Ok(filesystem) = self.filesystem.read() else {
             return false;
-        }
+        };
         let Ok(mut artifacts) = self.artifacts.lock() else {
             return false;
         };
@@ -2297,18 +2334,14 @@ impl ArtifactStagingInner {
             return false;
         };
         if !matches!(
-            unlinkat(&self.staging_root, artifact_identity, AtFlags::empty()),
+            filesystem.unlink(&self.staging_root, artifact_identity),
             Ok(()) | Err(Errno::NOENT)
         ) {
             return false;
         }
         if let Some(guard_identity) = identity_guards.get(artifact_identity)
             && !matches!(
-                unlinkat(
-                    &self.staging_root,
-                    guard_identity.as_ref(),
-                    AtFlags::empty(),
-                ),
+                filesystem.unlink(&self.staging_root, guard_identity.as_ref()),
                 Ok(()) | Err(Errno::NOENT)
             )
         {

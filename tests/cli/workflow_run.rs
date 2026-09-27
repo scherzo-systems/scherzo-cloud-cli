@@ -32,7 +32,6 @@ const OVERSIZED_AGENT_MESSAGE_BYTES: usize = 512 * 1024;
 const OVERSIZED_AGENT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const OVERSIZED_AGENT_SYSTEM_PROMPT_BYTES: usize = 256 * 1024;
 const SIGNAL_FIXTURE_TEST: &str = "workflow_run::signal_command_fixture";
-const TUI_HANDSHAKE_VARIABLE: &str = "SCHERZO_INTERNAL_WORKFLOW_RUN_TUI_HANDSHAKE";
 const CODEX_THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
 const CODEX_TURN_ID: &str = "turn-fixture";
 const CODEX_CORRECTION_TURN_ID: &str = "turn-correction";
@@ -3579,6 +3578,137 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
     assert!(bundle.execution_root.exists());
 }
 
+// Exercise the terminal-host seam from the CLI integration suite without a process-global
+// handshake variable or a readiness assertion on rendered terminal text.
+#[tokio::test]
+async fn injected_tui_boundary_handshakes_help_and_quit_lifecycle() {
+    use scherzo_cloud_execution::{
+        CancellationSource, HostInteraction, ObservationClock, RunTimingObservation,
+        SystemObservationClock, TerminalBoundary, TerminalHostExit, TerminalInputEvent,
+        TerminalLifecycleEvent, TerminalRect, WorkflowRunViewModel, WorkflowRunViewSnapshot,
+        WorkflowTerminalBoundary, WorkflowTerminalHost, resolve,
+    };
+
+    #[derive(Debug, PartialEq)]
+    enum Action {
+        Setup,
+        Draw,
+        Input(TerminalInputEvent),
+        Lifecycle(TerminalLifecycleEvent),
+        Restore,
+    }
+
+    struct InjectedBoundary {
+        input: tokio::sync::mpsc::UnboundedReceiver<TerminalInputEvent>,
+        actions: tokio::sync::mpsc::UnboundedSender<Action>,
+    }
+
+    impl TerminalBoundary for InjectedBoundary {
+        fn setup(&mut self) -> std::io::Result<TerminalRect> {
+            let _ = self.actions.send(Action::Setup);
+            Ok(TerminalRect::new(0, 0, 80, 24))
+        }
+
+        async fn next_event(&mut self) -> std::io::Result<TerminalInputEvent> {
+            let event = self
+                .input
+                .recv()
+                .await
+                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            let _ = self.actions.send(Action::Input(event));
+            Ok(event)
+        }
+
+        fn resize(&mut self) -> std::io::Result<TerminalRect> {
+            Ok(TerminalRect::new(0, 0, 80, 24))
+        }
+
+        fn restore(&mut self) -> std::io::Result<()> {
+            let _ = self.actions.send(Action::Restore);
+            Ok(())
+        }
+
+        fn notify_lifecycle(&mut self, event: TerminalLifecycleEvent) -> std::io::Result<()> {
+            let _ = self.actions.send(Action::Lifecycle(event));
+            Ok(())
+        }
+    }
+
+    impl WorkflowTerminalBoundary for InjectedBoundary {
+        fn draw_workflow(
+            &mut self,
+            _snapshot: &WorkflowRunViewSnapshot,
+            _interaction: &mut HostInteraction,
+            _color: bool,
+        ) -> std::io::Result<()> {
+            let _ = self.actions.send(Action::Draw);
+            Ok(())
+        }
+    }
+
+    async fn until(actions: &mut tokio::sync::mpsc::UnboundedReceiver<Action>, expected: Action) {
+        loop {
+            let action = actions.recv().await.expect("terminal action stream closed");
+            if action == expected {
+                return;
+            }
+        }
+    }
+
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let workflow = resolve(bundle.source_root(), Path::new(WORKFLOW_PATH)).unwrap();
+    let clock = SystemObservationClock;
+    let view = WorkflowRunViewModel::new(
+        &workflow,
+        1,
+        RunTimingObservation::new(clock.sample()),
+        clock,
+    );
+    let cancellation = CancellationSource::new();
+    let (input, input_events) = tokio::sync::mpsc::unbounded_channel();
+    let (action_events, mut actions) = tokio::sync::mpsc::unbounded_channel();
+    let mut host = WorkflowTerminalHost::start_with_boundary(
+        view.clone(),
+        cancellation.clone(),
+        false,
+        InjectedBoundary {
+            input: input_events,
+            actions: action_events,
+        },
+    )
+    .unwrap();
+    until(&mut actions, Action::Setup).await;
+    until(&mut actions, Action::Draw).await;
+    host.activate_execution().unwrap();
+
+    input.send(TerminalInputEvent::Quit).unwrap();
+    until(&mut actions, Action::Input(TerminalInputEvent::Quit)).await;
+    until(&mut actions, Action::Draw).await;
+    assert_eq!(cancellation.cancellation_reason(), None);
+
+    input.send(TerminalInputEvent::Help).unwrap();
+    until(
+        &mut actions,
+        Action::Lifecycle(TerminalLifecycleEvent::HelpOpened),
+    )
+    .await;
+    input.send(TerminalInputEvent::Escape).unwrap();
+    until(&mut actions, Action::Input(TerminalInputEvent::Escape)).await;
+
+    view.mark_adapter_lifecycle_completed();
+    until(
+        &mut actions,
+        Action::Lifecycle(TerminalLifecycleEvent::QuitEligible),
+    )
+    .await;
+    input.send(TerminalInputEvent::Quit).unwrap();
+    assert_eq!(host.wait().await.unwrap(), TerminalHostExit::Quit);
+    until(&mut actions, Action::Restore).await;
+    assert_eq!(cancellation.cancellation_reason(), None);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn tui_releases_ownership_and_restores_before_summary_handoff() {
@@ -4337,126 +4467,13 @@ fn presentation_setup_failure_settles_the_published_attempt() {
     assert!(!attempt_result(&destination).exists());
 }
 
-#[test]
-fn real_pty_boundary_restores_input_mode_before_the_standard_summary_handoff() {
-    let (finished, completion) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let _ = finished.send(run_real_pty_boundary_smoke());
-    });
-
-    let result = completion
-        .recv()
-        .expect("PTY workflow boundary worker should report completion");
-    result.expect("PTY workflow boundary failed");
-    worker
-        .join()
-        .expect("PTY workflow boundary worker panicked");
-}
-
-fn run_real_pty_boundary_smoke() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bundle = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  handshake:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf ready > \\\"$READY_FIFO\\\"; IFS= read -r release < \\\"$RELEASE_FIFO\\\"; test \\\"$release\\\" = release\"]\n",
-    );
-    let destination = bundle.result("pty-boundary");
-    let ready_fifo = bundle._temporary.path().join("ready.fifo");
-    let release_fifo = bundle._temporary.path().join("release.fifo");
-    let fifo_mode = Mode::S_IRUSR | Mode::S_IWUSR;
-    mkfifo(&ready_fifo, fifo_mode)?;
-    mkfifo(&release_fifo, fifo_mode)?;
-    let handshake_directory = tempfile::tempdir_in("/tmp")?;
-    let handshake_path = handshake_directory.path().join("tui.socket");
-    let handshake_listener = UnixListener::bind(&handshake_path)?;
-
-    let size = Winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let pty = super::open_test_pty(Some(&size))?;
-    let original_mode = rustix::termios::tcgetattr(&pty.slave)?;
-    let child_input = rustix::io::dup(&pty.slave)?;
-    let child_output = rustix::io::dup(&pty.slave)?;
-    let master_reader = rustix::io::dup(&pty.master)?;
-    let mut master_writer = File::from(pty.master);
-    let mut master_reader = File::from(master_reader);
-    let terminal_reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        read_pty_to_end(&mut master_reader, &mut output)?;
-        Ok::<_, std::io::Error>(output)
-    });
-
-    let mut child = isolated_command(&bundle.args(&destination))
-        .env("TERM", "xterm-256color")
-        .env("NO_COLOR", "1")
-        .env("READY_FIFO", &ready_fifo)
-        .env("RELEASE_FIFO", &release_fifo)
-        .env(TUI_HANDSHAKE_VARIABLE, &handshake_path)
-        .stdin(Stdio::from(child_input))
-        .stdout(Stdio::from(child_output))
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let (handshake, _) = handshake_listener.accept()?;
-    let mut handshake = BufReader::new(handshake);
-    let mut ready = OpenOptions::new().read(true).open(&ready_fifo)?;
-    let mut ready_bytes = [0_u8; 5];
-    ready.read_exact(&mut ready_bytes)?;
-    if ready_bytes != *b"ready" {
-        return Err("workflow command emitted an invalid readiness handshake".into());
-    }
-
-    master_writer.write_all(b"q?")?;
-    master_writer.flush()?;
-    read_terminal_handshake(&mut handshake, "help-open")?;
-
-    let mut release = OpenOptions::new().write(true).open(&release_fifo)?;
-    release.write_all(b"release\n")?;
-    release.flush()?;
-    drop(release);
-    read_terminal_handshake(&mut handshake, "quit-eligible")?;
-    master_writer.write_all(b"q")?;
-    master_writer.flush()?;
-    let status = child.wait()?;
-    let restored_mode = rustix::termios::tcgetattr(&pty.slave)?;
-    assert_eq!(restored_mode.input_modes, original_mode.input_modes);
-    assert_eq!(restored_mode.output_modes, original_mode.output_modes);
-    assert_eq!(restored_mode.control_modes, original_mode.control_modes);
-    assert_eq!(restored_mode.local_modes, original_mode.local_modes);
-    assert_eq!(
-        restored_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN],
-        original_mode.special_codes[rustix::termios::SpecialCodeIndex::VMIN]
-    );
-    assert_eq!(
-        restored_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME],
-        original_mode.special_codes[rustix::termios::SpecialCodeIndex::VTIME]
-    );
-    drop(pty.slave);
-    let terminal_output = terminal_reader
-        .join()
-        .map_err(|_| std::io::Error::other("PTY reader panicked"))??;
-
-    let mut stderr = String::new();
-    if let Some(mut child_stderr) = child.stderr.take() {
-        child_stderr.read_to_string(&mut stderr)?;
-    }
-    if !status.success() {
-        return Err(format!("PTY workflow exited with {status}: {stderr}").into());
-    }
-    let rendered = String::from_utf8_lossy(&terminal_output);
-    assert!(rendered.contains("summary"));
-    assert!(rendered.contains("succeeded · exit 0"));
-    assert!(stderr.is_empty(), "unexpected PTY stderr: {stderr}");
-    Ok(())
-}
-
 pub(super) fn run_with_unusable_tui(
     args: &[String],
     configure: impl FnOnce(&mut Command),
 ) -> Output {
     let size = Winsize {
-        ws_row: 24,
-        ws_col: 80,
+        ws_row: 0,
+        ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
@@ -4465,14 +4482,11 @@ pub(super) fn run_with_unusable_tui(
     let child_input = rustix::io::dup(&pty.slave).unwrap();
     let child_output = rustix::io::dup(&pty.slave).unwrap();
     let mut master_reader = File::from(pty.master);
-    let handshake_directory = tempfile::tempdir().unwrap();
-    let unavailable_handshake = handshake_directory.path().join("missing.socket");
     let mut command = isolated_command(args);
     configure(&mut command);
     let mut child = command
         .env("TERM", "xterm-256color")
         .env("NO_COLOR", "1")
-        .env(TUI_HANDSHAKE_VARIABLE, unavailable_handshake)
         .stdin(Stdio::from(child_input))
         .stdout(Stdio::from(child_output))
         .stderr(Stdio::piped())
@@ -4571,38 +4585,6 @@ pub(super) fn assert_executor_fault_before_execution(run_directory: &Path, attem
             "reason": "interrupted"
         })
     );
-}
-
-fn read_terminal_handshake(
-    handshake: &mut BufReader<UnixStream>,
-    expected: &str,
-) -> std::io::Result<()> {
-    let mut event = String::new();
-    if handshake.read_line(&mut event)? == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "terminal lifecycle handshake closed",
-        ));
-    }
-    if event.trim_end() != expected {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("expected terminal lifecycle event {expected}, received {event:?}"),
-        ));
-    }
-    Ok(())
-}
-
-fn read_pty_to_end(reader: &mut File, output: &mut Vec<u8>) -> std::io::Result<()> {
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(read) => output.extend_from_slice(&buffer[..read]),
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 #[test]

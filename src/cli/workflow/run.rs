@@ -112,10 +112,7 @@ impl Command {
         })?;
         let presentation_config = self.presentation_config_with_input_plan(&input_plan);
         let cancellation = CancellationSource::new();
-        let signal_task = match start_signal_observation(cancellation.clone()) {
-            Ok(task) => task,
-            Err(error) => return Err(error.into()),
-        };
+        let signal_task = start_signal_observation(cancellation.clone(), UnixSignals::new()?);
 
         let inputs = match acquire_inputs(&input_plan, &cancellation).await {
             Ok(inputs) => inputs,
@@ -1376,30 +1373,47 @@ async fn read_stdin_bounded(
     result
 }
 
+pub(super) struct UnixSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl UnixSignals {
+    pub(super) fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("install local workflow interrupt observation")?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install local workflow termination observation")?,
+        })
+    }
+}
+
+pub(super) trait SignalEvents: Send + 'static {
+    fn next(&mut self) -> impl Future<Output = Option<CancellationReason>> + Send;
+}
+
+impl SignalEvents for UnixSignals {
+    async fn next(&mut self) -> Option<CancellationReason> {
+        tokio::select! {
+            biased;
+            signal = self.interrupt.recv() => signal.map(|()| CancellationReason::UserRequest),
+            signal = self.terminate.recv() => signal.map(|()| CancellationReason::TerminationRequest),
+        }
+    }
+}
+
 pub(super) fn start_signal_observation(
     cancellation: CancellationSource,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("install local workflow interrupt observation")?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("install local workflow termination observation")?;
-    Ok(tokio::spawn(async move {
-        loop {
-            let reason = tokio::select! {
-                biased;
-                signal = interrupt.recv() => signal.map(|()| CancellationReason::UserRequest),
-                signal = terminate.recv() => {
-                    signal.map(|()| CancellationReason::TerminationRequest)
-                }
-            };
-            let Some(reason) = reason else {
-                return;
-            };
+    mut signals: impl SignalEvents,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(reason) = signals.next().await {
             if handle_observed_signal(&cancellation, reason) {
                 return;
             }
         }
-    }))
+    })
 }
 
 fn handle_observed_signal(cancellation: &CancellationSource, reason: CancellationReason) -> bool {
@@ -1407,20 +1421,6 @@ fn handle_observed_signal(cancellation: &CancellationSource, reason: Cancellatio
         return false;
     }
     cancellation.finalization_cancellation_requested() && cancellation.request_force_abort()
-}
-
-#[cfg(test)]
-async fn observe_first_signal(
-    interrupt: impl Future<Output = ()> + Send,
-    terminate: impl Future<Output = ()> + Send,
-    cancellation: CancellationSource,
-) {
-    let reason = tokio::select! {
-        biased;
-        () = interrupt => CancellationReason::UserRequest,
-        () = terminate => CancellationReason::TerminationRequest,
-    };
-    cancellation.request_cancellation(reason);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2628,26 +2628,36 @@ mod tests {
     #[tokio::test]
     async fn injected_signals_map_once_to_the_closed_cancellation_reason() {
         let cancellation = CancellationSource::new();
-        let (interrupt_sender, interrupt) = tokio::sync::oneshot::channel::<()>();
-        let (terminate_sender, terminate) = tokio::sync::oneshot::channel::<()>();
-        let observer = tokio::spawn(observe_first_signal(
-            async move {
-                interrupt.await.unwrap();
-            },
-            async move {
-                terminate.await.unwrap();
-            },
-            cancellation.clone(),
-        ));
-
-        terminate_sender.send(()).unwrap();
+        struct InjectedSignals(tokio::sync::mpsc::UnboundedReceiver<CancellationReason>);
+        impl SignalEvents for InjectedSignals {
+            async fn next(&mut self) -> Option<CancellationReason> {
+                self.0.recv().await
+            }
+        }
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let observer = start_signal_observation(cancellation.clone(), InjectedSignals(receiver));
+        sender.send(CancellationReason::TerminationRequest).unwrap();
         assert_eq!(
             cancellation.wait_for_cancellation().await,
             CancellationReason::TerminationRequest
         );
-        observer.await.unwrap();
-        assert!(interrupt_sender.send(()).is_err());
         assert!(!cancellation.request_cancellation(CancellationReason::UserRequest));
+        drop(sender);
+        observer.await.unwrap();
+
+        let finalization = CancellationSource::new();
+        assert!(finalization.fixture_begin_finalization_arm());
+        assert!(finalization.fixture_complete_finalization_arm());
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let observer = start_signal_observation(finalization.clone(), InjectedSignals(receiver));
+        sender.send(CancellationReason::UserRequest).unwrap();
+        assert_eq!(
+            finalization.wait_for_cancellation().await,
+            CancellationReason::UserRequest
+        );
+        sender.send(CancellationReason::TerminationRequest).unwrap();
+        observer.await.unwrap();
+        assert!(!finalization.request_force_abort());
     }
 
     #[test]

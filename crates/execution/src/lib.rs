@@ -146,7 +146,10 @@ pub use workflow::step_runtime::{AgentExecution, StepFailureCause, WorkflowExecu
 pub use workflow::terminal_host::archived::{
     ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
 };
-pub use workflow::terminal_host::{TerminalHostExit, WorkflowTerminalHost};
+pub use workflow::terminal_host::{
+    HostInteraction, TerminalBoundary, TerminalHostExit, TerminalInputEvent,
+    TerminalLifecycleEvent, TerminalRect, WorkflowTerminalBoundary, WorkflowTerminalHost,
+};
 pub use workflow::validated::{
     ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, WorkflowNodeRole, WorkflowValueType,
 };
