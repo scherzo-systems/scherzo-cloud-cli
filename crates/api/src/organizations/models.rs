@@ -182,6 +182,7 @@ pub enum OrganizationAuditSubjectKind {
     LinearAuthorizationSession,
     LinearConnection,
     Project,
+    WebhookSubscription,
     RepositoryConnection,
     Assignment,
 }
@@ -952,6 +953,9 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             ),
             Kind::LinearConnection => (OrganizationAuditSubjectKind::LinearConnection, "lcn_"),
             Kind::Project => (OrganizationAuditSubjectKind::Project, "prj_"),
+            Kind::WebhookSubscription => {
+                (OrganizationAuditSubjectKind::WebhookSubscription, "whs_")
+            }
             Kind::RepositoryConnection => {
                 (OrganizationAuditSubjectKind::RepositoryConnection, "rpc_")
             }
@@ -975,6 +979,7 @@ impl From<models::OrganizationAuditChange> for OrganizationAuditChange {
             Field::Slug => "slug",
             Field::State => "state",
             Field::Mode => "mode",
+            Field::Version => "version",
             Field::RunnerPoolId => "runner_pool_id",
             Field::RepositoryConnectionId => "repository_connection_id",
             Field::ProviderRepositoryId => "provider_repository_id",

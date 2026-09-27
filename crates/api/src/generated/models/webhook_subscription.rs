@@ -17,80 +17,80 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunListItem {
+pub struct WebhookSubscription {
     #[serde(rename = "id")]
     pub id: String,
-    #[serde(rename = "displayName", deserialize_with = "Option::deserialize")]
-    pub display_name: Option<String>,
     #[serde(rename = "projectId")]
     pub project_id: String,
-    #[serde(rename = "workflowPath")]
-    pub workflow_path: String,
+    #[serde(rename = "url")]
+    pub url: String,
     #[serde(rename = "state")]
     pub state: State,
+    #[serde(rename = "version")]
+    pub version: i64,
+    #[serde(rename = "eventTypes")]
+    pub event_types: Vec<String>,
+    #[serde(rename = "workflowPaths", skip_serializing_if = "Option::is_none")]
+    pub workflow_paths: Option<Vec<String>>,
+    #[serde(rename = "steps", skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<models::WebhookStepSelector>>,
+    #[serde(rename = "contextKeys")]
+    pub context_keys: Vec<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
-    #[serde(rename = "integrationContext")]
-    pub integration_context: std::collections::HashMap<String, String>,
-    #[serde(rename = "placement", deserialize_with = "Option::deserialize")]
-    pub placement: Option<Box<models::RunPlacement>>,
+    #[serde(
+        rename = "previousKeyExpiresAt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub previous_key_expires_at: Option<String>,
+    /// Standard padded Base64 of 32 random bytes. Present only on the first successful create or rotation response. Decode before HMAC verification.
+    #[serde(rename = "secret", skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
-impl RunListItem {
+impl WebhookSubscription {
     pub fn new(
         id: String,
-        display_name: Option<String>,
         project_id: String,
-        workflow_path: String,
+        url: String,
         state: State,
+        version: i64,
+        event_types: Vec<String>,
+        context_keys: Vec<String>,
         created_at: String,
         updated_at: String,
-        integration_context: std::collections::HashMap<String, String>,
-        placement: Option<models::RunPlacement>,
-    ) -> RunListItem {
-        RunListItem {
+    ) -> WebhookSubscription {
+        WebhookSubscription {
             id,
-            display_name,
             project_id,
-            workflow_path,
+            url,
             state,
+            version,
+            event_types,
+            workflow_paths: None,
+            steps: None,
+            context_keys,
             created_at,
             updated_at,
-            integration_context,
-            placement: placement.map(Box::new),
+            previous_key_expires_at: None,
+            secret: None,
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum State {
-    #[serde(rename = "queued")]
-    Queued,
-    #[serde(rename = "assigning")]
-    Assigning,
-    #[serde(rename = "preparing")]
-    Preparing,
-    #[serde(rename = "assigned")]
-    Assigned,
-    #[serde(rename = "running")]
-    Running,
-    #[serde(rename = "cancelling")]
-    Cancelling,
-    #[serde(rename = "succeeded")]
-    Succeeded,
-    #[serde(rename = "failed")]
-    Failed,
-    #[serde(rename = "cancelled")]
-    Cancelled,
-    #[serde(rename = "interrupted")]
-    Interrupted,
-    #[serde(rename = "rejected")]
-    Rejected,
+    #[serde(rename = "enabled")]
+    Enabled,
+    #[serde(rename = "disabled")]
+    Disabled,
+    #[serde(rename = "deleted")]
+    Deleted,
 }
 
 impl Default for State {
     fn default() -> State {
-        Self::Queued
+        Self::Enabled
     }
 }

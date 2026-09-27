@@ -193,6 +193,30 @@ mod tests {
     use scherzo_cloud_test_support::ScriptedHttpServer;
 
     #[test]
+    fn generated_webhook_response_preserves_secret_once_and_complete_selectors() {
+        let body = serde_json::json!({
+            "id":"whs_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "projectId":"prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "url":"https://receiver.example.test/hook", "state":"enabled", "version":1,
+            "eventTypes":["step.failed"], "workflowPaths":["workflows/build.yaml"],
+            "steps":[{"scope":["outer"], "role":"step", "id":"publish"}],
+            "contextKeys":["team"], "createdAt":"2026-08-04T12:00:00Z",
+            "updatedAt":"2026-08-04T12:00:00Z",
+            "secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        });
+        let created: generated::models::WebhookSubscription =
+            serde_json::from_value(body.clone()).expect("generated create response");
+        assert_eq!(created.version, 1);
+        assert!(created.secret.is_some());
+        assert_eq!(created.steps.unwrap()[0].scope, vec!["outer"]);
+        let mut replay = body;
+        replay.as_object_mut().unwrap().remove("secret");
+        let decoded: generated::models::WebhookSubscription =
+            serde_json::from_value(replay).expect("generated replay response");
+        assert!(decoded.secret.is_none());
+    }
+
+    #[test]
     fn generated_problem_preserves_opaque_actions() {
         let input = serde_json::json!({
             "type": "https://api.scherzo.dev/problems/principal-not-provisioned",

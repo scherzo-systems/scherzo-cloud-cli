@@ -463,6 +463,7 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
         OrganizationAuditSubjectKind::RunnerCredential => "runner_credential",
         OrganizationAuditSubjectKind::GithubInstallation => "github_installation",
         OrganizationAuditSubjectKind::Project => "project",
+        OrganizationAuditSubjectKind::WebhookSubscription => "webhook_subscription",
         OrganizationAuditSubjectKind::RepositoryConnection => "repository_connection",
         OrganizationAuditSubjectKind::Assignment => "assignment",
         OrganizationAuditSubjectKind::LinearAuthorizationSession => "linear_authorization_session",

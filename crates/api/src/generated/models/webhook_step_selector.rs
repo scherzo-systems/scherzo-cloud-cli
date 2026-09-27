@@ -17,26 +17,30 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LinearIntegrationContextSourceOneOf {
-    #[serde(rename = "type")]
-    pub r#type: Type,
-    #[serde(rename = "value")]
-    pub value: String,
+pub struct WebhookStepSelector {
+    #[serde(rename = "scope")]
+    pub scope: Vec<String>,
+    #[serde(rename = "role")]
+    pub role: Role,
+    #[serde(rename = "id")]
+    pub id: String,
 }
 
-impl LinearIntegrationContextSourceOneOf {
-    pub fn new(r#type: Type, value: String) -> LinearIntegrationContextSourceOneOf {
-        LinearIntegrationContextSourceOneOf { r#type, value }
+impl WebhookStepSelector {
+    pub fn new(scope: Vec<String>, role: Role, id: String) -> WebhookStepSelector {
+        WebhookStepSelector { scope, role, id }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Type {
-    #[serde(rename = "literal")]
-    Literal,
+pub enum Role {
+    #[serde(rename = "step")]
+    Step,
+    #[serde(rename = "finalizer")]
+    Finalizer,
 }
 
-impl Default for Type {
-    fn default() -> Type {
-        Self::Literal
+impl Default for Role {
+    fn default() -> Role {
+        Self::Step
     }
 }

@@ -18,27 +18,10 @@ use crate::generated::{apis::ResponseContent, models};
 use reqwest;
 use serde::{Deserialize, Serialize, de::Error as _};
 
-/// struct for typed errors of method [`create_run`]
+/// struct for typed errors of method [`create_webhook_subscription`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum CreateRunError {
-    Status400(models::Problem),
-    Status401(models::Problem),
-    Status403(models::Problem),
-    Status404(models::Problem),
-    Status409(models::Problem),
-    Status410(models::RunInputProblem),
-    Status413(models::Problem),
-    Status415(models::Problem),
-    Status500(models::Problem),
-    Status503(models::RunInputProblem),
-    UnknownValue(serde_json::Value),
-}
-
-/// struct for typed errors of method [`get_run`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum GetRunError {
+pub enum CreateWebhookSubscriptionError {
     Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
@@ -48,65 +31,89 @@ pub enum GetRunError {
     UnknownValue(serde_json::Value),
 }
 
-/// struct for typed errors of method [`get_run_cancellation_request`]
+/// struct for typed errors of method [`delete_webhook_subscription`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum GetRunCancellationRequestError {
-    Status400(models::Problem),
-    Status401(models::Problem),
-    Status403(models::Problem),
-    Status404(models::Problem),
-    Status429(models::Problem),
-    Status500(models::Problem),
-    Status503(models::Problem),
-    UnknownValue(serde_json::Value),
-}
-
-/// struct for typed errors of method [`list_runs`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ListRunsError {
-    Status400(models::Problem),
-    Status401(models::Problem),
-    Status403(models::Problem),
-    Status404(models::Problem),
-    Status500(models::Problem),
-    UnknownValue(serde_json::Value),
-}
-
-/// struct for typed errors of method [`request_run_cancellation`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RequestRunCancellationError {
+pub enum DeleteWebhookSubscriptionError {
     Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
-    Status413(models::Problem),
-    Status415(models::Problem),
-    Status429(models::Problem),
     Status500(models::Problem),
-    Status503(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
-/// Resolves the selected project's default branch or the exact supplied branch to one SHA-1 commit, obtains the pinned repository bytes, and resolves the Workflow Format V1 source closure before enqueueing the coordinator command. The idempotency fingerprint covers only normalized caller inputs; completed or pending exact retries retain the original pin.
-pub fn create_run(
+/// struct for typed errors of method [`disable_webhook_subscription`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DisableWebhookSubscriptionError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`enable_webhook_subscription`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EnableWebhookSubscriptionError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`revoke_previous_webhook_secret`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokePreviousWebhookSecretError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`rotate_webhook_secret`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RotateWebhookSecretError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+pub fn create_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
+    project_id: &str,
     idempotency_key: &str,
-    create_run_request: models::CreateRunRequest,
-) -> Result<models::RunCreationAcceptance, Error<CreateRunError>> {
+    create_webhook_subscription_request: models::CreateWebhookSubscriptionRequest,
+) -> Result<models::WebhookSubscription, Error<CreateWebhookSubscriptionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
     let p_header_idempotency_key = idempotency_key;
-    let p_body_create_run_request = create_run_request;
+    let p_body_create_webhook_subscription_request = create_webhook_subscription_request;
 
     let uri_str = format!(
-        "{}/v1/organizations/{organizationRef}/runs",
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/webhooks",
         configuration.base_path,
-        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref)
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id)
     );
     let mut req_builder = configuration
         .client
@@ -119,7 +126,7 @@ pub fn create_run(
     if let Some(ref token) = configuration.bearer_access_token {
         req_builder = req_builder.bearer_auth(token.to_owned());
     };
-    req_builder = req_builder.json(&p_body_create_run_request);
+    req_builder = req_builder.json(&p_body_create_webhook_subscription_request);
 
     let req = req_builder.build()?;
     let resp = configuration.client.execute(req)?;
@@ -138,18 +145,18 @@ pub fn create_run(
             ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
             ContentType::Text => {
                 return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::RunCreationAcceptance`",
+                    "Received `text/plain` content type response that cannot be converted to `models::WebhookSubscription`",
                 )));
             }
             ContentType::Unsupported(unknown_type) => {
                 return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunCreationAcceptance`"
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::WebhookSubscription`"
                 ))));
             }
         }
     } else {
         let content = resp.text()?;
-        let entity: Option<CreateRunError> = serde_json::from_str(&content).ok();
+        let entity: Option<CreateWebhookSubscriptionError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -158,255 +165,75 @@ pub fn create_run(
     }
 }
 
-pub fn get_run(
+pub fn delete_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
-    run_id: &str,
-) -> Result<models::Run, Error<GetRunError>> {
-    // add a prefix to parameters to efficiently prevent name collisions
-    let p_path_organization_ref = organization_ref;
-    let p_path_run_id = run_id;
-
-    let uri_str = format!(
-        "{}/v1/organizations/{organizationRef}/runs/{runId}",
-        configuration.base_path,
-        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
-        runId = crate::generated::apis::urlencode(p_path_run_id)
-    );
-    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
-
-    if let Some(ref user_agent) = configuration.user_agent {
-        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
-    }
-    if let Some(ref token) = configuration.bearer_access_token {
-        req_builder = req_builder.bearer_auth(token.to_owned());
-    };
-
-    let req = req_builder.build()?;
-    let resp = configuration.client.execute(req)?;
-
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    let content_type = super::ContentType::from(content_type);
-
-    if !status.is_client_error() && !status.is_server_error() {
-        let content = resp.text()?;
-        match content_type {
-            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
-            ContentType::Text => {
-                return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::Run`",
-                )));
-            }
-            ContentType::Unsupported(unknown_type) => {
-                return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::Run`"
-                ))));
-            }
-        }
-    } else {
-        let content = resp.text()?;
-        let entity: Option<GetRunError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
-    }
-}
-
-pub fn get_run_cancellation_request(
-    configuration: &configuration::Configuration,
-    organization_ref: &str,
-    run_id: &str,
-    request_id: &str,
-) -> Result<models::RunCancellationEnvelope, Error<GetRunCancellationRequestError>> {
-    // add a prefix to parameters to efficiently prevent name collisions
-    let p_path_organization_ref = organization_ref;
-    let p_path_run_id = run_id;
-    let p_path_request_id = request_id;
-
-    let uri_str = format!(
-        "{}/v1/organizations/{organizationRef}/runs/{runId}/cancellation-requests/{requestId}",
-        configuration.base_path,
-        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
-        runId = crate::generated::apis::urlencode(p_path_run_id),
-        requestId = crate::generated::apis::urlencode(p_path_request_id)
-    );
-    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
-
-    if let Some(ref user_agent) = configuration.user_agent {
-        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
-    }
-    if let Some(ref token) = configuration.bearer_access_token {
-        req_builder = req_builder.bearer_auth(token.to_owned());
-    };
-
-    let req = req_builder.build()?;
-    let resp = configuration.client.execute(req)?;
-
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    let content_type = super::ContentType::from(content_type);
-
-    if !status.is_client_error() && !status.is_server_error() {
-        let content = resp.text()?;
-        match content_type {
-            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
-            ContentType::Text => {
-                return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::RunCancellationEnvelope`",
-                )));
-            }
-            ContentType::Unsupported(unknown_type) => {
-                return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunCancellationEnvelope`"
-                ))));
-            }
-        }
-    } else {
-        let content = resp.text()?;
-        let entity: Option<GetRunCancellationRequestError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
-    }
-}
-
-/// Requires the same active organization membership as getRun. Results are ordered by createdAt descending, then run ID descending. All filters are conjunctive. Repeat integrationContext for multiple exact key=value matches; split at the first equals sign. Context keys and values are private and must not be logged. A cursor is opaque and bound to the organization and exact filters. Run creation requests still pending materialization are not listed.
-pub fn list_runs(
-    configuration: &configuration::Configuration,
-    organization_ref: &str,
-    limit: Option<i32>,
-    cursor: Option<&str>,
-    project_id: Option<&str>,
-    state_group: Option<&str>,
-    created_after: Option<String>,
-    integration_context: Option<Vec<String>>,
-) -> Result<models::RunList, Error<ListRunsError>> {
-    // add a prefix to parameters to efficiently prevent name collisions
-    let p_path_organization_ref = organization_ref;
-    let p_query_limit = limit;
-    let p_query_cursor = cursor;
-    let p_query_project_id = project_id;
-    let p_query_state_group = state_group;
-    let p_query_created_after = created_after;
-    let p_query_integration_context = integration_context;
-
-    let uri_str = format!(
-        "{}/v1/organizations/{organizationRef}/runs",
-        configuration.base_path,
-        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref)
-    );
-    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
-
-    if let Some(ref param_value) = p_query_limit {
-        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
-    }
-    if let Some(ref param_value) = p_query_cursor {
-        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
-    }
-    if let Some(ref param_value) = p_query_project_id {
-        req_builder = req_builder.query(&[("projectId", &param_value.to_string())]);
-    }
-    if let Some(ref param_value) = p_query_state_group {
-        req_builder = req_builder.query(&[("stateGroup", &param_value.to_string())]);
-    }
-    if let Some(ref param_value) = p_query_created_after {
-        req_builder = req_builder.query(&[("createdAfter", &param_value.to_string())]);
-    }
-    if let Some(ref param_value) = p_query_integration_context {
-        req_builder = match "multi" {
-            "multi" => req_builder.query(
-                &param_value
-                    .iter()
-                    .map(|p| ("integrationContext".to_owned(), p.to_string()))
-                    .collect::<Vec<(std::string::String, std::string::String)>>(),
-            ),
-            _ => req_builder.query(&[(
-                "integrationContext",
-                &param_value
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<String>>()
-                    .join(",")
-                    .to_string(),
-            )]),
-        };
-    }
-    if let Some(ref user_agent) = configuration.user_agent {
-        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
-    }
-    if let Some(ref token) = configuration.bearer_access_token {
-        req_builder = req_builder.bearer_auth(token.to_owned());
-    };
-
-    let req = req_builder.build()?;
-    let resp = configuration.client.execute(req)?;
-
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    let content_type = super::ContentType::from(content_type);
-
-    if !status.is_client_error() && !status.is_server_error() {
-        let content = resp.text()?;
-        match content_type {
-            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
-            ContentType::Text => {
-                return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::RunList`",
-                )));
-            }
-            ContentType::Unsupported(unknown_type) => {
-                return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunList`"
-                ))));
-            }
-        }
-    } else {
-        let content = resp.text()?;
-        let entity: Option<ListRunsError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
-    }
-}
-
-/// Acceptance does not confirm execution stopped. Exact same-key replay returns the original status, headers, and snapshot; a new key may escalate to force. Membership is checked again on replay. A terminal run is a resolved no-op.
-pub fn request_run_cancellation(
-    configuration: &configuration::Configuration,
-    organization_ref: &str,
-    run_id: &str,
+    project_id: &str,
+    webhook_id: &str,
     idempotency_key: &str,
-    run_cancellation_request: models::RunCancellationRequest,
-) -> Result<models::RunCancellationEnvelope, Error<RequestRunCancellationError>> {
+) -> Result<(), Error<DeleteWebhookSubscriptionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
-    let p_path_run_id = run_id;
+    let p_path_project_id = project_id;
+    let p_path_webhook_id = webhook_id;
     let p_header_idempotency_key = idempotency_key;
-    let p_body_run_cancellation_request = run_cancellation_request;
 
     let uri_str = format!(
-        "{}/v1/organizations/{organizationRef}/runs/{runId}/cancellation-requests",
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/webhooks/{webhookId}",
         configuration.base_path,
         organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
-        runId = crate::generated::apis::urlencode(p_path_run_id)
+        projectId = crate::generated::apis::urlencode(p_path_project_id),
+        webhookId = crate::generated::apis::urlencode(p_path_webhook_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<DeleteWebhookSubscriptionError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+pub fn disable_webhook_subscription(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    webhook_id: &str,
+    idempotency_key: &str,
+) -> Result<models::WebhookSubscription, Error<DisableWebhookSubscriptionError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_path_webhook_id = webhook_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/webhooks/{webhookId}/disable",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id),
+        webhookId = crate::generated::apis::urlencode(p_path_webhook_id)
     );
     let mut req_builder = configuration
         .client
@@ -419,7 +246,6 @@ pub fn request_run_cancellation(
     if let Some(ref token) = configuration.bearer_access_token {
         req_builder = req_builder.bearer_auth(token.to_owned());
     };
-    req_builder = req_builder.json(&p_body_run_cancellation_request);
 
     let req = req_builder.build()?;
     let resp = configuration.client.execute(req)?;
@@ -438,18 +264,225 @@ pub fn request_run_cancellation(
             ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
             ContentType::Text => {
                 return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::RunCancellationEnvelope`",
+                    "Received `text/plain` content type response that cannot be converted to `models::WebhookSubscription`",
                 )));
             }
             ContentType::Unsupported(unknown_type) => {
                 return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunCancellationEnvelope`"
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::WebhookSubscription`"
                 ))));
             }
         }
     } else {
         let content = resp.text()?;
-        let entity: Option<RequestRunCancellationError> = serde_json::from_str(&content).ok();
+        let entity: Option<DisableWebhookSubscriptionError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+pub fn enable_webhook_subscription(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    webhook_id: &str,
+    idempotency_key: &str,
+) -> Result<models::WebhookSubscription, Error<EnableWebhookSubscriptionError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_path_webhook_id = webhook_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/webhooks/{webhookId}/enable",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id),
+        webhookId = crate::generated::apis::urlencode(p_path_webhook_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::WebhookSubscription`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::WebhookSubscription`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<EnableWebhookSubscriptionError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+pub fn revoke_previous_webhook_secret(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    webhook_id: &str,
+    idempotency_key: &str,
+) -> Result<models::WebhookSubscription, Error<RevokePreviousWebhookSecretError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_path_webhook_id = webhook_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/webhooks/{webhookId}/revoke-previous-secret",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id),
+        webhookId = crate::generated::apis::urlencode(p_path_webhook_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::WebhookSubscription`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::WebhookSubscription`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokePreviousWebhookSecretError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+pub fn rotate_webhook_secret(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    webhook_id: &str,
+    idempotency_key: &str,
+) -> Result<models::WebhookSubscription, Error<RotateWebhookSecretError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_path_webhook_id = webhook_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/webhooks/{webhookId}/rotate-secret",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id),
+        webhookId = crate::generated::apis::urlencode(p_path_webhook_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::WebhookSubscription`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::WebhookSubscription`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RotateWebhookSecretError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
