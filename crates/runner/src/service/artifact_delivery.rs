@@ -268,6 +268,32 @@ enum RetryAction {
 }
 
 impl ArtifactDeliveryBroker {
+    pub(super) fn record_preparation_failure(
+        &self,
+        run_id: &str,
+        assignment_id: &str,
+        attempt_id: &str,
+        details: impl IntoIterator<Item = KeyValue>,
+    ) {
+        if let Some(recorder) = &self.recorder {
+            recorder.record(
+                "runner.artifact_preparation_failed",
+                [
+                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.to_owned()),
+                    KeyValue::new(
+                        telemetry::attribute::ASSIGNMENT_ID,
+                        assignment_id.to_owned(),
+                    ),
+                    KeyValue::new(telemetry::attribute::ATTEMPT_ID, attempt_id.to_owned()),
+                    KeyValue::new(telemetry::attribute::ARTIFACT_OPERATION, "preparation"),
+                    KeyValue::new(telemetry::attribute::ARTIFACT_FAILURE_ORIGIN, "runner"),
+                ]
+                .into_iter()
+                .chain(details),
+            );
+        }
+    }
+
     pub(super) fn new(
         outbox: ObservationOutbox,
         sleeper: Arc<dyn Sleeper>,
@@ -1223,6 +1249,59 @@ mod tests {
             "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
             Arc::from(&b"{}"[..]),
         )
+    }
+
+    #[test]
+    fn preparation_failure_is_correlated_without_artifact_contents() {
+        let (recorder, capture) = telemetry::test_recorder("artifact-test");
+        let (sleeper, _) = controlled_sleeper();
+        let broker =
+            ArtifactDeliveryBroker::new(ObservationOutbox::new(), sleeper, true, Some(recorder));
+        broker.record_preparation_failure(
+            "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abh",
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abk",
+            [
+                KeyValue::new(
+                    telemetry::attribute::ARTIFACT_PREPARATION_STAGE,
+                    "result_publication",
+                ),
+                KeyValue::new(
+                    telemetry::attribute::ARTIFACT_RESULT_INVARIANT,
+                    "step_metadata",
+                ),
+                KeyValue::new(
+                    telemetry::attribute::ARTIFACT_FAILURE_CODE,
+                    "publication_failed",
+                ),
+            ],
+        );
+
+        let records = capture.records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["event.name"], "runner.artifact_preparation_failed");
+        assert_eq!(
+            record[telemetry::attribute::RUN_ID],
+            "run_01k0z6r1w8f4jy2m7q9v3x5abc"
+        );
+        assert_eq!(
+            record[telemetry::attribute::ARTIFACT_PREPARATION_STAGE],
+            "result_publication"
+        );
+        assert_eq!(
+            record[telemetry::attribute::ARTIFACT_RESULT_INVARIANT],
+            "step_metadata"
+        );
+        assert_eq!(
+            record[telemetry::attribute::ARTIFACT_OPERATION],
+            "preparation"
+        );
+        assert_eq!(
+            record[telemetry::attribute::ARTIFACT_FAILURE_CODE],
+            "publication_failed"
+        );
+        assert!(!record.contains_key(telemetry::attribute::WORKSPACE_PATH));
     }
 
     #[tokio::test]

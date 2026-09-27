@@ -48,6 +48,12 @@ pub(crate) mod attribute {
     pub(crate) const ARTIFACT_MEMBER: &str = "scherzo.artifact.member";
     pub(crate) const ARTIFACT_FAILURE_ORIGIN: &str = "scherzo.artifact.failure_origin";
     pub(crate) const ARTIFACT_FAILURE_CODE: &str = "scherzo.artifact.failure_code";
+    pub(crate) const ARTIFACT_PREPARATION_STAGE: &str = "scherzo.artifact.preparation_stage";
+    pub(crate) const ARTIFACT_PUBLICATION_PHASE: &str = "scherzo.artifact.publication_phase";
+    pub(crate) const ARTIFACT_PUBLICATION_KIND: &str = "scherzo.artifact.publication_kind";
+    pub(crate) const ARTIFACT_RESULT_INVARIANT: &str = "scherzo.artifact.result_invariant";
+    pub(crate) const ARTIFACT_MEMBER_INDEX: &str = "scherzo.artifact.member_index";
+    pub(crate) const ARTIFACT_NODE_ID: &str = "scherzo.artifact.node_id";
     pub(crate) const PROTOCOL_REQUEST_MESSAGE_ID: &str = "scherzo.protocol.request_message_id";
     pub(crate) const ASSIGNMENT_PREPARATION_PHASE: &str = "scherzo.assignment.preparation_phase";
     pub(crate) const OWNED_PROCESSES_STOPPED: &str = "scherzo.teardown.owned_processes_stopped";

@@ -413,6 +413,37 @@ impl LocalPublicationError {
         self.invariant
     }
 
+    /// Stable, content-free details for operator diagnostics. In particular, these
+    /// omit the export name, which comes from the workflow definition.
+    pub fn diagnostic_codes(&self) -> (&'static str, &'static str, Option<&'static str>) {
+        let phase = match self.phase {
+            LocalPublicationPhase::TargetValidation => "target_validation",
+            LocalPublicationPhase::Staging => "staging",
+            LocalPublicationPhase::ExportCopy => "export_copy",
+            LocalPublicationPhase::Serialization => "serialization",
+            LocalPublicationPhase::Close => "close",
+            LocalPublicationPhase::Verification => "verification",
+            LocalPublicationPhase::Commit => "commit",
+        };
+        let kind = match self.kind {
+            LocalPublicationFailureKind::InvalidResultPath => "invalid_result_path",
+            LocalPublicationFailureKind::ParentUnavailable => "parent_unavailable",
+            LocalPublicationFailureKind::DestinationExists => "destination_exists",
+            LocalPublicationFailureKind::StagingUnavailable => "staging_unavailable",
+            LocalPublicationFailureKind::CarrierHandoffUnavailable => "carrier_handoff_unavailable",
+            LocalPublicationFailureKind::ExportWriteUnavailable => "export_write_unavailable",
+            LocalPublicationFailureKind::UnsupportedExport => "unsupported_export",
+            LocalPublicationFailureKind::InvalidRunResult => "invalid_run_result",
+            LocalPublicationFailureKind::ResultConflict => "result_conflict",
+            LocalPublicationFailureKind::SerializationUnavailable => "serialization_unavailable",
+            LocalPublicationFailureKind::VerificationUnavailable => "verification_unavailable",
+            LocalPublicationFailureKind::AtomicPublicationUnavailable => {
+                "atomic_publication_unavailable"
+            }
+        };
+        (phase, kind, self.invariant.map(RunResultInvariant::as_str))
+    }
+
     fn new(phase: LocalPublicationPhase, kind: LocalPublicationFailureKind) -> Self {
         Self {
             phase,

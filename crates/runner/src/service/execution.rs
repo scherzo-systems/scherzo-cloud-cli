@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::FutureExt as _;
+use opentelemetry::KeyValue;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -27,6 +28,7 @@ use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
 };
 use super::workspace::{RetentionReason, WorkspaceDisposition};
+use crate::telemetry;
 use scherzo_cloud_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
     AgentInputStaging, ArtifactStaging, AuthenticatedProcessGroup, CancellationReason,
@@ -417,6 +419,24 @@ pub(super) struct ExecutionJob {
     start_authority: tokio::sync::watch::Receiver<bool>,
     infrastructure_interruption: tokio::sync::watch::Receiver<Option<InfrastructureInterruption>>,
     workspace_release_reported: AtomicBool,
+}
+
+struct RunnerResultFailure {
+    code: &'static str,
+    node: Option<String>,
+}
+
+impl RunnerResultFailure {
+    fn new(code: &'static str) -> Self {
+        Self { code, node: None }
+    }
+
+    fn for_node(code: &'static str, node: &str) -> Self {
+        Self {
+            code,
+            node: Some(node.to_owned()),
+        }
+    }
 }
 
 impl ExecutionJob {
@@ -898,36 +918,81 @@ impl ExecutionJob {
         }
 
         let finished_at = RunnerExecutionClock.now();
-        let prepared = self
-            .runner_result(
-                &diagnostics,
-                result.clone(),
-                &observer,
-                started_at,
-                finished_at,
-            )
-            .and_then(|run| {
-                prepare_cloud_workflow_result(
-                    &run,
-                    self.accepted.project_id().to_owned(),
-                    self.accepted.repository_connection_id().to_owned(),
-                    self.accepted.source_object_format().to_owned(),
-                    self.accepted.source_commit_oid().to_owned(),
-                    self.accepted.source_display_snapshot().map(|snapshot| {
-                        CloudSourceDisplaySnapshotV1 {
-                            organization_display_name: snapshot.organization_display_name.clone(),
-                            project_name: snapshot.project_name.clone(),
-                            repository: CloudSourceDisplayRepositoryV1 {
-                                provider_kind: snapshot.repository.provider_kind.clone(),
-                                full_name: snapshot.repository.full_name.clone(),
-                            },
-                        }
-                    }),
-                )
-                .ok()
-            });
+        let prepared = match self.runner_result(
+            &diagnostics,
+            result.clone(),
+            &observer,
+            started_at,
+            finished_at,
+        ) {
+            Ok(run) => match prepare_cloud_workflow_result(
+                &run,
+                self.accepted.project_id().to_owned(),
+                self.accepted.repository_connection_id().to_owned(),
+                self.accepted.source_object_format().to_owned(),
+                self.accepted.source_commit_oid().to_owned(),
+                self.accepted.source_display_snapshot().map(|snapshot| {
+                    CloudSourceDisplaySnapshotV1 {
+                        organization_display_name: snapshot.organization_display_name.clone(),
+                        project_name: snapshot.project_name.clone(),
+                        repository: CloudSourceDisplayRepositoryV1 {
+                            provider_kind: snapshot.repository.provider_kind.clone(),
+                            full_name: snapshot.repository.full_name.clone(),
+                        },
+                    }
+                }),
+            ) {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    let (phase, kind, invariant) = error.diagnostic_codes();
+                    let mut details = vec![
+                        KeyValue::new(telemetry::attribute::ARTIFACT_PUBLICATION_PHASE, phase),
+                        KeyValue::new(telemetry::attribute::ARTIFACT_PUBLICATION_KIND, kind),
+                    ];
+                    if let Some(invariant) = invariant {
+                        details.push(KeyValue::new(
+                            telemetry::attribute::ARTIFACT_RESULT_INVARIANT,
+                            invariant,
+                        ));
+                    }
+                    self.record_preparation_failure(
+                        "result_publication",
+                        "publication_failed",
+                        details,
+                    );
+                    None
+                }
+            },
+            Err(failure) => {
+                let mut details = Vec::new();
+                if let Some(node) = failure.node {
+                    details.push(KeyValue::new(telemetry::attribute::ARTIFACT_NODE_ID, node));
+                }
+                self.record_preparation_failure("runner_result", failure.code, details);
+                None
+            }
+        };
         let carriers_ready = match &prepared {
-            Some(prepared) => verify_prepared_carriers(&artifacts, prepared).await,
+            Some(prepared) => match verify_prepared_carriers(&artifacts, prepared).await {
+                Ok(()) => true,
+                Err(failure) => {
+                    self.record_preparation_failure(
+                        "carrier_verification",
+                        failure.code,
+                        failure
+                            .member_index
+                            .map(|index| {
+                                KeyValue::new(
+                                    telemetry::attribute::ARTIFACT_MEMBER_INDEX,
+                                    telemetry::integer(index),
+                                )
+                            })
+                            .into_iter()
+                            .collect(),
+                    );
+                    false
+                }
+            },
             None => false,
         };
         let delivery = match (prepared, carriers_ready) {
@@ -1079,6 +1144,25 @@ impl ExecutionJob {
         )
     }
 
+    fn record_preparation_failure(
+        &self,
+        stage: &'static str,
+        code: &'static str,
+        details: Vec<KeyValue>,
+    ) {
+        self.artifact_delivery.record_preparation_failure(
+            self.accepted.run_id(),
+            self.accepted.assignment_id(),
+            self.accepted.attempt_id(),
+            [
+                KeyValue::new(telemetry::attribute::ARTIFACT_PREPARATION_STAGE, stage),
+                KeyValue::new(telemetry::attribute::ARTIFACT_FAILURE_CODE, code),
+            ]
+            .into_iter()
+            .chain(details),
+        );
+    }
+
     fn runner_result(
         &self,
         diagnostics: &StepDiagnosticLog,
@@ -1086,19 +1170,29 @@ impl ExecutionJob {
         observer: &RunnerExecutionObserver,
         started_at: RunnerExecutionInstant,
         finished_at: RunnerExecutionInstant,
-    ) -> Option<WorkflowRunResult> {
+    ) -> Result<WorkflowRunResult, RunnerResultFailure> {
         let workflow = self.accepted.admitted.workflow();
         let cancellation =
-            observed_workflow_cancellation(&execution.outcome, observer.cancellation())?;
+            observed_workflow_cancellation(&execution.outcome, observer.cancellation())
+                .ok_or_else(|| RunnerResultFailure::new("cancellation_inconsistent"))?;
         let mut states = execution.steps;
         let mut recoveries = execution.recoveries;
         let mut steps = Vec::with_capacity(states.len());
         for id in &workflow.definition.presentation_order {
-            let state = states.remove(id)?;
-            let recovery_state = recoveries.remove(id)?;
-            let recovery = step_recovery_summary_v1(recovery_state.as_ref()).ok()?;
+            let state = states
+                .remove(id)
+                .ok_or_else(|| RunnerResultFailure::for_node("step_state_missing", id))?;
+            let recovery_state = recoveries
+                .remove(id)
+                .ok_or_else(|| RunnerResultFailure::for_node("step_recovery_missing", id))?;
+            let recovery = step_recovery_summary_v1(recovery_state.as_ref())
+                .map_err(|_| RunnerResultFailure::for_node("recovery_summary_invalid", id))?;
             let (kind, failure_policy) =
-                workflow_step_kind_policy(workflow.definition.steps.get(id)?);
+                workflow_step_kind_policy(
+                    workflow.definition.steps.get(id).ok_or_else(|| {
+                        RunnerResultFailure::for_node("step_definition_missing", id)
+                    })?,
+                );
             steps.push(WorkflowRunStep {
                 id: id.clone(),
                 role: WorkflowNodeRole::Step,
@@ -1126,17 +1220,35 @@ impl ExecutionJob {
                     .collect::<BTreeMap<_, _>>();
                 let mut finalizers = Vec::with_capacity(summarized.len());
                 for id in &workflow.definition.finalizer_presentation_order {
-                    let state = states.remove(id)?;
-                    let summary = summarized.remove(id)?;
-                    let finalizer = workflow.definition.finalizers.get(id)?;
+                    let state = states.remove(id).ok_or_else(|| {
+                        RunnerResultFailure::for_node("finalizer_state_missing", id)
+                    })?;
+                    let summary = summarized.remove(id).ok_or_else(|| {
+                        RunnerResultFailure::for_node("finalizer_summary_missing", id)
+                    })?;
+                    let finalizer = workflow.definition.finalizers.get(id).ok_or_else(|| {
+                        RunnerResultFailure::for_node("finalizer_definition_missing", id)
+                    })?;
                     let (kind, failure_policy) = workflow_step_kind_policy(&finalizer.body);
                     if summary.failure_policy != failure_policy
                         || !summary_disposition_matches(&summary.disposition, &state)
                     {
-                        return None;
+                        return Err(RunnerResultFailure::for_node(
+                            "finalizer_disposition_mismatch",
+                            id,
+                        ));
                     }
-                    if recoveries.remove(id)?.is_some() {
-                        return None;
+                    if recoveries
+                        .remove(id)
+                        .ok_or_else(|| {
+                            RunnerResultFailure::for_node("finalizer_recovery_missing", id)
+                        })?
+                        .is_some()
+                    {
+                        return Err(RunnerResultFailure::for_node(
+                            "finalizer_recovery_unexpected",
+                            id,
+                        ));
                     }
                     finalizers.push(WorkflowRunStep {
                         id: id.clone(),
@@ -1153,7 +1265,7 @@ impl ExecutionJob {
                     });
                 }
                 if !summarized.is_empty() {
-                    return None;
+                    return Err(RunnerResultFailure::new("finalizer_summary_unconsumed"));
                 }
                 Some(WorkflowRunFinalization {
                     trigger: summary.trigger,
@@ -1167,12 +1279,14 @@ impl ExecutionJob {
                     force_abort: summary.force_abort,
                 })
             }
-            (true, Some(_)) | (false, None) => return None,
+            (true, Some(_)) | (false, None) => {
+                return Err(RunnerResultFailure::new("finalization_shape_mismatch"));
+            }
         };
         if !states.is_empty() || !recoveries.is_empty() {
-            return None;
+            return Err(RunnerResultFailure::new("step_state_unconsumed"));
         }
-        Some(WorkflowRunResult {
+        Ok(WorkflowRunResult {
             run_directory: self.accepted.root.private.path().to_owned(),
             attempt_number: self.accepted.attempt_number,
             continuation: None,
@@ -1286,13 +1400,25 @@ impl ExecutionJob {
                     Err(RenewalRequestFailure::LeaseClock) => {
                         return Err(LeaseClockError::ClockUnavailable);
                     }
-                    Err(RenewalRequestFailure::Outbox | RenewalRequestFailure::Sequence) => {
+                    Err(RenewalRequestFailure::Outbox) => {
+                        self.record_preparation_failure(
+                            "delivery_wait",
+                            "lease_renewal_outbox_failed",
+                            Vec::new(),
+                        );
+                        return Ok(internal_delivery_failure("preparation"));
+                    }
+                    Err(RenewalRequestFailure::Sequence) => {
+                        self.record_preparation_failure(
+                            "delivery_wait",
+                            "lease_renewal_sequence_failed",
+                            Vec::new(),
+                        );
                         return Ok(internal_delivery_failure("preparation"));
                     }
                 }
                 tokio::select! {
-                    result = &mut completion => return Ok(result
-                        .unwrap_or_else(|_| internal_delivery_failure("preparation"))),
+                    result = &mut completion => return Ok(self.delivery_completion(result)),
                     changed = authority_updates.changed() => {
                         if changed.is_err() {
                             self.artifact_delivery.cancel_assignment(assignment_id);
@@ -1308,8 +1434,7 @@ impl ExecutionJob {
                 continue;
             }
             tokio::select! {
-                result = &mut completion => return Ok(result
-                    .unwrap_or_else(|_| internal_delivery_failure("preparation"))),
+                result = &mut completion => return Ok(self.delivery_completion(result)),
                 changed = authority_updates.changed() => {
                     if changed.is_err() {
                         self.artifact_delivery.cancel_assignment(assignment_id);
@@ -1321,6 +1446,20 @@ impl ExecutionJob {
                 }
             }
         }
+    }
+
+    fn delivery_completion(
+        &self,
+        result: Result<ArtifactDeliveryOutcome, tokio::sync::oneshot::error::RecvError>,
+    ) -> ArtifactDeliveryOutcome {
+        result.unwrap_or_else(|_| {
+            self.record_preparation_failure(
+                "delivery_wait",
+                "delivery_completion_lost",
+                Vec::new(),
+            );
+            internal_delivery_failure("preparation")
+        })
     }
 
     async fn wait_for_start_authority(
@@ -2044,45 +2183,64 @@ async fn wait_for_lease_deadline_or_armed(
 async fn verify_prepared_carriers(
     artifacts: &ArtifactStaging,
     prepared: &PreparedCloudWorkflowResult,
-) -> bool {
+) -> Result<(), CarrierVerificationFailure> {
     let artifacts = artifacts.clone();
     let carriers = prepared.carriers.clone();
     tokio::task::spawn_blocking(move || {
-        carriers.iter().all(|carrier| match &carrier.body {
-            CloudCarrierBody::Staged(staged) => {
-                let Ok(mut file) = artifacts.open_artifact(staged.handle()) else {
-                    return false;
-                };
-                let mut context = ring::digest::Context::new(&SHA256);
-                let mut size = 0_u64;
-                let mut buffer = [0_u8; 64 * 1024];
-                loop {
-                    let Ok(read) = file.read(&mut buffer) else {
-                        return false;
-                    };
-                    if read == 0 {
-                        break;
+        for (index, carrier) in carriers.iter().enumerate() {
+            let failure = |code| CarrierVerificationFailure {
+                code,
+                member_index: Some(u64::try_from(index).unwrap_or(u64::MAX)),
+            };
+            match &carrier.body {
+                CloudCarrierBody::Staged(staged) => {
+                    let mut file = artifacts
+                        .open_artifact(staged.handle())
+                        .map_err(|_| failure("open_failed"))?;
+                    let mut context = ring::digest::Context::new(&SHA256);
+                    let mut size = 0_u64;
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        let read = file.read(&mut buffer).map_err(|_| failure("read_failed"))?;
+                        if read == 0 {
+                            break;
+                        }
+                        let read_size =
+                            u64::try_from(read).map_err(|_| failure("size_overflow"))?;
+                        size = size
+                            .checked_add(read_size)
+                            .ok_or_else(|| failure("size_overflow"))?;
+                        context.update(&buffer[..read]);
                     }
-                    let Ok(read_size) = u64::try_from(read) else {
-                        return false;
-                    };
-                    let Some(next_size) = size.checked_add(read_size) else {
-                        return false;
-                    };
-                    size = next_size;
-                    context.update(&buffer[..read]);
+                    if size != carrier.size_bytes {
+                        return Err(failure("size_mismatch"));
+                    }
+                    if !digest_matches(&carrier.sha256, context.finish().as_ref()) {
+                        return Err(failure("digest_mismatch"));
+                    }
                 }
-                size == carrier.size_bytes
-                    && digest_matches(&carrier.sha256, context.finish().as_ref())
+                CloudCarrierBody::Bytes(bytes) => {
+                    if u64::try_from(bytes.len()) != Ok(carrier.size_bytes) {
+                        return Err(failure("size_mismatch"));
+                    }
+                    if !digest_matches(&carrier.sha256, digest(&SHA256, bytes).as_ref()) {
+                        return Err(failure("digest_mismatch"));
+                    }
+                }
             }
-            CloudCarrierBody::Bytes(bytes) => {
-                u64::try_from(bytes.len()) == Ok(carrier.size_bytes)
-                    && digest_matches(&carrier.sha256, digest(&SHA256, bytes).as_ref())
-            }
-        })
+        }
+        Ok(())
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(Err(CarrierVerificationFailure {
+        code: "verification_task_failed",
+        member_index: None,
+    }))
+}
+
+struct CarrierVerificationFailure {
+    code: &'static str,
+    member_index: Option<u64>,
 }
 
 fn digest_matches(expected: &str, digest: &[u8]) -> bool {
