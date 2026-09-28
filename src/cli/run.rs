@@ -2245,10 +2245,55 @@ mod tests {
             "cancellation": null,
             "interruption": null,
             "artifactDelivery": null,
+            "portableResult": "absent",
+            "continuation": null,
             "createdAt": "2026-08-10T12:00:00Z",
             "updatedAt": "2026-08-10T12:00:00Z"
         }))
         .expect("run fixture should match the generated model")
+    }
+
+    #[test]
+    fn cloud_run_reader_distinguishes_pending_preparation_from_portable_result() {
+        let mut document = serde_json::to_value(run(RunState::Running)).unwrap();
+        document["continuation"] = serde_json::json!({
+            "request": { "fromSteps": ["rerun"], "definition": "inherited" },
+            "fromSteps": ["rerun"], "reexecutedSteps": ["rerun"],
+            "inheritedSteps": [{"id": "produce", "priorState": "succeeded", "definitionChanged": false}],
+            "definitionSource": {
+                "kind": "inherited",
+                "manifestDigest": {"algorithm": "sha256", "value": "a".repeat(64)},
+                "priorManifestDigest": {"algorithm": "sha256", "value": "a".repeat(64)}
+            },
+            "workspace": {
+                "executionRoot": "/runner/work", "priorExecutionRoot": "/runner/work",
+                "preparation": "pending", "startSnapshot": null, "priorSettlementSnapshot": null,
+                "modified": "unknown", "quiescence": null
+            }
+        });
+        let pending: Run = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(pending.portable_result).unwrap(),
+            "absent"
+        );
+        let continuation = pending.continuation.as_ref().unwrap();
+        assert!(continuation.workspace.start_snapshot.is_none());
+        assert!(continuation.workspace.quiescence.is_none());
+        document["state"] = serde_json::json!("interrupted");
+        document["interruption"] = serde_json::json!({
+            "phase": "accepted", "cause": "retained_workspace_unavailable",
+            "executorFault": null, "stopConfirmed": false
+        });
+        document["continuation"]["workspace"]["preparation"] = serde_json::json!("unavailable");
+        let unavailable: Run = serde_json::from_value(document).unwrap();
+        assert!(
+            unavailable
+                .continuation
+                .unwrap()
+                .workspace
+                .start_snapshot
+                .is_none()
+        );
     }
 
     #[test]

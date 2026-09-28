@@ -309,10 +309,11 @@
           "properties": {
             "executionRoot": {"$ref": "#/$defs/AbsolutePath"},
             "priorExecutionRoot": {"$ref": "#/$defs/AbsolutePath"},
-            "startSnapshot": {"$ref": "#/$defs/StartSnapshot"},
+            "preparation": {"enum": ["pending", "ready", "unavailable"]},
+            "startSnapshot": {"oneOf": [{"$ref": "#/$defs/StartSnapshot"}, {"type": "null"}]},
             "priorSettlementSnapshot": {"$ref": "#/$defs/SettlementSnapshot"},
             "modified": {"oneOf": [{"type": "boolean"}, {"const": "unknown"}]},
-            "quiescence": {"type": "object", "additionalProperties": false,
+            "quiescence": {"type": ["object", "null"], "additionalProperties": false,
               "required": ["groupsRecorded", "groupsTerminated", "groupsAbsent", "provenAt"],
               "properties": {"groupsRecorded": {"type": "integer", "minimum": 0},
                 "groupsTerminated": {"type": "integer", "minimum": 0},

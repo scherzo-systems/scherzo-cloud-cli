@@ -731,6 +731,8 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         && (run.state != models::run::State::Cancelling || run.cancellation.is_some())
         && valid_interruption(run.state, run.interruption.as_deref())
         && valid_artifact_delivery(run.artifact_delivery.as_deref())
+        && valid_portable_result(&run)
+        && valid_staged_continuation(&run)
         && valid_timestamp(&run.created_at)
         && valid_timestamp(&run.updated_at);
     if valid {
@@ -785,7 +787,108 @@ fn valid_interruption(
         models::run_interruption::Cause::ExecutionLeaseExpired => {
             interruption.executor_fault.is_none()
         }
+        models::run_interruption::Cause::RetainedWorkspaceUnavailable
+        | models::run_interruption::Cause::OwnershipUnproven => {
+            !interruption.stop_confirmed && interruption.executor_fault.is_none()
+        }
     }
+}
+
+fn valid_portable_result(run: &Run) -> bool {
+    let delivered = matches!(
+        run.artifact_delivery.as_deref(),
+        Some(models::RunArtifactDelivery::RunArtifactDeliverySucceeded(_))
+    );
+    matches!(run.portable_result, models::run::PortableResult::Available) == delivered
+}
+
+fn valid_staged_continuation(run: &Run) -> bool {
+    let Some(continuation) = &run.continuation else {
+        return true;
+    };
+    let workspace = &continuation.workspace;
+    if !workspace
+        .prior_settlement_snapshot
+        .as_deref()
+        .is_none_or(|snapshot| valid_continuation_snapshot(snapshot, true))
+    {
+        return false;
+    }
+    let modified_unknown = matches!(
+        workspace.modified.as_ref(),
+        models::RunContinuationWorkspaceModified::String(value) if value == "unknown"
+    );
+    match workspace.preparation {
+        models::run_continuation_workspace::Preparation::Pending => {
+            !terminal_run(run.state)
+                && workspace.start_snapshot.is_none()
+                && workspace.quiescence.is_none()
+                && modified_unknown
+        }
+        models::run_continuation_workspace::Preparation::Unavailable => {
+            matches!(
+                run.state,
+                RunState::Failed | RunState::Cancelled | RunState::Interrupted
+            ) && run.artifact_delivery.is_none()
+                && workspace.start_snapshot.is_none()
+                && workspace.quiescence.is_none()
+                && modified_unknown
+        }
+        models::run_continuation_workspace::Preparation::Ready => {
+            let Some(start) = workspace.start_snapshot.as_deref() else {
+                return false;
+            };
+            if !valid_continuation_snapshot(start, false)
+                || !workspace.quiescence.as_ref().is_some_and(|proof| {
+                    proof.groups_recorded >= 0
+                        && proof.groups_terminated >= 0
+                        && proof.groups_absent >= 0
+                        && proof.groups_terminated.checked_add(proof.groups_absent)
+                            == Some(proof.groups_recorded)
+                        && valid_timestamp(&proof.proven_at)
+                })
+            {
+                return false;
+            }
+            let prior = workspace.prior_settlement_snapshot.as_deref();
+            let comparable = workspace.execution_root == workspace.prior_execution_root
+                && start.value.is_some()
+                && prior.is_some_and(|prior| {
+                    prior.value.is_some()
+                        && prior.algorithm == start.algorithm
+                        && prior.settled_by
+                            == Some(models::run_continuation_snapshot::SettledBy::Engine)
+                });
+            if comparable {
+                let changed = prior
+                    .and_then(|prior| prior.value.as_ref())
+                    .zip(start.value.as_ref())
+                    .is_some_and(|(prior, start)| prior != start);
+                matches!(
+                    workspace.modified.as_ref(),
+                    models::RunContinuationWorkspaceModified::Boolean(value) if *value == changed
+                )
+            } else {
+                modified_unknown
+            }
+        }
+    }
+}
+
+fn valid_continuation_snapshot(
+    snapshot: &models::RunContinuationSnapshot,
+    settlement: bool,
+) -> bool {
+    (snapshot.settled_by.is_some() == settlement)
+        && (snapshot.unavailable.is_some()
+            && snapshot.value.is_none()
+            && snapshot.taken_at.is_none()
+            || snapshot.unavailable.is_none()
+                && snapshot
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| lowercase_hex(value, 64))
+                && snapshot.taken_at.as_deref().is_some_and(valid_timestamp))
 }
 
 fn valid_artifact_delivery(delivery: Option<&models::RunArtifactDelivery>) -> bool {

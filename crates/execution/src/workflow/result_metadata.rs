@@ -19,13 +19,13 @@ use super::force_abort_evidence::{
     ordinary_node_cancellation_matches,
 };
 use super::publication::{
-    CancellationReasonV1, ContinuationDefinitionSourceV1, ContinuationRecordV1,
-    ContinuationRequestedDefinitionV1, DiagnosticStreamV1, ExportProvenanceV1, ExportSourceV1,
-    ExportUnavailableReasonV1, ExportV1, FailureCodeV1, FailurePhaseV1, FailureV1,
-    FinalizationTriggerV1, ForceAbortPhaseV1, RecoveryHandlerFailureCodeV1,
-    RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
-    RecoveryTerminationV1, RunResultInvariant, WorkflowNodeRoleV1, WorkflowOutcomeV1,
-    WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    CancellationReasonV1, ContinuationDefinitionSourceV1, ContinuationPreparationV1,
+    ContinuationRecordV1, ContinuationRequestedDefinitionV1, DiagnosticStreamV1,
+    ExportProvenanceV1, ExportSourceV1, ExportUnavailableReasonV1, ExportV1, FailureCodeV1,
+    FailurePhaseV1, FailureV1, FinalizationTriggerV1, ForceAbortPhaseV1,
+    RecoveryHandlerFailureCodeV1, RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1,
+    RecoveryInvocationStateV1, RecoveryTerminationV1, RunResultInvariant, WorkflowNodeRoleV1,
+    WorkflowOutcomeV1, WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_identifier, is_lowercase_hex,
@@ -260,7 +260,10 @@ fn validate_continuation(result: &WorkflowResultV1) -> Result<(), ResultMetadata
         .then_some(())
         .ok_or(ResultMetadataError);
     };
-    if result.attempt_number <= 1 || !validate_continuation_record(continuation) {
+    if result.attempt_number <= 1
+        || !validate_continuation_record(continuation)
+        || continuation.workspace.preparation != ContinuationPreparationV1::Ready
+    {
         return Err(ResultMetadataError);
     }
     let local_request = match &continuation.request.definition {
@@ -408,12 +411,27 @@ pub(super) fn validate_continuation_record(record: &ContinuationRecordV1) -> boo
         _ => false,
     };
     let workspace = &record.workspace;
-    let quiescence_valid = workspace
-        .quiescence
-        .groups_terminated
-        .checked_add(workspace.quiescence.groups_absent)
-        == Some(workspace.quiescence.groups_recorded)
-        && parse_canonical_utc_timestamp(&workspace.quiescence.proven_at).is_some();
+    let quiescence_valid = workspace.quiescence.as_ref().is_some_and(|proof| {
+        proof.groups_terminated.checked_add(proof.groups_absent) == Some(proof.groups_recorded)
+            && parse_canonical_utc_timestamp(&proof.proven_at).is_some()
+    });
+    let preparation_valid = match workspace.preparation {
+        ContinuationPreparationV1::Ready => {
+            workspace
+                .start_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.validate(false))
+                && quiescence_valid
+        }
+        ContinuationPreparationV1::Pending | ContinuationPreparationV1::Unavailable => {
+            workspace.start_snapshot.is_none()
+                && workspace.quiescence.is_none()
+                && matches!(
+                    workspace.modified,
+                    super::publication::WorkspaceModifiedV1::Unknown(_)
+                )
+        }
+    };
     definition_valid
         && record
             .request
@@ -426,34 +444,34 @@ pub(super) fn validate_continuation_record(record: &ContinuationRecordV1) -> boo
             .is_none_or(|version| version > 0)
         && is_canonical_absolute_path(&workspace.execution_root)
         && is_canonical_absolute_path(&workspace.prior_execution_root)
-        && workspace.start_snapshot.validate(false)
+        && preparation_valid
         && workspace
             .prior_settlement_snapshot
             .as_ref()
             .is_none_or(|snapshot| snapshot.validate(true))
         && workspace_modified_valid(workspace)
-        && quiescence_valid
 }
 
 fn workspace_modified_valid(workspace: &super::publication::ContinuationWorkspaceV1) -> bool {
-    let comparable = workspace.execution_root == workspace.prior_execution_root
-        && workspace.start_snapshot.unavailable.is_none()
-        && workspace.start_snapshot.value.is_some()
-        && workspace
-            .prior_settlement_snapshot
-            .as_ref()
-            .is_some_and(|prior| {
-                prior.unavailable.is_none()
-                    && prior.value.is_some()
-                    && prior.algorithm == workspace.start_snapshot.algorithm
-                    && prior.settled_by
-                        == Some(super::workspace_snapshot::WorkspaceSnapshotSettlementV1::Engine)
-            });
+    let comparable = workspace.preparation == ContinuationPreparationV1::Ready
+        && workspace.execution_root == workspace.prior_execution_root
+        && workspace.start_snapshot.as_ref().is_some_and(|start| {
+            start.unavailable.is_none()
+                && start.value.is_some()
+                && workspace.prior_settlement_snapshot.as_ref().is_some_and(|prior| {
+                    prior.unavailable.is_none()
+                        && prior.value.is_some()
+                        && prior.algorithm == start.algorithm
+                        && prior.settled_by
+                            == Some(super::workspace_snapshot::WorkspaceSnapshotSettlementV1::Engine)
+                })
+        });
     match &workspace.modified {
         super::publication::WorkspaceModifiedV1::Known(modified) if comparable => workspace
             .prior_settlement_snapshot
             .as_ref()
-            .is_some_and(|prior| *modified == (prior.value != workspace.start_snapshot.value)),
+            .zip(workspace.start_snapshot.as_ref())
+            .is_some_and(|(prior, start)| *modified == (prior.value != start.value)),
         super::publication::WorkspaceModifiedV1::Unknown(
             super::publication::WorkspaceModifiedUnknownV1::Unknown,
         ) => !comparable,

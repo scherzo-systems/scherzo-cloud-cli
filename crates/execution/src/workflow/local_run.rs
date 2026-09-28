@@ -1813,15 +1813,16 @@ impl PendingLocalContinuation {
                     .ok_or(LocalRunDirectoryError::InvalidPath)?
                     .to_owned(),
                 prior_execution_root: prior.execution_root.clone(),
+                preparation: super::publication::ContinuationPreparationV1::Ready,
                 modified: compare_continuation_snapshots(
                     admitted.execution().root(),
                     Path::new(&prior.execution_root),
                     &start,
                     prior_settlement.as_ref(),
                 ),
-                start_snapshot: start,
+                start_snapshot: Some(start),
                 prior_settlement_snapshot: prior_settlement,
-                quiescence: self.quiescence.clone(),
+                quiescence: Some(self.quiescence.clone()),
             },
         };
         let mut attempt = fresh_attempt(
@@ -7791,6 +7792,8 @@ fn validate_attempt_continuation(
         .map(|step| step.id.as_str())
         .collect::<Vec<_>>();
     if attempt.trigger != AttemptTriggerV1::Continuation
+        || continuation.workspace.preparation
+            != super::publication::ContinuationPreparationV1::Ready
         || !super::result_metadata::validate_continuation_record(continuation)
         || continuation.workspace.execution_root != attempt.execution_root
         || reexecuted

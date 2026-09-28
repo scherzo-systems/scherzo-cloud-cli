@@ -1217,11 +1217,18 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
         .unwrap(),
     )
     .unwrap();
-    assert!(
-        jsonschema::validator_for(&schema)
-            .unwrap()
-            .is_valid(&status)
+    let status_validator = jsonschema::validator_for(&schema).unwrap();
+    assert_eq!(
+        status["state"]["attempts"][1]["continuation"]["workspace"]["preparation"],
+        "ready"
     );
+    assert!(status_validator.is_valid(&status));
+    let mut historical_status = status.clone();
+    historical_status["state"]["attempts"][1]["continuation"]["workspace"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preparation");
+    assert!(status_validator.is_valid(&historical_status));
     let view = isolated_command(&[
         "workflow".to_owned(),
         "view".to_owned(),
@@ -1259,6 +1266,10 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     )
     .unwrap();
     let validator = jsonschema::validator_for(&view_schema).unwrap();
+    assert_eq!(
+        view["result"]["continuation"]["workspace"]["preparation"],
+        "ready"
+    );
     assert!(
         validator.is_valid(&view),
         "{:?}",
@@ -1267,6 +1278,12 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
             .map(|error| error.to_string())
             .collect::<Vec<_>>()
     );
+    let mut historical_view = view.clone();
+    historical_view["result"]["continuation"]["workspace"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preparation");
+    assert!(validator.is_valid(&historical_view));
     assert_eq!(
         fs::read_to_string(bundle.execution_root().join("calls")).unwrap(),
         "first\nsecond\nsecond\n"

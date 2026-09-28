@@ -209,11 +209,23 @@ pub(crate) enum ContinuationDefinitionSourceV1 {
 pub(crate) struct ContinuationWorkspaceV1 {
     pub(crate) execution_root: String,
     pub(crate) prior_execution_root: String,
-    pub(crate) start_snapshot: WorkspaceSnapshotV1,
+    // Pre-staged local records omitted preparation; they were ready at admission.
+    #[serde(default)]
+    pub(crate) preparation: ContinuationPreparationV1,
+    pub(crate) start_snapshot: Option<WorkspaceSnapshotV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prior_settlement_snapshot: Option<WorkspaceSnapshotV1>,
     pub(crate) modified: WorkspaceModifiedV1,
-    pub(crate) quiescence: ContinuationQuiescenceV1,
+    pub(crate) quiescence: Option<ContinuationQuiescenceV1>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContinuationPreparationV1 {
+    Pending,
+    #[default]
+    Ready,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

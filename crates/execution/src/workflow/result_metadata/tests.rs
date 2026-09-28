@@ -277,6 +277,47 @@ fn inherited_result_metadata_validates_producers_and_workspace_comparison() {
 }
 
 #[test]
+fn staged_workspace_evidence_does_not_claim_preparation_or_inherited_bytes() {
+    let mut document = continuation_result_fixture();
+    // Historical local results had no preparation field and remain readable.
+    assert!(decode(&encode(&document)).is_ok());
+    document["continuation"]["workspace"]["preparation"] = json!("ready");
+    assert!(decode(&encode(&document)).is_ok());
+
+    let mut pending = document.clone();
+    pending["continuation"]["workspace"]["preparation"] = json!("pending");
+    pending["continuation"]["workspace"]["startSnapshot"] = Value::Null;
+    pending["continuation"]["workspace"]["quiescence"] = Value::Null;
+    pending["continuation"]["workspace"]["modified"] = json!("unknown");
+    let pending_record: super::super::publication::ContinuationRecordV1 =
+        serde_json::from_value(pending["continuation"].clone()).unwrap();
+    assert!(validate_continuation_record(&pending_record));
+    // A portable result cannot precede an authoritative engine result.
+    assert_eq!(
+        validate_with_invariant(&serde_json::from_value(pending.clone()).unwrap()),
+        Err(RunResultInvariant::Continuation)
+    );
+    pending["continuation"]["workspace"]["preparation"] = json!("unavailable");
+    let unavailable: super::super::publication::ContinuationRecordV1 =
+        serde_json::from_value(pending["continuation"].clone()).unwrap();
+    assert!(validate_continuation_record(&unavailable));
+    pending["continuation"]["workspace"]["modified"] = json!(false);
+    let false_claim: super::super::publication::ContinuationRecordV1 =
+        serde_json::from_value(pending["continuation"].clone()).unwrap();
+    assert!(!validate_continuation_record(&false_claim));
+
+    // An unexported original producer remains a reference, not a carrier inventory.
+    document["continuation"]["workspace"]["priorSettlementSnapshot"] = Value::Null;
+    document["continuation"]["workspace"]["modified"] = json!("unknown");
+    assert!(decode(&encode(&document)).is_ok());
+    assert_eq!(
+        document["outputProducers"]["produce"]["message"]["attemptNumber"],
+        1
+    );
+    assert_eq!(document["exports"], json!({}));
+}
+
+#[test]
 fn unavailable_inherited_exports_require_a_resolved_skipped_source() {
     let mut document = continuation_result_fixture();
     document["outputProducers"] = json!({});

@@ -2464,7 +2464,20 @@ fn continuation_claim_commits_one_partitioned_attempt_after_failed_run() {
     let record = current.continuation.as_ref().unwrap();
     assert_eq!(record.reexecuted_steps, ["first", "second"]);
     assert!(record.inherited_steps.is_empty());
-    assert_eq!(record.workspace.quiescence.groups_recorded, 0);
+    assert_eq!(
+        record
+            .workspace
+            .quiescence
+            .as_ref()
+            .unwrap()
+            .groups_recorded,
+        0
+    );
+    assert_eq!(
+        record.workspace.preparation,
+        super::super::publication::ContinuationPreparationV1::Ready
+    );
+    assert!(record.workspace.start_snapshot.is_some());
     drop(owned);
 }
 

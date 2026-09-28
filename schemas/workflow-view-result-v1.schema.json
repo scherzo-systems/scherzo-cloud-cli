@@ -1933,8 +1933,14 @@
               "priorExecutionRoot": {
                 "$ref": "#/$defs/AbsolutePath"
               },
+              "preparation": {
+                "enum": ["pending", "ready", "unavailable"]
+              },
               "startSnapshot": {
-                "$ref": "#/$defs/StartSnapshot"
+                "oneOf": [
+                  {"$ref": "#/$defs/StartSnapshot"},
+                  {"type": "null"}
+                ]
               },
               "priorSettlementSnapshot": {
                 "$ref": "#/$defs/SettlementSnapshot"
@@ -1950,7 +1956,7 @@
                 ]
               },
               "quiescence": {
-                "type": "object",
+                "type": ["object", "null"],
                 "additionalProperties": false,
                 "required": [
                   "groupsRecorded",
