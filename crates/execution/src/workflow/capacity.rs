@@ -10,6 +10,7 @@ pub(crate) const RUNNER_OBSERVATION_RESERVE: u64 = 64;
 pub(crate) const RUNNER_ORDINARY_FRAME_BYTES: u64 = 262_144;
 pub const RUNNER_TERMINAL_FRAME_BYTES: u64 = 67_108_864;
 pub const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 1_024_720_896;
+pub(crate) const MAXIMUM_CONDITION_TRANSITION_COUNT: u64 = 256;
 pub(crate) const MAXIMUM_CONDITION_TRANSITION_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAXIMUM_PORTABLE_RESULT_BYTES: u64 = 901_080_408;
@@ -328,7 +329,7 @@ pub fn valid_condition_capacity(capacity: ConditionCapacityBounds) -> bool {
             && capacity.portable_result_bytes == ORDINARY_PORTABLE_RESULT_BYTES
             && expected_outbox == Some(capacity.encoded_outbox_bytes);
     }
-    capacity.condition_transition_count <= 256
+    capacity.condition_transition_count <= MAXIMUM_CONDITION_TRANSITION_COUNT
         && (1..=MAXIMUM_CONDITION_TRANSITION_BYTES)
             .contains(&capacity.aggregate_condition_transition_bytes)
         && capacity.aggregate_condition_transition_bytes.checked_mul(2)

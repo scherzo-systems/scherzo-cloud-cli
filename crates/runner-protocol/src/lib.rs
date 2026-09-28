@@ -1201,9 +1201,10 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             let maximum_parallel_steps =
                 u64::try_from(execution_spec.execution_limits.maximum_parallel_steps.0)
                     .map_err(|_| DecodeError::InvalidFrame("maximumParallelSteps"))?;
-            let cancellation_grace_seconds =
-                u64::try_from(execution_spec.execution_limits.cancellation_grace_seconds.0)
-                    .map_err(|_| DecodeError::InvalidFrame("cancellationGraceSeconds"))?;
+            let cancellation_grace_seconds = execution_spec
+                .execution_limits
+                .cancellation_grace_seconds
+                .get();
             let workflow_definition_source = WorkflowDefinitionSourceV1RunnerProjection {
                 repository_connection_id: execution_spec
                     .workflow_definition_source

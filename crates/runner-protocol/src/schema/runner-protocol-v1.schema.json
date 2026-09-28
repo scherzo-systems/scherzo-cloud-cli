@@ -189,7 +189,9 @@
           "$ref": "#/$defs/nonnegativeSequence"
         },
         "cancellationGraceSeconds": {
-          "$ref": "#/$defs/nonnegativeSequence"
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
         }
       },
       "required": [

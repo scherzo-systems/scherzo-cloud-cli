@@ -48,6 +48,13 @@ use scherzo_cloud_runner_protocol::{
 };
 
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
+const MAXIMUM_GENERAL_TRANSITIONS: u64 = 1_286;
+const MAXIMUM_SELECTED_TRANSITIONS: u64 = 1_030;
+const MAXIMUM_INVOCATIONS: u64 = 488;
+const MAXIMUM_RETAINED_BYTES_PER_INVOCATION: u64 = 4_194_304;
+const MAXIMUM_DIAGNOSTIC_RETENTION_BYTES: u64 = 134_217_728;
+const MAXIMUM_NATIVE_SESSION_RETENTION_BYTES: u64 = 67_108_864;
+const MAXIMUM_AGGREGATE_RETENTION_BYTES: u64 = 201_326_592;
 pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
@@ -4684,22 +4691,22 @@ fn validate_execution_spec(
         || capacity.execution_contract != "workflow_v1_cloud_inputs_artifacts@1"
         || capacity.source_closure_digest != workflow.workflow_source_closure_digest
         || capacity.general_maximum_transitions == 0
-        || capacity.general_maximum_transitions > 1_286
+        || capacity.general_maximum_transitions > MAXIMUM_GENERAL_TRANSITIONS
         || capacity.selected_maximum_transitions == 0
-        || capacity.selected_maximum_transitions > 1_030
+        || capacity.selected_maximum_transitions > MAXIMUM_SELECTED_TRANSITIONS
         || capacity.maximum_invocations == 0
-        || capacity.maximum_invocations > 488
+        || capacity.maximum_invocations > MAXIMUM_INVOCATIONS
         || capacity.maximum_retained_bytes_per_invocation == 0
-        || capacity.maximum_retained_bytes_per_invocation > 4_194_304
+        || capacity.maximum_retained_bytes_per_invocation > MAXIMUM_RETAINED_BYTES_PER_INVOCATION
         || capacity.diagnostic_retention_bytes < capacity.maximum_retained_bytes_per_invocation
-        || capacity.diagnostic_retention_bytes > 134_217_728
+        || capacity.diagnostic_retention_bytes > MAXIMUM_DIAGNOSTIC_RETENTION_BYTES
         || capacity.native_session_retention_bytes < capacity.maximum_retained_bytes_per_invocation
-        || capacity.native_session_retention_bytes > 67_108_864
+        || capacity.native_session_retention_bytes > MAXIMUM_NATIVE_SESSION_RETENTION_BYTES
         || capacity
             .diagnostic_retention_bytes
             .checked_add(capacity.native_session_retention_bytes)
             != Some(capacity.aggregate_retention_bytes)
-        || capacity.aggregate_retention_bytes > 201_326_592
+        || capacity.aggregate_retention_bytes > MAXIMUM_AGGREGATE_RETENTION_BYTES
         || !valid_condition_capacity(ConditionCapacityBounds::from_parts(
             capacity.selected_maximum_transitions,
             (
@@ -6959,6 +6966,57 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         for (failure, expected) in cases {
             assert_eq!(run_input_decline(failure), expected);
         }
+    }
+
+    #[test]
+    fn runner_admission_limits_match_shared_contract() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../execution/tests/fixtures/workflow/v1/capacity-contract.json"
+        )))
+        .unwrap();
+        let number = |path: &[&str]| -> u64 {
+            path.iter()
+                .fold(&contract, |value, key| &value[*key])
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(
+            MAXIMUM_CANCELLATION_GRACE.as_secs(),
+            number(&["cancellationGraceSeconds", "maximum"])
+        );
+        assert_eq!(
+            MAXIMUM_GENERAL_TRANSITIONS,
+            number(&["transitionBounds", "general", "maximumWithFinalizers"])
+        );
+        assert_eq!(
+            MAXIMUM_SELECTED_TRANSITIONS,
+            number(&["transitionBounds", "selected", "maximumWithFinalizers"])
+        );
+        assert_eq!(
+            MAXIMUM_INVOCATIONS,
+            number(&["commonBounds", "maximumInvocations", "maximum"])
+        );
+        assert_eq!(
+            MAXIMUM_RETAINED_BYTES_PER_INVOCATION,
+            number(&[
+                "commonBounds",
+                "maximumRetainedBytesPerInvocation",
+                "maximum"
+            ])
+        );
+        assert_eq!(
+            MAXIMUM_DIAGNOSTIC_RETENTION_BYTES,
+            number(&["commonBounds", "diagnosticRetentionBytes", "maximum"])
+        );
+        assert_eq!(
+            MAXIMUM_NATIVE_SESSION_RETENTION_BYTES,
+            number(&["commonBounds", "nativeSessionRetentionBytes", "maximum"])
+        );
+        assert_eq!(
+            MAXIMUM_AGGREGATE_RETENTION_BYTES,
+            number(&["commonBounds", "aggregateRetentionBytes", "maximum"])
+        );
     }
 
     #[tokio::test]

@@ -67,6 +67,175 @@ struct Expected {
 }
 
 #[test]
+fn cloud_capacity_limits_match_shared_contract() {
+    let contract: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/workflow/v1/capacity-contract.json"
+    )))
+    .unwrap();
+    let number = |path: &[&str]| -> u64 {
+        path.iter()
+            .fold(&contract, |value, key| &value[*key])
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(
+        GENERAL_MAXIMUM_TRANSITIONS_WITHOUT_FINALIZERS,
+        number(&["transitionBounds", "general", "maximumWithoutFinalizers"])
+    );
+    assert_eq!(
+        GENERAL_MAXIMUM_TRANSITIONS_WITH_FINALIZERS,
+        number(&["transitionBounds", "general", "maximumWithFinalizers"])
+    );
+    assert_eq!(
+        CLOUD_MAXIMUM_TRANSITIONS_WITHOUT_FINALIZERS,
+        number(&["transitionBounds", "selected", "maximumWithoutFinalizers"])
+    );
+    assert_eq!(
+        CLOUD_MAXIMUM_TRANSITIONS_WITH_FINALIZERS,
+        number(&["transitionBounds", "selected", "maximumWithFinalizers"])
+    );
+    assert_eq!(number(&["transitionBounds", "general", "minimum"]), 1);
+    assert_eq!(number(&["transitionBounds", "selected", "minimum"]), 1);
+    assert_eq!(
+        number(&["commonBounds", "maximumInvocations", "minimum"]),
+        1
+    );
+    assert_eq!(
+        number(&[
+            "commonBounds",
+            "maximumRetainedBytesPerInvocation",
+            "minimum"
+        ]),
+        1
+    );
+    assert_eq!(
+        number(&["cancellationGraceSeconds", "minimum"]),
+        super::super::cancellation::MINIMUM_CANCELLATION_GRACE.as_secs()
+    );
+    assert_eq!(
+        RUNNER_OBSERVATION_RESERVE,
+        number(&["formulas", "runnerObservationReserve"])
+    );
+    assert_eq!(
+        RUNNER_ORDINARY_FRAME_BYTES,
+        number(&["formulas", "runnerOrdinaryFrameBytes"])
+    );
+    assert_eq!(
+        RUNNER_TERMINAL_FRAME_BYTES,
+        number(&[
+            "variants",
+            "ordinary",
+            "terminalResultStructureBytes",
+            "exact"
+        ])
+    );
+    assert_eq!(
+        ORDINARY_PORTABLE_RESULT_BYTES,
+        number(&["variants", "ordinary", "portableResultBytes", "exact"])
+    );
+    assert_eq!(
+        MAXIMUM_CONDITION_TRANSITION_COUNT,
+        number(&[
+            "variants",
+            "conditional",
+            "conditionTransitionCount",
+            "maximum"
+        ])
+    );
+    assert_eq!(
+        MAXIMUM_CONDITION_TRANSITION_BYTES,
+        number(&[
+            "variants",
+            "conditional",
+            "aggregateConditionTransitionBytes",
+            "maximum"
+        ])
+    );
+    assert_eq!(
+        MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES,
+        number(&[
+            "variants",
+            "conditional",
+            "terminalResultStructureBytes",
+            "maximum"
+        ])
+    );
+    assert_eq!(
+        MAXIMUM_PORTABLE_RESULT_BYTES,
+        number(&["variants", "conditional", "portableResultBytes", "maximum"])
+    );
+    assert_eq!(
+        MAXIMUM_ENCODED_OUTBOX_BYTES,
+        number(&["variants", "conditional", "encodedOutboxBytes", "maximum"])
+    );
+    let overhead = super::super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+        + super::super::result_metadata::MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES;
+    assert_eq!(
+        overhead,
+        number(&["formulas", "portableResultStructureOverheadBytes"])
+    );
+    assert_eq!(
+        (CLOUD_MAXIMUM_TRANSITIONS_WITH_FINALIZERS + RUNNER_OBSERVATION_RESERVE)
+            * RUNNER_ORDINARY_FRAME_BYTES
+            + RUNNER_TERMINAL_FRAME_BYTES
+            - RUNNER_ORDINARY_FRAME_BYTES,
+        number(&["variants", "ordinary", "encodedOutboxBytes", "maximum"])
+    );
+    for (path, value) in [
+        ("conditionTransitionCount", 1),
+        ("aggregateConditionTransitionBytes", 1),
+        ("terminalResultStructureBytes", 2),
+        ("portableResultBytes", overhead + 2),
+        ("encodedOutboxBytes", 3),
+    ] {
+        assert_eq!(number(&["variants", "conditional", path, "minimum"]), value);
+    }
+    assert_eq!(
+        number(&[
+            "variants",
+            "ordinary",
+            "aggregateConditionTransitionBytes",
+            "exact"
+        ]),
+        0
+    );
+    assert_eq!(
+        super::super::cancellation::MAXIMUM_CANCELLATION_GRACE.as_secs(),
+        number(&["cancellationGraceSeconds", "maximum"])
+    );
+    assert_eq!(
+        super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
+        number(&[
+            "commonBounds",
+            "maximumRetainedBytesPerInvocation",
+            "maximum"
+        ])
+    );
+    let budget = super::super::admission::WorkflowCapacityBudget::supported_maximum();
+    assert_eq!(
+        budget.maximum_invocations,
+        number(&["commonBounds", "maximumInvocations", "maximum"])
+    );
+    assert_eq!(
+        budget.diagnostic_retention_bytes,
+        number(&["commonBounds", "diagnosticRetentionBytes", "maximum"])
+    );
+    assert_eq!(
+        budget.native_session_retention_bytes,
+        number(&["commonBounds", "nativeSessionRetentionBytes", "maximum"])
+    );
+    assert_eq!(
+        budget.aggregate_retention_bytes,
+        number(&["commonBounds", "aggregateRetentionBytes", "maximum"])
+    );
+    assert_eq!(
+        budget.encoded_outbox_bytes,
+        number(&["variants", "conditional", "encodedOutboxBytes", "maximum"])
+    );
+}
+
+#[test]
 fn condition_capacity_replay_and_runner_share_the_numerical_boundary() {
     let ordinary = ConditionCapacityBounds {
         selected_maximum_transitions: 7,
