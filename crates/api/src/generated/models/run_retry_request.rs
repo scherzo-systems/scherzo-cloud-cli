@@ -16,22 +16,16 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// OidcIdentityList : A page of OIDC identities linked to the authenticated principal.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OidcIdentityList {
-    #[serde(rename = "items")]
-    pub items: Vec<models::OidcIdentityLink>,
-    /// An opaque continuation cursor, omitted on the final page.
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+pub struct RunRetryRequest {
+    #[serde(rename = "expectedVersion", skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<i64>,
 }
 
-impl OidcIdentityList {
-    /// A page of OIDC identities linked to the authenticated principal.
-    pub fn new(items: Vec<models::OidcIdentityLink>) -> OidcIdentityList {
-        OidcIdentityList {
-            items,
-            next_cursor: None,
+impl RunRetryRequest {
+    pub fn new() -> RunRetryRequest {
+        RunRetryRequest {
+            expected_version: None,
         }
     }
 }
