@@ -31,24 +31,25 @@ use super::workspace::{RetentionReason, WorkspaceDisposition};
 use crate::telemetry;
 use scherzo_cloud_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
-    AgentInputStaging, ArtifactStaging, AuthenticatedProcessGroup, CancellationReason,
-    CancellationSource, CloudCarrierBody, CloudExecutionCapacityV1, CloudSourceDisplayRepositoryV1,
-    CloudSourceDisplaySnapshotV1, CoordinatorClock, DigestV1, DurableProcessGuardStore,
-    ExecutionObservation, ExecutionObserver, FailurePolicy, FinalizationGate, FinalizationSummary,
-    FinalizerResult, ForceAbortEvidence, InputStaging, InvocationAccountingLog, NoopCommitPort,
-    ObservedStepTransition, PreparedCloudWorkflowResult, PrimaryIssue, ProcessGuardRegistry,
-    ProcessGuardStoreError, ProcessIdentityInspector, ProcessIdentityObservation,
-    RecoveryDecisionKind, RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
-    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
-    RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnostic,
-    StepDiagnosticLog, StepFailureCause, StepRecoveryState, StepState, StepStateKind,
-    SystemProcessIdentityInspector, TargetExecutionNumber, TransitionEvent, TransitionObservation,
-    ValidatedRecoveryHandler, ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole,
-    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunId, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming,
-    WorkflowState, WorkflowStepTiming, command_output_v1, execute_workflow,
-    prepare_cloud_workflow_result, production_agent_dispatcher, step_recovery_summary_v1,
-    summary_disposition_matches, terminate_authenticated_process_group,
+    AgentInputStaging, ArtifactStaging, AuthenticatedProcessGroup, AuthenticatedSignalResult,
+    CancellationReason, CancellationSource, CloudCarrierBody, CloudExecutionCapacityV1,
+    CloudSourceDisplayRepositoryV1, CloudSourceDisplaySnapshotV1, CoordinatorClock, DigestV1,
+    DurableProcessGuardStore, ExecutionObservation, ExecutionObserver, FailurePolicy,
+    FinalizationGate, FinalizationSummary, FinalizerResult, ForceAbortEvidence, InputStaging,
+    InvocationAccountingLog, NoopCommitPort, ObservedStepTransition, PreparedCloudWorkflowResult,
+    PrimaryIssue, ProcessGuardRegistry, ProcessGuardStoreError, ProcessIdentityInspector,
+    ProcessIdentityObservation, RecoveryDecisionKind, RecoveryDiagnosticKindV1,
+    RecoveryHandlerActivity, RecoveryHandlerKind, RecoveryInvocationDiagnosticV1,
+    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryInvocationUsageV1,
+    RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnostic, StepDiagnosticLog,
+    StepFailureCause, StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector,
+    TargetExecutionNumber, TransitionEvent, TransitionObservation, ValidatedRecoveryHandler,
+    ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole, WorkflowRunCancellation,
+    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult,
+    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowState, WorkflowStepTiming,
+    command_output_v1, execute_workflow, prepare_cloud_workflow_result,
+    production_agent_dispatcher, step_recovery_summary_v1, summary_disposition_matches,
+    terminate_authenticated_process_group,
 };
 #[cfg(test)]
 use scherzo_cloud_execution::{
@@ -68,8 +69,26 @@ struct GuardRecord {
     lifecycle: GuardLifecycle,
 }
 
+trait GuardProcessControl: Send + Sync {
+    fn observe(&self, identity: &AuthenticatedProcessGroup) -> ProcessIdentityObservation;
+    fn terminate(&self, identity: &AuthenticatedProcessGroup) -> AuthenticatedSignalResult;
+}
+
+struct SystemGuardProcessControl;
+
+impl GuardProcessControl for SystemGuardProcessControl {
+    fn observe(&self, identity: &AuthenticatedProcessGroup) -> ProcessIdentityObservation {
+        SystemProcessIdentityInspector.observe(identity)
+    }
+
+    fn terminate(&self, identity: &AuthenticatedProcessGroup) -> AuthenticatedSignalResult {
+        terminate_authenticated_process_group(identity)
+    }
+}
+
 struct ProcessGuardState {
     next_id: u64,
+    control: Arc<dyn GuardProcessControl>,
     records: BTreeMap<String, GuardRecord>,
     forced_containment_started: bool,
     #[cfg(test)]
@@ -86,6 +105,7 @@ impl AssignmentProcessGuards {
         Self {
             state: Arc::new(Mutex::new(ProcessGuardState {
                 next_id: 1,
+                control: Arc::new(SystemGuardProcessControl),
                 records: BTreeMap::new(),
                 forced_containment_started: false,
                 #[cfg(test)]
@@ -104,35 +124,58 @@ impl AssignmentProcessGuards {
     }
 
     fn begin_forced_containment(&self) {
-        let identities = {
+        let (identities, control) = {
             let mut state = self.lock();
             state.forced_containment_started = true;
-            state
+            let identities = state
                 .records
                 .values()
                 .filter(|record| record.lifecycle != GuardLifecycle::Quiesced)
                 .map(|record| record.identity.clone())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (identities, Arc::clone(&state.control))
         };
         for identity in identities {
-            let _ = terminate_authenticated_process_group(&identity);
+            let _ = control.terminate(&identity);
         }
     }
 
-    pub(super) fn is_quiescent(&self) -> bool {
+    // Observe each registered identity once. The decision and the identities used in
+    // the report must describe the same observation, not two racing inspections.
+    fn quiescence_snapshot(&self) -> (bool, Vec<String>) {
         let state = self.lock();
+        let surviving = state
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                record.lifecycle != GuardLifecycle::Quiesced
+                    && !matches!(
+                        state.control.observe(&record.identity),
+                        ProcessIdentityObservation::Absent
+                    )
+            })
+            .map(|(id, record)| {
+                format!("{id} ({:?})", record.identity)
+                    .chars()
+                    .take(512)
+                    .collect::<String>()
+            })
+            .take(255)
+            .collect::<Vec<_>>();
         #[cfg(test)]
         if let Some(quiescent) = &state.quiescence_fixture {
-            return quiescent.load(std::sync::atomic::Ordering::Acquire);
+            return (quiescent.load(Ordering::Acquire), surviving);
         }
-        let inspector = SystemProcessIdentityInspector;
-        state.records.values().all(|record| {
-            record.lifecycle == GuardLifecycle::Quiesced
-                || matches!(
-                    inspector.observe(&record.identity),
-                    ProcessIdentityObservation::Absent
-                )
-        })
+        (surviving.is_empty(), surviving)
+    }
+
+    pub(super) fn is_quiescent(&self) -> bool {
+        self.quiescence_snapshot().0
+    }
+
+    #[cfg(test)]
+    fn use_control(&self, control: Arc<dyn GuardProcessControl>) {
+        self.lock().control = control;
     }
 
     #[cfg(test)]
@@ -415,6 +458,7 @@ pub(super) struct ExecutionJob {
     manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
     engine_terminal: Arc<AtomicBool>,
     lease_clock: LeaseClock,
+    containment_clock: LeaseClock,
     causal_lease: CausalLease,
     pub(super) authority_updates: tokio::sync::watch::Receiver<LeaseAuthority>,
     start_authority: tokio::sync::watch::Receiver<bool>,
@@ -440,6 +484,57 @@ impl RunnerResultFailure {
     }
 }
 
+#[cfg(test)]
+fn stubborn_guard_identity() -> AuthenticatedProcessGroup {
+    AuthenticatedProcessGroup::new(
+        rustix::process::Pid::from_raw(41).expect("fixture pid"),
+        "stubborn-fixture".to_owned(),
+    )
+    .expect("fixture identity")
+}
+
+#[cfg(test)]
+pub(super) struct FixtureGuardProcessControl {
+    alive: AtomicBool,
+    kill_succeeds: bool,
+    pub(super) kill_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FixtureGuardProcessControl {
+    pub(super) fn mark_absent(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl GuardProcessControl for FixtureGuardProcessControl {
+    fn observe(&self, identity: &AuthenticatedProcessGroup) -> ProcessIdentityObservation {
+        if *identity != stubborn_guard_identity() {
+            return SystemProcessIdentityInspector.observe(identity);
+        }
+        if self.alive.load(Ordering::Acquire) {
+            ProcessIdentityObservation::Exact {
+                leader: scherzo_cloud_execution::LeaderState::Running,
+            }
+        } else {
+            ProcessIdentityObservation::Absent
+        }
+    }
+
+    fn terminate(&self, identity: &AuthenticatedProcessGroup) -> AuthenticatedSignalResult {
+        if *identity != stubborn_guard_identity() {
+            return terminate_authenticated_process_group(identity);
+        }
+        self.kill_count.fetch_add(1, Ordering::AcqRel);
+        if self.kill_succeeds {
+            self.alive.store(false, Ordering::Release);
+            AuthenticatedSignalResult::Signalled
+        } else {
+            AuthenticatedSignalResult::Unavailable
+        }
+    }
+}
 impl ExecutionJob {
     pub(super) fn new(
         accepted: AcceptedAssignment,
@@ -455,6 +550,7 @@ impl ExecutionJob {
             artifact_delivery,
             manager_events,
             engine_terminal,
+            containment_clock: authority.lease_clock.clone(),
             lease_clock: authority.lease_clock,
             causal_lease: authority.causal_lease,
             authority_updates: authority.updates,
@@ -462,6 +558,43 @@ impl ExecutionJob {
             infrastructure_interruption: authority.infrastructure_interruption,
             workspace_release_reported: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn register_stubborn_fixture(
+        &self,
+        kill_succeeds: bool,
+    ) -> Arc<FixtureGuardProcessControl> {
+        let control = Arc::new(FixtureGuardProcessControl {
+            alive: AtomicBool::new(true),
+            kill_succeeds,
+            kill_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let guards = &self.accepted.process_guards;
+        guards.use_control(control.clone());
+        guards
+            .registry(true)
+            .register("fixture", 1, &stubborn_guard_identity())
+            .expect("register guard");
+        control
+    }
+
+    #[cfg(test)]
+    pub(super) fn use_containment_clock(&mut self, clock: LeaseClock) {
+        self.containment_clock = clock;
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_success_fixture(mut self, clock: LeaseClock) {
+        self.containment_clock = clock;
+        tokio::spawn(self.finish_execution(ExecutionCompletion::containment_gated(
+            ExecutionReport::Finished {
+                final_execution_event_sequence: 1,
+                outcome: terminal_outcome("succeeded", None, None, None, None, None),
+                artifact_delivery: json!({"outcome": "prepared", "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc"}),
+            },
+            WorkspaceDisposition::Remove,
+        )));
     }
 
     #[cfg(test)]
@@ -484,12 +617,21 @@ impl ExecutionJob {
                 .await
                 .is_err()
             {
-                process_guards.begin_forced_containment();
-                let quiescence = if process_guards.is_quiescent() {
+                let guards = process_guards.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || guards.begin_forced_containment()).await;
+                let check = process_guards.clone();
+                let snapshot = tokio::task::spawn_blocking(move || check.quiescence_snapshot())
+                    .await
+                    .ok();
+                let quiescence = if snapshot.as_ref().is_some_and(|(proven, _)| *proven) {
                     super::workspace::ProcessQuiescence::Proven
                 } else {
                     super::workspace::ProcessQuiescence::Failed
                 };
+                let quiescence_failure = snapshot
+                    .filter(|(proven, surviving)| !proven && !surviving.is_empty())
+                    .map(|(_, surviving)| surviving);
                 workflow_git.disable();
                 let release = root
                     .release_workspace_pending(
@@ -509,6 +651,7 @@ impl ExecutionJob {
                     lease_clock_failed: false,
                     retained_root: Some(Box::new(root)),
                     quiescence,
+                    quiescence_failure,
                     workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::Failed),
                 });
                 outbox.wake();
@@ -520,24 +663,81 @@ impl ExecutionJob {
         let assignment_id = self.accepted.assignment_id().to_owned();
         let attempt_id = self.accepted.attempt_id().to_owned();
         let run_id = self.accepted.run_id().to_owned();
-        let mut completion = self
+        let completion = self
             .run_workflow(&assignment_id, &attempt_id, &run_id)
             .await;
-        if matches!(
-            completion.workspace_disposition,
-            WorkspaceDisposition::Retain(_)
-        ) {
-            self.accepted.process_guards.begin_forced_containment();
+        self.finish_execution(completion).await;
+    }
+
+    async fn finish_execution(self, mut completion: ExecutionCompletion) {
+        let assignment_id = self.accepted.assignment_id().to_owned();
+        let attempt_id = self.accepted.attempt_id().to_owned();
+        let guards = self.accepted.process_guards.clone();
+        let mut snapshot = tokio::task::spawn_blocking({
+            let guards = guards.clone();
+            move || guards.quiescence_snapshot()
+        })
+        .await
+        .ok();
+        if !snapshot.as_ref().is_some_and(|(proven, _)| *proven)
+            || matches!(
+                completion.workspace_disposition,
+                WorkspaceDisposition::Retain(_)
+            )
+        {
+            // Kill while the authenticated leader is still observable. A TERM grace
+            // could let that leader exit, making later group signals unsafe.
+            let force = guards.clone();
+            let _ = tokio::task::spawn_blocking(move || force.begin_forced_containment()).await;
+            for _ in 0..80 {
+                let check = guards.clone();
+                if let Ok(observed) =
+                    tokio::task::spawn_blocking(move || check.quiescence_snapshot()).await
+                {
+                    let proven = observed.0;
+                    snapshot = Some(observed);
+                    if proven {
+                        break;
+                    }
+                }
+                if !self.wait_for_containment_poll().await {
+                    break;
+                }
+            }
+            // The last wait can be the one during which the group exits.
+            let check = guards.clone();
+            if let Ok(observed) =
+                tokio::task::spawn_blocking(move || check.quiescence_snapshot()).await
+            {
+                snapshot = Some(observed);
+            }
         }
-        let quiescence = if self.accepted.process_guards.is_quiescent() {
+        let proven = snapshot.as_ref().is_some_and(|(proven, _)| *proven);
+        let quiescence = if proven {
             super::workspace::ProcessQuiescence::Proven
         } else {
             super::workspace::ProcessQuiescence::Failed
         };
-        if quiescence == super::workspace::ProcessQuiescence::Proven
-            && let Some(report) = completion.deferred_containment_report.take()
-        {
-            completion.final_observation_id = self.enqueue(&assignment_id, &attempt_id, report);
+        let quiescence_failure = snapshot
+            .filter(|(proven, surviving)| !proven && !surviving.is_empty())
+            .map(|(_, surviving)| surviving);
+        if let Some(mut report) = completion.deferred_containment_report.take() {
+            // Cancellation is confirmed only after containment. A failed check
+            // must not publish a cancelled outcome, even with failure details.
+            let reportable_failure = quiescence_failure.is_some()
+                && matches!(&report, ExecutionReport::Finished { outcome, .. }
+                    if outcome["outcome"] != "cancelled");
+            if reportable_failure
+                && let Some(surviving) = &quiescence_failure
+                && let ExecutionReport::Finished { outcome, .. } = &mut report
+            {
+                outcome["quiescenceFailure"] = json!({
+                    "reason": "process_quiescence_failed", "survivingGuards": surviving
+                });
+            }
+            if quiescence == super::workspace::ProcessQuiescence::Proven || reportable_failure {
+                completion.final_observation_id = self.enqueue(&assignment_id, &attempt_id, report);
+            }
         }
         if completion.final_observation_id.is_some() && !completion.lease_clock_failed {
             match self.terminal_report_deadline() {
@@ -556,9 +756,22 @@ impl ExecutionJob {
             lease_clock_failed: completion.lease_clock_failed,
             retained_root: Some(Box::new(retained_root)),
             quiescence,
+            quiescence_failure,
             workspace_disposition: completion.workspace_disposition,
         });
         self.outbox.wake();
+    }
+
+    async fn wait_for_containment_poll(&self) -> bool {
+        let wait = self
+            .containment_clock
+            .now()
+            .and_then(|now| now.checked_add(Duration::from_millis(25)))
+            .and_then(|deadline| self.containment_clock.start_wait(deadline));
+        match wait {
+            Ok(wait) => wait.wait(&LeaseWaitCancellation::default()).await.is_ok(),
+            Err(_) => false,
+        }
     }
 
     async fn activate_workflow_git(&self) -> bool {
@@ -1163,11 +1376,7 @@ impl ExecutionJob {
                 report
             }
         };
-        ExecutionCompletion::with_budget(
-            self.enqueue(assignment_id, attempt_id, report),
-            final_delivery_budget,
-            workspace_disposition,
-        )
+        ExecutionCompletion::containment_gated(report, workspace_disposition)
     }
 
     fn record_preparation_failure(

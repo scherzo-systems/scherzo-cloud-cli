@@ -3717,6 +3717,20 @@
         "invocationEvidence"
       ]
     },
+    "ProcessQuiescenceFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": { "const": "process_quiescence_failed" },
+        "survivingGuards": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 255,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+        }
+      },
+      "required": ["reason", "survivingGuards"]
+    },
     "WorkflowTerminalOutcome": {
       "oneOf": [
         {
@@ -3734,7 +3748,8 @@
             },
             "recoverySummaries": {
               "$ref": "#/$defs/RecoverySummaries"
-            }
+            },
+            "quiescenceFailure": { "$ref": "#/$defs/ProcessQuiescenceFailure" }
           },
           "required": [
             "outcome",
@@ -3759,7 +3774,8 @@
             },
             "primaryIssue": {
               "$ref": "#/$defs/PrimaryIssue"
-            }
+            },
+            "quiescenceFailure": { "$ref": "#/$defs/ProcessQuiescenceFailure" }
           },
           "required": [
             "outcome",

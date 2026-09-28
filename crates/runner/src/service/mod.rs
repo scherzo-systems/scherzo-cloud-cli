@@ -268,7 +268,9 @@ pub(crate) enum ServiceError {
     LeaseClock(LeaseClockError),
     WorkRootInUse,
     WorkRootIsolation,
-    WorkspaceCleanupFailed,
+    WorkspaceCleanupFailed(Option<Vec<String>>),
+    SourceBrokerConfiguration(url::Url),
+    InputBrokerConfiguration(url::Url),
 }
 
 impl fmt::Display for ServiceError {
@@ -291,7 +293,23 @@ impl fmt::Display for ServiceError {
             Self::WorkRootIsolation => {
                 formatter.write_str("runner work-root isolation could not be established")
             }
-            Self::WorkspaceCleanupFailed => formatter.write_str("runner workspace cleanup failed"),
+            Self::WorkspaceCleanupFailed(Some(surviving)) => write!(
+                formatter,
+                "runner process quiescence unproven: surviving guards {surviving:?}\n\nInspect the retained workspace and stop surviving processes before restarting the runner."
+            ),
+            Self::WorkspaceCleanupFailed(None) => {
+                formatter.write_str("runner workspace cleanup failed")
+            }
+            Self::SourceBrokerConfiguration(endpoint) => write!(
+                formatter,
+                "start runner source credential broker: unsupported {} endpoint scheme\n\nUse a ws or wss runner endpoint.",
+                endpoint.scheme()
+            ),
+            Self::InputBrokerConfiguration(endpoint) => write!(
+                formatter,
+                "start runner run-input broker: unsupported {} endpoint scheme\n\nUse a ws or wss runner endpoint.",
+                endpoint.scheme()
+            ),
         }
     }
 }
@@ -300,7 +318,7 @@ impl ServiceError {
     pub(crate) const fn requires_operator_recovery(&self) -> bool {
         matches!(
             self,
-            Self::WorkRootInUse | Self::WorkRootIsolation | Self::WorkspaceCleanupFailed
+            Self::WorkRootInUse | Self::WorkRootIsolation | Self::WorkspaceCleanupFailed(_)
         )
     }
 }
@@ -314,7 +332,9 @@ impl std::error::Error for ServiceError {
             | Self::ShutdownDeadlineExceeded
             | Self::WorkRootInUse
             | Self::WorkRootIsolation
-            | Self::WorkspaceCleanupFailed => None,
+            | Self::WorkspaceCleanupFailed(_)
+            | Self::SourceBrokerConfiguration(_)
+            | Self::InputBrokerConfiguration(_) => None,
             Self::Connection(error) => Some(error),
             Self::Control(error) => Some(error),
             Self::LeaseClock(error) => Some(error),
@@ -481,11 +501,8 @@ async fn run_connection_loop_with_work_root(
         Arc::clone(&sleeper),
         Arc::clone(&work_root),
         Arc::clone(&recorder),
-    );
-    let assignment_dependencies = match source_broker {
-        Some(source_broker) => assignment_dependencies.with_source_broker(source_broker),
-        None => assignment_dependencies,
-    };
+        source_broker,
+    )?;
     let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new(
         &config,
         lease_clock,
@@ -544,7 +561,11 @@ async fn run_connection_loop_with_work_root(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cleanup_failure_ready_to_exit()
         {
-            return Err(workspace_cleanup_failure(&recorder));
+            let detail = assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .quiescence_failure();
+            return Err(workspace_cleanup_failure(&recorder, detail));
         }
         if assignment_manager
             .lock()
@@ -624,13 +645,24 @@ async fn run_connection_loop_with_work_root(
             };
             tokio::pin!(connection);
             loop {
+                let notification = assignment_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .notification();
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if assignment_manager
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .cleanup_failure_ready_to_exit()
                 {
                     cancel_attempt(&connection_event, &active_effect_event);
-                    return Err(workspace_cleanup_failure(&recorder));
+                    let detail = assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .quiescence_failure();
+                    return Err(workspace_cleanup_failure(&recorder, detail));
                 }
                 if shutting_down
                     && assignment_manager
@@ -645,12 +677,6 @@ async fn run_connection_loop_with_work_root(
                     return finish_shutdown_cleanup(&work_root, &recorder, shutdown, deadline)
                         .await;
                 }
-                let notification = assignment_manager
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .notification();
-                let notified = notification.notified();
-                tokio::pin!(notified);
                 if shutting_down {
                     let Some(deadline) = shutdown_deadline.as_mut() else {
                         return Err(ServiceError::AssignmentShutdown);
@@ -797,7 +823,26 @@ async fn run_connection_loop_with_work_root(
                     return Err(ServiceError::Connection(error));
                 }
                 loop {
+                    let notification = assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .notification();
+                    let notified = notification.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cleanup_failure_ready_to_exit()
+                    {
+                        let detail = assignment_manager
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .quiescence_failure();
+                        return Err(workspace_cleanup_failure(&recorder, detail));
+                    }
                     tokio::select! {
+                        () = &mut notified => {}
                         Some(request) = reload_requests.recv() => {
                             if let Some(promoted) = reload_dependencies
                                 .perform(
@@ -880,7 +925,22 @@ async fn run_connection_loop_with_work_root(
             )
             .await?;
         } else {
+            let notification = assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .notification();
+            let notified = notification.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cleanup_failure_ready_to_exit()
+            {
+                continue;
+            }
             tokio::select! {
+                () = &mut notified => {}
                 Some(request) = reload_requests.recv() => {
                     if let Some(promoted) = reload_dependencies
                         .perform(
@@ -972,7 +1032,7 @@ async fn finish_shutdown_cleanup(
         result = &mut completion => match result {
             workspace::CleanupResult::Released | workspace::CleanupResult::Retained => Ok(()),
             workspace::CleanupResult::Quarantined(_) | workspace::CleanupResult::Preempted => {
-                Err(workspace_cleanup_failure(recorder))
+                Err(workspace_cleanup_failure(recorder, None))
             }
         },
         () = deadline.as_mut() => {
@@ -1422,9 +1482,16 @@ fn record_startup_retention(recorder: &Recorder, retained: &[workspace::Retained
     }
 }
 
-fn workspace_cleanup_failure(recorder: &Recorder) -> ServiceError {
-    record_non_admitting_failure(recorder, "workspace_cleanup_failed");
-    ServiceError::WorkspaceCleanupFailed
+fn workspace_cleanup_failure(recorder: &Recorder, detail: Option<Vec<String>>) -> ServiceError {
+    record_non_admitting_failure(
+        recorder,
+        if detail.is_some() {
+            "process_quiescence_failed"
+        } else {
+            "workspace_cleanup_failed"
+        },
+    );
+    ServiceError::WorkspaceCleanupFailed(detail)
 }
 
 fn record_non_admitting_failure(recorder: &Recorder, error_type: &'static str) {
@@ -1512,7 +1579,7 @@ mod tests {
         for error in [
             ServiceError::WorkRootInUse,
             ServiceError::WorkRootIsolation,
-            ServiceError::WorkspaceCleanupFailed,
+            ServiceError::WorkspaceCleanupFailed(None),
         ] {
             assert!(error.requires_operator_recovery());
         }

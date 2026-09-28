@@ -1418,6 +1418,7 @@ pub(super) enum ManagerEvent {
         lease_clock_failed: bool,
         retained_root: Option<Box<AssignmentRoot>>,
         quiescence: ProcessQuiescence,
+        quiescence_failure: Option<Vec<String>>,
         workspace_disposition: WorkspaceDisposition,
     },
     FinalGraceElapsed {
@@ -1547,6 +1548,8 @@ impl AdmissionRuntime {
     }
 }
 
+type ProductionBrokers = (Arc<dyn SourceCredentialBroker>, Arc<dyn RunInputBroker>);
+
 pub(super) struct AssignmentDependencies {
     work_root: Arc<WorkRootLease>,
     root_preparer: Arc<dyn AssignmentRootPreparer>,
@@ -1587,36 +1590,53 @@ impl AssignmentDependencies {
         sleeper: Arc<dyn Sleeper>,
         work_root: Arc<WorkRootLease>,
         recorder: Arc<crate::telemetry::Recorder>,
-    ) -> Self {
-        let source_broker = HttpSourceCredentialBroker::new(
+        source_override: Option<Arc<dyn SourceCredentialBroker>>,
+    ) -> Result<Self, super::ServiceError> {
+        let (source_broker, input_broker) = Self::production_brokers(
             config.endpoint(),
             config.credential(),
             boot_id,
             config.repository_url_policy(),
-        )
-        .ok()
-        .map(|broker| broker.with_recorder(Arc::clone(&recorder)))
-        .map(|broker| Arc::new(broker) as Arc<dyn SourceCredentialBroker>);
-        let input_broker = HttpRunInputBroker::new(config.endpoint(), config.credential(), boot_id)
-            .ok()
-            .map(|broker| Arc::new(broker) as Arc<dyn RunInputBroker>);
-        Self::new(
+            recorder.clone(),
+            source_override,
+        )?;
+        Ok(Self::new(
             work_root,
             sleeper,
-            source_broker,
-            input_broker,
+            Some(source_broker),
+            Some(input_broker),
             Arc::from(recorder.service_version()),
             Some(recorder),
             true,
-        )
+        ))
     }
 
-    pub(super) fn with_source_broker(
-        mut self,
-        source_broker: Arc<dyn SourceCredentialBroker>,
-    ) -> Self {
-        self.source_broker = Some(source_broker);
-        self
+    fn production_brokers(
+        endpoint: &url::Url,
+        credential: &crate::credential::Credential,
+        boot_id: &str,
+        repository_url_policy: super::config::RepositoryUrlPolicy,
+        recorder: Arc<crate::telemetry::Recorder>,
+        source_override: Option<Arc<dyn SourceCredentialBroker>>,
+    ) -> Result<ProductionBrokers, super::ServiceError> {
+        let source_broker = match source_override {
+            Some(source) => source,
+            None => Arc::new(
+                HttpSourceCredentialBroker::new(
+                    endpoint,
+                    credential,
+                    boot_id,
+                    repository_url_policy,
+                )
+                .map_err(|_| super::ServiceError::SourceBrokerConfiguration(endpoint.clone()))?
+                .with_recorder(recorder),
+            ),
+        };
+        let input_broker = Arc::new(
+            HttpRunInputBroker::new(endpoint, credential, boot_id)
+                .map_err(|_| super::ServiceError::InputBrokerConfiguration(endpoint.clone()))?,
+        );
+        Ok((source_broker, input_broker))
     }
 }
 
@@ -1656,6 +1676,8 @@ pub(super) struct AssignmentManager {
     lease_clock_failed: bool,
     lease_clock_failure_report: Option<u64>,
     cleanup_failed: bool,
+    cleanup_failure_report: Option<u64>,
+    quiescence_failure: Option<Vec<String>>,
     deferred_successor: Option<AssignmentOffer>,
     deferred_offer_failure: Option<AssignmentManagerFailure>,
     fenced_final_graces: BTreeSet<FencedFinalGrace>,
@@ -1718,6 +1740,8 @@ impl AssignmentManager {
             lease_clock_failed: false,
             lease_clock_failure_report: None,
             cleanup_failed: false,
+            cleanup_failure_report: None,
+            quiescence_failure: None,
             deferred_successor: None,
             deferred_offer_failure: None,
             fenced_final_graces: BTreeSet::new(),
@@ -3028,6 +3052,9 @@ impl AssignmentManager {
             retained.response_observation_id = None;
         }
         if observation.is_terminal() {
+            if self.cleanup_failure_report == Some(id) {
+                self.cleanup_failure_report = None;
+            }
             if self.lease_clock_failure_report == Some(id) {
                 self.lease_clock_failure_report = None;
             }
@@ -3432,7 +3459,12 @@ impl AssignmentManager {
         self.cleanup_failed
             && !matches!(self.slot, Some(LocalSlot::Releasing(_)))
             && self.deferred_successor.is_none()
+            && self.cleanup_failure_report.is_none()
             && self.outbox.replay_obligations_dispatched()
+    }
+
+    pub(super) fn quiescence_failure(&self) -> Option<Vec<String>> {
+        self.quiescence_failure.clone()
     }
 
     pub(super) fn shutdown_complete(&mut self) -> bool {
@@ -3664,6 +3696,7 @@ impl AssignmentManager {
                     lease_clock_failed,
                     retained_root,
                     quiescence,
+                    quiescence_failure,
                     workspace_disposition,
                 } => {
                     let running = match self.slot.take() {
@@ -3685,6 +3718,37 @@ impl AssignmentManager {
                         // Unproven process containment permanently fences this boot from
                         // admitting another assignment, even after its roots are retained.
                         self.cleanup_failed = true;
+                        self.quiescence_failure = quiescence_failure;
+                        // A transport send only marks the terminal frame encoded. Keep
+                        // the fenced boot alive for its Cloud acknowledgement (and
+                        // reconnect/replay) until the existing delivery deadline.
+                        if let (Some(id), Some(deadline)) =
+                            (final_observation_id, final_delivery_deadline)
+                            && !lease_clock_failed
+                        {
+                            let pending_deadline = self
+                                .clamp_to_shutdown_cleanup_deadline(deadline)
+                                .ok()
+                                .filter(|deadline| {
+                                    self.lease_clock
+                                        .now()
+                                        .and_then(|now| now.checked_cmp(*deadline))
+                                        .is_ok_and(|order| order == std::cmp::Ordering::Less)
+                                });
+                            if let Some(deadline) = pending_deadline {
+                                self.cleanup_failure_report = Some(id);
+                                if self
+                                    .start_final_grace(assignment_id.clone(), id, deadline, false)
+                                    .is_err()
+                                {
+                                    self.cleanup_failure_report = None;
+                                    self.lease_clock_failed = true;
+                                    self.retire_assignment_observations(&assignment_id);
+                                }
+                            } else {
+                                self.retire_assignment_observations(&assignment_id);
+                            }
+                        }
                         let after = if final_observation_id.is_some() {
                             ReleaseAfter::Reporting(Box::new(identity))
                         } else {
@@ -3816,6 +3880,12 @@ impl AssignmentManager {
                     final_observation_id,
                     continue_reporting,
                 } => {
+                    if self.cleanup_failure_report == Some(final_observation_id) {
+                        self.cleanup_failure_report = None;
+                        self.retire_assignment_observations(&assignment_id);
+                        self.reporting = None;
+                        continue;
+                    }
                     if self.fenced_final_graces.remove(&FencedFinalGrace {
                         assignment_id: assignment_id.clone(),
                         final_observation_id,
@@ -3864,6 +3934,19 @@ impl AssignmentManager {
                 } => self.finish_cleanup(assignment_id, result),
                 ManagerEvent::LeaseClockFailed => {
                     self.lease_clock_failed = true;
+                    if let Some(id) = self.cleanup_failure_report.take() {
+                        let assignment_id = {
+                            self.outbox
+                                .lock()
+                                .entries
+                                .iter()
+                                .find(|entry| entry.id == id)
+                                .map(|entry| entry.observation.assignment_id().to_owned())
+                        };
+                        if let Some(assignment_id) = assignment_id {
+                            self.retire_assignment_observations(&assignment_id);
+                        }
+                    }
                     if let Some(LocalSlot::Running(running)) = &mut self.slot {
                         revoke_authority(running);
                     }
@@ -5422,7 +5505,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let scenario = std::env::var("CODEX_FIXTURE_SCENARIO").unwrap();
         assert!(matches!(
             scenario.as_str(),
-            "no-value" | "failure-after-start-stubborn" | "cancellation-stubborn"
+            "no-value"
+                | "success-stubborn"
+                | "failure-after-start-stubborn"
+                | "cancellation-stubborn"
         ));
         let sqlite_home = PathBuf::from(std::env::var_os("CODEX_FIXTURE_SQLITE_HOME").unwrap());
         assert!(sqlite_home.is_absolute());
@@ -5531,8 +5617,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 std::thread::park();
             }
         }
-        if scenario == "failure-after-start-stubborn" {
+        if scenario == "success-stubborn" || scenario == "failure-after-start-stubborn" {
             materialize_runner_stubborn_descendant();
+        }
+        if scenario == "failure-after-start-stubborn" {
             write_codex_fixture_frame(
                 &mut output,
                 json!({"method": "error", "params": {
@@ -6425,6 +6513,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 lease_clock_failed: false,
                 retained_root: None,
                 quiescence: ProcessQuiescence::Proven,
+                quiescence_failure: None,
                 workspace_disposition: WorkspaceDisposition::Remove,
             })
             .unwrap();
@@ -8049,12 +8138,33 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
         offer_then_prepare(&mut manager, &offered).await;
-        let job = execution_job(&mut manager, &offered);
+        let mut job = execution_job(&mut manager, &offered);
         job.use_quiescence_fixture(Arc::new(AtomicBool::new(false)));
+        let (clock, _control, mut waits) = controlled_lease_clock();
+        job.use_containment_clock(clock);
         manager
             .handle_cancel(cancel_for(&offered, CancellationMode::Graceful, "bm"))
             .unwrap();
         job.spawn();
+        with_watchdog(async {
+            let notification = manager.notification();
+            let mut released = 0;
+            while released < 80 {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                let pending = manager.pending_observations(&BTreeSet::new(), 100);
+                fail_pending_artifact_registrations(&mut manager, &pending);
+                tokio::select! {
+                    Some((_, timer)) = waits.recv() => {
+                        timer.release();
+                        released += 1;
+                    }
+                    () = &mut notified => {}
+                }
+            }
+        })
+        .await
+        .expect("failed containment did not complete bounded rechecks");
 
         with_watchdog(async {
             let notification = manager.notification();
@@ -8116,6 +8226,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                     lease_clock_failed: false,
                     retained_root: None,
                     quiescence: ProcessQuiescence::Proven,
+                    quiescence_failure: None,
                     workspace_disposition: WorkspaceDisposition::Remove,
                 }
             };
@@ -9432,6 +9543,7 @@ steps:
                 lease_clock_failed: false,
                 retained_root: None,
                 quiescence: ProcessQuiescence::Proven,
+                quiescence_failure: None,
                 workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::Failed),
             })
             .unwrap();
@@ -9931,21 +10043,243 @@ steps:
         ));
     }
 
-    #[tokio::test]
-    async fn codex_failure_reports_only_after_stubborn_descendants_quiesce() {
+    #[test]
+    fn invalid_source_and_input_broker_endpoints_fail_construction() {
+        let invalid = url::Url::parse("https://localhost/v1/runner/connect").unwrap();
+        let valid = url::Url::parse("wss://localhost/v1/runner/connect").unwrap();
+        let credential = crate::credential::test_credential();
+        let (recorder, _capture) = crate::telemetry::test_recorder("broker-startup");
+        let policy = RepositoryUrlPolicy::production();
+        let error = AssignmentDependencies::production_brokers(
+            &invalid,
+            &credential,
+            "boot",
+            policy,
+            recorder.clone(),
+            None,
+        )
+        .err()
+        .expect("invalid source endpoint must fail startup");
+        assert!(matches!(
+            error,
+            super::super::ServiceError::SourceBrokerConfiguration(_)
+        ));
+        assert!(!error.requires_operator_recovery());
+
+        let source: Arc<dyn SourceCredentialBroker> =
+            Arc::new(HttpSourceCredentialBroker::new(&valid, &credential, "boot", policy).unwrap());
+        let error = AssignmentDependencies::production_brokers(
+            &invalid,
+            &credential,
+            "boot",
+            policy,
+            recorder,
+            Some(source),
+        )
+        .err()
+        .expect("invalid input endpoint must fail startup");
+        assert!(matches!(
+            error,
+            super::super::ServiceError::InputBrokerConfiguration(_)
+        ));
+        assert!(!error.requires_operator_recovery());
+    }
+
+    async fn run_codex_with_stubborn_descendant(
+        scenario: &str,
+    ) -> (tempfile::TempDir, AssignmentManager, Vec<ExecutionReport>) {
         let (temporary, mut manager) =
             manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
-        select_codex_scenario(&mut manager, "failure-after-start-stubborn");
+        select_codex_scenario(&mut manager, scenario);
         manager.guard_processes = true;
-
         let offered = offer("bg");
         offer_then_prepare(&mut manager, &offered).await;
         spawn_execution(&mut manager, &offered);
         wait_for_fixture_path(&temporary.path().join("codex.descendant")).await;
-
         let reports = with_watchdog(wait_for_terminal(&mut manager))
             .await
-            .expect("failed workflow did not reap its process group");
+            .expect("stubborn descendant did not produce a terminal report");
+        (temporary, manager, reports)
+    }
+
+    async fn assert_normal_success_and_reuse(
+        manager: &mut AssignmentManager,
+        reports: &[ExecutionReport],
+    ) {
+        assert!(
+            matches!(reports.last(), Some(ExecutionReport::Finished { outcome, .. })
+            if outcome["outcome"] == "succeeded" && outcome.get("quiescenceFailure").is_none())
+        );
+        acknowledge_terminal_and_settle(manager).await;
+        assert!(!manager.cleanup_failed);
+        let successor = offer("bh");
+        manager
+            .handle_offer(successor.clone())
+            .expect("runner accepts successor");
+        wait_for_offer_preparation(manager).await;
+    }
+
+    #[tokio::test]
+    async fn codex_success_contains_stubborn_descendants_and_releases_slot() {
+        let (temporary, mut manager, reports) =
+            run_codex_with_stubborn_descendant("success-stubborn").await;
+        assert_codex_fixture_quiescent(&temporary);
+        assert_normal_success_and_reuse(&mut manager, &reports).await;
+    }
+
+    // A real unkillable same-user process cannot be safely left running by a test.
+    // Exercise the post-engine boundary with an injected identity inspector/signal
+    // adapter; the Codex fixture above covers actual child-group teardown.
+    async fn finish_with_stubborn_guard(
+        kill_succeeds: bool,
+        exits_on_last_wait: bool,
+    ) -> (
+        tempfile::TempDir,
+        AssignmentManager,
+        Arc<crate::service::execution::FixtureGuardProcessControl>,
+        Vec<ExecutionReport>,
+    ) {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (temporary, mut manager) = manager_fixture(workflow);
+        manager.guard_processes = true;
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let job = execution_job(&mut manager, &offered);
+        let control = job.register_stubborn_fixture(kill_succeeds);
+        let (clock, _clock_control, mut waits) =
+            crate::service::lease_clock::controlled_lease_clock();
+        job.finish_success_fixture(clock);
+        with_watchdog(async {
+            for index in 0..if kill_succeeds { 0 } else { 80 } {
+                let (_, timer) = waits.recv().await.expect("containment wait was armed");
+                if exits_on_last_wait && index == 79 {
+                    control.mark_absent();
+                }
+                timer.release();
+            }
+        })
+        .await
+        .expect("containment did not perform bounded rechecks");
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .expect("guard did not produce a terminal report");
+        (temporary, manager, control, reports)
+    }
+
+    #[tokio::test]
+    async fn post_success_guard_containment_releases_workspace_and_slot() {
+        let (_temporary, mut manager, control, reports) =
+            finish_with_stubborn_guard(true, false).await;
+        assert_eq!(control.kill_count.load(Ordering::Acquire), 1);
+        assert_normal_success_and_reuse(&mut manager, &reports).await;
+    }
+
+    #[tokio::test]
+    async fn last_containment_wait_observes_departed_guard_before_fencing() {
+        let (_temporary, mut manager, control, reports) =
+            finish_with_stubborn_guard(false, true).await;
+        assert_eq!(control.kill_count.load(Ordering::Acquire), 1);
+        assert_normal_success_and_reuse(&mut manager, &reports).await;
+    }
+
+    #[tokio::test]
+    async fn uncontainable_guard_is_named_in_terminal_report_and_fences_offers() {
+        let (_temporary, mut manager, control, reports) =
+            finish_with_stubborn_guard(false, false).await;
+        assert!(
+            matches!(reports.last(), Some(ExecutionReport::Finished { outcome, .. })
+            if outcome["quiescenceFailure"]["reason"] == "process_quiescence_failed"
+                && outcome["quiescenceFailure"]["survivingGuards"].as_array()
+                    .is_some_and(|guards| guards.iter().any(|guard| guard.as_str().is_some_and(|id| id.contains("stubborn-fixture")))))
+        );
+        wait_for_execution_finalization(&mut manager).await;
+        assert_eq!(control.kill_count.load(Ordering::Acquire), 1);
+        assert!(manager.cleanup_failed);
+        let detail = manager.quiescence_failure();
+        let (recorder, _capture) = crate::telemetry::test_recorder("quiescence-exit");
+        let exit = crate::service::workspace_cleanup_failure(&recorder, detail);
+        assert!(
+            matches!(exit, crate::service::ServiceError::WorkspaceCleanupFailed(Some(ref guards))
+            if guards.iter().any(|guard| guard.contains("stubborn-fixture")))
+        );
+        assert!(exit.requires_operator_recovery());
+    }
+
+    #[tokio::test]
+    async fn quiescence_failure_waits_for_terminal_ack_or_delivery_deadline() {
+        for acknowledge in [true, false] {
+            let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+            let (_temporary, mut manager) = manager_fixture(workflow);
+            let (clock, _control, mut waits) = controlled_lease_clock();
+            manager.lease_clock = clock;
+            let offered = offer("bg");
+            offer_then_prepare(&mut manager, &offered).await;
+            let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
+            manager.acknowledge_observation(acceptance);
+            let job = execution_job(&mut manager, &offered);
+            drop(job);
+            let identity = match &manager.slot {
+                Some(LocalSlot::Running(running)) => running.identity.clone(),
+                _ => panic!("fixture assignment must be running"),
+            };
+            let id = enqueue_finished(&manager, &identity);
+            let deadline = manager
+                .lease_clock
+                .now()
+                .unwrap()
+                .checked_add(Duration::from_secs(5))
+                .unwrap();
+            manager
+                .event_sender
+                .send(ManagerEvent::Finished {
+                    assignment_id: identity.assignment_id.clone(),
+                    final_observation_id: Some(id),
+                    final_delivery_deadline: Some(deadline),
+                    lease_clock_failed: false,
+                    retained_root: None,
+                    quiescence: ProcessQuiescence::Failed,
+                    quiescence_failure: Some(vec!["guard-fixture".to_owned()]),
+                    workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::Failed),
+                })
+                .unwrap();
+            manager.pending_observations(&BTreeSet::new(), 100);
+            assert!(manager.cleanup_failed);
+            manager.mark_observation_encoded(id);
+            assert!(!manager.cleanup_failure_ready_to_exit());
+            // A send on a lost transport must remain replayable until Cloud acks it.
+            manager.finish_transport();
+            assert!(
+                manager
+                    .pending_observations(&BTreeSet::new(), 100)
+                    .iter()
+                    .any(|entry| entry.id == id)
+            );
+            assert!(!manager.cleanup_failure_ready_to_exit());
+            let timer = with_watchdog(waits.recv())
+                .await
+                .expect("terminal delivery timer was not armed")
+                .expect("controlled lease clock closed")
+                .1;
+            if acknowledge {
+                manager.mark_observation_encoded(id);
+                manager.acknowledge_observation(id);
+                assert!(manager.cleanup_failure_ready_to_exit());
+            } else {
+                timer.release();
+                with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+                    manager.cleanup_failure_ready_to_exit()
+                }))
+                .await
+                .expect("terminal deadline did not release the fenced boot");
+                assert!(!manager.outbox.contains(id));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_failure_reports_only_after_stubborn_descendants_quiesce() {
+        let (temporary, _manager, reports) =
+            run_codex_with_stubborn_descendant("failure-after-start-stubborn").await;
 
         assert!(reports.iter().any(|report| matches!(
             report,
