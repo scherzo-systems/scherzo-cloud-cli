@@ -217,6 +217,53 @@ mod tests {
     }
 
     #[test]
+    fn generated_webhook_inspection_decodes_closed_attempt_evidence() {
+        let detail: generated::models::WebhookDelivery = serde_json::from_value(serde_json::json!({
+            "id": "whd_01k0z6r1w8f4jy2m7q9v3x5ab1", "eventId": "evt_01k0z6r1w8f4jy2m7q9v3x5ab1",
+            "eventType": "step.failed", "runId": "run_01k0z6r1w8f4jy2m7q9v3x5ab1",
+            "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5ab1", "workflowPath": "workflows/build.yaml",
+            "sequence": 12, "subscriptionVersion": 3, "createdAt": "2026-08-04T12:00:00Z",
+            "state": "failed", "cycles": [{
+                "number": 1, "origin": "automatic", "state": "failed",
+                "dueAt": "2026-08-04T12:00:00Z", "createdAt": "2026-08-04T12:00:00Z",
+                "updatedAt": "2026-08-04T12:00:02Z", "failureCode": "http_permanent_status",
+                "attempts": [{
+                    "id": "wha_01k0z6r1w8f4jy2m7q9v3x5ab1", "startedAt": "2026-08-04T12:00:01Z",
+                    "finishedAt": "2026-08-04T12:00:02Z", "currentKeyVersion": 2,
+                    "previousKeyVersion": 1, "httpStatus": 403,
+                    "failureCode": "http_permanent_status"
+                }]
+            }]
+        }))
+        .expect("delivery detail fixture");
+        assert_eq!(detail.sequence, 12);
+        assert_eq!(
+            detail.cycles.as_ref().unwrap()[0].attempts[0].http_status,
+            Some(403)
+        );
+        let list: generated::models::WebhookDeliveryList = serde_json::from_value(serde_json::json!({
+            "items": [{
+                "id": "whd_01k0z6r1w8f4jy2m7q9v3x5ab2", "eventId": "evt_01k0z6r1w8f4jy2m7q9v3x5ab2",
+                "eventType": "run.failed", "runId": "run_01k0z6r1w8f4jy2m7q9v3x5ab2",
+                "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5ab2", "workflowPath": "workflows/build.yaml",
+                "sequence": 13, "subscriptionVersion": 3, "createdAt": "2026-08-04T12:00:00Z",
+                "state": "queued"
+            }], "nextCursor": "eyJvcGFxdWUiOnRydWV9"
+        }))
+        .expect("delivery page fixture");
+        assert_eq!(list.items[0].id, "whd_01k0z6r1w8f4jy2m7q9v3x5ab2");
+        let subscriptions: generated::models::WebhookSubscriptionList =
+            serde_json::from_value(serde_json::json!({"items": [{
+                "id": "whs_01k0z6r1w8f4jy2m7q9v3x5abc", "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "url": "https://receiver.example.test/hook", "state": "enabled", "version": 3,
+                "eventTypes": ["run.failed"], "contextKeys": [],
+                "createdAt": "2026-08-04T12:00:00Z", "updatedAt": "2026-08-04T12:00:02Z"
+            }]}))
+            .expect("subscription page fixture");
+        assert!(subscriptions.items[0].secret.is_none());
+    }
+
+    #[test]
     fn generated_problem_preserves_opaque_actions() {
         let input = serde_json::json!({
             "type": "https://api.scherzo.dev/problems/principal-not-provisioned",
