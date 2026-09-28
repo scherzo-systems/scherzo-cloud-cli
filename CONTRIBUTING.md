@@ -41,11 +41,13 @@ leaf.
 Require `--yes` for leaves ending in `delete`, `decline`, `end`, `leave`, `remove`,
 `revoke`, or `retire`, and for `account deletion request` and
 `organization deletion request`; no other leaf takes it. Reversible modes such as
-`runner disable` and `runner drain` do not take `--yes`. A command paginates when it
-returns one page and permits continuation: in that case expose `--limit` and `--cursor`
-together through `PaginationArgs`, which also supplies the exact `Pagination:`
-after-help from the style guide. Use its bound parameter for a family whose maximum
-differs from the standard 200 items.
+`runner disable` and `runner drain` do not take `--yes`.
+
+Every `list` leaf paginates unless the API-limited exception is recorded in
+[`docs/output-style.md`](docs/output-style.md). For a paginated leaf, expose
+`--limit` and `--cursor` together through `PaginationArgs`, which also supplies
+the exact `Pagination:` after-help from the style guide. Use its bound parameter
+for a family whose maximum differs from the standard 200 items.
 
 Every new command path needs exactly one help snapshot under `tests/cmd/help/`;
 [`cli::tests::every_customer_command_has_one_help_snapshot`](src/cli.rs) is the topology

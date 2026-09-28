@@ -8,6 +8,8 @@ use super::Cli;
 const LEAVES: &str = "accept begin cancel complete continue create decline delete disable doctor download drain enable end enroll history issue leave link list login logout move preview propose reference remove rename request retire retry revoke run schema seal serve set show signup status update upload validate version view wait";
 const GROUPS: &str = "account activation artifact audit auth authorization connection credential delegation deletion github identity input input-set installation invitation linear member organization pool project publication repository run runner runner-pool service-principal setup workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
+// These endpoints have no limit/cursor contract; see cli/docs/output-style.md.
+const UNPAGINATED_LISTS: [&str; 2] = ["github installation list", "github repository list"];
 
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
@@ -149,14 +151,16 @@ fn violations(root: &Command) -> BTreeSet<String> {
                 {
                     failures.insert(format!("confirmation|{path}"));
                 }
-                if has("cursor")
-                    && (!has("limit")
-                        || !node.get_after_help().is_some_and(|note| {
-                            note.to_string()
-                                .matches(super::PAGINATION_AFTER_HELP)
-                                .count()
-                                == 1
-                        }))
+                if (token == "list" && !UNPAGINATED_LISTS.contains(&path) && !has("cursor"))
+                    || (UNPAGINATED_LISTS.contains(&path) && has("cursor"))
+                    || (has("cursor")
+                        && (!has("limit")
+                            || !node.get_after_help().is_some_and(|note| {
+                                note.to_string()
+                                    .matches(super::PAGINATION_AFTER_HELP)
+                                    .count()
+                                    == 1
+                            })))
                 {
                     failures.insert(format!("pagination|{path}"));
                 }
@@ -507,6 +511,9 @@ fn structural_rules_reject_discriminating_changes() {
     };
     let found = violations(&fixture());
     assert!(found.contains("pagination|entity list"));
+    let unpaged = Command::new("fixture")
+        .subcommand(Command::new("entity").subcommand(Command::new("list").about("A")));
+    assert!(violations(&unpaged).contains("pagination|entity list"));
     let complete = Command::new("fixture").subcommand(
         Command::new("entity").subcommand(
             Command::new("list")

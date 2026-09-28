@@ -239,10 +239,20 @@ separate entity family.
   relative order: `--json`, then `--service-api-key-file`, then
   `--allow-insecure-http`. Other arguments and flags do not affect this
   relative-order check.
-- **Pagination:** every leaf that takes `--cursor` also takes `--limit` and
-  includes this exact after-help section (once per leaf):
+- **Pagination:** every `list` leaf takes `--cursor` and `--limit` and
+  includes this exact after-help section (once per leaf), except for the
+  specific API-limited leaves below:
 
 ```
 Pagination:
   This command returns one page. Pass --cursor <CURSOR> to continue.
 ```
+
+  `github installation list` and `github repository list` cannot offer bounded
+  pagination: the public GitHub installation and installation-repository API
+  endpoints accept neither a limit nor a cursor and return arrays with no
+  continuation cursor. The repository-discovery endpoint also collects the
+  provider's selection before returning it. Client-side slicing would still
+  require fetching the entire unbounded response and would misrepresent the
+  API's continuation semantics. Do not advertise pagination for these leaves
+  until the API supports it; the exception does not make large lists safe.
