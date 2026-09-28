@@ -260,6 +260,55 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
     }
 }
 
+#[test]
+fn ordinary_agent_diagnostics_survive_step_and_finalizer_publication() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let invocation = |id| RecoveryInvocationV1 {
+        invocation_id: id,
+        role: RecoveryInvocationRoleV1::Target,
+        target_execution: Some(1),
+        recovery_round: None,
+        state: RecoveryInvocationStateV1::Settled,
+        started_at: "2026-08-02T12:01:44.01Z".to_owned(),
+        finished_at: "2026-08-02T12:01:44.02Z".to_owned(),
+        duration_milliseconds: 10,
+        usage: RecoveryInvocationUsageV1::default(),
+        diagnostics: vec![RecoveryInvocationDiagnosticV1 {
+            kind: RecoveryDiagnosticKindV1::AgentHarnessStderr,
+            reference: format!("runner/invocations/{id}/stderr"),
+            stream: command_output_v1(&diagnostic(true)).unwrap().stderr,
+        }],
+        diagnostic_reference: None,
+    };
+    run.steps[1].kind = WorkflowRunStepKind::Agent;
+    run.steps[1].command_output = None;
+    run.steps[1].invocations = vec![invocation(1)];
+    let mut finalizer = succeeded_step("cleanup", BTreeMap::new());
+    finalizer.role = WorkflowNodeRole::Finalizer;
+    finalizer.kind = WorkflowRunStepKind::Agent;
+    finalizer.command_output = None;
+    finalizer.invocations = vec![invocation(2)];
+    run.finalization = Some(WorkflowRunFinalization {
+        trigger: FinalizationTrigger::Succeeded,
+        finalizers: vec![finalizer],
+        cancellation: None,
+        force_abort: false,
+    });
+    let destination = fixture.destination("ordinary-agent-diagnostics");
+    let terminal = publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let value = serde_json::to_value(terminal).unwrap();
+    assert_eq!(
+        value["result"]["steps"][1]["invocations"][0]["diagnostics"][0]["kind"],
+        "agent_harness_stderr"
+    );
+    assert_eq!(
+        value["result"]["finalization"]["finalizers"][0]["invocations"][0]["diagnostics"][0]["stream"]
+            ["retainedBytes"],
+        4
+    );
+}
+
 fn make_failed(run: &mut WorkflowRunResult) {
     let cause = StepFailureCause::Execution(StepExecutionFailure::Command(
         CommandExecutionFailure::UnsuccessfulExit { code: Some(23) },
@@ -1472,6 +1521,21 @@ fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
     assert_eq!(projected["code"], "harness_protocol_failed");
     assert!(projected.get("protocolRejection").is_none());
     assert!(!projected.to_string().contains("sensitive sentinel"));
+}
+
+#[test]
+fn launch_failure_projects_only_contract_supported_recovery_cause() {
+    let failure = crate::workflow::agent::AgentFailure::new(
+        crate::workflow::agent::AgentFailureCause::start_failure(
+            "process spawn",
+            std::io::Error::from_raw_os_error(libc::ENOENT),
+        ),
+    );
+    let projected = serde_json::to_value(agent_failure_cause(&failure)).unwrap();
+    assert_eq!(
+        projected,
+        serde_json::json!({ "code": "harness_start_failed" })
+    );
 }
 
 #[test]

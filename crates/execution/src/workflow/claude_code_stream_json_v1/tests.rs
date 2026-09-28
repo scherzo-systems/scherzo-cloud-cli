@@ -373,8 +373,14 @@ fn stream_continuations_from_another_thread_reject_the_response() {
 #[test]
 fn malformed_and_contradictory_recorded_streams_never_accept_a_response() {
     for (bytes, expected) in [
-        (MALFORMED, AgentFailureCause::HarnessStartFailed),
-        (MISSING_INIT, AgentFailureCause::HarnessStartFailed),
+        (
+            MALFORMED,
+            AgentFailureCause::start_failure("launch preparation", "unavailable"),
+        ),
+        (
+            MISSING_INIT,
+            AgentFailureCause::start_failure("launch preparation", "unavailable"),
+        ),
         (CONTRADICTORY_INIT, AgentFailureCause::HarnessProtocolFailed),
     ] {
         let (_, outcome) = replay(bytes, AgentValueKind::Response, 1024);
@@ -382,10 +388,16 @@ fn malformed_and_contradictory_recorded_streams_never_accept_a_response() {
     }
 
     let (_, invalid_utf8) = replay(&[0xff, b'\n'], AgentValueKind::Response, 1024);
-    assert_failed(invalid_utf8, AgentFailureCause::HarnessStartFailed);
+    assert_failed(
+        invalid_utf8,
+        AgentFailureCause::start_failure("launch preparation", "unavailable"),
+    );
 
     let (_, non_object) = replay(b"[]\n", AgentValueKind::Response, 1024);
-    assert_failed(non_object, AgentFailureCause::HarnessStartFailed);
+    assert_failed(
+        non_object,
+        AgentFailureCause::start_failure("launch preparation", "unavailable"),
+    );
 }
 
 #[test]
@@ -393,7 +405,10 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     let mut malformed = parser(AgentValueKind::None, 1024);
     assert_eq!(
         malformed.push_stdout(b"not-json\n", drop),
-        Err(AgentFailureCause::HarnessStartFailed)
+        Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable"
+        ))
     );
     let malformed = malformed.finish(false);
     assert_eq!(
@@ -632,7 +647,10 @@ fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
         let mut initialization = init(QUALIFICATION_VERSION, SESSION_ID);
         initialization[field] = replacement;
         let (_, outcome) = replay(&framed(&[initialization]), AgentValueKind::Response, 1024);
-        assert_failed(outcome, AgentFailureCause::HarnessStartFailed);
+        assert_failed(
+            outcome,
+            AgentFailureCause::start_failure("launch preparation", "unavailable"),
+        );
     }
 
     let mut duplicate_result = parser(AgentValueKind::Response, 1024);
@@ -693,11 +711,11 @@ fn truncation_and_frame_overflow_fail_in_the_current_protocol_phase() {
     );
     assert_eq!(
         oversized.push_stdout(b"123456789", drop).unwrap_err(),
-        AgentFailureCause::HarnessStartFailed
+        AgentFailureCause::start_failure("launch preparation", "unavailable")
     );
     assert_failed(
         oversized.finish(true),
-        AgentFailureCause::HarnessStartFailed,
+        AgentFailureCause::start_failure("launch preparation", "unavailable"),
     );
 }
 

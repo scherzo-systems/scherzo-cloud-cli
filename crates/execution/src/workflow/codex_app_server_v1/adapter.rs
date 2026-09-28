@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use rustix::process::Pid;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -162,7 +163,13 @@ where
         terminal: AgentTerminalCallback,
     ) {
         let cancellation = invocation.cancellation().clone();
-        let outcome = self.invoke_inner(invocation, &started).await;
+        let span = tracing::info_span!("agent_invocation", profile = "codex_app_server_v1",
+            step = %invocation.identity().step(),
+            sequence = invocation.identity().invocation().transition_sequence.get());
+        let outcome = self
+            .invoke_inner(invocation, &started)
+            .instrument(span)
+            .await;
         let outcome = cancellation
             .cancellation_reason()
             .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
@@ -199,7 +206,14 @@ where
         .await
         {
             Ok((invocation, Ok(plan))) => (invocation, plan),
-            Ok((_, Err(cause))) => return failed_agent_outcome(cause),
+            Ok((invocation, Err(cause))) => {
+                self.diagnostics.record_agent_start_failure(
+                    invocation.identity(),
+                    self.maximum_diagnostic_stream_bytes,
+                    &cause,
+                );
+                return failed_agent_outcome(cause);
+            }
             Err(_) => {
                 return setup_failed(AgentHarnessSetupStage::ExecutableLaunch);
             }
@@ -239,7 +253,14 @@ where
         }
         let (process, standard_error) = match launched {
             Ok(process) => process,
-            Err(cause) => return failed_agent_outcome(cause),
+            Err(cause) => {
+                self.diagnostics.record_agent_start_failure(
+                    invocation.identity(),
+                    self.maximum_diagnostic_stream_bytes,
+                    &cause,
+                );
+                return failed_agent_outcome(cause);
+            }
         };
         let Some(process_directives) = invocation.take_process_directives() else {
             let mut process = process;
@@ -306,6 +327,17 @@ where
         .await;
         finish_agent_diagnostic_capture(invocation.diagnostic_session(), diagnostic, &outcome)
             .await;
+        if let AgentOutcome::Failed(failure) = &outcome
+            && let AgentFailureCause::HarnessSetupRejected { stage, message } = failure.cause()
+        {
+            self.diagnostics.record_adapter_error(
+                invocation.identity().step().to_owned(),
+                invocation.identity().invocation(),
+                self.maximum_diagnostic_stream_bytes,
+                &format!("{stage:?} rejected"),
+                message,
+            );
+        }
         outcome
     }
 }
@@ -361,15 +393,17 @@ where
         || compatibility_profile_for_version(invocation.adapter().version())
             != Some(CodexCompatibilityProfile::CodexAppServerV1)
         || !invocation.adapter().executable().is_absolute()
-        || invocation
-            .diagnostic_session()
-            .verify_path_binding()
-            .is_err()
     {
         return Err(AgentFailureCause::HarnessSetupFailed {
             stage: AgentHarnessSetupStage::ExecutableLaunch,
         });
     }
+    invocation
+        .diagnostic_session()
+        .verify_path_binding()
+        .map_err(|error| {
+            AgentFailureCause::start_failure("codex diagnostic session binding", error)
+        })?;
     let expected_cwd =
         invocation
             .process()
@@ -450,9 +484,9 @@ fn prepare_sqlite_state(
     codex_home: &Path,
 ) -> Result<tempfile::TempDir, AgentFailureCause> {
     let canonical_staging = std::fs::canonicalize(staging)
-        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+        .map_err(|error| AgentFailureCause::start_failure("codex staging directory", error))?;
     let canonical_codex_home = std::fs::canonicalize(codex_home)
-        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+        .map_err(|error| AgentFailureCause::start_failure("codex home", error))?;
     if canonical_staging != staging
         || !canonical_staging.is_absolute()
         || canonical_staging.starts_with(canonical_codex_home)
@@ -462,9 +496,9 @@ fn prepare_sqlite_state(
     let sqlite_state = tempfile::Builder::new()
         .prefix("codex-sqlite-")
         .tempdir_in(canonical_staging)
-        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+        .map_err(|error| AgentFailureCause::start_failure("codex sqlite tempdir", error))?;
     std::fs::set_permissions(sqlite_state.path(), std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))?;
+        .map_err(|error| AgentFailureCause::start_failure("codex sqlite permissions", error))?;
     Ok(sqlite_state)
 }
 
@@ -527,9 +561,7 @@ where
                 .map_err(|_| io::Error::other("agent working directory is unavailable"))
         },
     )
-    .map_err(|_| AgentFailureCause::HarnessSetupFailed {
-        stage: AgentHarnessSetupStage::ExecutableLaunch,
-    })?;
+    .map_err(|error| AgentFailureCause::start_failure("codex process spawn", error))?;
     let process_group = child.identity().process_group();
     let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
     else {
@@ -551,19 +583,17 @@ where
             });
         }
     };
-    if release_guarded_codex(invocation.diagnostic_session(), || {
+    if let Err(cause) = release_guarded_codex(invocation.diagnostic_session(), || {
         child
             .continue_execution_cancellable(cancellation)
-            .map_err(|_| ())?;
-        registration.mark_released().map_err(|_| ())
-    })
-    .is_err()
-    {
+            .map_err(|error| AgentFailureCause::start_failure("codex process release", error))?;
+        registration
+            .mark_released()
+            .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))
+    }) {
         let _ = child.force_stop_blocking();
         let _ = registration.mark_quiesced();
-        return Err(AgentFailureCause::HarnessSetupFailed {
-            stage: AgentHarnessSetupStage::ExecutableLaunch,
-        });
+        return Err(cause);
     }
     // jscpd:ignore-end
     Ok((
@@ -582,16 +612,12 @@ where
 
 fn release_guarded_codex(
     diagnostic_session: &AgentDiagnosticSession,
-    release: impl FnOnce() -> Result<(), ()>,
+    release: impl FnOnce() -> Result<(), AgentFailureCause>,
 ) -> Result<(), AgentFailureCause> {
-    diagnostic_session.verify_path_binding().map_err(|_| {
-        AgentFailureCause::HarnessSetupFailed {
-            stage: AgentHarnessSetupStage::ExecutableLaunch,
-        }
+    diagnostic_session.verify_path_binding().map_err(|error| {
+        AgentFailureCause::start_failure("codex diagnostic session binding", error)
     })?;
-    release().map_err(|()| AgentFailureCause::HarnessSetupFailed {
-        stage: AgentHarnessSetupStage::ExecutableLaunch,
-    })
+    release()
 }
 
 fn invocation_environment<Sink>(
@@ -1054,6 +1080,7 @@ where
             if matches!(
                 failure.cause(),
                 AgentFailureCause::HarnessSetupFailed { .. }
+                    | AgentFailureCause::HarnessSetupRejected { .. }
                     | AgentFailureCause::HarnessProtocolFailed
             ) =>
         {

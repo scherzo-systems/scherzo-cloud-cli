@@ -678,6 +678,28 @@ fn missing_values_invalid_cwd_and_unavailable_staging_are_typed_before_launch() 
     assert_eq!(launch_count.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+#[test]
+fn diagnostic_allocation_retains_os_error_at_materialization_boundary() {
+    let fixture = Fixture::new(ConsumerValueMode::None);
+    let profile_path = fixture
+        ._temporary
+        .path()
+        .join("run/attempts/000001/diagnostics/pi-json-v1");
+    fs::write(&profile_path, b"occupied").unwrap();
+
+    let error = materialization_error(fixture.materialize(CancellationSource::new()));
+    let AgentInputMaterializationError::Start(
+        AgentInputStartFailure::DiagnosticSessionUnavailable { error },
+    ) = error
+    else {
+        panic!("expected diagnostic allocation failure");
+    };
+    assert!(error.to_string().contains("diagnostic I/O"));
+    let os_error = std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string();
+    assert!(error.to_string().contains(&os_error));
+    assert_eq!(fixture.staging.active_view_count(), 0);
+}
+
 struct BoundaryGate {
     reached: std::sync::mpsc::Sender<AgentMaterializationBoundary>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,

@@ -21,7 +21,9 @@ use super::agent::{
     AgentInvocationStaging, AgentObservationSink, AgentProcessContext, AgentPrompt, AgentValueMode,
     MAXIMUM_INLINE_AGENT_INPUT_BYTES, StagedAgentAttachment,
 };
-use super::agent_diagnostics::{AgentDiagnosticSession, AgentDiagnosticSessionStore};
+use super::agent_diagnostics::{
+    AgentDiagnosticSession, AgentDiagnosticSessionError, AgentDiagnosticSessionStore,
+};
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CapturedArtifact};
 use super::claude_code::ClaudeCodeConfig;
 use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
@@ -199,6 +201,7 @@ pub enum AgentInputStartFailure {
     ArtifactStagingMismatch,
     AgentStagingMismatch,
     StagingUnavailable,
+    DiagnosticSessionUnavailable { error: AgentDiagnosticSessionError },
 }
 
 impl fmt::Display for AgentInputStartFailure {
@@ -951,11 +954,11 @@ fn allocate_diagnostic_session<'a>(
 > {
     match sessions.allocate(identity, harness.profile(), harness_version(harness)) {
         Ok(session) => Ok((lifecycle, view, session)),
-        Err(_) => {
+        Err(error) => {
             drop(lifecycle);
             Err(abort_view(
                 view,
-                start_error(AgentInputStartFailure::StagingUnavailable),
+                start_error(AgentInputStartFailure::DiagnosticSessionUnavailable { error }),
             ))
         }
     }

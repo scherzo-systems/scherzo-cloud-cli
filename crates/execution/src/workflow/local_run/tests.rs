@@ -2100,6 +2100,22 @@ fn finalizer_retry_uses_fresh_identity_and_omits_prior_finalization_bytes() {
                     force_abort: false,
                 },
             ));
+            attempt.progress.last_transition_sequence = 1;
+            attempt.progress.invocations.push(DurableInvocationV1 {
+                invocation_id: 1,
+                step_id: "cleanup".to_owned(),
+                node_role: AttemptNodeRoleV1::Finalizer,
+                role: crate::workflow::publication::RecoveryInvocationRoleV1::Target,
+                target_execution: Some(1),
+                recovery_round: None,
+                state: DurableInvocationStateV1::Settled,
+                started_at: attempt.created_at.clone(),
+                finished_at: attempt.settled_at.clone(),
+                usage: crate::workflow::publication::RecoveryInvocationUsageV1::default(),
+                diagnostics: Vec::new(),
+                diagnostic_reference: None,
+            });
+            recalculate_invocation_accounting(&mut attempt.progress)?;
             attempt.result = AttemptResultV1::NotPublished {
                 reason: ResultAbsentReasonV1::PublicationPending,
             };

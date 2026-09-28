@@ -2229,6 +2229,35 @@ fn local_claude_execution_rejects_a_version_that_contradicts_the_validated_snaps
         terminal["result"]["primaryIssue"]["detail"]["code"],
         "harness_start_failed"
     );
+    let invocation = &terminal["result"]["steps"][0]["invocations"][0];
+    assert_eq!(invocation["role"], "target");
+    assert_eq!(invocation["diagnostics"][0]["kind"], "agent_harness_stdout");
+    assert_eq!(invocation["diagnostics"][1]["kind"], "agent_harness_stderr");
+    assert_eq!(invocation["diagnostics"][1]["stream"]["fullyDrained"], true);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["attempts"][0]["progress"]["invocations"][0]["state"],
+        "settled"
+    );
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(
+        view.status.success(),
+        "{}",
+        String::from_utf8_lossy(&view.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert_eq!(
+        view["result"]["steps"][0]["invocations"][0]["invocationId"],
+        invocation["invocationId"]
+    );
     assert!(
         terminal["result"]["primaryIssue"]["detail"]
             .get("protocolRejection")
@@ -2832,6 +2861,95 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
                 .is_none()
         );
     }
+}
+
+#[test]
+fn interrupted_agent_can_be_abandoned_and_retried_without_an_active_ledger_entry() {
+    let blocked = ClaudeCodeFixture::with_execution(
+        "2.1.283 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        blocked_claude_code_execution(),
+    );
+    let bundle = RunBundle::new(response_claude_code_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let destination = bundle.result("interrupted-agent-retry");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let mut barrier = AgentBarrierFixture::new();
+    let process_pid = bundle.initial_cwd().join("blocked-agent.pid");
+    let child = isolated_command(&args)
+        .env(
+            "PATH",
+            fixture_path_with_host_tools(&[blocked.path_directory()]),
+        )
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .env("WORKFLOW_READY_FIFO", &barrier.ready_path)
+        .env("WORKFLOW_RELEASE_FIFO", &barrier.release_path)
+        .env("CLAUDE_FIXTURE_PID", &process_pid)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    barrier.wait_until_started();
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    assert!(matches!(
+        state["attempts"][0]["progress"]["steps"][0]["state"].as_str(),
+        Some("starting" | "running")
+    ));
+    assert!(
+        state["attempts"][0]["progress"]
+            .get("invocations")
+            .is_none()
+    );
+    kill_process(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        Signal::KILL,
+    )
+    .unwrap();
+    let _ = child.wait_with_output().unwrap();
+
+    let completed = ClaudeCodeFixture::with_execution(
+        "2.1.283 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        response_claude_code_execution(),
+    );
+    let retry = isolated_command(&[
+        "workflow".to_owned(),
+        "retry".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--execution-root".to_owned(),
+        bundle.execution_root().to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .env(
+        "PATH",
+        fixture_path_with_host_tools(&[completed.path_directory()]),
+    )
+    .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+    .output()
+    .unwrap();
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["attempts"][0]["state"], "interrupted");
+    assert!(
+        state["attempts"][0]["progress"]
+            .get("invocations")
+            .is_none()
+    );
+    assert_eq!(state["attempts"][1]["state"], "succeeded");
+    assert_eq!(
+        state["attempts"][1]["progress"]["invocations"][0]["state"],
+        "settled"
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
-pub(super) fn random_uuid_v4() -> Result<String, ()> {
+pub(super) fn random_uuid_v4() -> std::io::Result<String> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|_| ())?;
+    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(format!(

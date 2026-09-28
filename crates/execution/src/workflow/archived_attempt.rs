@@ -665,7 +665,8 @@ fn validate_and_project_result(
     validate_output_producers(attempt, result, workflow)?;
     let ordinary_steps = project_steps(&snapshot.root, attempt, result, workflow)?;
     validate_terminal_step_facts(ordinary_trigger, &ordinary_steps, workflow)?;
-    let (finalization, finalizers) = project_finalization(attempt, result, workflow)?;
+    let (finalization, finalizers) =
+        project_finalization(&snapshot.root, attempt, result, workflow)?;
     let mut steps = ordinary_steps;
     steps.extend(finalizers);
     let primary_issue = project_primary_issue(result, &steps)?;
@@ -805,6 +806,7 @@ fn project_steps(
 }
 
 fn project_finalization(
+    root: &OwnedFd,
     attempt: &LocalAttemptV1,
     result: &WorkflowResultV1,
     workflow: &super::resolution::ResolvedWorkflow,
@@ -870,6 +872,7 @@ fn project_finalization(
                 || durable.failure_policy != step_failure_policy(definition)
                 || !step_state_matches(finalizer.state, durable.state)
                 || !durable_finalizer_matches_wire(durable, finalizer)
+                || !durable_invocations_match_wire(root, attempt, &durable.id, finalizer)
                 || !step_kind_matches(&finalizer.kind, definition)
                 || !finalizer_disposition_matches_definition(declared, finalizer, result)
             {
@@ -1016,7 +1019,7 @@ fn durable_recovery_matches_wire(
     wire: &WorkflowStepV1,
 ) -> bool {
     let recovery_matches = match (&durable.recovery, &wire.recovery) {
-        (None, None) => wire.invocations.is_empty(),
+        (None, None) => true,
         (Some(durable), Some(wire)) => {
             durable.schema_version == wire.schema_version
                 && durable.configured_retries == wire.configured_retries
@@ -1046,15 +1049,21 @@ fn durable_recovery_matches_wire(
     if !recovery_matches {
         return false;
     }
+    durable_invocations_match_wire(root, attempt, &durable.id, wire)
+}
+
+fn durable_invocations_match_wire(
+    root: &OwnedFd,
+    attempt: &LocalAttemptV1,
+    id: &str,
+    wire: &WorkflowStepV1,
+) -> bool {
     let retained = attempt
         .progress
         .invocations
         .iter()
-        .filter(|invocation| invocation.step_id == durable.id)
+        .filter(|invocation| invocation.step_id == id)
         .collect::<Vec<_>>();
-    if wire.recovery.is_none() {
-        return true;
-    }
     retained.len() == wire.invocations.len()
         && retained
             .iter()

@@ -257,7 +257,7 @@ fn lossy_projection_classifies_agent_adapter_start_failure_without_internal_deta
     let cause = project_cause(
         FailurePhase::Start,
         &StepFailureCause::Start(StepStartFailure::Agent(
-            AgentFailureCause::HarnessStartFailed.into(),
+            AgentFailureCause::start_failure("launch preparation", "unavailable").into(),
         )),
     );
     assert_eq!(

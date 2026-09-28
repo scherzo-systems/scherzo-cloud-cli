@@ -833,9 +833,16 @@ pub(crate) enum AgentHarnessSetupStage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentFailureCause {
-    HarnessStartFailed,
+    HarnessStartFailed {
+        stage: &'static str,
+        error: String,
+    },
     HarnessSetupFailed {
         stage: AgentHarnessSetupStage,
+    },
+    HarnessSetupRejected {
+        stage: AgentHarnessSetupStage,
+        message: String,
     },
     HarnessInputTooLarge {
         input: AgentInputKind,
@@ -930,6 +937,15 @@ impl AgentFailure {
 
     pub(crate) fn protocol_rejection(&self) -> Option<&AgentProtocolRejectionDiagnostic> {
         self.protocol_rejection.as_deref()
+    }
+}
+
+impl AgentFailureCause {
+    pub(crate) fn start_failure(stage: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::HarnessStartFailed {
+            stage,
+            error: error.to_string(),
+        }
     }
 }
 

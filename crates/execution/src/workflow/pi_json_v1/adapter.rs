@@ -9,6 +9,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 use rustix::process::Pid;
 use tokio::io::AsyncReadExt as _;
@@ -134,7 +135,13 @@ where
         terminal: AgentTerminalCallback,
     ) {
         let cancellation = invocation.cancellation().clone();
-        let outcome = self.invoke_inner(invocation, &started).await;
+        let span = tracing::info_span!("agent_invocation", profile = "pi_json_v1",
+            step = %invocation.identity().step(),
+            sequence = invocation.identity().invocation().transition_sequence.get());
+        let outcome = self
+            .invoke_inner(invocation, &started)
+            .instrument(span)
+            .await;
         let outcome = cancellation
             .cancellation_reason()
             .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
@@ -175,11 +182,23 @@ where
         .await
         {
             Ok(preparation) => preparation,
-            Err(_) => return failed(AgentFailureCause::HarnessStartFailed),
+            Err(_) => {
+                return failed(AgentFailureCause::start_failure(
+                    "launch preparation",
+                    "unavailable",
+                ));
+            }
         };
         let (plan, mut result_bridge) = match preparation {
             Ok(preparation) => preparation,
-            Err(cause) => return failed(cause),
+            Err(cause) => {
+                self.diagnostics.record_agent_start_failure(
+                    invocation.identity(),
+                    self.maximum_diagnostic_stream_bytes,
+                    &cause,
+                );
+                return failed(cause);
+            }
         };
         let launch = if invocation.process_guards().is_durable() {
             let cancellation_source = invocation.cancellation().clone();
@@ -206,7 +225,10 @@ where
                 Ok((launch, cancellation_reason)) => (launch, cancellation_reason),
                 Err(_) => {
                     let _ = shutdown_result_bridge(result_bridge).await;
-                    return failed(AgentFailureCause::HarnessStartFailed);
+                    return failed(AgentFailureCause::start_failure(
+                        "launch preparation",
+                        "unavailable",
+                    ));
                 }
             }
         } else {
@@ -229,6 +251,11 @@ where
             Ok(launched) => launched,
             Err(cause) => {
                 let _ = shutdown_result_bridge(result_bridge).await;
+                self.diagnostics.record_agent_start_failure(
+                    invocation.identity(),
+                    self.maximum_diagnostic_stream_bytes,
+                    &cause,
+                );
                 return failed(cause);
             }
         };
@@ -236,7 +263,10 @@ where
             let mut process = process;
             let _ = process.child.force_stop(process.process_group).await;
             let _ = shutdown_result_bridge(result_bridge).await;
-            return failed(AgentFailureCause::HarnessStartFailed);
+            return failed(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         };
         let diagnostic = self.diagnostics.start_standard_error_capture(
             invocation.identity().step().to_owned(),
@@ -271,11 +301,16 @@ where
         let bridge_shutdown = shutdown_result_bridge(result_bridge).await;
         finish_agent_diagnostic_capture(invocation.diagnostic_session(), diagnostic, &outcome)
             .await;
-        if bridge_shutdown.is_err() && matches!(outcome, AgentOutcome::Completed(_)) {
-            failed(AgentFailureCause::HarnessProtocolFailed)
-        } else {
-            outcome
+        if let Err(error) = bridge_shutdown {
+            self.diagnostics.record_adapter_error(
+                invocation.identity().step().to_owned(),
+                invocation.identity().invocation(),
+                self.maximum_diagnostic_stream_bytes,
+                "bridge shutdown",
+                &error,
+            );
         }
+        outcome
     }
 
     fn prepare_result_bridge<Sink>(
@@ -296,7 +331,7 @@ where
             invocation.limits().result_validation_deadline(),
             self.clock.clone(),
         )
-        .map_err(|()| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| AgentFailureCause::start_failure("result bridge", error))?;
         let validator = AuthoritativeResultValidator::new(
             schema.clone(),
             invocation.limits().maximum_result_bytes(),
@@ -352,30 +387,42 @@ where
         AgentInputKind::Message,
     )?;
 
+    // The Claude and Pi adapters keep these admission guards local because their
+    // profile-specific launch contracts must remain independently typed.
+    // jscpd:ignore-start
     if invocation.adapter().profile() != AgentCompatibilityProfile::PiJsonV1
         || compatibility_profile_for_version(invocation.adapter().version())
             != Some(PiCompatibilityProfile::PiJsonV1)
         || !invocation.adapter().executable().is_absolute()
-        || invocation
-            .diagnostic_session()
-            .verify_pi_native_session_path_binding()
-            .is_err()
     {
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     }
-    let expected_cwd = invocation
-        .process()
-        .protocol_cwd()
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    // jscpd:ignore-end
+    invocation
+        .diagnostic_session()
+        .verify_pi_native_session_path_binding()
+        .map_err(|error| {
+            AgentFailureCause::start_failure("pi diagnostic session binding", error)
+        })?;
+    let expected_cwd = invocation.process().protocol_cwd().map_err(|error| {
+        AgentFailureCause::start_failure("working directory", format!("{error:?}"))
+    })?;
     let system_prompt = combined_system_prompt(
         &expected_cwd,
         invocation.prompt().system_prompt(),
         invocation.limits().maximum_system_prompt_bytes(),
     )?;
-    let expected_cwd = expected_cwd
-        .to_str()
-        .map(Arc::from)
-        .ok_or(AgentFailureCause::HarnessStartFailed)?;
+    let expected_cwd =
+        expected_cwd
+            .to_str()
+            .map(Arc::from)
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
     let staged_system_prompt =
         (system_prompt.len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES).then_some(system_prompt.as_str());
     let staged_message = if invocation.prompt().message().len() > MAXIMUM_INLINE_AGENT_INPUT_BYTES {
@@ -383,7 +430,10 @@ where
             invocation
                 .staging()
                 .message_file()
-                .ok_or(AgentFailureCause::HarnessStartFailed)?,
+                .ok_or(AgentFailureCause::start_failure(
+                    "launch preparation",
+                    "unavailable",
+                ))?,
         )
     } else {
         None
@@ -394,7 +444,7 @@ where
         staged_system_prompt,
         staged_message,
     )
-    .map_err(|()| AgentFailureCause::HarnessStartFailed)?;
+    .map_err(|error| AgentFailureCause::start_failure("input transport", error))?;
 
     let config = invocation.adapter().native_configuration();
     let mut arguments = Vec::with_capacity(15_usize.saturating_add(invocation.attachments().len()));
@@ -406,7 +456,10 @@ where
         invocation
             .diagnostic_session()
             .pi_native_session_directory()
-            .ok_or(AgentFailureCause::HarnessStartFailed)?
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?
             .as_os_str()
             .to_owned(),
         OsString::from("--model"),
@@ -453,7 +506,9 @@ where
     invocation
         .diagnostic_session()
         .verify_pi_native_session_path_binding()
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| {
+            AgentFailureCause::start_failure("pi diagnostic session binding", error)
+        })?;
     let mut command = Command::new(invocation.adapter().executable());
     command
         .args(&plan.arguments)
@@ -466,7 +521,9 @@ where
     invocation
         .process()
         .bind_command(command.as_std_mut())
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| {
+            AgentFailureCause::start_failure("command binding", format!("{error:?}"))
+        })?;
     Ok(command)
 }
 
@@ -518,7 +575,10 @@ where
     let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
     else {
         let _ = child.force_stop_blocking();
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     };
     let mut registration = match invocation.process_guards().register(
         invocation.identity().step(),
@@ -528,7 +588,10 @@ where
         Ok(registration) => registration,
         Err(_) => {
             let _ = child.force_stop_blocking();
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
     };
     if let Err(failure) = release_guarded_pi(invocation.diagnostic_session(), || {
@@ -544,7 +607,7 @@ where
                 spawn_diagnostics.capture(invocation, &error)
             }
             GuardedPiReleaseFailure::SessionBinding | GuardedPiReleaseFailure::GuardState => {
-                AgentFailureCause::HarnessStartFailed
+                AgentFailureCause::start_failure("launch preparation", "unavailable")
             }
         };
         let _ = child.force_stop_blocking();
@@ -590,12 +653,18 @@ async fn finish_direct_process_launch(
         .and_then(Pid::from_raw)
     else {
         stop_child(&mut child, None).await;
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     };
     let (Some(standard_output), Some(standard_error)) = (child.stdout.take(), child.stderr.take())
     else {
         stop_child(&mut child, Some(process_group)).await;
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     };
     Ok((
         LaunchedPiProcess {
@@ -628,7 +697,7 @@ impl ProcessSpawnDiagnosticCapture<'_> {
             self.maximum_stream_bytes,
             error,
         );
-        AgentFailureCause::HarnessStartFailed
+        AgentFailureCause::start_failure("process spawn", error)
     }
 }
 
@@ -642,7 +711,12 @@ fn combined_system_prompt(
     let project_prompt = match fs::read_to_string(working_directory.join(".pi/APPEND_SYSTEM.md")) {
         Ok(prompt) => Some(prompt),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(_) => return Err(AgentFailureCause::HarnessStartFailed),
+        Err(error) => {
+            return Err(AgentFailureCause::start_failure(
+                "project prompt read",
+                error,
+            ));
+        }
     };
     let combined = project_prompt.map_or_else(
         || workflow_prompt.to_owned(),
@@ -1151,7 +1225,7 @@ async fn respond_with_cancellation(
 
 async fn shutdown_result_bridge<Clock, Worker>(
     result_bridge: Option<ActiveResultBridge<Clock, Worker>>,
-) -> Result<(), ()> {
+) -> io::Result<()> {
     match result_bridge {
         Some(result_bridge) => result_bridge.bridge.shutdown().await,
         None => Ok(()),

@@ -7,6 +7,7 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::JoinHandle;
 
+use super::agent::{AgentFailureCause, AgentInvocationIdentity};
 use super::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
     ExecutionObservation, ExecutionObserver, SourceSequence,
@@ -147,8 +148,7 @@ impl StepDiagnosticLog {
             .cloned()
     }
 
-    #[cfg(test)]
-    pub(crate) fn invocation_ids(&self, step: &str) -> Vec<ActionId> {
+    pub fn invocation_ids(&self, step: &str) -> Vec<ActionId> {
         lock_entries(&self.entries)
             .keys()
             .filter_map(|(entry_step, invocation)| (entry_step == step).then_some(*invocation))
@@ -235,6 +235,64 @@ impl StepDiagnosticLog {
             standard_error.finish(true),
         );
         Ok(())
+    }
+
+    pub(super) fn record_agent_start_failure(
+        &self,
+        identity: &AgentInvocationIdentity,
+        maximum_stream_bytes: NonZeroU64,
+        cause: &AgentFailureCause,
+    ) {
+        if let AgentFailureCause::HarnessStartFailed { stage, error } = cause
+            && (*stage != "process spawn"
+                || self
+                    .get_invocation(identity.step(), identity.invocation())
+                    .is_none())
+        {
+            self.record_adapter_error(
+                identity.step().to_owned(),
+                identity.invocation(),
+                maximum_stream_bytes,
+                stage,
+                error,
+            );
+        }
+    }
+
+    pub(super) fn record_adapter_error(
+        &self,
+        step: String,
+        invocation: ActionId,
+        maximum_stream_bytes: NonZeroU64,
+        stage: &str,
+        error: &impl std::fmt::Display,
+    ) {
+        let existing = self.get_invocation(&step, invocation);
+        let message = format!("{stage}: {error}\n");
+        let mut stderr = DiagnosticStreamCapture::new(maximum_stream_bytes);
+        if let Some(existing) = &existing {
+            let previous = existing.standard_error();
+            let reserved = usize::try_from(maximum_stream_bytes.get())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(message.len());
+            let retained = previous.bytes().len().min(reserved);
+            stderr.capture(&previous.bytes()[..retained]);
+            stderr.discarded_bytes = previous
+                .truncation()
+                .map_or(0, |t| t.discarded_bytes())
+                .saturating_add(
+                    u64::try_from(previous.bytes().len() - retained).unwrap_or(u64::MAX),
+                );
+        }
+        stderr.capture(message.as_bytes());
+        let stdout = existing.as_ref().map_or_else(
+            || DiagnosticStreamCapture::new(maximum_stream_bytes).finish(true),
+            |existing| existing.standard_output().clone(),
+        );
+        let fully_drained = existing
+            .as_ref()
+            .is_none_or(|existing| existing.standard_error().fully_drained());
+        self.record(step, invocation, stdout, stderr.finish(fully_drained));
     }
 
     pub(super) fn record(

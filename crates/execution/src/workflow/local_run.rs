@@ -3581,6 +3581,58 @@ fn update_invocation_ledger<Deadline>(
             });
         }
     }
+    // Ordinary agents have no durable invocation until their result is known. An
+    // interrupted attempt must not leave an Active invocation in terminal state.
+    // Keep the launch identity in memory, as with a target awaiting recovery.
+    let pending_agents = {
+        let mut pending = store
+            .pending_recovery_invocations
+            .lock()
+            .map_err(|_| LocalRunDirectoryError::StateConflict)?;
+        let ready = pending
+            .iter()
+            .filter(|((number, step_id, execution_number), _)| {
+                *number == attempt.attempt_number
+                    && commit.state.invocation_is_agent(step_id, false)
+                    && !commit.state.steps.get(step_id).is_some_and(|runtime| {
+                        matches!(runtime.active_invocation, Some(ActiveStepInvocation::Target {
+                            execution_number: active,
+                        }) if active.get() == *execution_number)
+                    })
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        for (key, _) in &ready {
+            pending.remove(key);
+        }
+        ready
+    };
+    for ((_, step_id, execution_number), (invocation_id, started_at)) in pending_agents {
+        if attempt
+            .progress
+            .invocations
+            .iter()
+            .any(|invocation| invocation.invocation_id == invocation_id)
+        {
+            continue;
+        }
+        ensure_invocation_capacity(attempt)?;
+        attempt.progress.invocations.push(DurableInvocationV1 {
+            invocation_id,
+            node_role: attempt_node_role(attempt, &step_id)
+                .ok_or(LocalRunDirectoryError::StateConflict)?,
+            step_id,
+            role: super::publication::RecoveryInvocationRoleV1::Target,
+            target_execution: Some(execution_number),
+            recovery_round: None,
+            state: DurableInvocationStateV1::Active,
+            started_at,
+            finished_at: None,
+            usage: super::publication::RecoveryInvocationUsageV1::default(),
+            diagnostics: Vec::new(),
+            diagnostic_reference: None,
+        });
+    }
     for action in &commit.actions {
         let (role, target_execution, recovery_round) = match action.kind {
             CommittedActionKind::StartStep => (
@@ -3611,9 +3663,11 @@ fn update_invocation_ledger<Deadline>(
             .and_then(|runtime| runtime.recovery.as_ref());
         let recovery_active = runtime_recovery.is_some_and(|recovery| !recovery.rounds.is_empty());
         let invocation_id = action.id.transition_sequence.get();
-        if !recovery_active {
-            if runtime_recovery.is_some()
-                && matches!(action.kind, CommittedActionKind::StartStep)
+        if !recovery_active
+            || (matches!(action.kind, CommittedActionKind::StartStep)
+                && commit.state.invocation_is_agent(step_id, false))
+        {
+            if (runtime_recovery.is_some() || commit.state.invocation_is_agent(step_id, false))
                 && let Some(execution_number) = action.execution_number
             {
                 let key = (
@@ -3653,12 +3707,7 @@ fn update_invocation_ledger<Deadline>(
             }
             continue;
         }
-        if u64::try_from(attempt.progress.invocations.len())
-            .ok()
-            .is_none_or(|count| count >= attempt.progress.accounting.maximum_invocations)
-        {
-            return Err(LocalRunDirectoryError::StateConflict);
-        }
+        ensure_invocation_capacity(attempt)?;
         attempt.progress.invocations.push(DurableInvocationV1 {
             invocation_id,
             step_id: step_id.clone(),
@@ -3697,6 +3746,10 @@ fn update_invocation_ledger<Deadline>(
         };
         let diagnostic = diagnostics.get_invocation(&step_id, action);
         let agent = accounting.native_session(action);
+        let is_agent = commit.state.invocation_is_agent(
+            &step_id,
+            role == super::publication::RecoveryInvocationRoleV1::RecoveryHandler,
+        );
         let retained = diagnostic
             .as_ref()
             .map(|diagnostic| {
@@ -3704,7 +3757,7 @@ fn update_invocation_ledger<Deadline>(
                     attempt.attempt_number,
                     invocation_id,
                     diagnostic,
-                    agent.is_some(),
+                    is_agent,
                 )
             })
             .transpose()?;
@@ -3751,6 +3804,17 @@ fn update_invocation_ledger<Deadline>(
         .invocations
         .sort_by_key(|invocation| invocation.invocation_id);
     recalculate_invocation_accounting(&mut attempt.progress)
+}
+
+fn ensure_invocation_capacity(attempt: &LocalAttemptV1) -> Result<(), LocalRunDirectoryError> {
+    if u64::try_from(attempt.progress.invocations.len())
+        .ok()
+        .is_none_or(|count| count >= attempt.progress.accounting.maximum_invocations)
+    {
+        Err(LocalRunDirectoryError::StateConflict)
+    } else {
+        Ok(())
+    }
 }
 
 fn durable_invocation_is_active<Cause, Output>(
@@ -7513,8 +7577,8 @@ fn validate_attempt(
         validate_attempt_step(attempt, step, &mut step_ids)?;
     }
     validate_attempt_continuation(state_index, attempt)?;
-    validate_attempt_recovery(attempt, &step_ids)?;
     validate_attempt_finalization(attempt, &mut step_ids)?;
+    validate_attempt_recovery(attempt, &step_ids)?;
     validate_attempt_actions(attempt)?;
     validate_attempt_guards(attempt, &step_ids)?;
     validate_attempt_result(attempt)
@@ -8723,7 +8787,7 @@ fn valid_timestamp(value: &str) -> bool {
 }
 
 fn generate_uuid() -> Result<String, LocalRunDirectoryError> {
-    super::identity::random_uuid_v4().map_err(|()| LocalRunDirectoryError::IdentityUnavailable)
+    super::identity::random_uuid_v4().map_err(|_| LocalRunDirectoryError::IdentityUnavailable)
 }
 
 pub(super) fn is_canonical_uuid(value: &str) -> bool {

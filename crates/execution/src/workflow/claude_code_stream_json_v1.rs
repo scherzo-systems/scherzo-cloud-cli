@@ -535,7 +535,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         if self.session_id.is_none() {
             return self.protocol_failure_outcome(
-                AgentFailureCause::HarnessStartFailed,
+                AgentFailureCause::start_failure("launch preparation", "unavailable"),
                 ClaudeCodeStreamJsonV1RejectionReason::EndOfStreamInvariantInvalid,
                 ClaudeCodeStreamJsonV1ProtocolStage::EndOfStream,
             );
@@ -591,7 +591,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         let parser_owned_rejection = result.as_ref().is_err_and(|cause| {
             matches!(
                 cause,
-                AgentFailureCause::HarnessStartFailed | AgentFailureCause::HarnessProtocolFailed
+                AgentFailureCause::HarnessStartFailed { .. }
+                    | AgentFailureCause::HarnessProtocolFailed
             )
         });
         if parser_owned_rejection && self.protocol_rejection.is_none() {
@@ -1672,7 +1673,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         if self.session_id.is_some() {
             AgentFailureCause::HarnessProtocolFailed
         } else {
-            AgentFailureCause::HarnessStartFailed
+            AgentFailureCause::start_failure("launch preparation", "unavailable")
         }
     }
 

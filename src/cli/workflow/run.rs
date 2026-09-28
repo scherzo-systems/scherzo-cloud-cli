@@ -1912,7 +1912,12 @@ fn build_run_result(
             .ok_or_else(invalid_terminal_result_error)?;
         let recovery = step_recovery_summary_v1(recovery_state.as_ref())
             .map_err(|_| invalid_terminal_result_error())?;
-        let invocations = if recovery.is_some() {
+        let invocations = if recovery.is_some()
+            || kind == WorkflowRunStepKind::Agent
+                && durable_invocations
+                    .iter()
+                    .any(|invocation| invocation.step_id == *id)
+        {
             project_recovery_invocations(id, durable_invocations, diagnostics)?
         } else {
             Vec::new()
@@ -1986,7 +1991,15 @@ fn build_run_result(
                         .then(|| diagnostics.get(id))
                         .flatten(),
                     recovery: None,
-                    invocations: Vec::new(),
+                    invocations: if kind == WorkflowRunStepKind::Agent
+                        && durable_invocations
+                            .iter()
+                            .any(|invocation| invocation.step_id == *id)
+                    {
+                        project_recovery_invocations(id, durable_invocations, diagnostics)?
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
             if !retained.is_empty() {

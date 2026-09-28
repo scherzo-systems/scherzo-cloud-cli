@@ -1817,6 +1817,43 @@ fn one_rejection_queues_one_same_thread_correction_then_exhausts() {
 }
 
 #[test]
+fn rejected_correction_turn_remains_a_post_start_protocol_failure() {
+    let mut parser = running_parser(AgentValueKind::Result, 1024);
+    let text = result_envelope(json!(-1));
+    feed(&mut parser, item_started("first", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("first", &text, json!("final_answer")),
+    )
+    .unwrap();
+    feed(
+        &mut parser,
+        turn_completed(
+            vec![json!({
+                "id": "first", "type": "agentMessage", "text": text, "phase": "final_answer"
+            })],
+            "completed",
+        ),
+    )
+    .unwrap();
+    parser.take_result_candidate().unwrap();
+    parser.reject_result(Arc::from("feedback")).unwrap();
+    assert_eq!(take_json(&mut parser)["id"], 6);
+    assert_eq!(
+        feed(
+            &mut parser,
+            json!({"id": 6, "error": {"code": -32603, "message": "turn failed"}})
+        )
+        .unwrap_err(),
+        AgentFailureCause::HarnessProtocolFailed
+    );
+    assert_eq!(
+        parser.finish(false),
+        AgentOutcome::Failed(AgentFailureCause::HarnessProtocolFailed.into())
+    );
+}
+
+#[test]
 fn malformed_oversized_truncated_and_correlation_inputs_are_bounded_by_phase() {
     let mut malformed = parser(AgentValueKind::None, 1024, None);
     assert_eq!(

@@ -798,8 +798,19 @@ impl CodexAppServerV1Parser {
         if result.is_some() == error.is_some() {
             return Err(self.failure_for_current_phase());
         }
-        if error.is_some() {
-            return Err(self.failure_for(CodexAppServerV1RejectionReason::ResponseRejected));
+        if let Some(error) = error {
+            self.record_rejection(CodexAppServerV1RejectionReason::ResponseRejected);
+            if let (false, Some(stage), Some(message)) = (
+                self.invocation_start_acknowledged,
+                self.state.failure_stage(),
+                error.get("message").and_then(Value::as_str),
+            ) {
+                return Err(AgentFailureCause::HarnessSetupRejected {
+                    stage,
+                    message: message.to_owned(),
+                });
+            }
+            return Err(self.phase_failure_cause());
         }
         let result = result
             .and_then(Value::as_object)

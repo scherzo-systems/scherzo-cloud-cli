@@ -955,19 +955,13 @@ fn validate_step_recovery(
     step: &WorkflowStepV1,
     maximum_stream_bytes: u64,
 ) -> Result<(), ResultMetadataError> {
-    let Some(recovery) = &step.recovery else {
-        return step
-            .invocations
-            .is_empty()
-            .then_some(())
-            .ok_or(ResultMetadataError);
-    };
-    if step.role != WorkflowNodeRoleV1::Step
-        || recovery.schema_version != 1
-        || !(1..=10).contains(&recovery.configured_retries)
-        || recovery.rounds.is_empty()
-        || recovery.rounds.len() > usize::from(recovery.configured_retries)
-        || step.invocations.is_empty()
+    if let Some(recovery) = &step.recovery
+        && (step.role != WorkflowNodeRoleV1::Step
+            || recovery.schema_version != 1
+            || !(1..=10).contains(&recovery.configured_retries)
+            || recovery.rounds.is_empty()
+            || recovery.rounds.len() > usize::from(recovery.configured_retries)
+            || step.invocations.is_empty())
     {
         return Err(ResultMetadataError);
     }
@@ -1023,6 +1017,16 @@ fn validate_step_recovery(
     if retained_diagnostic_bytes > super::MAXIMUM_RETAINED_STREAM_BYTES_PER_RUN {
         return Err(ResultMetadataError);
     }
+    let Some(recovery) = &step.recovery else {
+        return (step.invocations.is_empty()
+            || step.kind == "agent"
+                && step.invocations.len() == 1
+                && step.started_at.is_some()
+                && step.invocations[0].role == RecoveryInvocationRoleV1::Target
+                && step.invocations[0].target_execution == Some(1))
+        .then_some(())
+        .ok_or(ResultMetadataError);
+    };
 
     for (index, round) in recovery.rounds.iter().enumerate() {
         let expected_round = u8::try_from(index + 1).map_err(|_| ResultMetadataError)?;

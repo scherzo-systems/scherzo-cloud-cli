@@ -445,7 +445,8 @@ impl PiJsonV1Parser {
         let parser_owned_rejection = result.as_ref().is_err_and(|cause| {
             matches!(
                 cause,
-                AgentFailureCause::HarnessStartFailed | AgentFailureCause::HarnessProtocolFailed
+                AgentFailureCause::HarnessStartFailed { .. }
+                    | AgentFailureCause::HarnessProtocolFailed
             )
         });
         if parser_owned_rejection && self.protocol_rejection.is_none() {
@@ -630,7 +631,10 @@ impl PiJsonV1Parser {
             || required_string(object, "timestamp").is_none()
             || required_string(object, "cwd") != Some(self.expected_cwd.as_ref())
         {
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
         self.protocol.header_seen = true;
         Ok(())
@@ -1460,7 +1464,7 @@ impl PiJsonV1Parser {
         if self.protocol.ever_started {
             AgentFailureCause::HarnessProtocolFailed
         } else {
-            AgentFailureCause::HarnessStartFailed
+            AgentFailureCause::start_failure("launch preparation", "unavailable")
         }
     }
 
@@ -1566,10 +1570,13 @@ impl ProtocolState {
         let failure = if self.ever_started {
             AgentFailureCause::HarnessProtocolFailed
         } else {
-            AgentFailureCause::HarnessStartFailed
+            AgentFailureCause::start_failure("launch preparation", "unavailable")
         };
         if !self.header_seen || !self.ever_started {
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
         if !self.settled
             || self.agent_active

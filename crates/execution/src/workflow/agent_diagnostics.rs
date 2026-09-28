@@ -29,8 +29,35 @@ const PROTOCOL_REJECTION_FILE: &str = "protocol-rejection.json";
 const MAXIMUM_PROTOCOL_REJECTION_BYTES: usize = 16 * 1024;
 const IDENTITY_ATTEMPTS: usize = 16;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AgentDiagnosticSessionError;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentDiagnosticSessionError {
+    stage: &'static str,
+    detail: String,
+}
+
+impl AgentDiagnosticSessionError {
+    fn invalid(stage: &'static str) -> Self {
+        Self {
+            stage,
+            detail: "invalid diagnostic session state".to_owned(),
+        }
+    }
+
+    fn at(stage: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentDiagnosticSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.detail)
+    }
+}
+
+impl std::error::Error for AgentDiagnosticSessionError {}
 
 #[derive(Clone)]
 pub struct AgentDiagnosticSessionStore {
@@ -130,7 +157,7 @@ impl AgentDiagnosticSessionStore {
         attempt_number: u64,
     ) -> Result<Self, AgentDiagnosticSessionError> {
         if attempt_number == 0 {
-            return Err(AgentDiagnosticSessionError);
+            return Err(AgentDiagnosticSessionError::invalid("diagnostic session"));
         }
         Self::create_with_owner(
             attempt_directory,
@@ -155,23 +182,27 @@ impl AgentDiagnosticSessionStore {
         local_owner: Option<LocalDiagnosticOwner>,
     ) -> Result<Self, AgentDiagnosticSessionError> {
         if !attempt_path.is_absolute() {
-            return Err(AgentDiagnosticSessionError);
+            return Err(AgentDiagnosticSessionError::invalid("diagnostic session"));
         }
         mkdirat(attempt_directory, DIAGNOSTICS_DIRECTORY, Mode::RWXU)
-            .map_err(|_| AgentDiagnosticSessionError)?;
+            .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
         let root = match open_directory(attempt_directory, DIAGNOSTICS_DIRECTORY) {
             Ok(directory) => directory,
-            Err(_) => {
+            Err(error) => {
                 let _ = unlinkat(attempt_directory, DIAGNOSTICS_DIRECTORY, AtFlags::REMOVEDIR);
-                return Err(AgentDiagnosticSessionError);
+                return Err(AgentDiagnosticSessionError::at(
+                    "open diagnostics directory",
+                    error,
+                ));
             }
         };
-        if fchmod(&root, Mode::RWXU).is_err()
-            || sync_directory(&root).is_err()
-            || sync_directory(attempt_directory).is_err()
-        {
+        let prepared = fchmod(&root, Mode::RWXU)
+            .map_err(|error| AgentDiagnosticSessionError::at("chmod diagnostics directory", error))
+            .and_then(|()| sync_directory(&root))
+            .and_then(|()| sync_directory(attempt_directory));
+        if let Err(error) = prepared {
             let _ = unlinkat(attempt_directory, DIAGNOSTICS_DIRECTORY, AtFlags::REMOVEDIR);
-            return Err(AgentDiagnosticSessionError);
+            return Err(error);
         }
         Ok(Self {
             root: Arc::new(root),
@@ -199,10 +230,13 @@ impl AgentDiagnosticSessionStore {
                 Ok(()) => {
                     let invocation = match open_directory(&profile_directory, &directory_name) {
                         Ok(directory) => directory,
-                        Err(_) => {
+                        Err(error) => {
                             let _ =
                                 unlinkat(&profile_directory, &directory_name, AtFlags::REMOVEDIR);
-                            return Err(AgentDiagnosticSessionError);
+                            return Err(AgentDiagnosticSessionError::at(
+                                "open invocation directory",
+                                error,
+                            ));
                         }
                     };
                     let result = self.prepare_invocation(
@@ -221,10 +255,17 @@ impl AgentDiagnosticSessionStore {
                     return result;
                 }
                 Err(Errno::EXIST) => {}
-                Err(_) => return Err(AgentDiagnosticSessionError),
+                Err(error) => {
+                    return Err(AgentDiagnosticSessionError::at(
+                        "diagnostic directory",
+                        error,
+                    ));
+                }
             }
         }
-        Err(AgentDiagnosticSessionError)
+        Err(AgentDiagnosticSessionError::invalid(
+            "diagnostic identity collisions",
+        ))
     }
 
     #[expect(
@@ -241,15 +282,17 @@ impl AgentDiagnosticSessionStore {
         profile: AgentCompatibilityProfile,
         harness_version: &str,
     ) -> Result<AgentDiagnosticSession, AgentDiagnosticSessionError> {
-        fchmod(invocation, Mode::RWXU).map_err(|_| AgentDiagnosticSessionError)?;
+        fchmod(invocation, Mode::RWXU)
+            .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
         let invocation_path = profile_path.join(directory_name);
         let create_native_session =
             || -> Result<(PathBuf, OwnedFd), AgentDiagnosticSessionError> {
                 mkdirat(invocation, NATIVE_SESSION_DIRECTORY, Mode::RWXU)
-                    .map_err(|_| AgentDiagnosticSessionError)?;
+                    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
                 let directory_handle = open_directory(invocation, NATIVE_SESSION_DIRECTORY)
-                    .map_err(|_| AgentDiagnosticSessionError)?;
-                fchmod(&directory_handle, Mode::RWXU).map_err(|_| AgentDiagnosticSessionError)?;
+                    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
+                fchmod(&directory_handle, Mode::RWXU)
+                    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
                 Ok((
                     invocation_path.join(NATIVE_SESSION_DIRECTORY),
                     directory_handle,
@@ -273,12 +316,13 @@ impl AgentDiagnosticSessionStore {
                     CLAUDE_CODE_RESOURCES_DIRECTORY,
                     Mode::RWXU,
                 )
-                .map_err(|_| AgentDiagnosticSessionError)?;
+                .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
                 let resources_directory_handle =
-                    open_directory(&directory_handle, CLAUDE_CODE_RESOURCES_DIRECTORY)
-                        .map_err(|_| AgentDiagnosticSessionError)?;
+                    open_directory(&directory_handle, CLAUDE_CODE_RESOURCES_DIRECTORY).map_err(
+                        |error| AgentDiagnosticSessionError::at("diagnostic I/O", error),
+                    )?;
                 fchmod(&resources_directory_handle, Mode::RWXU)
-                    .map_err(|_| AgentDiagnosticSessionError)?;
+                    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
                 (
                     None,
                     Some(ClaudeCodeNativeDiagnosticSession {
@@ -309,7 +353,10 @@ impl AgentDiagnosticSessionStore {
 
         let session = AgentDiagnosticSession {
             directory: invocation_path,
-            directory_handle: Arc::new(dup(invocation).map_err(|_| AgentDiagnosticSessionError)?),
+            directory_handle: Arc::new(
+                dup(invocation)
+                    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?,
+            ),
             pi_native_session,
             claude_code_native_session,
         };
@@ -376,7 +423,7 @@ fn metadata_bytes(
             })
         }
     }
-    .map_err(|_| AgentDiagnosticSessionError)?;
+    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -431,14 +478,14 @@ impl AgentDiagnosticSession {
         diagnostic: &AgentProtocolRejectionDiagnostic,
     ) -> Result<(), AgentDiagnosticSessionError> {
         self.verify_path_binding()?;
-        let mut bytes =
-            serde_json::to_vec_pretty(diagnostic).map_err(|_| AgentDiagnosticSessionError)?;
+        let mut bytes = serde_json::to_vec_pretty(diagnostic)
+            .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
         bytes.push(b'\n');
         if bytes.len() > MAXIMUM_PROTOCOL_REJECTION_BYTES {
-            return Err(AgentDiagnosticSessionError);
+            return Err(AgentDiagnosticSessionError::invalid("diagnostic session"));
         }
         fchmod(self.directory_handle.as_ref(), Mode::RWXU)
-            .map_err(|_| AgentDiagnosticSessionError)?;
+            .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
         remove_protocol_rejection_residue(self.directory_handle.as_ref())?;
         write_immutable_file(
             self.directory_handle.as_ref(),
@@ -454,7 +501,7 @@ impl AgentDiagnosticSession {
         let native_session = self
             .pi_native_session
             .as_ref()
-            .ok_or(AgentDiagnosticSessionError)?;
+            .ok_or(AgentDiagnosticSessionError::invalid("diagnostic session"))?;
         verify_directory_binding(
             &native_session.directory,
             native_session.directory_handle.as_ref(),
@@ -467,7 +514,7 @@ impl AgentDiagnosticSession {
         let native_session = self
             .claude_code_native_session
             .as_ref()
-            .ok_or(AgentDiagnosticSessionError)?;
+            .ok_or(AgentDiagnosticSessionError::invalid("diagnostic session"))?;
         verify_directory_binding(
             &native_session.directory,
             native_session.directory_handle.as_ref(),
@@ -555,7 +602,7 @@ fn fixture_diagnostic_directory(native_session_directory: &Path) -> (PathBuf, Ar
 fn generate_claude_code_session_id() -> Result<Arc<str>, AgentDiagnosticSessionError> {
     super::identity::random_uuid_v4()
         .map(Arc::from)
-        .map_err(|()| AgentDiagnosticSessionError)
+        .map_err(|error| AgentDiagnosticSessionError::at("session ID generation", error))
 }
 
 fn verify_directory_binding(
@@ -563,14 +610,17 @@ fn verify_directory_binding(
     retained: &OwnedFd,
 ) -> Result<(), AgentDiagnosticSessionError> {
     if !path.is_absolute() {
-        return Err(AgentDiagnosticSessionError);
+        return Err(AgentDiagnosticSessionError::invalid("diagnostic session"));
     }
-    let reopened = open_directory_path(path).map_err(|_| AgentDiagnosticSessionError)?;
-    let retained = fstat(retained).map_err(|_| AgentDiagnosticSessionError)?;
-    let named = fstat(&reopened).map_err(|_| AgentDiagnosticSessionError)?;
+    let reopened = open_directory_path(path)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
+    let retained = fstat(retained)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
+    let named = fstat(&reopened)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
     (retained.st_dev == named.st_dev && retained.st_ino == named.st_ino)
         .then_some(())
-        .ok_or(AgentDiagnosticSessionError)
+        .ok_or(AgentDiagnosticSessionError::invalid("diagnostic session"))
 }
 
 fn create_or_open_directory(
@@ -579,10 +629,17 @@ fn create_or_open_directory(
 ) -> Result<OwnedFd, AgentDiagnosticSessionError> {
     match mkdirat(parent, name, Mode::RWXU) {
         Ok(()) | Err(Errno::EXIST) => {}
-        Err(_) => return Err(AgentDiagnosticSessionError),
+        Err(error) => {
+            return Err(AgentDiagnosticSessionError::at(
+                "diagnostic directory",
+                error,
+            ));
+        }
     }
-    let directory = open_directory(parent, name).map_err(|_| AgentDiagnosticSessionError)?;
-    fchmod(&directory, Mode::RWXU).map_err(|_| AgentDiagnosticSessionError)?;
+    let directory = open_directory(parent, name)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
+    fchmod(&directory, Mode::RWXU)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
     Ok(directory)
 }
 
@@ -597,9 +654,9 @@ fn remove_protocol_rejection_residue(
                 PROTOCOL_REJECTION_FILE,
                 AtFlags::SYMLINK_NOFOLLOW,
             )
-            .map_err(|_| AgentDiagnosticSessionError)?;
+            .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
             if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
-                return Err(AgentDiagnosticSessionError);
+                return Err(AgentDiagnosticSessionError::invalid("diagnostic session"));
             }
             chmodat(
                 invocation,
@@ -607,11 +664,12 @@ fn remove_protocol_rejection_residue(
                 Mode::RWXU,
                 AtFlags::empty(),
             )
-            .map_err(|_| AgentDiagnosticSessionError)?;
+            .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
             let directory = open_directory(invocation, PROTOCOL_REJECTION_FILE)
-                .map_err(|_| AgentDiagnosticSessionError)?;
-            remove_open_tree_at(invocation, PROTOCOL_REJECTION_FILE, &directory)
-                .map_err(|_| AgentDiagnosticSessionError)
+                .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
+            remove_open_tree_at(invocation, PROTOCOL_REJECTION_FILE, &directory).map_err(|error| {
+                AgentDiagnosticSessionError::at("diagnostic residue", format!("{error:?}"))
+            })
         }
     }
 }
@@ -627,13 +685,14 @@ fn write_immutable_file(
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )
-    .map_err(|_| AgentDiagnosticSessionError)?;
+    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
     let mut file = File::from(descriptor);
     file.write_all(bytes)
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
-        .map_err(|_| AgentDiagnosticSessionError)?;
-    fchmod(file.as_fd(), Mode::RUSR).map_err(|_| AgentDiagnosticSessionError)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
+    fchmod(file.as_fd(), Mode::RUSR)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))
 }
 
 fn open_directory(parent: &OwnedFd, name: &str) -> Result<OwnedFd, Errno> {
@@ -646,10 +705,11 @@ fn open_directory(parent: &OwnedFd, name: &str) -> Result<OwnedFd, Errno> {
 }
 
 fn sync_directory(directory: &OwnedFd) -> Result<(), AgentDiagnosticSessionError> {
-    let duplicate = dup(directory).map_err(|_| AgentDiagnosticSessionError)?;
+    let duplicate =
+        dup(directory).map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
     File::from(duplicate)
         .sync_all()
-        .map_err(|_| AgentDiagnosticSessionError)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))
 }
 
 #[cfg(test)]
@@ -715,7 +775,7 @@ mod tests {
 
         assert!(matches!(
             store.allocate(&identity, AgentCompatibilityProfile::PiJsonV1, "0.84.2"),
-            Err(AgentDiagnosticSessionError)
+            Err(AgentDiagnosticSessionError { .. })
         ));
     }
 

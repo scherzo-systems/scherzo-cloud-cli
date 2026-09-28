@@ -48,7 +48,8 @@ where
         {
             return Err(launch_failure());
         }
-        let metadata = fs::symlink_metadata(attachment.path()).map_err(|_| launch_failure())?;
+        let metadata = fs::symlink_metadata(attachment.path())
+            .map_err(|error| AgentFailureCause::start_failure("codex attachment stat", error))?;
         if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o377 != 0 {
             return Err(launch_failure());
         }
@@ -119,8 +120,10 @@ fn read_staged_attachment(
     bytes
         .try_reserve_exact(capacity)
         .map_err(|_| launch_failure())?;
-    let mut file = File::open(attachment.path()).map_err(|_| launch_failure())?;
-    file.read_to_end(&mut bytes).map_err(|_| launch_failure())?;
+    let mut file = File::open(attachment.path())
+        .map_err(|error| AgentFailureCause::start_failure("codex attachment open", error))?;
+    file.read_to_end(&mut bytes)
+        .map_err(|error| AgentFailureCause::start_failure("codex attachment read", error))?;
     if u64::try_from(bytes.len()) != Ok(expected_bytes) {
         return Err(launch_failure());
     }

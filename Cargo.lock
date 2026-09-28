@@ -2148,6 +2148,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tracing",
  "ulid",
  "unicode-segmentation",
  "unicode-width",

@@ -1030,6 +1030,7 @@ struct RunningResultFixture {
     tool_name: String,
     observations: mpsc::UnboundedReceiver<AgentObservationEnvelope>,
     cancellation: CancellationSource,
+    diagnostics: StepDiagnosticLog,
 }
 
 impl RunningResultFixture {
@@ -1178,10 +1179,7 @@ where
         .result_endpoint
         .join("pi-json-v1-result-extension.ts");
     let tool_name = fixture.result_tool_name;
-    let socket_address = validation_socket_address(&tool_name);
-    let alias_directory = socket_address.parent().unwrap().parent().unwrap();
-    let _ = fs::remove_file(alias_directory.join("e"));
-    let _ = fs::remove_dir(alias_directory);
+    let diagnostics = fixture.diagnostics.clone();
     let (task, started, terminal) = start_invocation_with_clock_and_worker(
         fixture.invocation,
         fixture.diagnostics,
@@ -1196,6 +1194,7 @@ where
         }
     }
     started.receive().await.unwrap();
+    let socket_address = validation_socket_address(&extension_path);
     RunningResultFixture {
         _temporary: fixture._temporary,
         task,
@@ -1214,15 +1213,15 @@ where
         tool_name,
         observations: fixture.observations,
         cancellation,
+        diagnostics,
     }
 }
 
-fn validation_socket_address(tool_name: &str) -> PathBuf {
-    let identity = tool_name.strip_prefix("scherzo_result_").unwrap();
-    Path::new("/tmp")
-        .join(format!(".szp-{identity}-{}", std::process::id()))
-        .join("e")
-        .join("result-validation.sock")
+fn validation_socket_address(extension: &Path) -> PathBuf {
+    let source = fs::read_to_string(extension).unwrap();
+    let (_, suffix) = source.split_once("socketPath\\\":\\\"").unwrap();
+    let (socket, _) = suffix.split_once("\\\"").unwrap();
+    PathBuf::from(socket)
 }
 
 fn open_fifo_reader(path: &Path) -> fs::File {
@@ -1621,8 +1620,78 @@ async fn assert_permission_denied_spawn_failure(fixture: ProcessFixture) {
     let outcome = terminal.receive().await.unwrap();
     task.await.unwrap();
 
-    assert_agent_failure(&outcome, AgentFailureCause::HarnessStartFailed);
+    assert_agent_failure(
+        &outcome,
+        AgentFailureCause::start_failure(
+            "process spawn",
+            std::io::Error::from_raw_os_error(libc::EACCES),
+        ),
+    );
     assert_permission_denied_spawn_diagnostic(&diagnostics);
+}
+
+async fn assert_launch_failure_detail(fixture: ProcessFixture, stage: &str, fragment: &str) {
+    let diagnostics = fixture.diagnostics.clone();
+    let (task, started, terminal) = start_invocation(fixture.invocation, diagnostics.clone());
+    assert_eq!(
+        started.receive().await,
+        Err(AgentStartReceiveError::CallbackDropped)
+    );
+    let outcome = terminal.receive().await.unwrap();
+    task.await.unwrap();
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected launch failure")
+    };
+    let AgentFailureCause::HarnessStartFailed {
+        stage: actual,
+        error,
+    } = failure.cause()
+    else {
+        panic!("expected typed launch failure")
+    };
+    assert_eq!(*actual, stage);
+    assert!(error.contains(fragment), "{error}");
+    assert!(
+        String::from_utf8_lossy(
+            diagnostics
+                .get("agent-step")
+                .unwrap()
+                .standard_error()
+                .bytes()
+        )
+        .contains(fragment)
+    );
+}
+
+#[tokio::test]
+async fn missing_executable_retains_spawn_error() {
+    let fixture = ProcessFixture::new("success", "system".into(), "message".into());
+    fs::remove_file(fixture.invocation.adapter().executable()).unwrap();
+    let os_error = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    assert_launch_failure_detail(fixture, "process spawn", &os_error).await;
+}
+
+#[tokio::test]
+async fn unwritable_result_endpoint_retains_preparation_error() {
+    let fixture = ProcessFixture::new("success", "system".into(), "message".into());
+    fs::set_permissions(&fixture.result_endpoint, fs::Permissions::from_mode(0o500)).unwrap();
+    assert_launch_failure_detail(fixture, "input transport", "not writable").await;
+}
+
+#[tokio::test]
+async fn socket_bind_failure_retains_bind_error() {
+    let fixture = ProcessFixture::new_with_value_mode(
+        "success",
+        "system".into(),
+        "message".into(),
+        count_result_mode(),
+    );
+    fs::write(
+        fixture.result_endpoint.join("result-validation.sock"),
+        b"occupied",
+    )
+    .unwrap();
+    assert_launch_failure_detail(fixture, "result bridge", "socket bind").await;
 }
 
 #[tokio::test]
@@ -1973,6 +2042,36 @@ async fn result_bridge_rejects_then_accepts_one_exactly_correlated_candidate() {
 }
 
 #[tokio::test]
+async fn bridge_cleanup_failure_does_not_replace_completed_result() {
+    with_watchdog(async {
+        let fixture = result_process_fixture("result-bridge");
+        let mut running =
+            launch_result_fixture(fixture, TestClock::Pending, InlineValidationWorker).await;
+        let first =
+            validation_socket_exchange(&running.socket_address, running.first_request()).await;
+        assert_eq!(first["kind"], "Rejected");
+        write_signal(running.first_release.clone()).await;
+        read_signal(running.second_ready.clone()).await;
+        validate_corrected_result(&running).await;
+        // Replace the socket entry after the last exchange, before the process settles.
+        fs::remove_file(&running.socket_path).unwrap();
+        fs::create_dir(&running.socket_path).unwrap();
+        write_signal(running.second_release.clone()).await;
+        assert!(matches!(
+            running.finish().await,
+            AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+        ));
+        let diagnostic = running.diagnostics.get("agent-step").unwrap();
+        assert!(
+            String::from_utf8_lossy(diagnostic.standard_error().bytes())
+                .contains("bridge shutdown")
+        );
+        fs::remove_dir(&running.socket_path).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn accepted_result_exits_and_quiesces_before_the_injected_settlement_deadline() {
     with_watchdog(async {
         let (mut running, _now_seconds, _deadline_release, mut registered_deadlines) =
@@ -2189,8 +2288,27 @@ fn launch_rejects_a_session_path_rebound_after_planning() {
 
     assert!(matches!(
         build_command(&fixture.invocation, &plan),
-        Err(AgentFailureCause::HarnessStartFailed)
+        Err(AgentFailureCause::HarnessStartFailed { .. })
     ));
+}
+
+#[test]
+fn missing_diagnostic_session_retains_binding_error_in_launch_cause() {
+    let fixture = ProcessFixture::new("success", "system".to_owned(), "message".to_owned());
+    std::fs::rename(
+        &fixture.expected_diagnostic_session,
+        fixture
+            .expected_diagnostic_session
+            .with_file_name("moved-session"),
+    )
+    .unwrap();
+    let error = prepare_launch(&fixture.invocation).unwrap_err();
+    let AgentFailureCause::HarnessStartFailed { stage, error } = error else {
+        panic!("expected launch failure");
+    };
+    assert_eq!(stage, "pi diagnostic session binding");
+    let os_error = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    assert!(error.contains(&os_error), "{error}");
 }
 
 #[tokio::test]
@@ -2316,7 +2434,10 @@ async fn every_pre_agent_start_process_failure_is_a_start_failure_without_starte
                 release_agent,
             )
             .await;
-            assert_agent_failure(&outcome, AgentFailureCause::HarnessStartFailed);
+            assert_agent_failure(
+                &outcome,
+                AgentFailureCause::start_failure("launch preparation", "unavailable"),
+            );
             assert!(!lifecycle_started);
             assert!(!observations.iter().any(|observation| matches!(
                 observation.observation(),
@@ -2348,7 +2469,10 @@ async fn every_pre_agent_start_process_failure_is_a_start_failure_without_starte
         .await;
         assert_agent_failure(
             &terminal.receive().await.unwrap(),
-            AgentFailureCause::HarnessStartFailed,
+            AgentFailureCause::start_failure(
+                "process spawn",
+                std::io::Error::from_raw_os_error(libc::ENOENT),
+            ),
         );
         assert!(started.receive().await.is_err());
     })

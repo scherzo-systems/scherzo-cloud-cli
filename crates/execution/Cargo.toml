@@ -20,6 +20,7 @@ flate2.workspace = true
 fs4.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 jsonschema.workspace = true
 libc.workspace = true
 nix.workspace = true

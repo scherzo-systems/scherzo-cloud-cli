@@ -3848,6 +3848,22 @@ pub(super) mod structured_result {
 pub(super) mod start_failure {
     use super::*;
 
+    #[test]
+    fn stale_diagnostic_session_binding_preserves_the_binding_failure() {
+        let fixture = ProcessFixture::new("normal", AgentValueMode::None, 1024);
+        let replacement = fixture.diagnostic_session.with_extension("replacement");
+        std::fs::rename(&fixture.diagnostic_session, &replacement).unwrap();
+        std::fs::create_dir(&fixture.diagnostic_session).unwrap();
+
+        let Err(AgentFailureCause::HarnessStartFailed { stage, error }) =
+            prepare_launch(fixture.invocation.as_ref().unwrap())
+        else {
+            panic!("stale diagnostic-session binding did not produce a typed launch failure");
+        };
+        assert_eq!(stage, "codex diagnostic session binding");
+        assert!(!error.is_empty());
+    }
+
     #[tokio::test]
     async fn every_launch_and_setup_stage_is_typed_and_quiescent() {
         with_watchdog(async {
@@ -3857,29 +3873,49 @@ pub(super) mod start_failure {
             assert_eq!(
                 outcome,
                 AgentOutcome::Failed(
-                    AgentFailureCause::HarnessSetupFailed {
-                        stage: AgentHarnessSetupStage::ExecutableLaunch,
-                    }
+                    AgentFailureCause::start_failure(
+                        "codex process release",
+                        std::io::Error::from_raw_os_error(libc::ENOENT)
+                    )
                     .into(),
                 )
             );
 
-            for (scenario, stage) in [
+            for (scenario, stage, message) in [
                 (
                     "initialize-rejected",
                     AgentHarnessSetupStage::Initialization,
+                    Some("rejected"),
                 ),
-                ("initialize-eof", AgentHarnessSetupStage::Initialization),
+                (
+                    "initialize-eof",
+                    AgentHarnessSetupStage::Initialization,
+                    None,
+                ),
                 (
                     "config-read-rejected",
                     AgentHarnessSetupStage::EffectiveConfiguration,
+                    Some("config failed"),
                 ),
-                ("thread-start-rejected", AgentHarnessSetupStage::ThreadStart),
-                ("turn-start-rejected", AgentHarnessSetupStage::TurnStart),
-                ("premature-turn-started", AgentHarnessSetupStage::TurnStart),
+                (
+                    "thread-start-rejected",
+                    AgentHarnessSetupStage::ThreadStart,
+                    Some("thread failed"),
+                ),
+                (
+                    "turn-start-rejected",
+                    AgentHarnessSetupStage::TurnStart,
+                    Some("turn failed"),
+                ),
+                (
+                    "premature-turn-started",
+                    AgentHarnessSetupStage::TurnStart,
+                    None,
+                ),
                 (
                     "mismatched-turn-started",
                     AgentHarnessSetupStage::StartAcknowledgement,
+                    None,
                 ),
             ] {
                 let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
@@ -3887,9 +3923,27 @@ pub(super) mod start_failure {
                 assert!(!started, "{scenario}");
                 assert_failure_cause(
                     outcome,
-                    AgentFailureCause::HarnessSetupFailed { stage },
+                    message.map_or(AgentFailureCause::HarnessSetupFailed { stage }, |message| {
+                        AgentFailureCause::HarnessSetupRejected {
+                            stage,
+                            message: message.to_owned(),
+                        }
+                    }),
                     scenario,
                 );
+                if let Some(message) = message {
+                    assert!(
+                        String::from_utf8_lossy(
+                            fixture
+                                .diagnostics
+                                .get("agent-step")
+                                .unwrap()
+                                .standard_error()
+                                .bytes()
+                        )
+                        .contains(message)
+                    );
+                }
                 assert!(fixture.protocol_rejection().is_file());
                 assert_no_native_rollout(&fixture);
             }

@@ -1,3 +1,4 @@
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -29,7 +30,7 @@ impl PreparedInputTransport {
         staging_directory: &Path,
         system_prompt: Option<&str>,
         message_path: Option<&Path>,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, io::Error> {
         validate_result_endpoint_directory(staging_directory)?;
 
         let identity = result_tool_name(identity)?;
@@ -39,7 +40,7 @@ impl PreparedInputTransport {
             let path = staging_directory.join(SYSTEM_PROMPT_FILE_NAME);
             write_private_file(&path, prompt.as_bytes()).map(|()| path)
         });
-        let system_prompt_path = system_prompt_path.transpose().map_err(|_| ())?;
+        let system_prompt_path = system_prompt_path.transpose()?;
         let extension_path = staging_directory.join(EXTENSION_FILE_NAME);
         let message = staged_input_config(message_path, message_marker.as_deref())?;
         let system_prompt = staged_input_config(
@@ -54,7 +55,7 @@ impl PreparedInputTransport {
                 system_prompt,
             },
         )?;
-        write_private_file(&extension_path, source.as_bytes()).map_err(|_| ())?;
+        write_private_file(&extension_path, source.as_bytes())?;
 
         Ok(Self {
             extension_path,
@@ -94,12 +95,14 @@ struct StagedInputConfig<'a> {
 fn staged_input_config<'a>(
     path: Option<&'a Path>,
     marker: Option<&'a str>,
-) -> Result<Option<StagedInputConfig<'a>>, ()> {
+) -> Result<Option<StagedInputConfig<'a>>, io::Error> {
     path.zip(marker)
         .map(|(path, marker)| {
             Ok(StagedInputConfig {
                 marker,
-                path: path.to_str().ok_or(())?,
+                path: path.to_str().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "input path is not UTF-8")
+                })?,
             })
         })
         .transpose()

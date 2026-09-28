@@ -2993,7 +2993,10 @@ async fn harness_start_failure_is_a_start_failure() {
         let started = control.wait_until_started().await.unwrap();
         started
             .control()
-            .fail(AgentFailureCause::HarnessStartFailed)
+            .fail(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))
             .await
             .unwrap();
 

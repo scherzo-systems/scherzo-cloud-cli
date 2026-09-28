@@ -617,6 +617,7 @@ struct RuntimeRecovery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeStep {
     role: WorkflowNodeRole,
+    is_agent: bool,
     failure_policy: FailurePolicy,
     condition: Option<ResolvedPredicate>,
     condition_values: BTreeMap<String, ResolvedValueSource>,
@@ -752,6 +753,7 @@ fn runtime_step(
     let common = common_step(step);
     RuntimeStep {
         role,
+        is_agent: matches!(step, ValidatedStep::Agent(_)),
         failure_policy: common.failure_policy,
         condition: common.condition.clone(),
         condition_values: common.condition_values.clone(),
@@ -903,6 +905,19 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
 impl<Cause, Output, Deadline> RuntimeState<Cause, Output, Deadline> {
     pub(crate) const fn transition_capacity_exceeded(&self) -> bool {
         self.transition_capacity_exceeded
+    }
+
+    pub(crate) fn invocation_is_agent(&self, id: &str, handler: bool) -> bool {
+        self.definition.steps.get(id).is_some_and(|step| {
+            if handler {
+                step.recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.handler_kind)
+                    == Some(RecoveryHandlerKind::Agent)
+            } else {
+                step.is_agent
+            }
+        })
     }
 }
 

@@ -23,6 +23,10 @@ use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::result_validation::{decode_uri_fragment, join_pointer};
 use crate::workflow::schema_common::lowercase_hex;
 
+fn invalid_bridge(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const RESOURCE_ID_PREFIX: &str = "https://schemas.scherzo.invalid/workflow-result/";
 const MAX_MODEL_REFERENCE_EXPANSIONS: usize = 128;
@@ -55,40 +59,55 @@ impl PreparedResultBridge {
         limits: PiJsonV1ProtocolLimits,
         receive_deadline: PositiveDuration,
         clock: Clock,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, io::Error> {
         validate_result_endpoint_directory(staging_directory)?;
         let tool_name = Arc::<str>::from(result_tool_name(identity)?);
         let socket_path = staging_directory.join(SOCKET_FILE_NAME);
         let extension_path = staging_directory.join(EXTENSION_FILE_NAME);
-        let socket_alias_directory = socket_alias_directory(&tool_name)?;
+        let transport = derive_transport_schema(schema)?;
+        let socket_alias_directory = create_random_socket_alias(&tool_name, staging_directory)?;
         let socket_alias = socket_alias_directory.join(SOCKET_ALIAS_NAME);
         let socket_address = socket_alias.join(SOCKET_FILE_NAME);
-        let transport = derive_transport_schema(schema)?;
-        let source = materialize_extension(&ExtensionConfig {
+        let source = match materialize_extension(&ExtensionConfig {
             tool_name: &tool_name,
-            socket_path: socket_address.to_str().ok_or(())?,
+            socket_path: socket_address
+                .to_str()
+                .ok_or_else(|| invalid_bridge("socket path is not UTF-8"))?,
             parameters: &transport.native_parameters,
-        })?;
-
-        create_socket_alias(&socket_alias_directory, &socket_alias, staging_directory)?;
-        let listener = match UnixListener::bind(&socket_address) {
-            Ok(listener) => listener,
-            Err(_) => {
+        }) {
+            Ok(source) => source,
+            Err(error) => {
                 let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
-                return Err(());
+                return Err(error);
             }
         };
-        if let Err(()) = make_socket_private(&socket_path) {
+        let listener = match UnixListener::bind(&socket_address) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("socket bind: {error}"),
+                ));
+            }
+        };
+        if let Err(error) = make_socket_private(&socket_path) {
             drop(listener);
             let _ = fs::remove_file(&socket_path);
             let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
-            return Err(());
+            return Err(io::Error::new(
+                error.kind(),
+                format!("socket permissions: {error}"),
+            ));
         }
-        if write_private_file(&extension_path, source.as_bytes()).is_err() {
+        if let Err(error) = write_private_file(&extension_path, source.as_bytes()) {
             drop(listener);
             let _ = fs::remove_file(&socket_path);
             let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
-            return Err(());
+            return Err(io::Error::new(
+                error.kind(),
+                format!("extension write: {error}"),
+            ));
         }
         let server = ResultSocketServer::start(
             listener,
@@ -117,7 +136,7 @@ impl PreparedResultBridge {
         self.server.receive().await
     }
 
-    pub(super) async fn shutdown(self) -> Result<(), ()> {
+    pub(super) async fn shutdown(self) -> Result<(), io::Error> {
         let Self {
             extension_path,
             socket_path,
@@ -157,15 +176,18 @@ impl IncomingResultRequest {
         &self.request
     }
 
-    pub(super) async fn respond(self, response: ValidatePiResultV1Response) -> Result<(), ()> {
+    pub(super) async fn respond(
+        self,
+        response: ValidatePiResultV1Response,
+    ) -> Result<(), io::Error> {
         let (delivered, delivery) = oneshot::channel();
         self.response
             .send(ResponseCommand {
                 response,
                 delivered,
             })
-            .map_err(|_| ())?;
-        delivery.await.map_err(|_| ())?
+            .map_err(|_| invalid_bridge("response channel closed"))?;
+        delivery.await.map_err(invalid_bridge)?
     }
 }
 
@@ -231,7 +253,7 @@ impl ValidatePiResultV1Response {
 #[derive(Debug)]
 struct ResponseCommand {
     response: ValidatePiResultV1Response,
-    delivered: oneshot::Sender<Result<(), ()>>,
+    delivered: oneshot::Sender<Result<(), io::Error>>,
 }
 
 #[derive(Debug)]
@@ -268,11 +290,11 @@ impl ResultSocketServer {
             .unwrap_or(ResultSocketEvent::Closed)
     }
 
-    async fn shutdown(self) -> Result<(), ()> {
+    async fn shutdown(self) -> Result<(), io::Error> {
         let Self { events, stop, task } = self;
         drop(events);
         stop.send_replace(true);
-        task.await.map_err(|_| ())
+        task.await.map_err(invalid_bridge)
     }
 }
 
@@ -487,23 +509,23 @@ async fn write_response_frame(
     stop: &mut watch::Receiver<bool>,
     response: &ValidatePiResultV1Response,
     maximum_frame_bytes: NonZeroU64,
-) -> Result<(), ()> {
-    let payload = serde_json::to_vec(response).map_err(|_| ())?;
-    let payload_length = u64::try_from(payload.len()).map_err(|_| ())?;
+) -> Result<(), io::Error> {
+    let payload = serde_json::to_vec(response).map_err(invalid_bridge)?;
+    let payload_length = u64::try_from(payload.len()).map_err(invalid_bridge)?;
     if payload_length > maximum_frame_bytes.get() {
-        return Err(());
+        return Err(invalid_bridge("bridge response exceeds frame limit"));
     }
-    let payload_length = u32::try_from(payload_length).map_err(|_| ())?;
+    let payload_length = u32::try_from(payload_length).map_err(invalid_bridge)?;
     let mut frame = Vec::with_capacity(4_usize.saturating_add(payload.len()));
     frame.extend_from_slice(&payload_length.to_be_bytes());
     frame.extend_from_slice(&payload);
     let written = tokio::select! {
         biased;
-        _ = wait_for_stop(stop) => return Err(()),
+        _ = wait_for_stop(stop) => return Err(io::Error::new(io::ErrorKind::Interrupted, "bridge stopped")),
         result = stream.write_all(&frame) => result,
     };
-    written.map_err(|_| ())?;
-    stream.shutdown().await.map_err(|_| ())
+    written?;
+    stream.shutdown().await
 }
 
 async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
@@ -525,7 +547,7 @@ struct ExtensionConfig<'a> {
     parameters: &'a Value,
 }
 
-fn materialize_extension(config: &ExtensionConfig<'_>) -> Result<String, ()> {
+fn materialize_extension(config: &ExtensionConfig<'_>) -> Result<String, io::Error> {
     materialize_extension_config(EXTENSION_TEMPLATE, CONFIG_MARKER, config)
 }
 
@@ -533,14 +555,16 @@ pub(super) fn materialize_extension_config(
     template: &str,
     marker: &str,
     config: &impl Serialize,
-) -> Result<String, ()> {
+) -> Result<String, io::Error> {
     let mut markers = template.match_indices(marker);
-    let (marker_index, _) = markers.next().ok_or(())?;
+    let (marker_index, _) = markers
+        .next()
+        .ok_or_else(|| invalid_bridge("invalid bridge data"))?;
     if markers.next().is_some() {
-        return Err(());
+        return Err(invalid_bridge("invalid bridge data"));
     }
-    let config_json = serde_json::to_string(config).map_err(|_| ())?;
-    let encoded_config_json = serde_json::to_string(&config_json).map_err(|_| ())?;
+    let config_json = serde_json::to_string(config).map_err(invalid_bridge)?;
+    let encoded_config_json = serde_json::to_string(&config_json).map_err(invalid_bridge)?;
     let mut source = String::with_capacity(
         template
             .len()
@@ -553,7 +577,7 @@ pub(super) fn materialize_extension_config(
     Ok(source)
 }
 
-pub(super) fn result_tool_name(identity: &AgentInvocationIdentity) -> Result<String, ()> {
+pub(super) fn result_tool_name(identity: &AgentInvocationIdentity) -> Result<String, io::Error> {
     let mut context = ring::digest::Context::new(&SHA256);
     update_identity_component(&mut context, identity.run().as_ref().as_bytes())?;
     update_identity_component(&mut context, identity.step().as_bytes())?;
@@ -571,8 +595,8 @@ pub(super) fn result_tool_name(identity: &AgentInvocationIdentity) -> Result<Str
 fn update_identity_component(
     context: &mut ring::digest::Context,
     component: &[u8],
-) -> Result<(), ()> {
-    let length = u64::try_from(component.len()).map_err(|_| ())?;
+) -> Result<(), io::Error> {
+    let length = u64::try_from(component.len()).map_err(invalid_bridge)?;
     context.update(&length.to_be_bytes());
     context.update(component);
     Ok(())
@@ -583,7 +607,7 @@ struct TransportSchema {
     native_parameters: Value,
 }
 
-fn derive_complete_wrapper(schema: &RetainedJsonSchema) -> Result<(Value, String), ()> {
+fn derive_complete_wrapper(schema: &RetainedJsonSchema) -> Result<(Value, String), io::Error> {
     let synthetic_resource_id = || {
         format!(
             "{RESOURCE_ID_PREFIX}{}",
@@ -591,7 +615,9 @@ fn derive_complete_wrapper(schema: &RetainedJsonSchema) -> Result<(Value, String
         )
     };
     let mut embedded = schema.document().clone();
-    let embedded_object = embedded.as_object_mut().ok_or(())?;
+    let embedded_object = embedded
+        .as_object_mut()
+        .ok_or_else(|| invalid_bridge("invalid bridge data"))?;
     let resource_id = match embedded_object.get("$id") {
         Some(Value::String(authored_id)) if !authored_id.starts_with('#') => authored_id.clone(),
         Some(Value::String(_)) | None => {
@@ -599,7 +625,7 @@ fn derive_complete_wrapper(schema: &RetainedJsonSchema) -> Result<(Value, String
             embedded_object.insert("$id".to_owned(), Value::String(resource_id.clone()));
             resource_id
         }
-        Some(_) => return Err(()),
+        Some(_) => return Err(invalid_bridge("invalid bridge data")),
     };
 
     let complete_wrapper = json!({
@@ -614,7 +640,7 @@ fn derive_complete_wrapper(schema: &RetainedJsonSchema) -> Result<(Value, String
     Ok((complete_wrapper, resource_id))
 }
 
-fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchema, ()> {
+fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchema, io::Error> {
     let _ = derive_complete_wrapper(schema)?;
     let native_parameters = json!({
         "type": "object",
@@ -626,7 +652,7 @@ fn derive_transport_schema(schema: &RetainedJsonSchema) -> Result<TransportSchem
     Ok(TransportSchema { native_parameters })
 }
 
-fn derive_model_result_schema(schema: &Value) -> Result<Value, ()> {
+fn derive_model_result_schema(schema: &Value) -> Result<Value, io::Error> {
     // This projection is model guidance only. Expose a reference-only root, then
     // omit external identity and regex keywords that tool-schema consumers do
     // not handle portably; the complete authored schema remains authoritative.
@@ -656,7 +682,14 @@ impl<'a> ModelSchemaDerivation<'a> {
         }
     }
 
-    fn inline_root_references(&mut self, schema: &Value) -> Result<Value, ()> {
+    fn resolve_reference(&self, reference: &Value) -> io::Result<ResolvedLocalReference<'a>> {
+        let text = reference
+            .as_str()
+            .ok_or_else(|| invalid_bridge("schema reference is not a string"))?;
+        resolve_local_reference(self.root, text)
+    }
+
+    fn inline_root_references(&mut self, schema: &Value) -> Result<Value, io::Error> {
         let Some(object) = schema.as_object() else {
             return Ok(schema.clone());
         };
@@ -673,8 +706,7 @@ impl<'a> ModelSchemaDerivation<'a> {
             let Some(reference) = object.get(keyword) else {
                 continue;
             };
-            let reference_text = reference.as_str().ok_or(())?;
-            let resolved = resolve_local_reference(self.root, reference_text)?;
+            let resolved = self.resolve_reference(reference)?;
             let mut target = if self.begin_expansion(&resolved.pointer) {
                 let expanded = self.inline_root_references(resolved.schema);
                 self.active_reference_targets.pop();
@@ -691,7 +723,7 @@ impl<'a> ModelSchemaDerivation<'a> {
         Ok(combine_schema_constraints(Value::Object(siblings), exposed))
     }
 
-    fn inline_pattern_references(&mut self, schema: &Value) -> Result<Value, ()> {
+    fn inline_pattern_references(&mut self, schema: &Value) -> Result<Value, io::Error> {
         let Some(object) = schema.as_object() else {
             return Ok(schema.clone());
         };
@@ -703,8 +735,7 @@ impl<'a> ModelSchemaDerivation<'a> {
             let Some(reference) = object.get(keyword) else {
                 continue;
             };
-            let reference_text = reference.as_str().ok_or(())?;
-            let resolved = resolve_local_reference(self.root, reference_text)?;
+            let resolved = self.resolve_reference(reference)?;
             if !self.target_is_removed_pattern_schema(&resolved.pointer) {
                 continue;
             }
@@ -910,9 +941,12 @@ struct ResolvedLocalReference<'a> {
 fn resolve_local_reference<'a>(
     root: &'a Value,
     reference: &str,
-) -> Result<ResolvedLocalReference<'a>, ()> {
-    let fragment = reference.strip_prefix('#').ok_or(())?;
-    let fragment = decode_uri_fragment(fragment).map_err(|_| ())?;
+) -> Result<ResolvedLocalReference<'a>, io::Error> {
+    let fragment = reference
+        .strip_prefix('#')
+        .ok_or_else(|| invalid_bridge("invalid bridge data"))?;
+    let fragment =
+        decode_uri_fragment(fragment).map_err(|error| invalid_bridge(format!("{error:?}")))?;
     if fragment.is_empty() {
         return Ok(ResolvedLocalReference {
             schema: root,
@@ -926,9 +960,9 @@ fn resolve_local_reference<'a>(
                 schema,
                 pointer: fragment,
             })
-            .ok_or(());
+            .ok_or_else(|| invalid_bridge("invalid bridge data"));
     }
-    find_anchor(root, &fragment, "").ok_or(())
+    find_anchor(root, &fragment, "").ok_or_else(|| invalid_bridge("invalid bridge data"))
 }
 
 fn find_anchor<'a>(
@@ -985,7 +1019,7 @@ fn find_anchor<'a>(
 }
 
 impl ModelSchemaDerivation<'_> {
-    fn project_compatibility_schema(&mut self, schema: &Value) -> Result<Value, ()> {
+    fn project_compatibility_schema(&mut self, schema: &Value) -> Result<Value, io::Error> {
         let exposed = self.inline_pattern_references(schema)?;
         let Some(object) = exposed.as_object() else {
             return Ok(exposed);
@@ -1057,7 +1091,7 @@ impl ModelSchemaDerivation<'_> {
         &mut self,
         additional_properties: Option<&Value>,
         schema: &Map<String, Value>,
-    ) -> Result<Option<Value>, ()> {
+    ) -> Result<Option<Value>, io::Error> {
         let projected_additional = match additional_properties {
             Some(additional) => Some(self.project_compatibility_schema(additional)?),
             None => None,
@@ -1137,14 +1171,14 @@ impl Retrieve for RejectRetrieval {
     }
 }
 
-fn validate_transport_schema(wrapper: &Value) -> Result<(), ()> {
+fn validate_transport_schema(wrapper: &Value) -> Result<(), io::Error> {
     jsonschema::Validator::options()
         .with_draft(Draft::Draft202012)
         .with_pattern_options(PatternOptions::regex())
         .with_retriever(RejectRetrieval)
         .build(wrapper)
         .map(|_| ())
-        .map_err(|_| ())
+        .map_err(invalid_bridge)
 }
 
 fn single_schema_keywords() -> &'static [&'static str] {
@@ -1176,50 +1210,85 @@ fn map_schema_keywords() -> &'static [&'static str] {
     ]
 }
 
-pub(super) fn validate_result_endpoint_directory(directory: &Path) -> Result<(), ()> {
-    let metadata = fs::symlink_metadata(directory).map_err(|_| ())?;
+pub(super) fn validate_result_endpoint_directory(directory: &Path) -> Result<(), io::Error> {
+    let metadata = fs::symlink_metadata(directory)?;
     if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(());
+        return Err(invalid_bridge("result endpoint is not a private directory"));
+    }
+    if metadata.permissions().mode() & 0o200 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "result endpoint is not writable",
+        ));
     }
     Ok(())
 }
 
-fn socket_alias_directory(tool_name: &str) -> Result<PathBuf, ()> {
-    let identity = tool_name.strip_prefix(TOOL_NAME_PREFIX).ok_or(())?;
-    let identity = format!("{identity}-{}", std::process::id());
-    Ok(Path::new(SOCKET_ALIAS_ROOT).join(format!(".szp-{identity}")))
+fn socket_alias_directory(tool_name: &str) -> io::Result<PathBuf> {
+    let identity = tool_name
+        .strip_prefix(TOOL_NAME_PREFIX)
+        .ok_or_else(|| invalid_bridge("invalid result tool name"))?;
+    let mut nonce = [0_u8; 8];
+    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+    Ok(Path::new(SOCKET_ALIAS_ROOT).join(format!(".szp-{identity}-{}", lowercase_hex(&nonce))))
 }
 
-fn create_socket_alias(directory: &Path, alias: &Path, target: &Path) -> Result<(), ()> {
-    // AF_UNIX limits the address bytes even when the actual private staging path is valid.
-    // A private, deterministic short alias keeps the socket itself in result-endpoint while
-    // giving Pi and Node a portable Linux/macOS address that fits the native limit.
+fn create_random_socket_alias(tool_name: &str, target: &Path) -> io::Result<PathBuf> {
+    create_socket_alias_retry(target, || socket_alias_directory(tool_name))
+}
+
+fn create_socket_alias_retry(
+    target: &Path,
+    mut next_directory: impl FnMut() -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    for _ in 0..16 {
+        let directory = next_directory()?;
+        let alias = directory.join(SOCKET_ALIAS_NAME);
+        match create_socket_alias(&directory, &alias, target) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("socket alias: {error}"),
+                ));
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "socket alias collisions exhausted",
+    ))
+}
+
+fn create_socket_alias(directory: &Path, alias: &Path, target: &Path) -> io::Result<()> {
+    // AF_UNIX limits the address bytes even when the private staging path is valid.
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
-    builder.create(directory).map_err(|_| ())?;
-    if fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).is_err() {
+    builder.create(directory)?;
+    if let Err(error) = fs::set_permissions(directory, fs::Permissions::from_mode(0o700)) {
         let _ = fs::remove_dir(directory);
-        return Err(());
+        return Err(error);
     }
-    if symlink(target, alias).is_err() {
+    if let Err(error) = symlink(target, alias) {
         let _ = fs::remove_dir(directory);
-        return Err(());
+        return Err(error);
     }
     Ok(())
 }
 
-fn remove_socket_alias(directory: &Path, alias: &Path) -> Result<(), ()> {
+fn remove_socket_alias(directory: &Path, alias: &Path) -> io::Result<()> {
     let alias_result = remove_materialized_file(alias);
     let directory_result = match fs::remove_dir(directory) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(()),
+        Err(error) => Err(error),
     };
     alias_result.and(directory_result)
 }
 
-fn make_socket_private(path: &Path) -> Result<(), ()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| ())
+fn make_socket_private(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -1233,11 +1302,11 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.set_permissions(fs::Permissions::from_mode(0o400))
 }
 
-fn remove_materialized_file(path: &Path) -> Result<(), ()> {
+fn remove_materialized_file(path: &Path) -> Result<(), io::Error> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(()),
+        Err(error) => Err(error),
     }
 }
 

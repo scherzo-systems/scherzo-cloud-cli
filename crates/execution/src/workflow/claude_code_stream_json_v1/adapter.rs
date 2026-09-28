@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -163,7 +164,13 @@ where
         terminal: AgentTerminalCallback,
     ) {
         let cancellation = invocation.cancellation().clone();
-        let outcome = self.invoke_inner(invocation, &started).await;
+        let span = tracing::info_span!("agent_invocation", profile = "claude_code_stream_json_v1",
+            step = %invocation.identity().step(),
+            sequence = invocation.identity().invocation().transition_sequence.get());
+        let outcome = self
+            .invoke_inner(invocation, &started)
+            .instrument(span)
+            .await;
         let outcome = cancellation
             .cancellation_reason()
             .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
@@ -203,8 +210,20 @@ where
         .await
         {
             Ok((invocation, Ok(plan))) => (invocation, plan),
-            Ok((_, Err(cause))) => return failed_agent_outcome(cause),
-            Err(_) => return failed_agent_outcome(AgentFailureCause::HarnessStartFailed),
+            Ok((invocation, Err(cause))) => {
+                self.diagnostics.record_agent_start_failure(
+                    invocation.identity(),
+                    self.maximum_diagnostic_stream_bytes,
+                    &cause,
+                );
+                return failed_agent_outcome(cause);
+            }
+            Err(_) => {
+                return failed_agent_outcome(AgentFailureCause::start_failure(
+                    "launch preparation",
+                    "unavailable",
+                ));
+            }
         };
         // jscpd:ignore-end
         // The shared validator is wired into a native exchange here, while Pi wires it
@@ -238,7 +257,10 @@ where
             {
                 Ok(launch) => launch,
                 Err(_) => {
-                    return failed_agent_outcome(AgentFailureCause::HarnessStartFailed);
+                    return failed_agent_outcome(AgentFailureCause::start_failure(
+                        "launch preparation",
+                        "unavailable",
+                    ));
                 }
             };
         if let Some(reason) = cancellation_reason {
@@ -249,12 +271,22 @@ where
         }
         let (process, standard_error) = match launched {
             Ok(process) => process,
-            Err(cause) => return failed_agent_outcome(cause),
+            Err(cause) => {
+                self.diagnostics.record_agent_start_failure(
+                    invocation.identity(),
+                    self.maximum_diagnostic_stream_bytes,
+                    &cause,
+                );
+                return failed_agent_outcome(cause);
+            }
         };
         let Some(process_directives) = invocation.take_process_directives() else {
             let mut process = process;
             let _ = process.child.force_stop(process.process_group).await;
-            return failed_agent_outcome(AgentFailureCause::HarnessStartFailed);
+            return failed_agent_outcome(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         };
         // Diagnostic drain is tied to Claude's stream driver lifetime rather than Pi's
         // result bridge and native-session settlement.
@@ -351,16 +383,25 @@ where
         invocation.limits().maximum_message_bytes(),
         AgentInputKind::Message,
     )?;
+    // The Claude and Pi adapters keep these admission guards local because their
+    // profile-specific launch contracts must remain independently typed.
+    // jscpd:ignore-start
     if invocation.adapter().profile() != AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
         || compatibility_profile_for_version(invocation.adapter().version()).is_none()
         || !invocation.adapter().executable().is_absolute()
-        || invocation
-            .diagnostic_session()
-            .verify_claude_code_native_session_path_binding()
-            .is_err()
     {
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     }
+    // jscpd:ignore-end
+    invocation
+        .diagnostic_session()
+        .verify_claude_code_native_session_path_binding()
+        .map_err(|error| {
+            AgentFailureCause::start_failure("claude diagnostic session binding", error)
+        })?;
 
     // Claude correlates this path in system/init and stages a native prompt file; Pi's
     // corresponding preparation uses a persisted session and injected input extension.
@@ -368,23 +409,30 @@ where
     let expected_cwd_path = invocation
         .process()
         .protocol_cwd()
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
     let session_id = Arc::from(
         invocation
             .diagnostic_session()
             .claude_code_native_session_id()
-            .ok_or(AgentFailureCause::HarnessStartFailed)?,
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?,
     );
     let native_session_bridge =
         ClaudeCodeNativeSessionBridge::prepare(invocation, &expected_cwd_path, &session_id)?;
-    let expected_cwd = expected_cwd_path
-        .to_str()
-        .map(Arc::from)
-        .ok_or(AgentFailureCause::HarnessStartFailed)?;
+    let expected_cwd =
+        expected_cwd_path
+            .to_str()
+            .map(Arc::from)
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
     let mut system_prompt_file = tempfile::Builder::new()
         .prefix(SYSTEM_PROMPT_FILE_PREFIX)
         .tempfile_in(invocation.staging().result_endpoint_directory())
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| AgentFailureCause::start_failure("claude prompt temp file", error))?;
     system_prompt_file
         .write_all(invocation.prompt().system_prompt().as_bytes())
         .and_then(|()| system_prompt_file.flush())
@@ -393,7 +441,7 @@ where
                 .as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o400))
         })
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| AgentFailureCause::start_failure("claude prompt write", error))?;
     // jscpd:ignore-end
 
     let configuration = invocation.adapter().native_configuration();
@@ -448,41 +496,55 @@ impl ClaudeCodeNativeSessionBridge {
         invocation
             .diagnostic_session()
             .verify_claude_code_native_session_path_binding()
-            .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+            .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
         let transcript = invocation
             .diagnostic_session()
             .claude_code_native_transcript_path()
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
         let resources = invocation
             .diagnostic_session()
             .claude_code_native_resources_directory()
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
         if !transcript.is_absolute() || !resources.is_absolute() {
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
 
         if !matches!(
             fs::symlink_metadata(&transcript),
             Err(error) if error.kind() == io::ErrorKind::NotFound
         ) {
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
 
         let config = claude_code_config_directory(invocation, expected_cwd)?;
-        let project = config.join("projects").join(native_project_slug(
-            expected_cwd
-                .to_str()
-                .ok_or(AgentFailureCause::HarnessStartFailed)?,
-        ));
+        let project =
+            config
+                .join("projects")
+                .join(native_project_slug(expected_cwd.to_str().ok_or(
+                    AgentFailureCause::start_failure("launch preparation", "unavailable"),
+                )?));
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);
         builder
             .create(&project)
-            .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
-        let project =
-            fs::canonicalize(project).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
-        let ambient_project_directory =
-            open_directory_path(&project).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+            .map_err(|error| AgentFailureCause::start_failure("claude project directory", error))?;
+        let project = fs::canonicalize(project).map_err(|error| {
+            AgentFailureCause::start_failure("claude project canonicalization", error)
+        })?;
+        let ambient_project_directory = open_directory_path(&project)
+            .map_err(|error| AgentFailureCause::start_failure("claude project open", error))?;
         let transcript_link_name = OsString::from(format!("{session_id}.jsonl"));
         let mut bridge = Self {
             ambient_project_directory,
@@ -523,15 +585,18 @@ impl ClaudeCodeNativeSessionBridge {
 
     fn create_link(&mut self, target: &Path, name: OsString) -> Result<(), AgentFailureCause> {
         symlinkat(target, &self.ambient_project_directory, &name)
-            .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+            .map_err(|error| AgentFailureCause::start_failure("claude session symlink", error))?;
         let metadata = statat(
             &self.ambient_project_directory,
             &name,
             AtFlags::SYMLINK_NOFOLLOW,
         )
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| AgentFailureCause::start_failure("claude session link stat", error))?;
         if FileType::from_raw_mode(metadata.st_mode) != FileType::Symlink {
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
         self.links.push(OwnedAmbientSessionLink {
             name,
@@ -573,7 +638,10 @@ where
         let home = environment
             .get(std::ffi::OsStr::new("HOME"))
             .map(PathBuf::from)
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
         home.join(".claude")
     };
     if directory.is_absolute() {
@@ -633,16 +701,19 @@ where
 {
     if invocation.attachments().is_empty() {
         return initial_user_text_frame(invocation.prompt().message())
-            .map_err(|_| AgentFailureCause::HarnessStartFailed);
+            .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"));
     }
 
     if invocation.attachments().len() > invocation.limits().maximum_attachments().get() {
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     }
     let mut validated = Vec::new();
     validated
         .try_reserve_exact(invocation.attachments().len())
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
     let mut total_bytes = 0_u64;
     for (index, attachment) in invocation.attachments().iter().enumerate() {
         let expected_identity = format!("{index:06}");
@@ -651,26 +722,38 @@ where
             .file_name()
             .and_then(|identity| identity.to_str())
             .filter(|identity| *identity == expected_identity)
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
         if !attachment.path().is_absolute() {
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
         let metadata = fs::symlink_metadata(attachment.path())
-            .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+            .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
         if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o377 != 0 {
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
         total_bytes = total_bytes
             .checked_add(metadata.len())
             .filter(|total| *total <= invocation.limits().maximum_attachment_bytes().get())
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
         validated.push((attachment, identity.to_owned(), metadata.len()));
     }
 
     let mut content = Vec::new();
     content
         .try_reserve_exact(validated.len().saturating_add(1))
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
     content.push(json!({
         "type": "text",
         "text": invocation.prompt().message(),
@@ -680,7 +763,7 @@ where
     }
 
     let empty_frame_bytes = user_content_frame(Vec::new())
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?
+        .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?
         .len();
     let mut block_bytes = content
         .iter()
@@ -690,23 +773,40 @@ where
         .iter()
         .try_fold(empty_frame_bytes, |total, bytes| total.checked_add(*bytes))
         .and_then(|total| total.checked_add(content.len().saturating_sub(1)))
-        .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        .ok_or(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ))?;
     if frame_bytes > MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES {
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     }
 
     for (index, (attachment, identity, expected_bytes)) in validated.iter().enumerate() {
         let content_index = index.saturating_add(1);
-        let reference_bytes = block_bytes
-            .get(content_index)
-            .copied()
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
-        let frame_without_reference = frame_bytes
-            .checked_sub(reference_bytes)
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        let reference_bytes =
+            block_bytes
+                .get(content_index)
+                .copied()
+                .ok_or(AgentFailureCause::start_failure(
+                    "launch preparation",
+                    "unavailable",
+                ))?;
+        let frame_without_reference =
+            frame_bytes
+                .checked_sub(reference_bytes)
+                .ok_or(AgentFailureCause::start_failure(
+                    "launch preparation",
+                    "unavailable",
+                ))?;
         let replacement_budget = MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES
             .checked_sub(frame_without_reference)
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            .ok_or(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ))?;
         if *expected_bytes > u64::try_from(replacement_budget).unwrap_or(u64::MAX) {
             continue;
         }
@@ -715,25 +815,37 @@ where
             continue;
         };
         let inline_bytes = serialized_content_block_bytes(&inline)?;
-        let candidate_frame_bytes = frame_without_reference
-            .checked_add(inline_bytes)
-            .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        let candidate_frame_bytes = frame_without_reference.checked_add(inline_bytes).ok_or(
+            AgentFailureCause::start_failure("launch preparation", "unavailable"),
+        )?;
         if candidate_frame_bytes <= MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES {
-            let content_slot = content
-                .get_mut(content_index)
-                .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            let content_slot =
+                content
+                    .get_mut(content_index)
+                    .ok_or(AgentFailureCause::start_failure(
+                        "launch preparation",
+                        "unavailable",
+                    ))?;
             *content_slot = inline;
-            let block_bytes_slot = block_bytes
-                .get_mut(content_index)
-                .ok_or(AgentFailureCause::HarnessStartFailed)?;
+            let block_bytes_slot =
+                block_bytes
+                    .get_mut(content_index)
+                    .ok_or(AgentFailureCause::start_failure(
+                        "launch preparation",
+                        "unavailable",
+                    ))?;
             *block_bytes_slot = inline_bytes;
             frame_bytes = candidate_frame_bytes;
         }
     }
 
-    let frame = user_content_frame(content).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    let frame = user_content_frame(content)
+        .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
     if frame.len() > MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES {
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     }
     Ok(frame)
 }
@@ -741,7 +853,7 @@ where
 fn serialized_content_block_bytes(block: &Value) -> Result<usize, AgentFailureCause> {
     serde_json::to_vec(block)
         .map(|bytes| bytes.len())
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)
+        .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))
 }
 
 fn attachment_inline_content_block(
@@ -797,7 +909,10 @@ fn attachment_reference_content_block(
     let sealed_path = attachment
         .path()
         .to_str()
-        .ok_or(AgentFailureCause::HarnessStartFailed)?;
+        .ok_or(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ))?;
     Ok(json!({
         "type": "text",
         "text": format!(
@@ -810,18 +925,21 @@ fn read_staged_attachment(
     attachment: &StagedAgentAttachment,
     expected_bytes: u64,
 ) -> Result<Vec<u8>, AgentFailureCause> {
-    let capacity =
-        usize::try_from(expected_bytes).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    let capacity = usize::try_from(expected_bytes)
+        .map_err(|error| AgentFailureCause::start_failure("attachment capacity", error))?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(capacity)
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
-    let mut file =
-        fs::File::open(attachment.path()).map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| AgentFailureCause::start_failure("attachment capacity", error))?;
+    let mut file = fs::File::open(attachment.path())
+        .map_err(|error| AgentFailureCause::start_failure("attachment read", error))?;
     file.read_to_end(&mut bytes)
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+        .map_err(|error| AgentFailureCause::start_failure("attachment read", error))?;
     if u64::try_from(bytes.len()) != Ok(expected_bytes) {
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "attachment length",
+            format!("expected {expected_bytes} bytes, read {}", bytes.len()),
+        ));
     }
     Ok(bytes)
 }
@@ -884,12 +1002,15 @@ where
                 .map_err(|_| io::Error::other("agent working directory is unavailable"))
         },
     )
-    .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
+    .map_err(|error| AgentFailureCause::start_failure("claude process spawn", error))?;
     let process_group = child.identity().process_group();
     let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
     else {
         let _ = child.force_stop_blocking();
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ));
     };
     let mut registration = match invocation.process_guards().register(
         invocation.identity().step(),
@@ -899,20 +1020,23 @@ where
         Ok(registration) => registration,
         Err(_) => {
             let _ = child.force_stop_blocking();
-            return Err(AgentFailureCause::HarnessStartFailed);
+            return Err(AgentFailureCause::start_failure(
+                "launch preparation",
+                "unavailable",
+            ));
         }
     };
-    if release_guarded_claude_code(invocation.diagnostic_session(), || {
+    if let Err(cause) = release_guarded_claude_code(invocation.diagnostic_session(), || {
         child
             .continue_execution_cancellable(cancellation)
-            .map_err(|_| ())?;
-        registration.mark_released().map_err(|_| ())
-    })
-    .is_err()
-    {
+            .map_err(|error| AgentFailureCause::start_failure("claude process release", error))?;
+        registration
+            .mark_released()
+            .map_err(|_| AgentFailureCause::start_failure("claude guard release", "unavailable"))
+    }) {
         let _ = child.force_stop_blocking();
         let _ = registration.mark_quiesced();
-        return Err(AgentFailureCause::HarnessStartFailed);
+        return Err(cause);
     }
 
     Ok((
@@ -932,12 +1056,14 @@ where
 
 fn release_guarded_claude_code(
     diagnostic_session: &AgentDiagnosticSession,
-    release: impl FnOnce() -> Result<(), ()>,
+    release: impl FnOnce() -> Result<(), AgentFailureCause>,
 ) -> Result<(), AgentFailureCause> {
     diagnostic_session
         .verify_claude_code_native_session_path_binding()
-        .map_err(|_| AgentFailureCause::HarnessStartFailed)?;
-    release().map_err(|()| AgentFailureCause::HarnessStartFailed)
+        .map_err(|error| {
+            AgentFailureCause::start_failure("claude diagnostic session binding", error)
+        })?;
+    release()
 }
 
 fn invocation_environment<Sink>(

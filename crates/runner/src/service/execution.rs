@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Read as _;
 use std::ops::Add;
@@ -40,19 +40,20 @@ use scherzo_cloud_execution::{
     ProcessGuardStoreError, ProcessIdentityInspector, ProcessIdentityObservation,
     RecoveryDecisionKind, RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
     RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
-    RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnosticLog,
-    StepFailureCause, StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector,
-    TransitionEvent, TransitionObservation, ValidatedStep, WorkflowExecutionResult,
-    WorkflowNodeRole, WorkflowRunCancellation, WorkflowRunFinalization,
-    WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult, WorkflowRunStep,
-    WorkflowRunStepKind, WorkflowRunTiming, WorkflowState, WorkflowStepTiming, command_output_v1,
-    execute_workflow, prepare_cloud_workflow_result, production_agent_dispatcher,
-    step_recovery_summary_v1, summary_disposition_matches, terminate_authenticated_process_group,
+    RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnostic,
+    StepDiagnosticLog, StepFailureCause, StepRecoveryState, StepState, StepStateKind,
+    SystemProcessIdentityInspector, TargetExecutionNumber, TransitionEvent, TransitionObservation,
+    ValidatedRecoveryHandler, ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole,
+    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
+    WorkflowRunId, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming,
+    WorkflowState, WorkflowStepTiming, command_output_v1, execute_workflow,
+    prepare_cloud_workflow_result, production_agent_dispatcher, step_recovery_summary_v1,
+    summary_disposition_matches, terminate_authenticated_process_group,
 };
 #[cfg(test)]
 use scherzo_cloud_execution::{
-    BlockedDetail, FinalizationTrigger, Prerequisite, RecoveryRoundNumber, TargetExecutionNumber,
-    TransitionSequence, spawn_isolated_command_launch,
+    BlockedDetail, FinalizationTrigger, Prerequisite, RecoveryRoundNumber, TransitionSequence,
+    spawn_isolated_command_launch,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -687,6 +688,23 @@ impl ExecutionJob {
         )) else {
             return self.execution_environment_lost(assignment_id, attempt_id);
         };
+        let recovery_agent_steps: BTreeSet<String> = self
+            .accepted
+            .admitted
+            .workflow()
+            .definition
+            .recoveries
+            .iter()
+            .filter_map(|(step, recovery)| {
+                recovery.as_ref().and_then(|recovery| {
+                    matches!(
+                        recovery.handler,
+                        Some(ValidatedRecoveryHandler::Agent { .. })
+                    )
+                    .then(|| step.clone())
+                })
+            })
+            .collect();
         let agent_staging = if self.accepted.admitted.agent_steps().is_empty() {
             None
         } else {
@@ -737,6 +755,14 @@ impl ExecutionJob {
             RunnerInvocationEvidence {
                 diagnostics: diagnostics.clone(),
                 accounting: accounting.clone(),
+                agent_steps: self
+                    .accepted
+                    .admitted
+                    .agent_steps()
+                    .keys()
+                    .cloned()
+                    .collect(),
+                recovery_agent_steps,
             },
         );
         let process_guard_registry = self
@@ -1261,7 +1287,7 @@ impl ExecutionJob {
                             .then(|| diagnostics.get(id))
                             .flatten(),
                         recovery: None,
-                        invocations: Vec::new(),
+                        invocations: observer.invocations_for_step(id),
                     });
                 }
                 if !summarized.is_empty() {
@@ -2282,6 +2308,8 @@ struct RunnerExecutionObserver {
 struct RunnerInvocationEvidence {
     diagnostics: StepDiagnosticLog,
     accounting: InvocationAccountingLog,
+    agent_steps: BTreeSet<String>,
+    recovery_agent_steps: BTreeSet<String>,
 }
 
 struct ObserverState {
@@ -2394,6 +2422,27 @@ impl RunnerExecutionObserver {
         finished_at: RunnerExecutionInstant,
         cancelled: bool,
     ) -> Option<RecoveryInvocationV1> {
+        let diagnostic = self
+            .invocation_evidence
+            .diagnostics
+            .get_invocation(step, invocation.id);
+        self.invocation_evidence_with_diagnostic(
+            step,
+            invocation,
+            finished_at,
+            cancelled,
+            diagnostic,
+        )
+    }
+
+    fn invocation_evidence_with_diagnostic(
+        &self,
+        step: &str,
+        invocation: RunnerActiveInvocation,
+        finished_at: RunnerExecutionInstant,
+        cancelled: bool,
+        diagnostic: Option<StepDiagnostic>,
+    ) -> Option<RecoveryInvocationV1> {
         let usage = self
             .invocation_evidence
             .accounting
@@ -2403,13 +2452,18 @@ impl RunnerExecutionObserver {
             .invocation_evidence
             .accounting
             .native_session(invocation.id);
-        let diagnostics = self
-            .invocation_evidence
-            .diagnostics
-            .get_invocation(step, invocation.id)
+        let configured_agent = match invocation.role {
+            ActiveStepInvocation::Target { .. } => {
+                self.invocation_evidence.agent_steps.contains(step)
+            }
+            ActiveStepInvocation::RecoveryHandler { .. } => {
+                self.invocation_evidence.recovery_agent_steps.contains(step)
+            }
+        };
+        let diagnostics = diagnostic
             .and_then(|diagnostic| command_output_v1(&diagnostic).ok())
             .map(|output| {
-                let (stdout_kind, stderr_kind) = if native.is_some() {
+                let (stdout_kind, stderr_kind) = if configured_agent || native.is_some() {
                     (
                         RecoveryDiagnosticKindV1::AgentHarnessStdout,
                         RecoveryDiagnosticKindV1::AgentHarnessStderr,
@@ -2661,6 +2715,52 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 {
                     state.faulted = true;
                     return;
+                }
+            }
+            if let TransitionEvent::Step { step, to, .. } = &transition.event
+                && matches!(
+                    to,
+                    StepStateKind::Succeeded | StepStateKind::Failed | StepStateKind::Cancelled
+                )
+                && observer.invocation_evidence.agent_steps.contains(step)
+                && invocation_evidence.is_none()
+                && !state.settled_invocations.values().any(|(id, _)| id == step)
+            {
+                let ids = observer
+                    .invocation_evidence
+                    .diagnostics
+                    .invocation_ids(step);
+                if ids.len() > 1 {
+                    state.faulted = true;
+                    return;
+                }
+                if let Some(id) = ids.first() {
+                    let Some(started_at) =
+                        state.step_timings.get(step).map(|timing| timing.started_at)
+                    else {
+                        state.faulted = true;
+                        return;
+                    };
+                    let active = RunnerActiveInvocation {
+                        id: *id,
+                        role: ActiveStepInvocation::Target {
+                            execution_number: TargetExecutionNumber::fixture(1),
+                        },
+                        started_at,
+                    };
+                    let Some(evidence) = observer.invocation_evidence(
+                        step,
+                        active,
+                        observed_at,
+                        *to == StepStateKind::Cancelled,
+                    ) else {
+                        state.faulted = true;
+                        return;
+                    };
+                    state
+                        .settled_invocations
+                        .insert(evidence.invocation_id, (step.clone(), evidence.clone()));
+                    invocation_evidence = Some(evidence);
                 }
             }
             if let TransitionEvent::ForceAbortAccepted { reason, phase, .. } = &transition.event {
@@ -3913,6 +4013,71 @@ mod tests {
             LeaseExecution::ContainmentDeadline
         ));
         assert!(late.result.send("one-unit-late").is_err());
+    }
+
+    #[test]
+    fn recovery_agent_allocation_failure_retains_harness_stderr_without_native_session() {
+        let observer = RunnerExecutionObserver::new(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            4,
+            ObservationOutbox::new(),
+            PostStopFence::with_workflow_git(None),
+            CancellationSource::new(),
+            RunnerInvocationEvidence {
+                recovery_agent_steps: BTreeSet::from(["verify".to_owned()]),
+                ..RunnerInvocationEvidence::default()
+            },
+        );
+        let diagnostic = StepDiagnostic::from_streams(
+            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
+            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(
+                b"allocation failed".as_slice(),
+                0,
+                true,
+            ),
+        );
+        let now = RunnerExecutionClock.now();
+        let handler = RunnerActiveInvocation {
+            id: ActionId {
+                transition_sequence: TransitionSequence(2),
+            },
+            role: ActiveStepInvocation::RecoveryHandler {
+                round: RecoveryRoundNumber::fixture(1),
+            },
+            started_at: now,
+        };
+        let result = observer
+            .invocation_evidence_with_diagnostic(
+                "verify",
+                handler,
+                now,
+                false,
+                Some(diagnostic.clone()),
+            )
+            .expect("handler evidence");
+        assert!(result.diagnostic_reference.is_none());
+        assert_eq!(result.diagnostics.len(), 2);
+        assert_eq!(
+            result.diagnostics[1].kind,
+            RecoveryDiagnosticKindV1::AgentHarnessStderr
+        );
+        assert_eq!(
+            serde_json::to_value(&result.diagnostics[1]).unwrap()["stream"]["data"],
+            BASE64_STANDARD.encode(b"allocation failed")
+        );
+        assert_eq!(
+            result.diagnostics[1].reference,
+            "runner/invocations/2/stderr"
+        );
+
+        let command = observer
+            .invocation_evidence_with_diagnostic("other", handler, now, false, Some(diagnostic))
+            .expect("command evidence");
+        assert_eq!(
+            command.diagnostics[1].kind,
+            RecoveryDiagnosticKindV1::CommandStderr
+        );
     }
 
     #[tokio::test]

@@ -577,9 +577,14 @@ fn fixed_identity_and_schema_materialize_the_checked_extension_bytes() {
     let distinct = result_tool_name(&fixed_identity("run-distinct", "step-fixed")).unwrap();
     assert_eq!(fixed, repeated);
     assert_ne!(fixed, distinct);
-    assert_ne!(
-        socket_alias_directory(&fixed).unwrap(),
-        socket_alias_directory(&distinct).unwrap()
+    assert!(
+        socket_alias_directory(&fixed)
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!(
+                "/tmp/.szp-{}-",
+                fixed.strip_prefix(TOOL_NAME_PREFIX).unwrap()
+            ))
     );
     assert!(fixed.starts_with(TOOL_NAME_PREFIX));
     assert!(
@@ -799,6 +804,21 @@ async fn shutdown_quiesces_with_queued_protocol_failures() {
     remove_socket_alias(&alias_directory, &alias_directory.join(SOCKET_ALIAS_NAME)).unwrap();
 }
 
+#[test]
+fn occupied_alias_directory_is_retried_without_touching_the_occupant() {
+    let temporary = tempfile::tempdir().unwrap();
+    let occupied = temporary.path().join("occupied");
+    let available = temporary.path().join("available");
+    fs::create_dir(&occupied).unwrap();
+    let mut directories = [occupied.clone(), available.clone()].into_iter();
+    let chosen =
+        create_socket_alias_retry(temporary.path(), || Ok(directories.next().unwrap())).unwrap();
+    assert_eq!(chosen, available);
+    assert!(occupied.is_dir());
+    assert!(available.join(SOCKET_ALIAS_NAME).is_symlink());
+    remove_socket_alias(&available, &available.join(SOCKET_ALIAS_NAME)).unwrap();
+}
+
 #[tokio::test]
 async fn prepared_socket_and_extension_are_private_until_explicit_quiescence() {
     let temporary = tempfile::tempdir().unwrap();
@@ -818,7 +838,6 @@ async fn prepared_socket_and_extension_are_private_until_explicit_quiescence() {
     let socket_address = alias_directory
         .join(SOCKET_ALIAS_NAME)
         .join(SOCKET_FILE_NAME);
-    let fixed_extension_bytes = fs::read(&extension_path).unwrap();
 
     assert!(extension_path.exists());
     assert!(socket_path.exists());
@@ -851,9 +870,11 @@ async fn prepared_socket_and_extension_are_private_until_explicit_quiescence() {
         TestClock::Pending,
     )
     .unwrap();
-    assert_eq!(
-        fs::read(second.extension_path()).unwrap(),
-        fixed_extension_bytes
+    let second_bytes = fs::read(second.extension_path()).unwrap();
+    assert!(
+        String::from_utf8(second_bytes)
+            .unwrap()
+            .contains(second.socket_alias_directory.to_str().unwrap())
     );
     second.shutdown().await.unwrap();
 }

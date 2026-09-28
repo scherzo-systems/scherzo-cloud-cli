@@ -49,6 +49,7 @@ fn definition(
                     (*step).to_owned(),
                     RuntimeStep {
                         role: WorkflowNodeRole::Step,
+                        is_agent: false,
                         failure_policy: FailurePolicy::Required,
                         condition: None,
                         condition_values: BTreeMap::new(),
@@ -99,6 +100,35 @@ fn definition(
         text_inputs: BTreeMap::new(),
         json_inputs: BTreeMap::new(),
     }
+}
+
+#[test]
+fn invocation_classification_uses_handler_kind_not_target_kind() {
+    let mut definition = definition(
+        &[
+            ("agent", &[] as &[&str], &[] as &[&str]),
+            ("command", &[], &[]),
+        ],
+        &[],
+        1,
+    );
+    let agent = definition.steps.get_mut("agent").unwrap();
+    agent.is_agent = true;
+    agent.recovery = Some(RuntimeRecovery {
+        retries: 1,
+        handler_kind: Some(RecoveryHandlerKind::Command),
+    });
+    definition.steps.get_mut("command").unwrap().recovery = Some(RuntimeRecovery {
+        retries: 1,
+        handler_kind: Some(RecoveryHandlerKind::Agent),
+    });
+
+    let state = initialize_test(definition).state;
+
+    assert!(state.invocation_is_agent("agent", false));
+    assert!(!state.invocation_is_agent("agent", true));
+    assert!(!state.invocation_is_agent("command", false));
+    assert!(state.invocation_is_agent("command", true));
 }
 
 fn initialize_test(definition: RuntimeDefinition) -> TestReduction {
@@ -372,6 +402,7 @@ fn finalizer_definition(
                 (*id).to_owned(),
                 RuntimeStep {
                     role: WorkflowNodeRole::Step,
+                    is_agent: false,
                     failure_policy: *policy,
                     condition: None,
                     condition_values: BTreeMap::new(),
@@ -389,6 +420,7 @@ fn finalizer_definition(
                 (*id).to_owned(),
                 RuntimeStep {
                     role: WorkflowNodeRole::Finalizer,
+                    is_agent: false,
                     failure_policy: *policy,
                     condition: None,
                     condition_values: BTreeMap::new(),

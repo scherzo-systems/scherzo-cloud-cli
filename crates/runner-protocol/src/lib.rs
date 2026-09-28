@@ -2595,6 +2595,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_recovery_launch_failure_passes_the_runner_encoder() {
+        let mut frame = maximal_recovery_terminal_frame();
+        let RunnerFrame::ExecutionFinished { outcome, .. } = &mut frame else {
+            panic!("expected terminal frame");
+        };
+        outcome["recoverySummaries"]["step0"]["rounds"][0]["failedExecution"]["failure"] =
+            json!({ "phase": "start", "cause": { "code": "harness_start_failed" } });
+        let encoded = encode_runner_frame(&frame).unwrap();
+        assert!(decode_frame(&encoded).is_ok());
+    }
+
+    #[test]
     fn canonical_maximal_recovery_frame_has_published_exact_size() {
         let fixture: Value = serde_json::from_slice(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

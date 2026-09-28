@@ -3072,7 +3072,10 @@ fn agent_input_failure_cause(failure: &AgentInputStartFailure) -> FailureCauseV1
         },
         AgentInputStartFailure::ArtifactStagingMismatch => FailureCodeV1::ArtifactStagingMismatch,
         AgentInputStartFailure::AgentStagingMismatch => FailureCodeV1::AgentStagingMismatch,
-        AgentInputStartFailure::StagingUnavailable => FailureCodeV1::AgentInputStagingUnavailable,
+        AgentInputStartFailure::StagingUnavailable
+        | AgentInputStartFailure::DiagnosticSessionUnavailable { .. } => {
+            FailureCodeV1::AgentInputStagingUnavailable
+        }
     })
 }
 
@@ -3082,9 +3085,9 @@ fn agent_failure_cause(failure: &AgentFailure) -> FailureCauseV1 {
 
 fn agent_failure_code(failure: &AgentFailureCause) -> FailureCodeV1 {
     match failure {
-        AgentFailureCause::HarnessStartFailed | AgentFailureCause::HarnessSetupFailed { .. } => {
-            FailureCodeV1::HarnessStartFailed
-        }
+        AgentFailureCause::HarnessStartFailed { .. }
+        | AgentFailureCause::HarnessSetupFailed { .. }
+        | AgentFailureCause::HarnessSetupRejected { .. } => FailureCodeV1::HarnessStartFailed,
         AgentFailureCause::HarnessInputTooLarge { .. } => FailureCodeV1::HarnessInputTooLarge,
         AgentFailureCause::HarnessFailed { .. } => FailureCodeV1::HarnessFailed,
         AgentFailureCause::HarnessProtocolFailed => FailureCodeV1::HarnessProtocolFailed,

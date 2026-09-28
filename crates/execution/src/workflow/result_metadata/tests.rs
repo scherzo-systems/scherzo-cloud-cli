@@ -771,6 +771,58 @@ fn recovered_result_fixture() -> Value {
     result
 }
 
+#[test]
+fn launch_failure_with_terminal_recovery_validates_for_publication() {
+    for termination in ["gave_up", "handler_failed"] {
+        let mut result = recovered_result_fixture();
+        let detail = json!({ "phase": "start", "code": "harness_start_failed" });
+        result["outcome"] = json!("failed");
+        result["exports"] = json!({});
+        result["steps"][0]["state"] = json!("failed");
+        result["steps"][0]["detail"] = detail.clone();
+        result["primaryIssue"] = json!({
+            "node": { "id": "produce", "role": "step" },
+            "state": "failed",
+            "detail": detail
+        });
+        result["steps"][0]["recovery"]["handlerKind"] = json!("cmd");
+        result["steps"][0]["recovery"]["rounds"][0]["failedExecution"]["failure"] = json!({
+            "phase": "start",
+            "cause": {
+                "code": "harness_start_failed"
+            }
+        });
+        result["steps"][0]["invocations"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        result["steps"][0]["invocations"]
+            .as_array_mut()
+            .unwrap()
+            .push(handler_invocation_fixture());
+        if termination == "gave_up" {
+            result["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
+                "kind": "cmd", "invocationId": 2, "outcome": "gave_up",
+                "summary": "No repair.", "reason": "Cannot recheck."
+            });
+            result["steps"][0]["recovery"]["termination"] =
+                json!({ "kind": "gave_up", "round": 1 });
+        } else {
+            let failure = json!({ "phase": "start", "cause": { "code": "context_unavailable" } });
+            result["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
+                "kind": "cmd", "invocationId": 2, "outcome": "failed",
+                "failure": failure
+            });
+            result["steps"][0]["recovery"]["termination"] = json!({
+                "kind": "handler_failed", "round": 1, "handlerFailure": failure
+            });
+        }
+
+        let decoded = decode(&encode(&result)).expect(termination);
+        assert_eq!(validate_with_invariant(&decoded), Ok(()));
+    }
+}
+
 fn handler_invocation_fixture() -> Value {
     json!({
         "invocationId": 2,

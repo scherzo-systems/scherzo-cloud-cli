@@ -1218,7 +1218,7 @@ fn an_existing_native_session_entry_is_never_selected_or_replaced() {
 
     assert!(matches!(
         prepare_launch(fixture.invocation.as_ref().unwrap()),
-        Err(AgentFailureCause::HarnessStartFailed)
+        Err(AgentFailureCause::HarnessStartFailed { .. })
     ));
     assert_eq!(
         std::fs::read(existing).unwrap(),
@@ -1379,6 +1379,31 @@ fn attachment_transport_is_ordered_lossless_and_uses_only_sealed_identities() {
     for diagnostic_name in ["../../caller-name.txt", "duplicate", "000999", "@escape"] {
         assert!(!serialized.contains(diagnostic_name));
     }
+}
+
+#[test]
+fn unreadable_native_attachment_preserves_the_attachment_read_failure() {
+    let fixture = ProcessFixture::with_attachments(
+        AgentValueMode::None,
+        1024,
+        &[AttachmentFixture {
+            media_type: "text/plain",
+            bytes: b"permission denied",
+            diagnostic_source_name: None,
+        }],
+    );
+    let attachment_path = fixture.invocation.as_ref().unwrap().attachments()[0]
+        .path()
+        .to_owned();
+    std::fs::set_permissions(&attachment_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let Err(AgentFailureCause::HarnessStartFailed { stage, error }) =
+        prepare_launch(fixture.invocation.as_ref().unwrap())
+    else {
+        panic!("unreadable attachment did not produce a typed launch failure");
+    };
+    assert_eq!(stage, "attachment read");
+    assert!(!error.is_empty());
 }
 
 #[test]
@@ -2101,7 +2126,10 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
     assert!(!started);
     assert_eq!(
         startup_outcome,
-        failed_agent_outcome(AgentFailureCause::HarnessStartFailed)
+        failed_agent_outcome(AgentFailureCause::start_failure(
+            "claude process release",
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        ))
     );
 
     let validation = ResultProcessFixture::new(

@@ -556,7 +556,10 @@ fn framing_handshake_lifecycle_terminal_and_eof_surfaces_remain_strict() {
     let mut malformed = parser(AgentValueKind::None);
     assert_eq!(
         malformed.push_ignoring(b"not-json\n"),
-        Err(AgentFailureCause::HarnessStartFailed)
+        Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable"
+        ))
     );
     assert_eq!(
         protocol_rejection(&malformed.finish(PiJsonV1ProcessCompletion::exited(false)))["detail"]["reason"],
@@ -806,7 +809,10 @@ fn retained_reconstruction_and_frame_bounds_remain_authoritative() {
     );
     assert_eq!(
         oversized.push_ignoring(&[b'x'; 129]),
-        Err(AgentFailureCause::HarnessStartFailed)
+        Err(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable"
+        ))
     );
 }
 

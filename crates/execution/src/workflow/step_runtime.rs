@@ -920,7 +920,21 @@ where
                         deadline: PhantomData,
                     },
                 )
-                .map_err(|_| RecoveryHandlerFailure::AgentInputFailed)?;
+                .map_err(|failure| {
+                    if let AgentInputMaterializationError::Start(
+                        AgentInputStartFailure::DiagnosticSessionUnavailable { error },
+                    ) = &failure
+                    {
+                        self.diagnostics.record_adapter_error(
+                            step.to_owned(),
+                            action,
+                            self.admitted.execution().limits().maximum_step_log_bytes(),
+                            "diagnostic session allocation",
+                            error,
+                        );
+                    }
+                    RecoveryHandlerFailure::AgentInputFailed
+                })?;
                 Ok(PreparedRecoveryHandler::Agent {
                     agent: Box::new(agent),
                     context,
@@ -1943,7 +1957,7 @@ where
                     &self.artifacts,
                     staging,
                     diagnostic_sessions,
-                    identity,
+                    identity.clone(),
                     &upstream,
                     finalization_context,
                     self.admitted.execution().cancellation().source().clone(),
@@ -1956,6 +1970,17 @@ where
                 )
                 .map_err(|failure| match failure {
                     AgentInputMaterializationError::Start(failure) => {
+                        if let AgentInputStartFailure::DiagnosticSessionUnavailable { error } =
+                            &failure
+                        {
+                            self.diagnostics.record_adapter_error(
+                                identity.step().to_owned(),
+                                identity.invocation(),
+                                self.admitted.execution().limits().maximum_step_log_bytes(),
+                                "diagnostic session allocation",
+                                error,
+                            );
+                        }
                         StepStartFailure::AgentInput(Box::new(failure))
                     }
                     AgentInputMaterializationError::Cancelled { .. } => {
