@@ -484,13 +484,34 @@ pub(super) async fn execute_owned_attempt(
         }
     };
 
-    if let Err(failure) = host.activate_execution() {
+    if let Err(failure) = host
+        .await_ready()
+        .await
+        .and_then(|()| host.activate_execution())
+    {
         signal_task.abort();
         settle_before_execution_failure(&owned_run).await;
         let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
         record_private_cleanup_failure(&owned_run, cleanup_failed);
         host.stop_terminal().await;
         return diagnose(failure);
+    }
+
+    if let ActiveRunHost::Standard(presentation) = &host {
+        let mut failures = presentation.subscribe_failures();
+        let output_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            loop {
+                if failures.borrow_and_update().is_some() {
+                    output_cancellation
+                        .request_cancellation(CancellationReason::CallerOutputFailure);
+                    break;
+                }
+                if failures.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     let agent_diagnostic_sessions = if agent_staging.is_some() {
@@ -1519,6 +1540,29 @@ enum ActiveRunHost {
 }
 
 impl ActiveRunHost {
+    async fn await_ready(&mut self) -> Result<(), PresentationFailure> {
+        match self {
+            Self::Standard(presentation) => {
+                // Let an immediately failing header reject the attempt before execution.
+                // A stalled output consumer must not hold up the workflow indefinitely.
+                let mut clock = SystemExecutionClock;
+                let deadline = clock.now() + Duration::from_millis(100);
+                tokio::select! {
+                    () = presentation.flush_pending() => {}
+                    () = clock.wait_until(deadline) => {}
+                }
+                presentation.failure().map_or(Ok(()), Err)
+            }
+            Self::Tui {
+                terminal: Some(terminal),
+                ..
+            } => terminal.await_ready().await,
+            Self::Tui { terminal: None, .. } => Err(PresentationFailure::operation(
+                PresentationFailureOperation::TerminalTask,
+            )),
+        }
+    }
+
     fn activate_execution(&mut self) -> Result<(), PresentationFailure> {
         match self {
             Self::Standard(_) => Ok(()),
@@ -1608,7 +1652,14 @@ impl ActiveRunHost {
         match self {
             Self::Standard(presentation) => {
                 if cleanup_failed || state_commit_failed {
-                    render_without_terminal_json(presentation, run, publication);
+                    if render_without_terminal_json(presentation, run, publication)
+                        .await
+                        .cannot_report_failure()
+                    {
+                        // A blocked presentation stream may also be stderr. Do not
+                        // render a second, unbounded diagnostic on that stream.
+                        return Ok(ExitCode::GeneralFailure);
+                    }
                     return Err(if state_commit_failed {
                         state_commit_failure()
                     } else {
@@ -1618,11 +1669,33 @@ impl ActiveRunHost {
                 }
                 let presented = match publication {
                     Ok(terminal) => {
-                        presentation.finish(run, PublicationPresentation::Published(terminal))
+                        present_standard(
+                            presentation,
+                            run,
+                            PublicationPresentation::Published(terminal),
+                            true,
+                        )
+                        .await
                     }
-                    Err(error) => presentation.finish(run, PublicationPresentation::Failed(error)),
+                    Err(error) => {
+                        present_standard(
+                            presentation,
+                            run,
+                            PublicationPresentation::Failed(error),
+                            true,
+                        )
+                        .await
+                    }
                 };
-                presentation_exit_code(presented)
+                match presented {
+                    StandardPresentation::DrainTimedOut => Ok(ExitCode::GeneralFailure),
+                    StandardPresentation::Completed(WorkflowRunPresentationResult::Failed(
+                        failure,
+                    )) if failure.error_kind == Some(io::ErrorKind::WouldBlock) => {
+                        Ok(ExitCode::GeneralFailure)
+                    }
+                    StandardPresentation::Completed(presented) => presentation_exit_code(presented),
+                }
             }
             Self::Tui {
                 terminal,
@@ -1698,21 +1771,64 @@ impl ActiveRunHost {
     }
 }
 
-fn render_without_terminal_json(
+enum StandardPresentation {
+    Completed(WorkflowRunPresentationResult),
+    DrainTimedOut,
+}
+
+impl StandardPresentation {
+    fn cannot_report_failure(&self) -> bool {
+        // An exhausted queue or timed-out drain may have stderr blocked too.
+        matches!(self, Self::DrainTimedOut)
+            || matches!(self, Self::Completed(WorkflowRunPresentationResult::Failed(failure))
+                if failure.error_kind == Some(io::ErrorKind::WouldBlock))
+    }
+}
+
+async fn present_standard(
+    presentation: &SystemPresentation,
+    run: &WorkflowRunResult,
+    publication: PublicationPresentation<'_>,
+    emit_terminal_json: bool,
+) -> StandardPresentation {
+    let output = async {
+        if emit_terminal_json {
+            presentation.finish(run, publication).await
+        } else {
+            presentation
+                .finish_without_terminal_json(run, publication)
+                .await
+        }
+    };
+    if run.cancellation.is_none()
+        && run.force_abort.is_none()
+        && !run.finalization.as_ref().is_some_and(|finalization| {
+            finalization.cancellation.is_some() || finalization.force_abort
+        })
+    {
+        return StandardPresentation::Completed(output.await);
+    }
+    // The workflow clock adapter bounds the final output wait for cancellation
+    // in either phase, including force-aborted finalizers;
+    // the presentation thread may be stuck in an unread pipe indefinitely.
+    let mut clock = SystemExecutionClock;
+    let deadline = clock.now() + Duration::from_millis(100);
+    tokio::select! {
+        presented = output => StandardPresentation::Completed(presented),
+        () = clock.wait_until(deadline) => StandardPresentation::DrainTimedOut,
+    }
+}
+
+async fn render_without_terminal_json(
     presentation: &SystemPresentation,
     run: &WorkflowRunResult,
     publication: &Result<WorkflowRunTerminalResultV1, LocalPublicationError>,
-) {
-    match publication {
-        Ok(terminal) => {
-            let _ = presentation
-                .finish_without_terminal_json(run, PublicationPresentation::Published(terminal));
-        }
-        Err(error) => {
-            let _ = presentation
-                .finish_without_terminal_json(run, PublicationPresentation::Failed(error));
-        }
-    }
+) -> StandardPresentation {
+    let publication = match publication {
+        Ok(terminal) => PublicationPresentation::Published(terminal),
+        Err(error) => PublicationPresentation::Failed(error),
+    };
+    present_standard(presentation, run, publication, false).await
 }
 
 fn cleanup_failure(
@@ -2183,8 +2299,8 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::symlink;
     use std::process::{Command as ProcessCommand, Stdio};
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
 
     use nix::sys::stat::Mode;
     use nix::unistd::mkfifo;
@@ -2243,6 +2359,8 @@ mod tests {
         clock: ControlledObservationClock,
         completed_at: ObservationTime,
         flushed: Arc<AtomicBool>,
+        entered: std::sync::mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
     }
 
     impl Write for DelayedHeaderWriter {
@@ -2251,6 +2369,12 @@ mod tests {
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            let _ = self.entered.send(());
+            let (lock, wake) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
             self.clock.set(self.completed_at);
             self.flushed.store(true, Ordering::SeqCst);
             Ok(())
@@ -2775,8 +2899,8 @@ mod tests {
         assert_eq!(available, expected);
     }
 
-    #[test]
-    fn execution_handoff_samples_timing_after_the_plain_header_is_flushed() {
+    #[tokio::test]
+    async fn execution_handoff_does_not_wait_for_a_blocked_plain_header() {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         std::fs::create_dir(&source_root).unwrap();
@@ -2792,6 +2916,8 @@ mod tests {
         let terminal = timing_point(monotonic, "2026-08-02T12:01:44.03Z", 530);
         let clock = ControlledObservationClock::new(opened);
         let flushed = Arc::new(AtomicBool::new(false));
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
 
         let prepared = initialize_execution_presentation(clock.clone(), || {
             let presentation = WorkflowRunOutput::new(
@@ -2813,6 +2939,8 @@ mod tests {
                     clock: clock.clone(),
                     completed_at: initialized,
                     flushed: flushed.clone(),
+                    entered,
+                    gate: gate.clone(),
                 },
                 io::sink(),
             )
@@ -2826,11 +2954,18 @@ mod tests {
         })
         .unwrap();
 
-        assert!(flushed.load(Ordering::SeqCst));
+        let wait = tokio::task::spawn_blocking(move || waiting.recv().unwrap());
+        wait.await.unwrap();
+        assert!(!flushed.load(Ordering::SeqCst));
         prepared.timing.record(&terminal_transition(), terminal);
         let timing = observed_run_timing(&prepared.timing.snapshot()).unwrap();
-        assert_eq!(timing.started_at, initialized.utc);
-        assert_eq!(timing.duration, Duration::from_millis(30));
+        assert_eq!(timing.started_at, opened.utc);
+        assert_eq!(timing.duration, Duration::from_millis(530));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        prepared.observer.flush_pending().await;
+        assert!(flushed.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

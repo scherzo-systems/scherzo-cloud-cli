@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -99,6 +99,31 @@ impl Write for FlushFailWriter {
         } else {
             Ok(())
         }
+    }
+}
+
+#[derive(Clone)]
+struct BlockingWriter {
+    blocked: Arc<AtomicBool>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    entered: std::sync::mpsc::Sender<()>,
+}
+
+impl Write for BlockingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.blocked.load(Ordering::SeqCst) {
+            let _ = self.entered.send(());
+            let (lock, wake) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -314,6 +339,7 @@ async fn render_start(source: &str, config: PresentationConfig) -> String {
             None,
         ))
         .await;
+    presentation.flush_pending().await;
     stdout.text()
 }
 
@@ -720,6 +746,7 @@ async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledg
         ))
         .await;
 
+    presentation.flush_pending().await;
     let output = stdout.text();
     assert!(output.contains(
         "run result · workflow.yaml · 3 steps · concurrency 2\nstarted 2026-08-02 12:01:44Z"
@@ -839,6 +866,7 @@ async fn safety_fragmentation_keeps_its_own_prefixed_records_when_redirected() {
         ))
         .await;
 
+    presentation.flush_pending().await;
     let output = stdout.text();
     assert_eq!(output.matches("stdout").count(), 2);
     assert!(output.contains(&format!("{SAFETY_CONTINUATION_MARKER} x")));
@@ -908,6 +936,7 @@ steps:
         ))
         .await;
 
+    presentation.flush_pending().await;
     let output = stdout.text();
     assert!(
         output.find("produce    output      report · file").unwrap()
@@ -976,6 +1005,7 @@ steps:
         ))
         .await;
 
+    presentation.flush_pending().await;
     let output = stdout.text();
     assert!(output.contains("plan       output      plan · json"));
     assert!(output.contains("plan       done        1 output committed"));
@@ -1037,7 +1067,9 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
         ))
         .await;
     assert!(matches!(
-        plain.finish(&run, PublicationPresentation::Published(&plain_terminal)),
+        plain
+            .finish(&run, PublicationPresentation::Published(&plain_terminal))
+            .await,
         WorkflowRunPresentationResult::Published {
             outcome: ExecutionOutcome::Succeeded,
             ..
@@ -1070,7 +1102,8 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
     ))
     .await;
     assert!(matches!(
-        json.finish(&run, PublicationPresentation::Published(&json_terminal)),
+        json.finish(&run, PublicationPresentation::Published(&json_terminal))
+            .await,
         WorkflowRunPresentationResult::Published {
             outcome: ExecutionOutcome::Succeeded,
             ..
@@ -1126,10 +1159,12 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
     )
     .unwrap();
     assert!(matches!(
-        cleanup.finish_without_terminal_json(
-            &run,
-            PublicationPresentation::Published(&cleanup_terminal),
-        ),
+        cleanup
+            .finish_without_terminal_json(
+                &run,
+                PublicationPresentation::Published(&cleanup_terminal),
+            )
+            .await,
         WorkflowRunPresentationResult::Published {
             outcome: ExecutionOutcome::Succeeded,
             ..
@@ -1185,8 +1220,8 @@ fn tui_handoff_uses_the_standard_summary_without_reopening_live_output() {
     assert!(!summary.contains("started 2026"));
 }
 
-#[test]
-fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
+#[tokio::test]
+async fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     let fixture = Fixture::new(workflow_source());
     let mut failed = fixture.succeeded_run();
     let cause = StepFailureCause::Execution(StepExecutionFailure::Command(
@@ -1231,10 +1266,12 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
         TestClock::fixed("2026-08-02T12:01:44Z"),
     )
     .unwrap();
-    presentation.finish(
-        &failed,
-        PublicationPresentation::Published(&failed_terminal),
-    );
+    presentation
+        .finish(
+            &failed,
+            PublicationPresentation::Published(&failed_terminal),
+        )
+        .await;
     let failed_view = failed_output.text();
     assert!(failed_view.contains("failed · exit 1"));
     assert!(
@@ -1289,10 +1326,12 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     )
     .unwrap();
     assert!(matches!(
-        presentation.finish(
-            &cancelled,
-            PublicationPresentation::Published(&cancelled_terminal),
-        ),
+        presentation
+            .finish(
+                &cancelled,
+                PublicationPresentation::Published(&cancelled_terminal),
+            )
+            .await,
         WorkflowRunPresentationResult::Published {
             outcome: ExecutionOutcome::Terminated,
             ..
@@ -1306,8 +1345,8 @@ fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     );
 }
 
-#[test]
-fn publication_failure_keeps_factual_human_summary_and_omits_json() {
+#[tokio::test]
+async fn publication_failure_keeps_factual_human_summary_and_omits_json() {
     let fixture = Fixture::new(workflow_source());
     let run = fixture.succeeded_run();
     let destination = fixture.destination("exists");
@@ -1327,7 +1366,9 @@ fn publication_failure_keeps_factual_human_summary_and_omits_json() {
     )
     .unwrap();
 
-    let result = presentation.finish(&run, PublicationPresentation::Failed(&failure));
+    let result = presentation
+        .finish(&run, PublicationPresentation::Failed(&failure))
+        .await;
 
     assert_eq!(
         result,
@@ -1340,14 +1381,14 @@ fn publication_failure_keeps_factual_human_summary_and_omits_json() {
     assert!(!stderr.text().contains("run result succeeded · exit"));
 }
 
-#[test]
-fn header_writer_failure_is_returned_without_local_rendering() {
+#[tokio::test]
+async fn header_writer_failure_is_returned_without_local_rendering() {
     let fixture = Fixture::new(workflow_source());
     let stdout = SharedWriter::default();
     stdout.fail();
     let stderr = SharedWriter::default();
 
-    let failure = WorkflowRunOutput::new(
+    let presentation = WorkflowRunOutput::new(
         config(RequestedPresentationMode::Plain, ColorChoice::Never),
         stdout,
         stderr.clone(),
@@ -1357,8 +1398,12 @@ fn header_writer_failure_is_returned_without_local_rendering() {
         2,
         TestClock::fixed("2026-08-02T12:01:44Z"),
     )
-    .err()
     .unwrap();
+    let mut failures = presentation.subscribe_failures();
+    if failures.borrow().is_none() {
+        failures.changed().await.unwrap();
+    }
+    let failure = failures.borrow().clone().unwrap();
 
     assert_eq!(
         failure.operation,
@@ -1366,6 +1411,57 @@ fn header_writer_failure_is_returned_without_local_rendering() {
     );
     assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
     assert!(stderr.text().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_writer_does_not_block_observation_or_cancellation() {
+    let fixture = Fixture::new(workflow_source());
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        BlockingWriter {
+            blocked: blocked.clone(),
+            gate: gate.clone(),
+            entered,
+        },
+        io::sink(),
+    )
+    .start(
+        &fixture.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    presentation.flush_pending().await;
+    blocked.store(true, Ordering::SeqCst);
+    presentation
+        .observe(step_transition("a", StepStateKind::Starting, None))
+        .await;
+    let wait = tokio::task::spawn_blocking(move || waiting.recv().unwrap());
+    wait.await.unwrap();
+    let cancellation = CancellationSource::new();
+    presentation
+        .observe(step_transition("b", StepStateKind::Starting, None))
+        .await;
+    cancellation.request_cancellation(CancellationReason::UserRequest);
+    assert_eq!(
+        cancellation.wait_for_cancellation().await,
+        CancellationReason::UserRequest
+    );
+    for _ in 0..PRESENTATION_QUEUE_CAPACITY {
+        presentation
+            .observe(step_transition("b", StepStateKind::Starting, None))
+            .await;
+    }
+    assert_eq!(
+        presentation.failure().unwrap().error_kind,
+        Some(io::ErrorKind::WouldBlock)
+    );
+    let (lock, wake) = &*gate;
+    *lock.lock().unwrap() = true;
+    wake.notify_all();
 }
 
 #[tokio::test]
@@ -1383,15 +1479,15 @@ async fn live_writer_failure_is_detected_when_the_destination_flush_fails() {
         TestClock::fixed("2026-08-02T12:01:44Z"),
     )
     .unwrap();
+    presentation.flush_pending().await;
     stdout.fail_flush();
 
     presentation
         .observe(step_transition("a", StepStateKind::Starting, None))
         .await;
 
-    let failure = presentation
-        .failure()
-        .expect("the live record must be flushed so the adapter can cancel promptly");
+    presentation.flush_pending().await;
+    let failure = presentation.failure().unwrap();
     assert_eq!(failure.operation, PresentationFailureOperation::LineWriter);
     assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
 }
@@ -1413,6 +1509,7 @@ async fn live_writer_failure_notifies_the_adapter_and_stops_further_writes() {
     )
     .unwrap();
     let failures = presentation.subscribe_failures();
+    presentation.flush_pending().await;
     let before_failure = stdout.text();
     stdout.fail();
 
@@ -1423,6 +1520,8 @@ async fn live_writer_failure_notifies_the_adapter_and_stops_further_writes() {
         .observe(step_transition("b", StepStateKind::Starting, None))
         .await;
 
+    let mut failures = failures;
+    failures.changed().await.unwrap();
     let failure = failures.borrow().clone().unwrap();
     assert_eq!(failure.operation, PresentationFailureOperation::LineWriter);
     assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
@@ -1430,8 +1529,8 @@ async fn live_writer_failure_notifies_the_adapter_and_stops_further_writes() {
     assert!(stderr.text().is_empty());
 }
 
-#[test]
-fn terminal_json_writer_failure_reports_the_published_result_path() {
+#[tokio::test]
+async fn terminal_json_writer_failure_reports_the_published_result_path() {
     let fixture = Fixture::new(workflow_source());
     let run = fixture.succeeded_run();
     let terminal = publish_workflow_result(
@@ -1455,7 +1554,10 @@ fn terminal_json_writer_failure_reports_the_published_result_path() {
     .unwrap();
     stdout.fail();
 
-    let result = presentation.finish(&run, PublicationPresentation::Published(&terminal));
+    presentation.flush_pending().await;
+    let result = presentation
+        .finish(&run, PublicationPresentation::Published(&terminal))
+        .await;
 
     let WorkflowRunPresentationResult::Failed(failure) = result else {
         panic!("terminal JSON failure must be typed");
@@ -1481,8 +1583,8 @@ fn durations_use_compound_units_after_one_minute() {
     assert_eq!(human_duration(Duration::from_secs(3723)), "1h02m03s");
 }
 
-#[test]
-fn json_color_always_styles_only_the_stderr_presentation() {
+#[tokio::test]
+async fn json_color_always_styles_only_the_stderr_presentation() {
     let fixture = Fixture::new(workflow_source());
     let run = fixture.succeeded_run();
     let terminal = publish_workflow_result(
@@ -1504,7 +1606,9 @@ fn json_color_always_styles_only_the_stderr_presentation() {
         TestClock::fixed("2026-08-02T12:01:44Z"),
     )
     .unwrap();
-    presentation.finish(&run, PublicationPresentation::Published(&terminal));
+    presentation
+        .finish(&run, PublicationPresentation::Published(&terminal))
+        .await;
 
     let presentation = stderr.text();
     for style in [STYLE_PRIMARY, STYLE_SECONDARY, STYLE_MUTED, STYLE_SUCCESS] {

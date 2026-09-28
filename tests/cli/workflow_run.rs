@@ -9,6 +9,7 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
@@ -4738,6 +4739,106 @@ fn plain_mode_reports_publication_failure_without_overwriting_the_racing_target(
         state["attempts"][0]["finalization"]["finalizers"][0]["state"],
         "succeeded"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cancellation_settles_with_a_full_unread_presentation_pipe() {
+    use nix::fcntl::{FcntlArg, fcntl};
+    use nix::unistd::pipe;
+
+    // The socket handshake proves execution reached the intended phase before
+    // signalling. A pre-filled pipe keeps either presentation destination blocked.
+    for (json, finalizer, shared_pipe, force_abort) in [
+        (false, false, false, false),
+        (false, false, true, false),
+        (true, false, false, false),
+        (false, true, true, false),
+        (true, true, false, false),
+        (false, true, true, true),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bundle = if finalizer {
+            finalizer_signal_bundle()
+        } else {
+            signal_bundle()
+        };
+        let destination = bundle.result("blocked-output-cancellation");
+        let mut args = bundle.args(&destination);
+        if json {
+            args.insert(args.len() - 1, "--json".to_owned());
+        }
+        let (reader, writer) = pipe().unwrap();
+        assert_eq!(fcntl(&writer, FcntlArg::F_SETPIPE_SZ(4096)).unwrap(), 4096);
+        let mut filling = File::from(writer);
+        filling.write_all(&vec![b'x'; 4096]).unwrap();
+        let (stdout, stderr) = if json {
+            (Stdio::null(), Stdio::from(filling))
+        } else if shared_pipe {
+            (
+                Stdio::from(filling.try_clone().unwrap()),
+                Stdio::from(filling),
+            )
+        } else {
+            (Stdio::from(filling), Stdio::null())
+        };
+        let mut child = isolated_command(&args)
+            .env(
+                "WORKFLOW_RUN_FIXTURE_SOCKET",
+                listener.local_addr().unwrap().to_string(),
+            )
+            .env(
+                "WORKFLOW_RUN_FIXTURE_MODE",
+                if force_abort { "signal-hold" } else { "wait" },
+            )
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        let (mut control, _) = listener.accept().unwrap();
+        if force_abort {
+            let mut report = [0_u8; 5];
+            control.read_exact(&mut report).unwrap();
+            assert_eq!(report[4], 1);
+        } else {
+            let mut ready = [0_u8; 1];
+            control.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, [1]);
+        }
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        let started = scherzo_cloud_support::monotonic_now();
+        kill_process(pid, Signal::INT).unwrap();
+        if force_abort {
+            let mut event = [0_u8; 1];
+            control.read_exact(&mut event).unwrap();
+            assert_eq!(event, [2]);
+            kill_process(pid, Signal::INT).unwrap();
+        }
+        let status = poll_until(
+            "cancelled workflow with unread presentation pipe",
+            || child.try_wait().unwrap(),
+            Option::is_some,
+        )
+        .unwrap();
+        assert!(
+            scherzo_cloud_support::monotonic_now().saturating_duration_since(started)
+                < Duration::from_secs(10),
+            "json={json}, finalizer={finalizer}, shared_pipe={shared_pipe}, force_abort={force_abort}"
+        );
+        assert_eq!(status.code(), Some(1));
+        let result = result_json(&destination);
+        if finalizer {
+            assert!(result.get("cancellation").is_none());
+            assert_eq!(
+                result["finalization"]["cancellation"]["reason"],
+                "user_request"
+            );
+            assert_eq!(result["finalization"]["forceAbort"], force_abort);
+        } else {
+            assert_eq!(result["cancellation"]["reason"], "user_request");
+        }
+        drop(reader);
+    }
 }
 
 #[test]

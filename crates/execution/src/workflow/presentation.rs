@@ -4,13 +4,14 @@ use std::fmt;
 use std::future::{Future, ready};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::ExecutionOutcome;
@@ -813,10 +814,25 @@ fn write_pretty_json(writer: &mut impl Write, value: &impl Serialize) -> io::Res
     writer.flush()
 }
 
+const PRESENTATION_QUEUE_CAPACITY: usize = 1024;
+
+struct PresentationQueue<StandardOutput, StandardError> {
+    sender: SyncSender<PresentationMessage<StandardOutput, StandardError>>,
+    finished: bool,
+}
+
+type PresentationMessage<StandardOutput, StandardError> =
+    Box<dyn FnOnce(&mut PresentationState<StandardOutput, StandardError>) + Send>;
+
 pub struct WorkflowRunPresentation<StandardOutput, StandardError, Clock> {
-    state: Arc<Mutex<PresentationState<StandardOutput, StandardError>>>,
+    // The lock only serializes nonblocking queue admission, never rendering or I/O.
+    sender: Arc<Mutex<PresentationQueue<StandardOutput, StandardError>>>,
+    failures: watch::Receiver<Option<PresentationFailure>>,
+    failure_sender: watch::Sender<Option<PresentationFailure>>,
+    queue_failure: Arc<Mutex<Option<PresentationFailure>>>,
     clock: Clock,
     opened_at: ObservationTime,
+    _writers: std::marker::PhantomData<fn() -> (StandardOutput, StandardError)>,
 }
 
 impl<StandardOutput, StandardError, Clock> Clone
@@ -826,9 +842,13 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            state: Arc::clone(&self.state),
+            sender: Arc::clone(&self.sender),
+            failures: self.failures.clone(),
+            failure_sender: self.failure_sender.clone(),
+            queue_failure: Arc::clone(&self.queue_failure),
             clock: self.clock.clone(),
             opened_at: self.opened_at,
+            _writers: std::marker::PhantomData,
         }
     }
 }
@@ -849,7 +869,7 @@ where
         maximum_parallel_steps: usize,
         clock: Clock,
     ) -> Result<Self, PresentationFailure> {
-        let (failure_sender, _) = watch::channel(None);
+        let (failure_sender, failures) = watch::channel(None);
         let mut state = PresentationState {
             mode: config.mode(),
             color: config.color_enabled(),
@@ -861,15 +881,37 @@ where
             last_accepted_order: None,
             step_starts: BTreeMap::new(),
             failure: None,
-            failure_sender,
+            failure_sender: failure_sender.clone(),
             finished: false,
         };
         let opened_at = clock.sample();
-        state.write_header(opened_at.utc, maximum_parallel_steps)?;
+        let (sender, receiver) = mpsc::sync_channel::<
+            PresentationMessage<StandardOutput, StandardError>,
+        >(PRESENTATION_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("workflow-presentation".to_owned())
+            .spawn(move || {
+                if let Err(failure) = state.write_header(opened_at.utc, maximum_parallel_steps) {
+                    state.record_failure(failure);
+                }
+                for message in receiver {
+                    message(&mut state);
+                }
+            })
+            .map_err(|error| {
+                PresentationFailure::writer(PresentationFailureOperation::HeaderWriter, &error)
+            })?;
         Ok(Self {
-            state: Arc::new(Mutex::new(state)),
+            sender: Arc::new(Mutex::new(PresentationQueue {
+                sender,
+                finished: false,
+            })),
+            failures,
+            failure_sender,
+            queue_failure: Arc::new(Mutex::new(None)),
             clock,
             opened_at,
+            _writers: std::marker::PhantomData,
         })
     }
 
@@ -877,38 +919,176 @@ where
         self.opened_at
     }
 
-    #[cfg(test)]
-    pub(crate) fn subscribe_failures(&self) -> watch::Receiver<Option<PresentationFailure>> {
-        lock_state(&self.state).failure_sender.subscribe()
+    pub fn subscribe_failures(&self) -> watch::Receiver<Option<PresentationFailure>> {
+        self.failure_sender.subscribe()
     }
 
     pub fn failure(&self) -> Option<PresentationFailure> {
-        lock_state(&self.state).failure.clone()
+        self.queue_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .or_else(|| self.failures.borrow().clone())
     }
 
-    pub fn finish(
+    /// Wait for previously accepted observations without blocking the caller's executor.
+    /// Queue exhaustion instead reports an output failure to subscribers.
+    pub async fn flush_pending(&self) {
+        let (reply, done) = oneshot::channel();
+        let submitted = {
+            let queue = self
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.sender.try_send(Box::new(move |_| {
+                let _ = reply.send(());
+            }))
+        };
+        if let Err(error) = submitted {
+            self.record_queue_failure(&error);
+            return;
+        }
+        if done.await.is_err() {
+            self.failure_sender
+                .send_replace(Some(PresentationFailure::operation(
+                    PresentationFailureOperation::LineWriter,
+                )));
+        }
+    }
+
+    pub async fn finish(
         &self,
         run: &WorkflowRunResult,
         publication: PublicationPresentation<'_>,
     ) -> WorkflowRunPresentationResult {
-        self.finish_internal(run, publication, true)
+        self.finish_queued(run, publication, true).await
     }
 
-    pub fn finish_without_terminal_json(
+    pub async fn finish_without_terminal_json(
         &self,
         run: &WorkflowRunResult,
         publication: PublicationPresentation<'_>,
     ) -> WorkflowRunPresentationResult {
-        self.finish_internal(run, publication, false)
+        self.finish_queued(run, publication, false).await
     }
 
-    fn finish_internal(
+    async fn finish_queued(
         &self,
         run: &WorkflowRunResult,
         publication: PublicationPresentation<'_>,
         emit_terminal_json: bool,
     ) -> WorkflowRunPresentationResult {
-        let mut state = lock_state(&self.state);
+        let run = run.clone();
+        let result_directory = match publication {
+            PublicationPresentation::Published(terminal) => {
+                Some(terminal.result_directory().to_owned())
+            }
+            PublicationPresentation::Failed(_) => None,
+        };
+        let publication = match publication {
+            PublicationPresentation::Published(terminal) => {
+                OwnedPublication::Published(Box::new(terminal.clone()))
+            }
+            PublicationPresentation::Failed(error) => OwnedPublication::Failed(error.clone()),
+        };
+        let (reply, result) = oneshot::channel();
+        let observed_at = self.clock.sample();
+        let submitted = {
+            let mut queue = self
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queue.finished {
+                return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                    PresentationFailureOperation::AlreadyFinished,
+                ));
+            }
+            queue.finished = true;
+            queue.sender.try_send(Box::new(move |state| {
+                let publication = match &publication {
+                    OwnedPublication::Published(terminal) => {
+                        PublicationPresentation::Published(terminal)
+                    }
+                    OwnedPublication::Failed(error) => PublicationPresentation::Failed(error),
+                };
+                let _ = reply.send(state.finish_internal(
+                    &run,
+                    publication,
+                    emit_terminal_json,
+                    observed_at,
+                ));
+            }))
+        };
+        if let Err(error) = submitted {
+            self.record_queue_failure(&error);
+            return WorkflowRunPresentationResult::Failed(
+                self.failure()
+                    .unwrap_or_else(|| {
+                        PresentationFailure::operation(PresentationFailureOperation::LineWriter)
+                    })
+                    .with_result_directory(result_directory.as_deref()),
+            );
+        }
+        let presented = result.await.unwrap_or_else(|_| {
+            WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                PresentationFailureOperation::LineWriter,
+            ))
+        });
+        let completed_path = match &presented {
+            WorkflowRunPresentationResult::Published {
+                result_directory, ..
+            } => Some(Some(result_directory.as_str())),
+            WorkflowRunPresentationResult::PublicationFailed(_) => Some(None),
+            _ => None,
+        };
+        if let Some(result_directory) = completed_path
+            && let Some(failure) = self.failure()
+        {
+            return WorkflowRunPresentationResult::Failed(
+                failure.with_result_directory(result_directory),
+            );
+        }
+        presented
+    }
+
+    fn record_queue_failure(
+        &self,
+        error: &TrySendError<PresentationMessage<StandardOutput, StandardError>>,
+    ) {
+        let mut queue_failure = self
+            .queue_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queue_failure.is_none() && self.failures.borrow().is_none() {
+            let kind = match error {
+                TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                TrySendError::Disconnected(_) => io::ErrorKind::BrokenPipe,
+            };
+            let failure = PresentationFailure {
+                operation: PresentationFailureOperation::LineWriter,
+                error_kind: Some(kind),
+                result_directory: None,
+            };
+            *queue_failure = Some(failure.clone());
+            self.failure_sender.send_replace(Some(failure));
+        }
+    }
+}
+
+enum OwnedPublication {
+    Published(Box<WorkflowRunTerminalResultV1>),
+    Failed(LocalPublicationError),
+}
+
+impl<StandardOutput: Write, StandardError: Write> PresentationState<StandardOutput, StandardError> {
+    fn finish_internal(
+        &mut self,
+        run: &WorkflowRunResult,
+        publication: PublicationPresentation<'_>,
+        emit_terminal_json: bool,
+        observed_at: ObservationTime,
+    ) -> WorkflowRunPresentationResult {
+        let state = self;
         if state.finished {
             return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
                 PresentationFailureOperation::AlreadyFinished,
@@ -924,7 +1104,6 @@ where
             return WorkflowRunPresentationResult::Failed(failure);
         }
 
-        let observed_at = self.clock.sample();
         if let Err(failure) = state.finish_child_streams(observed_at) {
             let failure = failure.with_result_directory(result_directory);
             return WorkflowRunPresentationResult::Failed(failure);
@@ -951,23 +1130,25 @@ where
         &self,
         observation: ExecutionObservation<Deadline>,
     ) -> impl Future<Output = ()> + Send {
-        let mut state = lock_state(&self.state);
-        if state.failure.is_none() && !state.finished {
-            let observed_at = self.clock.sample();
-            if let Err(failure) = state.render_observation(observed_at, observation) {
-                state.record_failure(failure);
-            }
+        let observed_at = self.clock.sample();
+        let queue = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !queue.finished
+            && self.failure().is_none()
+            && let Err(error) = queue.sender.try_send(Box::new(move |state| {
+                if state.failure.is_none()
+                    && !state.finished
+                    && let Err(failure) = state.render_observation(observed_at, observation)
+                {
+                    state.record_failure(failure);
+                }
+            }))
+        {
+            self.record_queue_failure(&error);
         }
         ready(())
-    }
-}
-
-fn lock_state<T, U>(
-    state: &Mutex<PresentationState<T, U>>,
-) -> MutexGuard<'_, PresentationState<T, U>> {
-    match state.lock() {
-        Ok(state) => state,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
