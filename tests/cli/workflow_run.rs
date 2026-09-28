@@ -9,7 +9,6 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
 
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
@@ -4822,7 +4821,7 @@ fn cancellation_settles_with_a_full_unread_presentation_pipe() {
         .unwrap();
         assert!(
             scherzo_cloud_support::monotonic_now().saturating_duration_since(started)
-                < Duration::from_secs(10),
+                < std::time::Duration::from_secs(10),
             "json={json}, finalizer={finalizer}, shared_pipe={shared_pipe}, force_abort={force_abort}"
         );
         assert_eq!(status.code(), Some(1));
