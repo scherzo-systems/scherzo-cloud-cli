@@ -6,6 +6,8 @@ pub(crate) mod archived_attempt;
 pub(crate) mod archived_presentation;
 pub(crate) mod artifact;
 mod artifact_json;
+mod artifact_limits;
+mod artifact_primitives;
 mod artifact_set;
 pub(crate) mod cancellation;
 mod canonical_json;

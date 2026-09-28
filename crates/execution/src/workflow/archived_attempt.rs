@@ -49,7 +49,6 @@ use super::validated::{
     WorkflowNodeRole, WorkflowValueType,
 };
 
-const RESULT_FILE: &str = "result.json";
 const SHA256_ALGORITHM: &str = "sha256";
 const BASE64_ENCODING: &str = "base64";
 
@@ -62,6 +61,7 @@ pub enum ArchivedAttemptOperationalErrorCode {
     StatusSnapshotUnstable,
     PublishedResultUnavailable,
     PublishedResultInvalid,
+    CarrierLimitExceeded,
     RetainedWorkflowInvalid,
 }
 
@@ -369,24 +369,38 @@ fn load_local_archived_attempt_with(
             verify_retained_output_evidence(&snapshot.root, &snapshot.state, attempt.attempt_number)
         })
         .map_err(|_| retained_workflow_invalid(&snapshot.run_directory))?;
-    let result_bytes = read_immutable_result(
+    let mut recovery_unsupported = false;
+    let result = artifact_set::read_and_validate_observing(
         &result_root,
-        observer,
-        &result_directory,
         result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+        || observer.result_file_opened(&result_directory),
+        |bytes| {
+            retained_budget
+                .account(bytes)
+                .map_err(|_| artifact_set::ArtifactSetError::Invalid)?;
+            let document = result_metadata::decode_document(bytes)
+                .map_err(|_| artifact_set::ArtifactSetError::Invalid)?;
+            if result_metadata::dispatch_recovery_summary_versions(&document).is_err() {
+                recovery_unsupported = true;
+                return Err(artifact_set::ArtifactSetError::Invalid);
+            }
+            Ok(())
+        },
     )
-    .map_err(|()| result_unavailable(&snapshot.run_directory))?;
-    retained_budget
-        .account(&result_bytes)
-        .map_err(|_| result_invalid(&snapshot.run_directory))?;
-    let result = decode_result(&result_bytes).map_err(|error| match error {
-        ArchivedResultDecodeError::Invalid => result_invalid(&snapshot.run_directory),
-        ArchivedResultDecodeError::RecoverySchemaUnsupported => {
+    .map_err(|failure| {
+        if recovery_unsupported {
             recovery_schema_unsupported(&snapshot.run_directory)
+        } else if failure.code().is_some() {
+            ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
+                code: ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded,
+                run_directory: Some(snapshot.run_directory.clone()),
+            })
+        } else if failure == artifact_set::ArtifactSetError::ResultFileUnavailable {
+            result_unavailable(&snapshot.run_directory)
+        } else {
+            result_invalid(&snapshot.run_directory)
         }
     })?;
-    artifact_set::validate(&result_root, &result)
-        .map_err(|_| result_invalid(&snapshot.run_directory))?;
     let validated = validate_and_project_result(
         &snapshot,
         &attempt,
@@ -562,70 +576,6 @@ fn open_relative_directory(root: &OwnedFd, relative: &str) -> Result<OwnedFd, ()
         directory = open_directory_at(&directory, name).map_err(|_| ())?;
     }
     Ok(directory)
-}
-
-fn read_immutable_result(
-    result_root: &OwnedFd,
-    observer: &mut impl ArchiveReadObserver,
-    result_directory: &Path,
-    maximum_bytes: u64,
-) -> Result<Vec<u8>, ()> {
-    let descriptor = openat(
-        result_root,
-        RESULT_FILE,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| ())?;
-    let opened = fstat(&descriptor).map_err(|_| ())?;
-    let opened_size = u64::try_from(opened.st_size).map_err(|_| ())?;
-    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
-        || opened_size > maximum_bytes
-    {
-        return Err(());
-    }
-    observer.result_file_opened(result_directory);
-    let mut file = File::from(descriptor);
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(maximum_bytes.checked_add(1).ok_or(())?)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
-    if u64::try_from(bytes.len())
-        .ok()
-        .is_none_or(|size| size > maximum_bytes || size != opened_size)
-    {
-        return Err(());
-    }
-    let opened_after = fstat(&file).map_err(|_| ())?;
-    let named_after =
-        statat(result_root, RESULT_FILE, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ())?;
-    if FileType::from_raw_mode(named_after.st_mode) != FileType::RegularFile
-        || opened.st_dev != opened_after.st_dev
-        || opened.st_ino != opened_after.st_ino
-        || opened.st_dev != named_after.st_dev
-        || opened.st_ino != named_after.st_ino
-        || opened.st_size != opened_after.st_size
-    {
-        return Err(());
-    }
-    Ok(bytes)
-}
-
-enum ArchivedResultDecodeError {
-    Invalid,
-    RecoverySchemaUnsupported,
-}
-
-fn decode_result(bytes: &[u8]) -> Result<WorkflowResultV1, ArchivedResultDecodeError> {
-    let document =
-        result_metadata::decode_document(bytes).map_err(|_| ArchivedResultDecodeError::Invalid)?;
-    result_metadata::dispatch_recovery_summary_versions(&document)
-        .map_err(|_| ArchivedResultDecodeError::RecoverySchemaUnsupported)?;
-    let result =
-        serde_json::from_value(document).map_err(|_| ArchivedResultDecodeError::Invalid)?;
-    result_metadata::validate(&result).map_err(|_| ArchivedResultDecodeError::Invalid)?;
-    Ok(result)
 }
 
 struct ProjectedResult {

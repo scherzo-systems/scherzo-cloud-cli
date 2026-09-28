@@ -6,29 +6,26 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ring::digest::{Context as DigestContext, SHA256};
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, open, openat, statat};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, fstat, open, openat, statat};
 use rustix::io::Errno;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::artifact_json::{self, ArtifactJsonFailure};
+use super::artifact_limits::{
+    MAXIMUM_CARRIERS, MAXIMUM_EXPORT_ENTRIES, MAXIMUM_EXPORTS, MAXIMUM_ROOT_ENTRIES,
+};
+use super::artifact_primitives::{self, PrimitiveFailure, retained_file_changed, same_identity};
 use super::git_artifact::{
     GitArtifactDescriptor, GitArtifactFailure, GitArtifactValidationBudget, validate_git_bundle,
 };
 use super::presentation::visible_text;
 use super::result_metadata::{self, ResultDocumentError};
-use super::schema_common::{is_identifier, is_lowercase_hex, lowercase_hex};
+use super::schema_common::{is_identifier, is_lowercase_hex};
 
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
-const ROOT_OVERFLOW_ENTRY: usize = 4_097;
-const MAXIMUM_EXPORTS: usize = 4_096;
-const MAXIMUM_CARRIERS: usize = 4_096;
-const EXPORTS_OVERFLOW_ENTRY: usize = 4_097;
-const MAXIMUM_CARRIER_BYTES: u64 = 1024 * 1024 * 1024;
-const MAXIMUM_TOTAL_CARRIER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_DIAGNOSTICS: usize = 8_192;
-const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 include!("portable_artifact_diagnostics_generated.rs");
 
@@ -558,10 +555,10 @@ pub fn validate_portable_artifact_set(
     }
 
     let summary = ArtifactValidationSummary {
-        declared_exports: usize_to_u64(metadata.declared_exports),
-        available_exports: usize_to_u64(metadata.available_exports),
-        unavailable_exports: usize_to_u64(metadata.unavailable_exports),
-        referenced_carriers: usize_to_u64(metadata.carriers.len()),
+        declared_exports: usize_to_u64(metadata.declared_exports)?,
+        available_exports: usize_to_u64(metadata.available_exports)?,
+        unavailable_exports: usize_to_u64(metadata.unavailable_exports)?,
+        referenced_carriers: usize_to_u64(metadata.carriers.len())?,
         carrier_bytes: total_bytes,
     };
     Ok(finish_report(artifact_directory, diagnostics, summary))
@@ -590,8 +587,8 @@ fn finish_report(
     }
 }
 
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+fn usize_to_u64(value: usize) -> Result<u64, PortableArtifactValidationFailure> {
+    u64::try_from(value).map_err(|_| PortableArtifactValidationFailure::ScratchUnavailable)
 }
 
 fn lexical_absolute(initial: &Path, argument: &Path) -> PathBuf {
@@ -632,7 +629,7 @@ fn inspect_root_boundary(
     cancelled: &AtomicBool,
     diagnostics: &mut Diagnostics,
 ) -> Result<(), PortableArtifactValidationFailure> {
-    match enumerate_names(root, ROOT_OVERFLOW_ENTRY, cancelled) {
+    match enumerate_names(root, MAXIMUM_ROOT_ENTRIES, cancelled) {
         Ok(EntryInventory::Overflow) => {
             diagnostics.root(ArtifactDiagnosticCode::RootEntryLimitExceeded, None)
         }
@@ -713,20 +710,20 @@ fn read_result(
     }
 
     let mut file = File::from(descriptor);
-    let bytes = match read_bounded(
+    let bytes = match artifact_primitives::read_bounded(
         &mut file,
         result_metadata::MAXIMUM_RESULT_JSON_BYTES,
         cancelled,
     ) {
-        Ok(BoundedRead::Complete(bytes)) => bytes,
-        Ok(BoundedRead::LimitExceeded) => {
+        Ok(bytes) => bytes,
+        Err(PrimitiveFailure::LimitExceeded) => {
             diagnostics.result(ArtifactDiagnosticCode::ResultLimitExceeded, None);
             return Ok(None);
         }
-        Err(ReadFailure::Interrupted) => {
+        Err(PrimitiveFailure::Interrupted) => {
             return Err(PortableArtifactValidationFailure::Interrupted);
         }
-        Err(ReadFailure::Unavailable) => {
+        Err(_) => {
             diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
             return Ok(None);
         }
@@ -735,48 +732,6 @@ fn read_result(
         diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
     }
     Ok(Some(bytes))
-}
-
-fn read_bounded(
-    file: &mut File,
-    maximum: u64,
-    cancelled: &AtomicBool,
-) -> Result<BoundedRead, ReadFailure> {
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(ReadFailure::Interrupted);
-        }
-        let observed = u64::try_from(bytes.len()).map_err(|_| ReadFailure::Unavailable)?;
-        let permitted = usize::try_from(
-            maximum
-                .saturating_sub(observed)
-                .saturating_add(1)
-                .min(COPY_BUFFER_BYTES as u64),
-        )
-        .map_err(|_| ReadFailure::Unavailable)?;
-        let read = file
-            .read(&mut buffer[..permitted])
-            .map_err(|_| ReadFailure::Unavailable)?;
-        if read == 0 {
-            return Ok(BoundedRead::Complete(bytes));
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if u64::try_from(bytes.len()).map_or(true, |length| length > maximum) {
-            return Ok(BoundedRead::LimitExceeded);
-        }
-    }
-}
-
-enum BoundedRead {
-    Complete(Vec<u8>),
-    LimitExceeded,
-}
-
-enum ReadFailure {
-    Interrupted,
-    Unavailable,
 }
 
 #[derive(Default)]
@@ -1134,45 +1089,57 @@ fn inspect_exports(
             diagnostics,
             name,
             ordinal,
-            direct_path,
-            fingerprint,
-            kind.filter(|kind| *kind != CarrierKind::GitBranch),
-            None,
-            direct_size,
-            direct_digest,
+            CarrierReference {
+                path: direct_path,
+                fingerprint,
+                kind: kind.filter(|kind| *kind != CarrierKind::GitBranch),
+                descriptor: None,
+                size_bytes: direct_size,
+                digest: direct_digest,
+            },
         );
         record_carrier_reference(
             &mut inspection,
             diagnostics,
             name,
             ordinal,
-            nested_path,
-            fingerprint,
-            (kind == Some(CarrierKind::GitBranch)).then_some(CarrierKind::GitBranch),
-            descriptor,
-            nested_size,
-            nested_digest,
+            CarrierReference {
+                path: nested_path,
+                fingerprint,
+                kind: (kind == Some(CarrierKind::GitBranch)).then_some(CarrierKind::GitBranch),
+                descriptor,
+                size_bytes: nested_size,
+                digest: nested_digest,
+            },
         );
     }
     inspection
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "keeps one bounded carrier-reference path"
-)]
-fn record_carrier_reference(
-    inspection: &mut MetadataInspection,
-    diagnostics: &mut Diagnostics,
-    name: &str,
-    ordinal: usize,
-    path: Option<&str>,
+struct CarrierReference<'a> {
+    path: Option<&'a str>,
     fingerprint: Option<MetadataFingerprint>,
     kind: Option<CarrierKind>,
     descriptor: Option<GitDescriptor>,
     size_bytes: Option<u64>,
     digest: Option<String>,
+}
+
+fn record_carrier_reference(
+    inspection: &mut MetadataInspection,
+    diagnostics: &mut Diagnostics,
+    name: &str,
+    ordinal: usize,
+    reference: CarrierReference<'_>,
 ) {
+    let CarrierReference {
+        path,
+        fingerprint,
+        kind,
+        descriptor,
+        size_bytes,
+        digest,
+    } = reference;
     let Some(path) = path else {
         return;
     };
@@ -1507,7 +1474,7 @@ fn enumerate_exports(
     cancelled: &AtomicBool,
     diagnostics: &mut Diagnostics,
 ) -> Result<EntryInventory, PortableArtifactValidationFailure> {
-    match enumerate_names(exports, EXPORTS_OVERFLOW_ENTRY, cancelled) {
+    match enumerate_names(exports, MAXIMUM_EXPORT_ENTRIES, cancelled) {
         Ok(inventory) => Ok(inventory),
         Err(EnumerationFailure::Interrupted) => Err(PortableArtifactValidationFailure::Interrupted),
         Err(EnumerationFailure::Unavailable) => {
@@ -1535,22 +1502,12 @@ fn enumerate_names(
     overflow_entry: usize,
     cancelled: &AtomicBool,
 ) -> Result<EntryInventory, EnumerationFailure> {
-    let mut names = BTreeSet::new();
-    for entry in Dir::read_from(directory).map_err(|_| EnumerationFailure::Unavailable)? {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(EnumerationFailure::Interrupted);
-        }
-        let entry = entry.map_err(|_| EnumerationFailure::Unavailable)?;
-        let name = entry.file_name().to_bytes();
-        if name == b"." || name == b".." {
-            continue;
-        }
-        names.insert(name.to_vec());
-        if names.len() >= overflow_entry {
-            return Ok(EntryInventory::Overflow);
-        }
+    match artifact_primitives::enumerate_names(directory, overflow_entry, cancelled) {
+        Ok(Some(names)) => Ok(EntryInventory::Complete(names)),
+        Ok(None) => Ok(EntryInventory::Overflow),
+        Err(PrimitiveFailure::Interrupted) => Err(EnumerationFailure::Interrupted),
+        Err(_) => Err(EnumerationFailure::Unavailable),
     }
-    Ok(EntryInventory::Complete(names))
 }
 
 fn validate_carrier(
@@ -1604,61 +1561,37 @@ fn validate_carrier(
     }
 
     let mut file = File::from(descriptor);
-    let mut digest = DigestContext::new(&SHA256);
-    let mut observed = 0_u64;
-    let mut complete = true;
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        check_cancelled(cancelled)?;
-        let per_remaining = MAXIMUM_CARRIER_BYTES.saturating_sub(observed);
-        let total_remaining = MAXIMUM_TOTAL_CARRIER_BYTES.saturating_sub(*total_bytes);
-        let permitted = per_remaining
-            .min(total_remaining)
-            .saturating_add(1)
-            .min(COPY_BUFFER_BYTES as u64);
-        if permitted == 0 {
-            diagnostics.carrier(
-                ArtifactDiagnosticCode::CarrierTotalSizeLimitExceeded,
-                path,
-                1,
-            );
-            complete = false;
-            break;
+    let hash = artifact_primitives::hash_bounded(&mut file, total_bytes, cancelled);
+    let (observed, observed_digest) = match hash {
+        Ok(hash) => hash,
+        Err(PrimitiveFailure::Interrupted) => {
+            return Err(PortableArtifactValidationFailure::Interrupted);
         }
-        let read = match file
-            .read(&mut buffer[..usize::try_from(permitted).unwrap_or(COPY_BUFFER_BYTES)])
-        {
-            Ok(read) => read,
-            Err(_) => {
-                diagnostics.carrier(ArtifactDiagnosticCode::CarrierUnavailable, path, 0);
-                complete = false;
-                break;
+        Err(failure) => {
+            let code = match failure {
+                PrimitiveFailure::LimitExceeded => ArtifactDiagnosticCode::CarrierSizeLimitExceeded,
+                PrimitiveFailure::TotalLimitExceeded => {
+                    ArtifactDiagnosticCode::CarrierTotalSizeLimitExceeded
+                }
+                _ => ArtifactDiagnosticCode::CarrierUnavailable,
+            };
+            diagnostics.carrier(
+                code,
+                path,
+                if code == ArtifactDiagnosticCode::CarrierUnavailable {
+                    0
+                } else {
+                    1
+                },
+            );
+            if retained_file_changed(exports, name, &file, &before) {
+                diagnose_current_carrier(exports, name, path, diagnostics);
             }
-        };
-        if read == 0 {
-            break;
+            return Ok(());
         }
-        let read_u64 = u64::try_from(read).unwrap_or(u64::MAX);
-        observed = observed.saturating_add(read_u64);
-        *total_bytes = total_bytes.saturating_add(read_u64);
-        if observed > MAXIMUM_CARRIER_BYTES {
-            diagnostics.carrier(ArtifactDiagnosticCode::CarrierSizeLimitExceeded, path, 1);
-            complete = false;
-            break;
-        }
-        if *total_bytes > MAXIMUM_TOTAL_CARRIER_BYTES {
-            diagnostics.carrier(
-                ArtifactDiagnosticCode::CarrierTotalSizeLimitExceeded,
-                path,
-                1,
-            );
-            complete = false;
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
+    };
 
-    if complete {
+    {
         if group
             .size_bytes
             .iter()
@@ -1666,7 +1599,6 @@ fn validate_carrier(
         {
             diagnostics.carrier(ArtifactDiagnosticCode::CarrierSizeMismatch, path, 2);
         }
-        let observed_digest = lowercase_hex(digest.finish().as_ref());
         if group
             .digests
             .iter()
@@ -1682,7 +1614,17 @@ fn validate_carrier(
                     let content = file
                         .seek(SeekFrom::Start(0))
                         .map_err(|_| TextContentFailure::Unavailable)
-                        .and_then(|_| validate_utf8(&mut file, cancelled));
+                        .and_then(|_| {
+                            artifact_primitives::validate_utf8(&mut file, cancelled).map_err(
+                                |failure| match failure {
+                                    PrimitiveFailure::InvalidText => TextContentFailure::Invalid,
+                                    PrimitiveFailure::Interrupted => {
+                                        TextContentFailure::Interrupted
+                                    }
+                                    _ => TextContentFailure::Unavailable,
+                                },
+                            )
+                        });
                     match content {
                         Ok(()) => {}
                         Err(TextContentFailure::Invalid) => {
@@ -1820,60 +1762,10 @@ fn diagnose_current_carrier(
     }
 }
 
-fn same_identity(left: &Stat, right: &Stat) -> bool {
-    left.st_dev == right.st_dev && left.st_ino == right.st_ino
-}
-
-fn retained_file_changed(directory: &OwnedFd, name: &str, file: &File, before: &Stat) -> bool {
-    let Ok(after) = fstat(file) else {
-        return true;
-    };
-    let Ok(named) = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
-        return true;
-    };
-    FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
-        || !same_identity(before, &after)
-        || before.st_size != after.st_size
-        || !same_identity(before, &named)
-}
-
 enum TextContentFailure {
     Invalid,
     Interrupted,
     Unavailable,
-}
-
-fn validate_utf8(reader: &mut impl Read, cancelled: &AtomicBool) -> Result<(), TextContentFailure> {
-    let mut pending = Vec::with_capacity(4);
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(TextContentFailure::Interrupted);
-        }
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|_| TextContentFailure::Unavailable)?;
-        if read == 0 {
-            return pending
-                .is_empty()
-                .then_some(())
-                .ok_or(TextContentFailure::Invalid);
-        }
-        pending.extend_from_slice(&buffer[..read]);
-        match std::str::from_utf8(&pending) {
-            Ok(_) => pending.clear(),
-            Err(error) if error.error_len().is_some() => {
-                return Err(TextContentFailure::Invalid);
-            }
-            Err(error) => {
-                let suffix = pending.split_off(error.valid_up_to());
-                if suffix.len() > 3 {
-                    return Err(TextContentFailure::Invalid);
-                }
-                pending = suffix;
-            }
-        }
-    }
 }
 
 enum JsonContentFailure {

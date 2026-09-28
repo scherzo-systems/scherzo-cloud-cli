@@ -2397,6 +2397,7 @@
                 "status_snapshot_unstable",
                 "published_result_unavailable",
                 "published_result_invalid",
+                "carrier_limit_exceeded",
                 "retained_workflow_invalid",
                 "attempt_unknown",
                 "attempt_nonterminal",

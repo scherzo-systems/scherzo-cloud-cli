@@ -29,8 +29,8 @@ use super::schema_common::lowercase_hex;
 use super::validated::WorkflowValueType;
 use super::value::{CapturedJson, CapturedText, CapturedValue};
 
-const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const COPY_BUFFER_BYTES_U64: u64 = 64 * 1024;
+pub(super) const COPY_BUFFER_BYTES: usize = 64 * 1024;
+pub(super) const COPY_BUFFER_BYTES_U64: u64 = 64 * 1024;
 const IDENTITY_ATTEMPTS: usize = 16;
 
 #[derive(Clone, Default)]

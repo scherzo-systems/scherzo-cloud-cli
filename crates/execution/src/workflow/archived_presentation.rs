@@ -505,6 +505,9 @@ pub const fn operational_error_code(code: ArchivedAttemptOperationalErrorCode) -
             "published_result_unavailable"
         }
         ArchivedAttemptOperationalErrorCode::PublishedResultInvalid => "published_result_invalid",
+        ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded => {
+            super::artifact_limits::CARRIER_LIMIT_DIAGNOSTIC_CODE
+        }
         ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid => "retained_workflow_invalid",
     }
 }
@@ -531,6 +534,9 @@ const fn operational_error_message(code: ArchivedAttemptOperationalErrorCode) ->
         }
         ArchivedAttemptOperationalErrorCode::PublishedResultInvalid => {
             "The published result is invalid. Select an intact published attempt."
+        }
+        ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded => {
+            "The published result has too many carriers. Select an intact published attempt."
         }
         ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid => {
             "The retained workflow is invalid. Select an intact workflow run directory."
@@ -880,6 +886,7 @@ mod tests {
             ArchivedAttemptOperationalErrorCode::StatusSnapshotUnstable,
             ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable,
             ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+            ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded,
             ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
         ];
         for code in operational {
@@ -906,6 +913,26 @@ mod tests {
             });
             assert_error_document(&error, ineligibility_code(reason), true);
         }
+    }
+
+    #[test]
+    fn archived_carrier_limit_json_error_matches_view_schema() {
+        let error = ArchivedAttemptLoadError::Operational(ArchivedAttemptOperationalError {
+            code: ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded,
+            run_directory: Some(PathBuf::from("/tmp/archive-run")),
+        });
+        let document: serde_json::Value =
+            serde_json::from_slice(&serialize_json_error(&error).unwrap()).unwrap();
+        assert_eq!(
+            document["error"]["code"],
+            super::super::artifact_limits::CARRIER_LIMIT_DIAGNOSTIC_CODE
+        );
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../schemas/workflow-view-result-v1.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::draft202012::new(&schema).unwrap();
+        assert!(validator.is_valid(&document));
     }
 
     fn assert_error_document(

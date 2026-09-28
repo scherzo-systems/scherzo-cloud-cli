@@ -33,8 +33,7 @@ use super::schema_common::{
 };
 
 const MAXIMUM_STEPS: usize = 256;
-const MAXIMUM_EXPORTS: usize = 4_096;
-const MAXIMUM_CARRIERS: usize = 4_096;
+use super::artifact_limits::{MAXIMUM_CARRIERS, MAXIMUM_EXPORTS};
 pub(super) const MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES: u64 = MAXIMUM_EXPORTS as u64 * 128 * 12;
 pub(super) const MAXIMUM_RESULT_NON_STREAM_JSON_BYTES: u64 = 64 * 1024 * 1024;
 // Durable capture reserves the live run byte budget independently for stdout and

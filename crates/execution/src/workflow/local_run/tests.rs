@@ -3998,23 +3998,36 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
 }
 
 #[test]
-fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
+fn artifact_set_carrier_boundary_is_shared_by_archive_and_portable_inspection() {
     let prefix = "a/b;x=";
     let value_count = 128 - prefix.chars().count();
     let media_type = format!("{prefix}{}", "\u{1f600}".repeat(value_count));
     let source_media_type = media_type.clone();
-    let mut source = format!(
-        "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      payload:\n        kind: file\n        from: path\n        path: payload.bin\n        mediaType: \"{source_media_type}\"\nexports:\n"
+    let mut source = String::from(
+        "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n",
     );
     for index in 0..4_096 {
+        source.push_str(&format!("      o{index:04}:\n        kind: file\n        from: path\n        path: p{index:04}.bin\n        mediaType: \"{source_media_type}\"\n"));
+    }
+    source.push_str("exports:\n");
+    for index in 0..4_096 {
         let name = format!("e{}{index:04}", "a".repeat(59));
-        source.push_str(&format!("  {name}:\n    ref: outputs.produce.payload\n"));
+        source.push_str(&format!(
+            "  {name}:\n    ref: outputs.produce.o{index:04}\n"
+        ));
     }
     let fixture = AdmittedFixture::from_source(&source);
     let run_path = fixture.run_path("large-result");
     let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
     settle_as_succeeded(&run);
-    retain_file_outputs_for_step(&run, "produce", &[("payload", &media_type, b"x")]);
+    let output_names = (0..4_096)
+        .map(|index| format!("o{index:04}"))
+        .collect::<Vec<_>>();
+    let retained = output_names
+        .iter()
+        .map(|name| (name.as_str(), media_type.as_str(), b"x".as_slice()))
+        .collect::<Vec<_>>();
+    retain_file_outputs_for_step(&run, "produce", &retained);
 
     let durable = read_state(run.root_handle()).unwrap();
     let attempt = durable.attempts.last().unwrap();
@@ -4031,7 +4044,11 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
         }
     });
     let exports = (0..4_096)
-        .map(|index| (format!("e{}{index:04}", "a".repeat(59)), metadata.clone()))
+        .map(|index| {
+            let mut entry = metadata.clone();
+            entry["path"] = format!("exports/{:04}", index + 1).into();
+            (format!("e{}{index:04}", "a".repeat(59)), entry)
+        })
         .collect::<serde_json::Map<_, _>>();
     let result = serde_json::json!({
         "schemaVersion": 1,
@@ -4102,9 +4119,13 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
         .run_directory()
         .join(attempt_result_relative_path(attempt.attempt_number));
     fs::create_dir_all(result_directory.join("exports")).unwrap();
-    fs::write(result_directory.join("exports/0001"), b"x").unwrap();
+    for index in 1..=4_096 {
+        fs::write(result_directory.join(format!("exports/{index:04}")), b"x").unwrap();
+    }
     fs::write(result_directory.join("result.json"), &result_bytes).unwrap();
     let result_root = open_directory_path(&result_directory).unwrap();
+    let valid_result = crate::workflow::result_metadata::decode(&result_bytes).unwrap();
+    crate::workflow::artifact_set::validate(&result_root, &valid_result).unwrap();
     crate::workflow::artifact_set::read_and_validate(
         &result_root,
         crate::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES,
@@ -4114,6 +4135,55 @@ fn archived_attempt_accepts_results_within_the_artifact_set_metadata_limit() {
 
     load_local_archived_attempt(&run_path, None)
         .expect("a valid published Artifact Set V1 result must remain inspectable");
+    let inspect = || {
+        crate::workflow::portable_artifact::validate_portable_artifact_set(
+            &result_directory,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap()
+    };
+    let valid_report = inspect();
+    assert!(valid_report.is_valid(), "{:?}", valid_report.diagnostics);
+    assert_eq!(valid_report.summary.unwrap().referenced_carriers, 4_096);
+
+    let mut overflow = serde_json::from_slice::<Value>(&result_bytes).unwrap();
+    let mut extra = metadata;
+    extra["path"] = "exports/4097".into();
+    overflow["exports"]
+        .as_object_mut()
+        .unwrap()
+        .insert("overflow".into(), extra);
+    let overflow_result = serde_json::from_value(overflow.clone()).unwrap();
+    fs::write(result_directory.join("exports/4097"), b"x").unwrap();
+    overwrite_result(&result_directory, overflow);
+    let direct_error =
+        crate::workflow::artifact_set::validate(&result_root, &overflow_result).unwrap_err();
+    assert_eq!(direct_error.code(), Some("carrier_limit_exceeded"));
+    let set_error = crate::workflow::artifact_set::read_and_validate(
+        &result_root,
+        crate::workflow::result_metadata::MAXIMUM_RESULT_JSON_BYTES,
+    )
+    .unwrap_err();
+    assert_eq!(set_error.code(), Some("carrier_limit_exceeded"));
+    let archive_error = load_local_archived_attempt(&run_path, None).unwrap_err();
+    assert_archive_operational(
+        archive_error,
+        ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded,
+    );
+    assert_eq!(
+        crate::workflow::archived_presentation::operational_error_code(
+            ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded,
+        ),
+        set_error.code().unwrap(),
+    );
+    let invalid_report = inspect();
+    assert!(!invalid_report.is_valid());
+    assert!(
+        invalid_report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "carrier_limit_exceeded")
+    );
 }
 
 #[test]
