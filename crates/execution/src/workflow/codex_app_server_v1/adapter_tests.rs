@@ -40,7 +40,8 @@ use crate::workflow::result_validation::{
 };
 use crate::workflow::runtime::{ActionId, TransitionSequence};
 
-const MODEL: &str = "gpt-5.4";
+// Keep this slug in the pinned Codex catalog: unknown slugs lose apply_patch and tool_search.
+const MODEL: &str = "gpt-5.5";
 const PROVIDER: &str = "loopback";
 const RESPONSE: &str = "driver response";
 const THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
