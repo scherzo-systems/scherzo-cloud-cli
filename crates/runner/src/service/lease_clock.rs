@@ -181,6 +181,14 @@ impl ControlledLeaseClock {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .timer_available = false;
     }
+
+    pub(super) fn make_wait_unavailable(&self) {
+        self.source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wait_available = false;
+    }
 }
 
 #[cfg(test)]

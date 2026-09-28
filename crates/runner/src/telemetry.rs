@@ -33,6 +33,13 @@ pub(crate) mod attribute {
     pub(crate) const HANDSHAKE_COMPLETED: &str = "scherzo.runner.handshake_completed";
     pub(crate) const OPENING_ACKNOWLEDGED: &str = "scherzo.runner.opening_acknowledged";
     pub(crate) const RUN_ID: &str = "scherzo.run.id";
+    pub(crate) const RUN_RESULT: &str = "scherzo.run.result";
+    pub(crate) const FAILURE_PHASE: &str = "scherzo.failure.phase";
+    pub(crate) const FAILURE_CODE: &str = "scherzo.failure.code";
+    pub(crate) const FAILURE_CAUSE_TYPE: &str = "scherzo.failure.cause_type";
+    pub(crate) const INTERRUPTION_CAUSE: &str = "scherzo.interruption.cause";
+    pub(crate) const EXECUTOR_FAULT_REASON: &str = "scherzo.executor_fault.reason";
+    pub(crate) const DIAGNOSTIC_STAGE: &str = "scherzo.diagnostic.stage";
     pub(crate) const RUNNER_BOOT_ID: &str = "scherzo.runner.boot_id";
     pub(crate) const RUNNER_ID: &str = "scherzo.runner.id";
     pub(crate) const RUNNER_SEQUENCE: &str = "scherzo.runner.sequence";
@@ -319,6 +326,10 @@ impl Recorder {
 
     pub(crate) fn service_version(&self) -> &str {
         &self.service_version
+    }
+
+    pub(crate) fn boot_id(&self) -> &str {
+        &self.service_instance_id
     }
 
     #[cfg(test)]

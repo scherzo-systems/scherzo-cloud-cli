@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use opentelemetry::KeyValue;
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 
@@ -1218,7 +1219,7 @@ pub(super) struct LeaseAuthority {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GrantValidationFailure {
     MissingBasis,
-    Arithmetic,
+    Arithmetic(LeaseClockError),
 }
 
 impl LeaseAuthority {
@@ -1279,6 +1280,124 @@ impl LeaseAuthority {
     }
 }
 
+// Shared with the execution job: the manager owns completion at the durable
+// acknowledgement/fence boundary, not at the end of the engine future.
+#[derive(Clone, Default)]
+pub(super) struct RunEvent(Arc<Mutex<RunEventState>>);
+
+#[derive(Default)]
+struct RunEventState {
+    event: Option<TelemetryEvent>,
+    result: Option<&'static str>,
+}
+
+pub(super) fn lease_clock_cause(error: LeaseClockError) -> &'static str {
+    match error {
+        #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+        LeaseClockError::UnsupportedPlatform => "lease_platform_unsupported",
+        LeaseClockError::ClockUnavailable => "lease_clock_unavailable",
+        LeaseClockError::TimerUnavailable => "lease_timer_unavailable",
+        LeaseClockError::TimerWaitFailed => "lease_timer_wait_failed",
+        LeaseClockError::ArithmeticOverflow => "lease_arithmetic_overflow",
+        LeaseClockError::IncompatibleInstant => "lease_incompatible_instant",
+    }
+}
+
+impl RunEvent {
+    fn start(
+        &self,
+        recorder: &crate::telemetry::Recorder,
+        identity: &AssignmentIdentity,
+        runner_id: &str,
+    ) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.event.is_none() {
+            state.event = Some(recorder.start(
+                "runner.run",
+                [
+                    KeyValue::new(crate::telemetry::attribute::RUN_ID, identity.run_id.clone()),
+                    KeyValue::new(
+                        crate::telemetry::attribute::ASSIGNMENT_ID,
+                        identity.assignment_id.clone(),
+                    ),
+                    KeyValue::new(
+                        crate::telemetry::attribute::ATTEMPT_ID,
+                        identity.attempt_id.clone(),
+                    ),
+                    KeyValue::new(crate::telemetry::attribute::RUNNER_ID, runner_id.to_owned()),
+                    KeyValue::new(
+                        crate::telemetry::attribute::RUNNER_BOOT_ID,
+                        recorder.boot_id().to_owned(),
+                    ),
+                ],
+            ));
+        }
+    }
+
+    pub(super) fn set(&self, attribute: KeyValue) {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(event) = &state.event {
+            event.set(attribute);
+        }
+    }
+
+    fn lease_clock_failure(&self, error: LeaseClockError, stage: &'static str) {
+        self.result("aborted");
+        for (key, value) in [
+            (
+                crate::telemetry::attribute::FAILURE_CAUSE_TYPE,
+                lease_clock_cause(error),
+            ),
+            (crate::telemetry::attribute::DIAGNOSTIC_STAGE, stage),
+            (
+                crate::telemetry::attribute::EXECUTOR_FAULT_REASON,
+                "runner_internal_failure",
+            ),
+        ] {
+            self.set(KeyValue::new(key, value));
+        }
+    }
+
+    pub(super) fn result(&self, result: &'static str) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.result = Some(result);
+        if let Some(event) = &state.event {
+            event.set(KeyValue::new(
+                crate::telemetry::attribute::RUN_RESULT,
+                result,
+            ));
+        }
+    }
+
+    fn finish(&self, override_result: Option<&'static str>) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = override_result.or(state.result).unwrap_or("aborted");
+        if let Some(event) = state.event.take() {
+            event.set(KeyValue::new(
+                crate::telemetry::attribute::RUN_RESULT,
+                result,
+            ));
+            event.finish(match result {
+                "succeeded" => TelemetryOutcome::Success,
+                "cancelled" | "interrupted" => TelemetryOutcome::Cancelled,
+                _ => TelemetryOutcome::Failure,
+            });
+        }
+    }
+}
+
 struct RunningAssignment {
     identity: AssignmentIdentity,
     cancellation: CancellationSource,
@@ -1291,6 +1410,7 @@ struct RunningAssignment {
     workflow_git: WorkflowGitAuthority,
     engine_terminal: Arc<AtomicBool>,
     workspace_release: Option<CleanupResult>,
+    run_event: RunEvent,
 }
 
 struct PreparingAssignment {
@@ -1416,6 +1536,7 @@ pub(super) enum ManagerEvent {
         final_observation_id: Option<u64>,
         final_delivery_deadline: Option<LeaseInstant>,
         lease_clock_failed: bool,
+        fenced: bool,
         retained_root: Option<Box<AssignmentRoot>>,
         quiescence: ProcessQuiescence,
         quiescence_failure: Option<Vec<String>>,
@@ -1430,7 +1551,10 @@ pub(super) enum ManagerEvent {
         assignment_id: String,
         result: CleanupResult,
     },
-    LeaseClockFailed,
+    LeaseClockFailed {
+        assignment_id: String,
+        error: LeaseClockError,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1661,6 +1785,8 @@ pub(super) struct AssignmentManager {
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
+    runner_id: String,
+    run_events: BTreeMap<String, RunEvent>,
     lease_policy: Option<ExecutionLeasePolicy>,
     slot: Option<LocalSlot>,
     reporting: Option<AssignmentIdentity>,
@@ -1682,6 +1808,14 @@ pub(super) struct AssignmentManager {
     deferred_offer_failure: Option<AssignmentManagerFailure>,
     fenced_final_graces: BTreeSet<FencedFinalGrace>,
     guard_processes: bool,
+}
+
+impl Drop for AssignmentManager {
+    fn drop(&mut self) {
+        for event in self.run_events.values() {
+            event.finish(Some("aborted"));
+        }
+    }
 }
 
 impl AssignmentManager {
@@ -1725,6 +1859,8 @@ impl AssignmentManager {
             source_broker,
             input_broker,
             recorder,
+            runner_id: config.credential().runner_id().to_owned(),
+            run_events: BTreeMap::new(),
             lease_policy: None,
             slot: None,
             reporting: None,
@@ -2582,7 +2718,7 @@ impl AssignmentManager {
                     self.finish_before_execution(identity, root, "execution_lease_expired")?;
                     return Ok(None);
                 }
-                Err(GrantValidationFailure::Arithmetic) => {
+                Err(GrantValidationFailure::Arithmetic(_)) => {
                     self.slot = Some(LocalSlot::Accepted(accepted));
                     self.lease_clock_failed = true;
                     return Err(AssignmentManagerFailure::LeaseClock);
@@ -2622,6 +2758,9 @@ impl AssignmentManager {
             tokio::sync::watch::channel(None);
         let workflow_git = accepted.workflow_git.clone();
         let engine_terminal = Arc::new(AtomicBool::new(false));
+        let run_event = RunEvent::default();
+        self.run_events
+            .insert(accepted.assignment_id().to_owned(), run_event.clone());
         self.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
             cancellation,
@@ -2634,6 +2773,7 @@ impl AssignmentManager {
             workflow_git,
             engine_terminal: Arc::clone(&engine_terminal),
             workspace_release: None,
+            run_event: run_event.clone(),
         })));
         Ok(Some(ExecutionJob::new(
             *accepted,
@@ -2641,6 +2781,7 @@ impl AssignmentManager {
             self.artifact_delivery.clone(),
             self.event_sender.clone(),
             engine_terminal,
+            run_event,
             ExecutionAuthority {
                 lease_clock: self.lease_clock.clone(),
                 causal_lease,
@@ -2723,6 +2864,11 @@ impl AssignmentManager {
             && running.identity.attempt_id == authorization.attempt_id
             && !self.has_pending_pre_execution_cancellation(&authorization.assignment_id)
         {
+            if let Some(recorder) = &self.recorder {
+                running
+                    .run_event
+                    .start(recorder, &running.identity, &self.runner_id);
+            }
             running.start_authority.send_replace(true);
         }
         Ok(())
@@ -2799,12 +2945,12 @@ impl AssignmentManager {
         };
         let now = match self.lease_clock.now() {
             Ok(now) => now,
-            Err(_) => return Err(self.fail_lease_clock()),
+            Err(error) => return Err(self.fail_lease_clock(error)),
         };
         let authority = running.authority_updates.borrow().clone();
         let cancellation_order = match now.checked_cmp(authority.cancellation_start) {
             Ok(ordering) => ordering,
-            Err(_) => return Err(self.fail_lease_clock()),
+            Err(error) => return Err(self.fail_lease_clock(error)),
         };
         // These local monotonic durations diagnose queueing and deadline pressure;
         // unavailable telemetry must not alter the authority decision.
@@ -2867,8 +3013,8 @@ impl AssignmentManager {
                     .insert(renewal.effect_id.clone(), renewal);
                 return Ok(timed(RenewalDisposition::MissingBasis));
             }
-            Err(GrantValidationFailure::Arithmetic) => {
-                return Err(self.fail_lease_clock());
+            Err(GrantValidationFailure::Arithmetic(error)) => {
+                return Err(self.fail_lease_clock(error));
             }
         };
         match next_authority.local_expiry.checked_cmp(current_expiry) {
@@ -2876,7 +3022,7 @@ impl AssignmentManager {
             Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
                 return Err(AssignmentManagerFailure::ConflictingOffer);
             }
-            Err(_) => return Err(self.fail_lease_clock()),
+            Err(error) => return Err(self.fail_lease_clock(error)),
         }
 
         let Some(LocalSlot::Running(running)) = &mut self.slot else {
@@ -3055,6 +3201,9 @@ impl AssignmentManager {
             if self.cleanup_failure_report == Some(id) {
                 self.cleanup_failure_report = None;
             }
+            if let Some(event) = self.run_events.remove(observation.assignment_id()) {
+                event.finish(None);
+            }
             if self.lease_clock_failure_report == Some(id) {
                 self.lease_clock_failure_report = None;
             }
@@ -3210,7 +3359,11 @@ impl AssignmentManager {
         root: Option<AssignmentRoot>,
         quiescence: ProcessQuiescence,
         disposition: WorkspaceDisposition,
+        fenced: bool,
     ) {
+        if let Some(event) = self.run_events.remove(&assignment_id) {
+            event.finish(Some(if fenced { "fenced" } else { "aborted" }));
+        }
         self.retire_assignment_observations(&assignment_id);
         self.cleanup_retained_root(
             assignment_id,
@@ -3694,6 +3847,7 @@ impl AssignmentManager {
                     final_observation_id,
                     final_delivery_deadline,
                     lease_clock_failed,
+                    fenced,
                     retained_root,
                     quiescence,
                     quiescence_failure,
@@ -3752,6 +3906,9 @@ impl AssignmentManager {
                         let after = if final_observation_id.is_some() {
                             ReleaseAfter::Reporting(Box::new(identity))
                         } else {
+                            if let Some(event) = self.run_events.remove(&assignment_id) {
+                                event.finish(Some(if fenced { "fenced" } else { "aborted" }));
+                            }
                             self.retire_assignment_observations(&assignment_id);
                             ReleaseAfter::Idle
                         };
@@ -3791,6 +3948,7 @@ impl AssignmentManager {
                             retained_root,
                             quiescence,
                             workspace_disposition,
+                            fenced,
                         );
                         continue;
                     };
@@ -3811,13 +3969,19 @@ impl AssignmentManager {
                             retained_root,
                             quiescence,
                             workspace_disposition,
+                            fenced,
                         );
                         continue;
                     };
                     let final_delivery_deadline =
                         match self.clamp_to_shutdown_cleanup_deadline(final_delivery_deadline) {
                             Ok(deadline) => deadline,
-                            Err(_) => {
+                            Err(error) => {
+                                self.classify_lease_clock(
+                                    &assignment_id,
+                                    error,
+                                    "terminal_acknowledgement",
+                                );
                                 self.retain_after_lease_clock_failure(
                                     assignment_id,
                                     retained_root,
@@ -3836,7 +4000,12 @@ impl AssignmentManager {
                     {
                         Ok(std::cmp::Ordering::Less) => true,
                         Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => false,
-                        Err(_) => {
+                        Err(error) => {
+                            self.classify_lease_clock(
+                                &assignment_id,
+                                error,
+                                "terminal_acknowledgement",
+                            );
                             self.retain_after_lease_clock_failure(
                                 assignment_id,
                                 retained_root,
@@ -3854,6 +4023,7 @@ impl AssignmentManager {
                             retained_root,
                             quiescence,
                             workspace_disposition,
+                            fenced,
                         );
                         continue;
                     }
@@ -3910,6 +4080,9 @@ impl AssignmentManager {
                         let after = if continue_reporting {
                             ReleaseAfter::Reporting(Box::new(finishing.identity))
                         } else {
+                            if let Some(event) = self.run_events.remove(&assignment_id) {
+                                event.finish(Some("aborted"));
+                            }
                             self.retire_assignment_observations(&assignment_id);
                             ReleaseAfter::Idle
                         };
@@ -3932,7 +4105,11 @@ impl AssignmentManager {
                     assignment_id,
                     result,
                 } => self.finish_cleanup(assignment_id, result),
-                ManagerEvent::LeaseClockFailed => {
+                ManagerEvent::LeaseClockFailed {
+                    assignment_id,
+                    error,
+                } => {
+                    self.classify_lease_clock(&assignment_id, error, "terminal_acknowledgement");
                     self.lease_clock_failed = true;
                     if let Some(id) = self.cleanup_failure_report.take() {
                         let assignment_id = {
@@ -3983,7 +4160,12 @@ impl AssignmentManager {
         deadline: LeaseInstant,
         continue_reporting: bool,
     ) -> Result<(), LeaseClockError> {
-        let wait = self.lease_clock.start_wait(deadline)?;
+        let wait = self
+            .lease_clock
+            .start_wait(deadline)
+            .inspect_err(|&error| {
+                self.classify_lease_clock(&assignment_id, error, "terminal_acknowledgement");
+            })?;
         let sender = self.event_sender.clone();
         let outbox = self.outbox.clone();
         tokio::spawn(async move {
@@ -3994,7 +4176,10 @@ impl AssignmentManager {
                     final_observation_id,
                     continue_reporting,
                 },
-                Err(_) => ManagerEvent::LeaseClockFailed,
+                Err(error) => ManagerEvent::LeaseClockFailed {
+                    assignment_id,
+                    error,
+                },
             };
             let _ = sender.send(event);
             outbox.wake();
@@ -4027,6 +4212,9 @@ impl AssignmentManager {
     }
 
     fn retire_assignment_observations(&mut self, assignment_id: &str) {
+        if let Some(event) = self.run_events.remove(assignment_id) {
+            event.finish(Some("fenced"));
+        }
         self.outbox.fence_assignment(assignment_id);
         self.artifact_delivery.cancel_assignment(assignment_id);
         for decision in &mut self.decisions {
@@ -4127,7 +4315,23 @@ impl AssignmentManager {
         }
     }
 
-    fn fail_lease_clock(&mut self) -> AssignmentManagerFailure {
+    fn classify_lease_clock(
+        &self,
+        assignment_id: &str,
+        error: LeaseClockError,
+        stage: &'static str,
+    ) {
+        if let Some(event) = self.run_events.get(assignment_id) {
+            event.lease_clock_failure(error, stage);
+        }
+    }
+
+    fn fail_lease_clock(&mut self, error: LeaseClockError) -> AssignmentManagerFailure {
+        if let Some(LocalSlot::Running(running)) = &self.slot {
+            running
+                .run_event
+                .lease_clock_failure(error, "lease_renewal");
+        }
         if let Some(LocalSlot::Running(running)) = &mut self.slot {
             revoke_authority(running);
         }
@@ -4160,7 +4364,7 @@ impl AssignmentManager {
             .basis(expected_sequence)
             .ok_or(GrantValidationFailure::MissingBasis)?;
         LeaseAuthority::derive(expected_sequence, basis, policy, cancellation_grace)
-            .map_err(|_| GrantValidationFailure::Arithmetic)
+            .map_err(GrantValidationFailure::Arithmetic)
     }
 }
 
@@ -4408,6 +4612,7 @@ pub(super) mod test_support {
             workflow_git,
             engine_terminal: Arc::new(AtomicBool::new(false)),
             workspace_release: None,
+            run_event: RunEvent::default(),
         })));
         RenewalTimingFixture {
             clock,
@@ -6511,6 +6716,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 final_observation_id: Some(final_observation_id),
                 final_delivery_deadline: Some(final_delivery_deadline),
                 lease_clock_failed: false,
+                fenced: false,
                 retained_root: None,
                 quiescence: ProcessQuiescence::Proven,
                 quiescence_failure: None,
@@ -6800,6 +7006,33 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             }
             notified.await;
         }
+    }
+
+    fn assert_acknowledged_run(
+        manager: &mut AssignmentManager,
+        capture: &crate::telemetry::TestCapture,
+        result: &str,
+    ) {
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event["event.name"] != "runner.run")
+        );
+        let final_id = manager
+            .pending_observations(&BTreeSet::new(), 100)
+            .into_iter()
+            .find(|pending| pending.observation.is_terminal())
+            .unwrap()
+            .id;
+        manager.acknowledge_observation(final_id);
+        let runs: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event["event.name"] == "runner.run")
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["scherzo.run.result"], result);
     }
 
     fn command_fixture_arguments() -> Vec<String> {
@@ -7993,6 +8226,253 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         );
     }
 
+    async fn run_event_fixture(
+        workflow: &str,
+    ) -> (
+        tempfile::TempDir,
+        AssignmentManager,
+        AssignmentOffer,
+        ExecutionJob,
+        crate::telemetry::TestCapture,
+    ) {
+        let (temporary, mut manager) = manager_fixture(workflow);
+        let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+        manager.recorder = Some(recorder);
+        let offered = offer("bg");
+        offer_then_prepare(&mut manager, &offered).await;
+        let job = execution_job(&mut manager, &offered);
+        (temporary, manager, offered, job, capture)
+    }
+
+    #[tokio::test]
+    async fn run_event_ends_once_at_terminal_ack_or_fence() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager, offered, _job, capture) = run_event_fixture(workflow).await;
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event["event.name"] != "runner.run")
+        );
+
+        let event = manager.run_events.get(&offered.assignment_id).unwrap();
+        event.result("failed");
+        event.set(KeyValue::new(
+            crate::telemetry::attribute::FAILURE_CAUSE_TYPE,
+            "occurrence_conflict",
+        ));
+        event.set(KeyValue::new(
+            crate::telemetry::attribute::DIAGNOSTIC_STAGE,
+            "harness_execution",
+        ));
+        let id = manager
+            .outbox
+            .enqueue(AssignmentObservation::Execution {
+                assignment_id: offered.assignment_id.clone(),
+                attempt_id: offered.attempt_id.clone(),
+                report: ExecutionReport::Aborted {
+                    last_execution_event_sequence: 0,
+                    reason: "runner_internal_failure".to_owned(),
+                },
+            })
+            .unwrap();
+        manager.acknowledge_observation(id);
+        manager.acknowledge_observation(id);
+        manager.retire_assignment_observations(&offered.assignment_id);
+        let run_events = |capture: &crate::telemetry::TestCapture| {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event["event.name"] == "runner.run")
+                .collect::<Vec<_>>()
+        };
+        let runs = run_events(&capture);
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run["scherzo.run.id"], offered.run_id);
+        assert_eq!(run["scherzo.assignment.id"], offered.assignment_id);
+        assert_eq!(run["scherzo.attempt.id"], offered.attempt_id);
+        assert_eq!(run["scherzo.runner.boot_id"], "rbt_fixture");
+        assert_eq!(run["scherzo.run.result"], "failed");
+        assert_eq!(run["scherzo.failure.cause_type"], "occurrence_conflict");
+        assert_eq!(run["scherzo.diagnostic.stage"], "harness_execution");
+        let spans = capture.spans();
+        let span = spans.iter().find(|span| span.name == "runner.run").unwrap();
+        for key in [
+            "scherzo.run.id",
+            "scherzo.assignment.id",
+            "scherzo.attempt.id",
+            "scherzo.run.result",
+            "scherzo.failure.cause_type",
+            "scherzo.diagnostic.stage",
+        ] {
+            assert_eq!(
+                span.attributes
+                    .iter()
+                    .find(|attribute| attribute.key.as_str() == key)
+                    .unwrap()
+                    .value
+                    .to_string()
+                    .trim_matches('"'),
+                run[key].as_str().unwrap()
+            );
+        }
+
+        let (_temporary, mut manager, offered, _job, capture) = run_event_fixture(workflow).await;
+        manager.retire_assignment_observations(&offered.assignment_id);
+        manager.retire_assignment_observations(&offered.assignment_id);
+        let runs = run_events(&capture);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["scherzo.run.result"], "fenced");
+    }
+
+    #[tokio::test]
+    async fn fenced_completion_keeps_its_disposition_without_a_report() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager, offered, _job, capture) = run_event_fixture(workflow).await;
+        manager
+            .event_sender
+            .send(ManagerEvent::Finished {
+                assignment_id: offered.assignment_id.clone(),
+                final_observation_id: None,
+                final_delivery_deadline: None,
+                lease_clock_failed: false,
+                fenced: true,
+                retained_root: None,
+                quiescence: ProcessQuiescence::Proven,
+                quiescence_failure: None,
+                workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::Interrupted),
+            })
+            .unwrap();
+        manager.drain_events();
+        assert_eq!(capture.event("runner.run")["scherzo.run.result"], "fenced");
+        assert_eq!(
+            capture
+                .events()
+                .iter()
+                .filter(|event| event["event.name"] == "runner.run")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_execution_activation_is_classified_without_error_text() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager, _offered, job, capture) = run_event_fixture(workflow).await;
+        if let Some(LocalSlot::Running(running)) = &manager.slot {
+            running.workflow_git.disable();
+        }
+        job.spawn();
+        let reports = with_watchdog(wait_for_terminal(&mut manager))
+            .await
+            .unwrap();
+        assert!(reports.iter().any(|report| matches!(report, ExecutionReport::Aborted { reason, .. } if reason == "execution_environment_lost")));
+        assert_acknowledged_run(&mut manager, &capture, "aborted");
+        let event = capture.event("runner.run");
+        assert_eq!(
+            event["scherzo.failure.cause_type"],
+            "workflow_git_activation_failed"
+        );
+        assert_eq!(event["scherzo.diagnostic.stage"], "workflow_git_activation");
+        assert!(
+            !serde_json::to_string(&event)
+                .unwrap()
+                .contains(_temporary.path().to_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_grace_clock_error_classifies_the_retained_run() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager, offered, _job, capture) = run_event_fixture(workflow).await;
+        let (clock, control, _waits) = controlled_lease_clock();
+        manager.lease_clock = clock;
+        control.make_timer_unavailable();
+        let deadline = manager.lease_clock.now().unwrap();
+        assert_eq!(
+            manager.start_final_grace(offered.assignment_id.clone(), 1, deadline, false),
+            Err(LeaseClockError::TimerUnavailable)
+        );
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event["event.name"] != "runner.run")
+        );
+        drop(manager);
+        let event = capture.event("runner.run");
+        assert_eq!(event["scherzo.run.result"], "aborted");
+        assert_eq!(
+            event["scherzo.failure.cause_type"],
+            "lease_timer_unavailable"
+        );
+        assert_eq!(
+            event["scherzo.diagnostic.stage"],
+            "terminal_acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_grace_wait_failure_classifies_the_retained_run() {
+        let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+        let (_temporary, mut manager, offered, _job, capture) = run_event_fixture(workflow).await;
+        let (clock, control, mut waits) = controlled_lease_clock();
+        manager.lease_clock = clock;
+        let deadline = manager.lease_clock.now().unwrap();
+        manager
+            .start_final_grace(offered.assignment_id.clone(), 1, deadline, false)
+            .unwrap();
+        let (_, release) = waits.recv().await.unwrap();
+        control.make_wait_unavailable();
+        release.release();
+        let failure = manager.events.recv().await.unwrap();
+        assert!(
+            matches!(&failure, ManagerEvent::LeaseClockFailed { assignment_id, error: LeaseClockError::TimerWaitFailed } if assignment_id == &offered.assignment_id)
+        );
+        manager.event_sender.send(failure).unwrap();
+        manager.drain_events();
+        assert!(manager.lease_clock_failed);
+        drop(manager);
+        let event = capture.event("runner.run");
+        assert_eq!(
+            event["scherzo.failure.cause_type"],
+            "lease_timer_wait_failed"
+        );
+        assert_eq!(
+            event["scherzo.diagnostic.stage"],
+            "terminal_acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_execution_reports_one_run_after_acknowledgement() {
+        for (command, expected) in [("true", "succeeded"), ("false", "failed")] {
+            let workflow = format!(
+                "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"{command}\"]\n"
+            );
+            let (_temporary, mut manager) = manager_fixture(&workflow);
+            let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+            manager.recorder = Some(recorder);
+            let offered = offer("bg");
+            offer_then_prepare(&mut manager, &offered).await;
+            spawn_execution(&mut manager, &offered);
+            let reports = with_watchdog(wait_for_terminal(&mut manager))
+                .await
+                .unwrap();
+            assert_eq!(
+                reports.iter().filter(|report| report.is_terminal()).count(),
+                1
+            );
+            assert_acknowledged_run(&mut manager, &capture, expected);
+            if expected == "failed" {
+                let run = capture.event("runner.run");
+                assert!(run["scherzo.failure.phase"].is_string());
+                assert!(run["scherzo.failure.code"].is_string());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cancellation_during_result_delivery_reports_execution_terminal() {
         let (_temporary, mut manager, offered, cancellation) = cancellable_running_fixture().await;
@@ -8071,10 +8551,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     #[tokio::test]
     async fn user_cancellation_completion_waits_for_process_quiescence() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-        let (_temporary, mut manager) = manager_fixture(workflow);
-        let offered = offer("bg");
-        offer_then_prepare(&mut manager, &offered).await;
-        let job = execution_job(&mut manager, &offered);
+        let (_temporary, mut manager, offered, job, capture) = run_event_fixture(workflow).await;
         manager
             .handle_cancel(cancel_for(&offered, CancellationMode::Graceful, "bm"))
             .unwrap();
@@ -8086,12 +8563,15 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             ExecutionReport::Finished { outcome, .. }
                 if outcome["outcome"] == "cancelled" && outcome["reason"] == "user_request"
         )));
+        assert_acknowledged_run(&mut manager, &capture, "cancelled");
     }
 
     #[tokio::test]
     async fn runner_shutdown_remains_an_interruption_after_user_cancellation() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
+        let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+        manager.recorder = Some(recorder);
         let offered = offer("bg");
         offer_then_prepare(&mut manager, &offered).await;
         spawn_execution(&mut manager, &offered);
@@ -8130,6 +8610,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 && terminal_outcome["outcome"] == "cancelled"
                 && terminal_outcome["reason"] == "user_request"
         )));
+        assert_acknowledged_run(&mut manager, &capture, "interrupted");
     }
 
     #[tokio::test]
@@ -8224,6 +8705,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                     final_observation_id: Some(final_observation_id),
                     final_delivery_deadline: None,
                     lease_clock_failed: false,
+                    fenced: false,
                     retained_root: None,
                     quiescence: ProcessQuiescence::Proven,
                     quiescence_failure: None,
@@ -9541,6 +10023,7 @@ steps:
                 final_observation_id: None,
                 final_delivery_deadline: None,
                 lease_clock_failed: false,
+                fenced: false,
                 retained_root: None,
                 quiescence: ProcessQuiescence::Proven,
                 quiescence_failure: None,
@@ -10236,6 +10719,7 @@ steps:
                     final_observation_id: Some(id),
                     final_delivery_deadline: Some(deadline),
                     lease_clock_failed: false,
+                    fenced: false,
                     retained_root: None,
                     quiescence: ProcessQuiescence::Failed,
                     quiescence_failure: Some(vec!["guard-fixture".to_owned()]),
@@ -10636,7 +11120,10 @@ steps:
         let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
         manager
             .event_sender
-            .send(ManagerEvent::LeaseClockFailed)
+            .send(ManagerEvent::LeaseClockFailed {
+                assignment_id: "unused".to_owned(),
+                error: LeaseClockError::TimerWaitFailed,
+            })
             .unwrap();
         manager.finish_transport();
         assert!(manager.lease_clock_failed);

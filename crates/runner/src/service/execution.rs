@@ -22,7 +22,8 @@ use super::artifact_delivery::{
 };
 use super::assignment::{
     AcceptedAssignment, AssignmentObservation, CausalLease, ExecutionReport, LeaseAuthority,
-    ManagerEvent, ObservationOutbox, RenewalRequestFailure,
+    ManagerEvent, ObservationOutbox, OutboxFailure, RenewalRequestFailure, RunEvent,
+    lease_clock_cause,
 };
 use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
@@ -31,25 +32,26 @@ use super::workspace::{RetentionReason, WorkspaceDisposition};
 use crate::telemetry;
 use scherzo_cloud_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
-    AgentInputStaging, ArtifactStaging, AuthenticatedProcessGroup, AuthenticatedSignalResult,
-    CancellationReason, CancellationSource, CloudCarrierBody, CloudExecutionCapacityV1,
-    CloudSourceDisplayRepositoryV1, CloudSourceDisplaySnapshotV1, CoordinatorClock, DigestV1,
+    AgentInputStaging, AgentInputStagingFailure, ArtifactStaging, ArtifactStagingFailure,
+    AuthenticatedProcessGroup, AuthenticatedSignalResult, CancellationReason, CancellationSource,
+    CloudCarrierBody, CloudExecutionCapacityV1, CloudSourceDisplayRepositoryV1,
+    CloudSourceDisplaySnapshotV1, CoordinationError, CoordinatorClock, DigestV1,
     DurableProcessGuardStore, ExecutionObservation, ExecutionObserver, FailurePolicy,
     FinalizationGate, FinalizationSummary, FinalizerResult, ForceAbortEvidence, InputStaging,
-    InvocationAccountingLog, NoopCommitPort, ObservedStepTransition, PreparedCloudWorkflowResult,
-    PrimaryIssue, ProcessGuardRegistry, ProcessGuardStoreError, ProcessIdentityInspector,
-    ProcessIdentityObservation, RecoveryDecisionKind, RecoveryDiagnosticKindV1,
-    RecoveryHandlerActivity, RecoveryHandlerKind, RecoveryInvocationDiagnosticV1,
-    RecoveryInvocationRoleV1, RecoveryInvocationStateV1, RecoveryInvocationUsageV1,
-    RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnostic, StepDiagnosticLog,
-    StepFailureCause, StepRecoveryState, StepState, StepStateKind, SystemProcessIdentityInspector,
-    TargetExecutionNumber, TransitionEvent, TransitionObservation, ValidatedRecoveryHandler,
-    ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole, WorkflowRunCancellation,
-    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult,
-    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowState, WorkflowStepTiming,
-    command_output_v1, execute_workflow, prepare_cloud_workflow_result,
-    production_agent_dispatcher, step_recovery_summary_v1, summary_disposition_matches,
-    terminate_authenticated_process_group,
+    InputStagingFailure, InvocationAccountingLog, NoopCommitPort, ObservedStepTransition,
+    PreparedCloudWorkflowResult, PrimaryIssue, ProcessGuardRegistry, ProcessGuardStoreError,
+    ProcessIdentityInspector, ProcessIdentityObservation, RecoveryDecisionKind,
+    RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
+    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
+    RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnostic,
+    StepDiagnosticLog, StepFailureCause, StepRecoveryState, StepState, StepStateKind,
+    SystemProcessIdentityInspector, TargetExecutionNumber, TransitionEvent, TransitionObservation,
+    ValidatedRecoveryHandler, ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole,
+    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
+    WorkflowRunId, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming,
+    WorkflowState, WorkflowStepTiming, command_output_v1, execute_workflow,
+    prepare_cloud_workflow_result, production_agent_dispatcher, step_recovery_summary_v1,
+    summary_disposition_matches, terminate_authenticated_process_group,
 };
 #[cfg(test)]
 use scherzo_cloud_execution::{
@@ -302,6 +304,7 @@ struct ExecutionCompletion {
     deferred_containment_report: Option<ExecutionReport>,
     final_delivery_deadline: Option<LeaseInstant>,
     lease_clock_failed: bool,
+    fenced: bool,
     workspace_disposition: WorkspaceDisposition,
 }
 
@@ -312,6 +315,7 @@ impl ExecutionCompletion {
             deferred_containment_report: None,
             final_delivery_deadline: None,
             lease_clock_failed: false,
+            fenced: false,
             workspace_disposition: WorkspaceDisposition::Retain(reason),
         }
     }
@@ -321,7 +325,9 @@ impl ExecutionCompletion {
     }
 
     fn fenced(final_observation_id: Option<u64>, _delivery_budget: Option<Duration>) -> Self {
-        Self::retained(final_observation_id, RetentionReason::Interrupted)
+        let mut completion = Self::retained(final_observation_id, RetentionReason::Interrupted);
+        completion.fenced = true;
+        completion
     }
 
     fn with_budget(
@@ -334,6 +340,7 @@ impl ExecutionCompletion {
             deferred_containment_report: None,
             final_delivery_deadline: None,
             lease_clock_failed: false,
+            fenced: false,
             workspace_disposition,
         }
     }
@@ -347,6 +354,7 @@ impl ExecutionCompletion {
             deferred_containment_report: Some(report),
             final_delivery_deadline: None,
             lease_clock_failed: false,
+            fenced: false,
             workspace_disposition,
         }
     }
@@ -361,6 +369,7 @@ impl ExecutionCompletion {
             deferred_containment_report: None,
             final_delivery_deadline: None,
             lease_clock_failed: true,
+            fenced: false,
             workspace_disposition: WorkspaceDisposition::Retain(RetentionReason::OutcomeUnknown),
         }
     }
@@ -419,10 +428,6 @@ impl<T: PreservableStaging> PreserveOnDrop<T> {
         staging.preserve_on_drop();
         Self { staging }
     }
-
-    fn from_result<Error>(result: Result<T, Error>) -> Option<Self> {
-        result.ok().map(Self::new)
-    }
 }
 
 impl<T: PreservableStaging> std::ops::Deref for PreserveOnDrop<T> {
@@ -464,6 +469,7 @@ pub(super) struct ExecutionJob {
     start_authority: tokio::sync::watch::Receiver<bool>,
     infrastructure_interruption: tokio::sync::watch::Receiver<Option<InfrastructureInterruption>>,
     workspace_release_reported: AtomicBool,
+    run_event: RunEvent,
 }
 
 struct RunnerResultFailure {
@@ -542,6 +548,7 @@ impl ExecutionJob {
         artifact_delivery: ArtifactDeliveryBroker,
         manager_events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
         engine_terminal: Arc<AtomicBool>,
+        run_event: RunEvent,
         authority: ExecutionAuthority,
     ) -> Self {
         Self {
@@ -557,6 +564,7 @@ impl ExecutionJob {
             start_authority: authority.start_authority,
             infrastructure_interruption: authority.infrastructure_interruption,
             workspace_release_reported: AtomicBool::new(false),
+            run_event,
         }
     }
 
@@ -611,12 +619,26 @@ impl ExecutionJob {
         let workflow_git = self.accepted.workflow_git.clone();
         let manager_events = self.manager_events.clone();
         let outbox = self.outbox.clone();
+        let run_event = self.run_event.clone();
         tokio::spawn(async move {
             if std::panic::AssertUnwindSafe(self.run())
                 .catch_unwind()
                 .await
                 .is_err()
             {
+                run_event.result("aborted");
+                run_event.set(KeyValue::new(
+                    telemetry::attribute::FAILURE_CAUSE_TYPE,
+                    "execution_panic",
+                ));
+                run_event.set(KeyValue::new(
+                    telemetry::attribute::EXECUTOR_FAULT_REASON,
+                    "runner_internal_failure",
+                ));
+                run_event.set(KeyValue::new(
+                    telemetry::attribute::DIAGNOSTIC_STAGE,
+                    "harness_execution",
+                ));
                 let guards = process_guards.clone();
                 let _ =
                     tokio::task::spawn_blocking(move || guards.begin_forced_containment()).await;
@@ -649,6 +671,7 @@ impl ExecutionJob {
                     final_observation_id: None,
                     final_delivery_deadline: None,
                     lease_clock_failed: false,
+                    fenced: false,
                     retained_root: Some(Box::new(root)),
                     quiescence,
                     quiescence_failure,
@@ -742,7 +765,10 @@ impl ExecutionJob {
         if completion.final_observation_id.is_some() && !completion.lease_clock_failed {
             match self.terminal_report_deadline() {
                 Ok(deadline) => completion.final_delivery_deadline = Some(deadline),
-                Err(_) => completion.lease_clock_failed = true,
+                Err(error) => {
+                    self.lease_clock_failure(error);
+                    completion.lease_clock_failed = true;
+                }
             }
         }
         let _ = self
@@ -754,6 +780,7 @@ impl ExecutionJob {
             final_observation_id: completion.final_observation_id,
             final_delivery_deadline: completion.final_delivery_deadline,
             lease_clock_failed: completion.lease_clock_failed,
+            fenced: completion.fenced,
             retained_root: Some(Box::new(retained_root)),
             quiescence,
             quiescence_failure,
@@ -805,6 +832,25 @@ impl ExecutionJob {
         result
     }
 
+    fn collapse(&self, code: &'static str, cause: &'static str, stage: &'static str) {
+        self.run_event.result("aborted");
+        for (key, value) in [
+            (telemetry::attribute::EXECUTOR_FAULT_REASON, code),
+            (telemetry::attribute::FAILURE_CAUSE_TYPE, cause),
+            (telemetry::attribute::DIAGNOSTIC_STAGE, stage),
+        ] {
+            self.run_event.set(KeyValue::new(key, value));
+        }
+    }
+
+    fn lease_clock_failure(&self, error: LeaseClockError) {
+        self.collapse(
+            "runner_internal_failure",
+            lease_clock_cause(error),
+            "execution_root",
+        );
+    }
+
     fn abort_retained(
         &self,
         assignment_id: &str,
@@ -820,11 +866,32 @@ impl ExecutionJob {
         ))
     }
 
+    fn stage_or_abort<T: PreservableStaging, E>(
+        &self,
+        staging: Result<T, E>,
+        classify: fn(E) -> &'static str,
+        stage: &'static str,
+        assignment_id: &str,
+        attempt_id: &str,
+    ) -> Result<PreserveOnDrop<T>, Box<ExecutionCompletion>> {
+        staging.map(PreserveOnDrop::new).map_err(|error| {
+            Box::new(self.execution_environment_lost(
+                assignment_id,
+                attempt_id,
+                classify(error),
+                stage,
+            ))
+        })
+    }
+
     fn execution_environment_lost(
         &self,
         assignment_id: &str,
         attempt_id: &str,
+        cause: &'static str,
+        stage: &'static str,
     ) -> ExecutionCompletion {
+        self.collapse("execution_environment_lost", cause, stage);
         self.abort_retained(assignment_id, attempt_id, 0, "execution_environment_lost")
     }
 
@@ -864,7 +931,12 @@ impl ExecutionJob {
         if !self.activate_workflow_git().await
             && cancellation.cancellation_reason() != Some(CancellationReason::RunnerShutdown)
         {
-            return self.execution_environment_lost(assignment_id, attempt_id);
+            return self.execution_environment_lost(
+                assignment_id,
+                attempt_id,
+                "workflow_git_activation_failed",
+                "workflow_git_activation",
+            );
         }
         if let Err(completion) = self
             .ensure_execution_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
@@ -878,7 +950,8 @@ impl ExecutionJob {
             .start_wait(initial_authority.renewal_request)
         {
             Ok(wait) => wait,
-            Err(_) => {
+            Err(error) => {
+                self.lease_clock_failure(error);
                 return self
                     .fail_before_execution(
                         &cancellation,
@@ -889,17 +962,31 @@ impl ExecutionJob {
                     .await;
             }
         };
-        let Some(artifacts) = PreserveOnDrop::from_result(ArtifactStaging::create(
-            self.accepted.admitted.execution(),
-            &self.accepted.root.private,
-        )) else {
-            return self.execution_environment_lost(assignment_id, attempt_id);
+        let artifacts = match self.stage_or_abort(
+            ArtifactStaging::create(
+                self.accepted.admitted.execution(),
+                &self.accepted.root.private,
+            ),
+            artifact_staging_cause,
+            "artifact_staging",
+            assignment_id,
+            attempt_id,
+        ) {
+            Ok(staging) => staging,
+            Err(completion) => return *completion,
         };
-        let Some(inputs) = PreserveOnDrop::from_result(InputStaging::create(
-            self.accepted.admitted.execution(),
-            &self.accepted.root.private,
-        )) else {
-            return self.execution_environment_lost(assignment_id, attempt_id);
+        let inputs = match self.stage_or_abort(
+            InputStaging::create(
+                self.accepted.admitted.execution(),
+                &self.accepted.root.private,
+            ),
+            input_staging_cause,
+            "input_staging",
+            assignment_id,
+            attempt_id,
+        ) {
+            Ok(staging) => staging,
+            Err(completion) => return *completion,
         };
         let recovery_agent_steps: BTreeSet<String> = self
             .accepted
@@ -926,23 +1013,42 @@ impl ExecutionJob {
                 &self.accepted.root.private,
             ) {
                 Ok(staging) => Some(PreserveOnDrop::new(staging)),
-                Err(_) => return self.execution_environment_lost(assignment_id, attempt_id),
+                Err(error) => {
+                    return self.execution_environment_lost(
+                        assignment_id,
+                        attempt_id,
+                        agent_input_staging_cause(error),
+                        "agent_input_staging",
+                    );
+                }
             }
         };
 
         let agent_diagnostic_sessions = if agent_staging.is_some() {
-            let attempt_handle = std::fs::File::open(&self.accepted.root.private)
-                .map(OwnedFd::from)
-                .ok();
-            match attempt_handle.and_then(|attempt_handle| {
-                AgentDiagnosticSessionStore::create_transient(
-                    &attempt_handle,
-                    &self.accepted.root.private,
-                )
-                .ok()
-            }) {
-                Some(sessions) => Some(sessions),
-                None => return self.execution_environment_lost(assignment_id, attempt_id),
+            let attempt_handle = match std::fs::File::open(&self.accepted.root.private) {
+                Ok(handle) => OwnedFd::from(handle),
+                Err(error) => {
+                    return self.execution_environment_lost(
+                        assignment_id,
+                        attempt_id,
+                        diagnostic_open_cause(&error),
+                        "diagnostic_sessions",
+                    );
+                }
+            };
+            match AgentDiagnosticSessionStore::create_transient(
+                &attempt_handle,
+                &self.accepted.root.private,
+            ) {
+                Ok(sessions) => Some(sessions),
+                Err(_) => {
+                    return self.execution_environment_lost(
+                        assignment_id,
+                        attempt_id,
+                        "diagnostic_session_creation_failed",
+                        "diagnostic_sessions",
+                    );
+                }
             }
         } else {
             None
@@ -991,19 +1097,25 @@ impl ExecutionJob {
                 .execution()
                 .limits()
                 .maximum_step_log_bytes();
-            let Ok(dispatcher) = production_agent_dispatcher(
+            let dispatcher = production_agent_dispatcher(
                 diagnostics.clone(),
                 maximum_log_bytes,
                 RunnerExecutionClock,
                 observer.clone(),
                 &self.accepted.execution_version,
-            ) else {
-                return self.abort_retained(
-                    assignment_id,
-                    attempt_id,
-                    observer.last_sequence(),
-                    "runner_internal_failure",
-                );
+            );
+            let dispatcher = match dispatcher {
+                Ok(dispatcher) => dispatcher,
+                Err(error) => {
+                    let cause = dispatcher_cause(&error);
+                    self.collapse("runner_internal_failure", cause, "harness_start");
+                    return self.abort_retained(
+                        assignment_id,
+                        attempt_id,
+                        observer.last_sequence(),
+                        "runner_internal_failure",
+                    );
+                }
             };
             let agents = AgentExecution::enabled_with_accounting(
                 WorkflowRunId::from(Arc::from(run_id)),
@@ -1088,10 +1200,15 @@ impl ExecutionJob {
                 infrastructure_interruption,
             } => (result, final_delivery_budget, infrastructure_interruption),
             LeaseExecution::Completed {
-                output: Err(_),
+                output: Err(error),
                 final_delivery_budget,
                 ..
             } => {
+                self.collapse(
+                    "runner_internal_failure",
+                    coordination_cause(error),
+                    "harness_execution",
+                );
                 return self
                     .abort_unless_fenced(
                         &post_stop_fence,
@@ -1106,7 +1223,8 @@ impl ExecutionJob {
             LeaseExecution::ContainmentDeadline => {
                 return ExecutionCompletion::fenced(None, None);
             }
-            LeaseExecution::LeaseClockFailed { quiescent } => {
+            LeaseExecution::LeaseClockFailed { quiescent, error } => {
+                self.lease_clock_failure(error);
                 let report = quiescent.then(|| {
                     self.abort(
                         assignment_id,
@@ -1119,6 +1237,11 @@ impl ExecutionJob {
             }
         };
         if observer.faulted() {
+            self.collapse(
+                "runner_internal_failure",
+                "execution_observer_faulted",
+                "harness_execution",
+            );
             return self
                 .abort_unless_fenced(
                     &post_stop_fence,
@@ -1138,12 +1261,21 @@ impl ExecutionJob {
             .definition
             .finalizers
             .is_empty();
-        if last_sequence == 0
-            || observer.terminal_sequence() != Some(last_sequence)
-            || !terminal_result_agrees(observer.terminal_state().as_ref(), &result.outcome)
-            || observer.force_abort() != result.force_abort
-            || has_finalizers != result.finalization_summary.is_some()
-        {
+        let inconsistency = if last_sequence == 0 {
+            Some("terminal_sequence_missing")
+        } else if observer.terminal_sequence() != Some(last_sequence) {
+            Some("terminal_sequence_mismatch")
+        } else if !terminal_result_agrees(observer.terminal_state().as_ref(), &result.outcome) {
+            Some("terminal_outcome_mismatch")
+        } else if observer.force_abort() != result.force_abort {
+            Some("force_abort_mismatch")
+        } else if has_finalizers != result.finalization_summary.is_some() {
+            Some("finalization_shape_mismatch")
+        } else {
+            None
+        };
+        if let Some(cause) = inconsistency {
+            self.collapse("engine_result_inconsistent", cause, "harness_execution");
             return self
                 .abort_unless_fenced(
                     &post_stop_fence,
@@ -1203,6 +1335,7 @@ impl ExecutionJob {
                 }
             },
             Err(failure) => {
+                self.collapse("runner_internal_failure", failure.code, "bundle_generation");
                 let mut details = Vec::new();
                 if let Some(node) = failure.node {
                     details.push(KeyValue::new(telemetry::attribute::ARTIFACT_NODE_ID, node));
@@ -1243,7 +1376,8 @@ impl ExecutionJob {
         };
         let delivery = match delivery {
             Ok(delivery) => delivery,
-            Err(_) => {
+            Err(error) => {
+                self.lease_clock_failure(error);
                 post_stop_fence.fence();
                 self.accepted.process_guards.begin_forced_containment();
                 return ExecutionCompletion::lease_clock_failed(self.abort(
@@ -1255,7 +1389,7 @@ impl ExecutionJob {
             }
         };
         if delivery == ArtifactDeliveryOutcome::AuthorityLost {
-            return ExecutionCompletion::without_report();
+            return ExecutionCompletion::fenced(None, None);
         }
         let infrastructure_interruption = infrastructure_interruption.or(match &result.outcome {
             RunOutcome::Cancelled {
@@ -1356,6 +1490,11 @@ impl ExecutionJob {
                         artifact_delivery,
                     }
                 } else {
+                    self.collapse(
+                        "runner_internal_failure",
+                        "unexpected_cancellation_reason",
+                        "harness_execution",
+                    );
                     return self
                         .abort_unless_fenced(
                             &post_stop_fence,
@@ -1742,7 +1881,8 @@ impl ExecutionJob {
                     }
                 }
                 elapsed = wait_for_lease_deadline(&self.lease_clock, cancellation_start) => {
-                    if elapsed.is_err() {
+                    if let Err(error) = elapsed {
+                        self.lease_clock_failure(error);
                         return Err(self
                             .fail_before_execution(
                                 cancellation,
@@ -1772,10 +1912,13 @@ impl ExecutionJob {
     ) -> Result<(), ExecutionCompletion> {
         match self.has_execution_authority() {
             Ok(true) => Ok(()),
-            Ok(false) => Err(ExecutionCompletion::without_report()),
-            Err(_) => Err(self
-                .fail_before_execution(cancellation, post_stop_fence, assignment_id, attempt_id)
-                .await),
+            Ok(false) => Err(ExecutionCompletion::fenced(None, None)),
+            Err(error) => {
+                self.lease_clock_failure(error);
+                Err(self
+                    .fail_before_execution(cancellation, post_stop_fence, assignment_id, attempt_id)
+                    .await)
+            }
         }
     }
 
@@ -1847,13 +1990,74 @@ impl ExecutionJob {
         attempt_id: &str,
         report: ExecutionReport,
     ) -> Option<u64> {
-        self.outbox
-            .enqueue(AssignmentObservation::Execution {
-                assignment_id: assignment_id.to_owned(),
-                attempt_id: attempt_id.to_owned(),
-                report,
-            })
-            .ok()
+        let terminal = report.is_terminal();
+        if terminal {
+            self.describe_report(&report);
+        }
+        let enqueued = self.outbox.enqueue(AssignmentObservation::Execution {
+            assignment_id: assignment_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            report,
+        });
+        if let Err(error) = enqueued {
+            self.collapse(
+                "runner_internal_failure",
+                outbox_cause(error, terminal),
+                "execution_root",
+            );
+        }
+        enqueued.ok()
+    }
+
+    fn describe_report(&self, report: &ExecutionReport) {
+        match report {
+            ExecutionReport::Finished { outcome, .. } => {
+                match outcome["outcome"].as_str() {
+                    Some("succeeded") => self.run_event.result("succeeded"),
+                    Some("failed") => {
+                        self.run_event.result("failed");
+                        for (key, value) in [
+                            (
+                                telemetry::attribute::FAILURE_PHASE,
+                                outcome["primaryIssue"]["detail"]["phase"].as_str(),
+                            ),
+                            (
+                                telemetry::attribute::FAILURE_CODE,
+                                outcome["primaryIssue"]["detail"]["code"].as_str(),
+                            ),
+                        ] {
+                            if let Some(value) = value {
+                                self.run_event.set(KeyValue::new(key, value.to_owned()));
+                            }
+                        }
+                    }
+                    Some("cancelled") => self.run_event.result("cancelled"),
+                    _ => self.run_event.result("aborted"),
+                }
+                if let Some(reason) = outcome["reason"].as_str() {
+                    self.run_event.set(KeyValue::new(
+                        telemetry::attribute::INTERRUPTION_CAUSE,
+                        reason.to_owned(),
+                    ));
+                }
+            }
+            ExecutionReport::Interrupted { reason, .. }
+            | ExecutionReport::AssignmentInterrupted { reason } => {
+                self.run_event.result("interrupted");
+                self.run_event.set(KeyValue::new(
+                    telemetry::attribute::INTERRUPTION_CAUSE,
+                    reason.clone(),
+                ));
+            }
+            ExecutionReport::Aborted { reason, .. } => {
+                self.run_event.result("aborted");
+                self.run_event.set(KeyValue::new(
+                    telemetry::attribute::EXECUTOR_FAULT_REASON,
+                    reason.clone(),
+                ));
+            }
+            ExecutionReport::Started | ExecutionReport::Transition { .. } => {}
+        }
     }
 
     fn abort(
@@ -1882,7 +2086,7 @@ fn cancellation_before_start_completion(reason: CancellationReason) -> Execution
         CancellationReason::TerminationRequest
         | CancellationReason::CallerOutputFailure
         | CancellationReason::RunnerShutdown
-        | CancellationReason::ExecutionLeaseExpired => ExecutionCompletion::without_report(),
+        | CancellationReason::ExecutionLeaseExpired => ExecutionCompletion::fenced(None, None),
     }
 }
 
@@ -2005,6 +2209,7 @@ enum LeaseExecution<Output> {
     ContainmentDeadline,
     LeaseClockFailed {
         quiescent: bool,
+        error: LeaseClockError,
     },
 }
 
@@ -2043,13 +2248,15 @@ where
         };
         let now = match lease_clock.now() {
             Ok(now) => now,
-            Err(_) => {
-                return fail_lease_clock(cancellation, post_stop_fence, process_guards);
+            Err(error) => {
+                return fail_lease_clock(error, cancellation, post_stop_fence, process_guards);
             }
         };
         let cancellation_due = match now.checked_cmp(authority.cancellation_start) {
             Ok(ordering) => ordering != std::cmp::Ordering::Less,
-            Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+            Err(error) => {
+                return fail_lease_clock(error, cancellation, post_stop_fence, process_guards);
+            }
         };
         if authority.revoked || cancellation_due {
             return finish_after_lease_loss(
@@ -2073,12 +2280,12 @@ where
                 authority.renewal_request,
                 armed_wait,
             ) => {
-                if wait.is_err() {
-                    return fail_lease_timer(&mut execution, failure).await;
+                if let Err(error) = wait {
+                    return fail_lease_timer(&mut execution, failure, error).await;
                 }
                 let now = match lease_clock.now() {
                     Ok(now) => now,
-                    Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+                    Err(error) => return fail_lease_clock(error, cancellation, post_stop_fence, process_guards),
                 };
                 if !matches!(
                     now.checked_cmp(authority.cancellation_start),
@@ -2102,7 +2309,7 @@ where
                 ) {
                     Ok(()) => {}
                     Err(RenewalRequestFailure::LeaseClock) => {
-                        return fail_lease_clock(cancellation, post_stop_fence, process_guards);
+                        return fail_lease_clock(LeaseClockError::ClockUnavailable, cancellation, post_stop_fence, process_guards);
                     }
                     Err(RenewalRequestFailure::Outbox | RenewalRequestFailure::Sequence) => {
                         return finish_after_lease_loss(
@@ -2118,8 +2325,8 @@ where
                 tokio::select! {
                     biased;
                     wait = wait_for_lease_deadline(lease_clock, authority.cancellation_start) => {
-                        if wait.is_err() {
-                            return fail_lease_timer(&mut execution, failure).await;
+                        if let Err(error) = wait {
+                            return fail_lease_timer(&mut execution, failure, error).await;
                         }
                         let latest_authority = authority_updates.borrow_and_update().clone();
                         if latest_authority != authority {
@@ -2213,7 +2420,9 @@ fn complete_ready_execution<Output>(
     } = failure;
     let now = match lease_clock.now() {
         Ok(now) => now,
-        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+        Err(error) => {
+            return fail_lease_clock(error, cancellation, post_stop_fence, process_guards);
+        }
     };
     if !lease_already_lost {
         match now.checked_cmp(authority.cancellation_start) {
@@ -2225,7 +2434,9 @@ fn complete_ready_execution<Output>(
                 };
             }
             Ok(_) => {}
-            Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+            Err(error) => {
+                return fail_lease_clock(error, cancellation, post_stop_fence, process_guards);
+            }
         }
     }
     cancellation.request_cancellation(CancellationReason::ExecutionLeaseExpired);
@@ -2242,7 +2453,9 @@ fn complete_ready_execution<Output>(
         Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => {
             begin_forced_containment(cancellation, post_stop_fence, process_guards);
         }
-        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+        Err(error) => {
+            return fail_lease_clock(error, cancellation, post_stop_fence, process_guards);
+        }
     }
     match lease_clock
         .now()
@@ -2263,8 +2476,9 @@ fn complete_ready_execution<Output>(
         Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
             LeaseExecution::ContainmentDeadline
         }
-        Err(_) => LeaseExecution::LeaseClockFailed {
+        Err(error) => LeaseExecution::LeaseClockFailed {
             quiescent: process_guards.is_quiescent(),
+            error,
         },
     }
 }
@@ -2288,19 +2502,23 @@ where
     };
     let now = match lease_clock.now() {
         Ok(now) => now,
-        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+        Err(error) => {
+            return fail_lease_clock(error, cancellation, post_stop_fence, process_guards);
+        }
     };
     let before_force_stop = match now.checked_cmp(authority.force_stop_start) {
         Ok(std::cmp::Ordering::Less) => true,
         Ok(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => false,
-        Err(_) => return fail_lease_clock(cancellation, post_stop_fence, process_guards),
+        Err(error) => {
+            return fail_lease_clock(error, cancellation, post_stop_fence, process_guards);
+        }
     };
     if before_force_stop {
         tokio::select! {
             biased;
             wait = wait_for_lease_deadline(lease_clock, authority.force_stop_start) => {
-                if wait.is_err() {
-                    return fail_lease_timer(execution, failure).await;
+                if let Err(error) = wait {
+                    return fail_lease_timer(execution, failure, error).await;
                 }
             }
             output = execution.as_mut() => {
@@ -2319,18 +2537,20 @@ where
     begin_forced_containment(cancellation, post_stop_fence, process_guards);
     let now = match lease_clock.now() {
         Ok(now) => now,
-        Err(_) => {
+        Err(error) => {
             return LeaseExecution::LeaseClockFailed {
                 quiescent: process_guards.is_quiescent(),
+                error,
             };
         }
     };
     match now.checked_cmp(authority.force_stop_end) {
         Ok(std::cmp::Ordering::Greater) => return LeaseExecution::ContainmentDeadline,
         Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {}
-        Err(_) => {
+        Err(error) => {
             return LeaseExecution::LeaseClockFailed {
                 quiescent: process_guards.is_quiescent(),
+                error,
             };
         }
     }
@@ -2347,7 +2567,7 @@ where
         wait = wait_for_lease_deadline(lease_clock, authority.force_stop_end) => {
             match wait {
                 Ok(()) => LeaseExecution::ContainmentDeadline,
-                Err(_) => fail_lease_timer(execution, failure).await,
+                Err(error) => fail_lease_timer(execution, failure, error).await,
             }
         }
     }
@@ -2356,6 +2576,7 @@ where
 async fn fail_lease_timer<F, Output>(
     execution: &mut std::pin::Pin<&mut F>,
     failure: LeaseFailureContext<'_>,
+    error: LeaseClockError,
 ) -> LeaseExecution<Output>
 where
     F: Future<Output = Output>,
@@ -2371,10 +2592,12 @@ where
     }
     LeaseExecution::LeaseClockFailed {
         quiescent: process_guards.is_quiescent(),
+        error,
     }
 }
 
 fn fail_lease_clock<Output>(
+    error: LeaseClockError,
     cancellation: &CancellationSource,
     post_stop_fence: &PostStopFence,
     process_guards: &AssignmentProcessGuards,
@@ -2382,6 +2605,7 @@ fn fail_lease_clock<Output>(
     begin_forced_containment(cancellation, post_stop_fence, process_guards);
     LeaseExecution::LeaseClockFailed {
         quiescent: process_guards.is_quiescent(),
+        error,
     }
 }
 
@@ -3492,6 +3716,83 @@ fn node_role(role: WorkflowNodeRole) -> &'static str {
     }
 }
 
+fn outbox_cause(error: OutboxFailure, terminal: bool) -> &'static str {
+    match (terminal, error) {
+        (false, OutboxFailure::Encoding) => "start_observation_encoding_failed",
+        (false, OutboxFailure::Capacity) => "start_observation_capacity_exceeded",
+        (false, OutboxFailure::Sequence) => "start_observation_sequence_exhausted",
+        (true, OutboxFailure::Encoding) => "terminal_observation_encoding_failed",
+        (true, OutboxFailure::Capacity) => "terminal_observation_capacity_exceeded",
+        (true, OutboxFailure::Sequence) => "terminal_observation_sequence_exhausted",
+    }
+}
+
+fn artifact_staging_cause(error: ArtifactStagingFailure) -> &'static str {
+    match error {
+        ArtifactStagingFailure::ExecutionRootUnavailable => "artifact_execution_root_unavailable",
+        ArtifactStagingFailure::StagingParentUnavailable => "artifact_staging_parent_unavailable",
+        ArtifactStagingFailure::StagingParentExposed => "artifact_staging_parent_exposed",
+        ArtifactStagingFailure::IdentityUnavailable => "artifact_staging_identity_unavailable",
+    }
+}
+
+fn input_staging_cause(error: InputStagingFailure) -> &'static str {
+    match error {
+        InputStagingFailure::ExecutionRootUnavailable => "input_execution_root_unavailable",
+        InputStagingFailure::StagingParentUnavailable => "input_staging_parent_unavailable",
+        InputStagingFailure::StagingParentExposed => "input_staging_parent_exposed",
+        InputStagingFailure::IdentityUnavailable => "input_staging_identity_unavailable",
+    }
+}
+
+fn agent_input_staging_cause(error: AgentInputStagingFailure) -> &'static str {
+    match error {
+        AgentInputStagingFailure::ExecutionRootUnavailable => {
+            "agent_input_execution_root_unavailable"
+        }
+        AgentInputStagingFailure::StagingParentUnavailable => {
+            "agent_input_staging_parent_unavailable"
+        }
+        AgentInputStagingFailure::StagingParentExposed => "agent_input_staging_parent_exposed",
+        AgentInputStagingFailure::IdentityUnavailable => "agent_input_staging_identity_unavailable",
+    }
+}
+
+fn diagnostic_open_cause(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "diagnostic_directory_missing",
+        std::io::ErrorKind::PermissionDenied => "diagnostic_directory_permission_denied",
+        _ => "diagnostic_directory_io_failure",
+    }
+}
+
+fn dispatcher_cause(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "agent_dispatcher_resource_missing",
+        std::io::ErrorKind::PermissionDenied => "agent_dispatcher_permission_denied",
+        std::io::ErrorKind::OutOfMemory => "agent_dispatcher_out_of_memory",
+        _ => "agent_dispatcher_io_failure",
+    }
+}
+
+fn coordination_cause(error: CoordinationError) -> &'static str {
+    match error {
+        CoordinationError::ArtifactStagingMismatch => "artifact_staging_mismatch",
+        CoordinationError::InputStagingMismatch => "input_staging_mismatch",
+        CoordinationError::AgentInputStagingMismatch => "agent_input_staging_mismatch",
+        CoordinationError::AgentRuntimeUnavailable => "agent_runtime_unavailable",
+        CoordinationError::CommitFailed => "coordination_commit_failed",
+        CoordinationError::OccurrenceChannelClosed => "occurrence_channel_closed",
+        CoordinationError::OccurrenceConflict => "occurrence_conflict",
+        CoordinationError::OccurrenceIdentityCapacityExceeded => {
+            "occurrence_identity_capacity_exceeded"
+        }
+        CoordinationError::OccurrenceOrdinalExhausted => "occurrence_ordinal_exhausted",
+        CoordinationError::ReducerStateUnavailable => "reducer_state_unavailable",
+        CoordinationError::TransitionCapacityExceeded => "transition_capacity_exceeded",
+    }
+}
+
 fn terminal_result_agrees(terminal: Option<&WorkflowState>, outcome: &RunOutcome) -> bool {
     match (terminal, outcome) {
         (Some(WorkflowState::Succeeded), RunOutcome::Succeeded) => true,
@@ -3689,6 +3990,130 @@ mod tests {
     };
     // jscpd:ignore-end
 
+    #[test]
+    fn typed_outbox_and_staging_causes_keep_the_failure_identity() {
+        for (error, suffix) in [
+            (OutboxFailure::Encoding, "encoding_failed"),
+            (OutboxFailure::Capacity, "capacity_exceeded"),
+            (OutboxFailure::Sequence, "sequence_exhausted"),
+        ] {
+            assert_eq!(
+                outbox_cause(error, false),
+                format!("start_observation_{suffix}")
+            );
+            assert_eq!(
+                outbox_cause(error, true),
+                format!("terminal_observation_{suffix}")
+            );
+        }
+        assert_eq!(
+            artifact_staging_cause(ArtifactStagingFailure::StagingParentExposed),
+            "artifact_staging_parent_exposed"
+        );
+        assert_eq!(
+            input_staging_cause(InputStagingFailure::IdentityUnavailable),
+            "input_staging_identity_unavailable"
+        );
+        assert_eq!(
+            agent_input_staging_cause(AgentInputStagingFailure::ExecutionRootUnavailable),
+            "agent_input_execution_root_unavailable"
+        );
+        let sentinel = "/private/sentinel/SECRET";
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, sentinel);
+        assert_eq!(
+            diagnostic_open_cause(&error),
+            "diagnostic_directory_permission_denied"
+        );
+    }
+
+    #[test]
+    fn collapse_causes_are_variant_based_and_ignore_error_text() {
+        let sentinel = "/private/sentinel/runner secret ERROR TEXT";
+        for (kind, expected) in [
+            (
+                std::io::ErrorKind::NotFound,
+                "agent_dispatcher_resource_missing",
+            ),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                "agent_dispatcher_permission_denied",
+            ),
+            (std::io::ErrorKind::Other, "agent_dispatcher_io_failure"),
+        ] {
+            let error = std::io::Error::new(kind, sentinel);
+            let cause = dispatcher_cause(&error);
+            assert_eq!(cause, expected);
+            assert!(!cause.contains(sentinel));
+        }
+        let cases = [
+            (
+                CoordinationError::ArtifactStagingMismatch,
+                "artifact_staging_mismatch",
+            ),
+            (
+                CoordinationError::InputStagingMismatch,
+                "input_staging_mismatch",
+            ),
+            (
+                CoordinationError::AgentInputStagingMismatch,
+                "agent_input_staging_mismatch",
+            ),
+            (
+                CoordinationError::AgentRuntimeUnavailable,
+                "agent_runtime_unavailable",
+            ),
+            (
+                CoordinationError::CommitFailed,
+                "coordination_commit_failed",
+            ),
+            (
+                CoordinationError::OccurrenceChannelClosed,
+                "occurrence_channel_closed",
+            ),
+            (CoordinationError::OccurrenceConflict, "occurrence_conflict"),
+            (
+                CoordinationError::OccurrenceIdentityCapacityExceeded,
+                "occurrence_identity_capacity_exceeded",
+            ),
+            (
+                CoordinationError::OccurrenceOrdinalExhausted,
+                "occurrence_ordinal_exhausted",
+            ),
+            (
+                CoordinationError::ReducerStateUnavailable,
+                "reducer_state_unavailable",
+            ),
+            (
+                CoordinationError::TransitionCapacityExceeded,
+                "transition_capacity_exceeded",
+            ),
+        ];
+        let (recorder, capture) = telemetry::test_recorder("rbt_fixture");
+        let event = recorder.start("runner.run", []);
+        event.set(KeyValue::new(
+            telemetry::attribute::FAILURE_CAUSE_TYPE,
+            dispatcher_cause(&std::io::Error::new(std::io::ErrorKind::NotFound, sentinel)),
+        ));
+        event.finish(telemetry::Outcome::Failure);
+        let encoded = serde_json::to_string(&capture.event("runner.run")).unwrap();
+        assert!(!encoded.contains(sentinel));
+        let span = capture
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "runner.run")
+            .unwrap();
+        assert_eq!(
+            span.attributes.iter().find(|attribute| attribute.key.as_str() == telemetry::attribute::FAILURE_CAUSE_TYPE).unwrap().value.to_string(),
+            "agent_dispatcher_resource_missing"
+        );
+
+        let mut slugs = BTreeSet::new();
+        for (error, expected) in cases {
+            assert_eq!(coordination_cause(error), expected);
+            assert!(slugs.insert(expected));
+        }
+    }
+
     fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {
         LeaseAuthority {
             sequence: 4,
@@ -3860,7 +4285,10 @@ mod tests {
     ) {
         assert!(matches!(
             lease_clock_failure_outcome(supervised.task).await,
-            LeaseExecution::LeaseClockFailed { quiescent: true }
+            LeaseExecution::LeaseClockFailed {
+                quiescent: true,
+                ..
+            }
         ));
         assert_forced_containment(
             &supervised.cancellation,

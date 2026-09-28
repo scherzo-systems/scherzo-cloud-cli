@@ -87,7 +87,10 @@ async fn unknown_artifact_observation_acknowledgement_does_not_consume_delivery(
     };
     manager
         .event_sender
-        .send(ManagerEvent::LeaseClockFailed)
+        .send(ManagerEvent::LeaseClockFailed {
+            assignment_id: "unused".to_owned(),
+            error: LeaseClockError::TimerWaitFailed,
+        })
         .unwrap();
     assert_eq!(
         manager.handle_artifact_response(observation_id + 1, delivery_id, failed_registration()),

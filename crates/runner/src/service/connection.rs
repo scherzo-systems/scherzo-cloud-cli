@@ -5016,7 +5016,12 @@ mod tests {
         assert_eq!(event["scherzo.runner.sequence"], 2);
         assert_eq!(event["scherzo.outcome"], "success");
         let encoded = serde_json::to_string(event).expect("encode effect event");
-        assert!(!encoded.contains("runner.run"));
+        // An effect acknowledgement does not itself claim an execution result.
+        assert!(
+            all_events
+                .iter()
+                .all(|event| event["event.name"] != "runner.run")
+        );
         assert!(!encoded.contains("accepted"));
         assert!(!encoded.contains("executed"));
         assert!(!encoded.contains("abcdefghijklmnopqrstuvwxyzABCDEFG-012345678"));
