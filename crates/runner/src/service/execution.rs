@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::ops::Add;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1316,6 +1318,24 @@ impl ExecutionJob {
                 Ok(prepared) => Some(prepared),
                 Err(error) => {
                     let (phase, kind, invariant) = error.diagnostic_codes();
+                    let private_root = self.accepted.root.private.path().to_path_buf();
+                    let retained = tokio::task::spawn_blocking(move || {
+                        retain_result_publication_failure(
+                            &private_root,
+                            &run.outcome,
+                            &run.steps,
+                            run.finalization.as_ref(),
+                            (phase, kind, invariant),
+                        )
+                    })
+                    .await;
+                    if !matches!(retained, Ok(Ok(()))) {
+                        self.record_preparation_failure(
+                            "diagnostic_retention",
+                            "diagnostic_retention_failed",
+                            Vec::new(),
+                        );
+                    }
                     let mut details = vec![
                         KeyValue::new(telemetry::attribute::ARTIFACT_PUBLICATION_PHASE, phase),
                         KeyValue::new(telemetry::attribute::ARTIFACT_PUBLICATION_KIND, kind),
@@ -3709,6 +3729,97 @@ fn workflow_issue(issue: &PrimaryIssue) -> Value {
     json!(issue)
 }
 
+// The portable result may reject inconsistent step metadata. Keep the original
+// failure and its bounded command diagnostic in the runner-private retained
+// workspace so that a second failure cannot erase the first one.
+fn retain_result_publication_failure(
+    private_root: &Path,
+    run_outcome: &RunOutcome,
+    steps: &[WorkflowRunStep],
+    finalization: Option<&WorkflowRunFinalization>,
+    publication: (&str, &str, Option<&str>),
+) -> std::io::Result<()> {
+    let (outcome, primary_issue) = match run_outcome {
+        RunOutcome::Succeeded => ("succeeded", None),
+        RunOutcome::Failed { primary_issue, .. } => ("failed", Some(workflow_issue(primary_issue))),
+        RunOutcome::Cancelled { .. } => ("cancelled", None),
+    };
+    let failed_node = primary_issue.as_ref().and_then(|issue| issue.get("node"));
+    let step = failed_node.and_then(|node| {
+        let id = node.get("id")?.as_str()?;
+        let role = node.get("role")?.as_str()?;
+        steps
+            .iter()
+            .chain(finalization.iter().flat_map(|summary| &summary.finalizers))
+            .find(|step| step.id == id && node_role(step.role) == role)
+    });
+    let command_output = step
+        .and_then(|step| step.command_output.as_ref())
+        .and_then(|diagnostic| command_output_v1(diagnostic).ok());
+    let record = json!({
+        "schemaVersion": 1,
+        "outcome": outcome,
+        "primaryIssue": primary_issue,
+        "publicationFailure": {
+            "phase": publication.0,
+            "kind": publication.1,
+            "invariant": publication.2,
+        },
+        "stepMetadata": steps.iter()
+            .chain(finalization.iter().flat_map(|summary| &summary.finalizers))
+            .map(|step| json!({
+                "id": step.id,
+                "role": node_role(step.role),
+                "state": run_step_state_name(&step.state),
+                "timingPresent": step.timing.is_some(),
+                "commandOutputPresent": step.command_output.is_some(),
+                "recoveryPresent": step.recovery.is_some(),
+                "invocationCount": step.invocations.len(),
+            }))
+            .collect::<Vec<_>>(),
+        "failedNode": step.map(|step| json!({
+            "id": step.id,
+            "role": node_role(step.role),
+            "kind": match step.kind {
+                WorkflowRunStepKind::Command => "cmd",
+                WorkflowRunStepKind::Agent => "agent",
+            },
+            "timingPresent": step.timing.is_some(),
+            "commandOutputPresent": step.command_output.is_some(),
+            "recovery": step.recovery,
+            "invocations": step.invocations,
+        })),
+        "failedCommandOutput": command_output,
+    });
+    let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+    let path = private_root.join("result-publication-failure.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()
+}
+
+fn run_step_state_name<Output>(state: &StepState<Output>) -> &'static str {
+    match state {
+        StepState::Pending => "pending",
+        StepState::Starting => "starting",
+        StepState::Running => "running",
+        StepState::CapturingOutputs => "capturing_outputs",
+        StepState::Recovering { .. } => "recovering",
+        StepState::Cancelling { .. } => "cancelling",
+        StepState::Succeeded { .. } => "succeeded",
+        StepState::Inherited { .. } => "inherited",
+        StepState::Failed { .. } => "failed",
+        StepState::Blocked { .. } => "blocked",
+        StepState::Skipped { .. } => "skipped",
+        StepState::NotRun { .. } => "not_run",
+        StepState::Cancelled { .. } => "cancelled",
+    }
+}
+
 fn node_role(role: WorkflowNodeRole) -> &'static str {
     match role {
         WorkflowNodeRole::Step => "step",
@@ -4945,6 +5056,75 @@ mod tests {
                     "prerequisites": [{"kind": "control", "node": "analyze"}]
                 },
             })
+        );
+    }
+
+    #[test]
+    fn invalid_result_publication_retains_the_original_command_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let private_root = tempfile::tempdir().unwrap();
+        let issue: PrimaryIssue = serde_json::from_value(json!({
+            "node": {"id": "finish", "role": "step"},
+            "state": "failed",
+            "detail": {
+                "phase": "execution",
+                "code": "command_exit",
+                "exitCode": 42,
+            },
+        }))
+        .unwrap();
+        let detail = serde_json::from_value(workflow_issue(&issue)["detail"].clone()).unwrap();
+        let diagnostic = StepDiagnostic::from_streams(
+            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
+            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(
+                b"publication failed".as_slice(),
+                0,
+                true,
+            ),
+        );
+        let step = WorkflowRunStep {
+            id: "finish".to_owned(),
+            role: WorkflowNodeRole::Step,
+            kind: WorkflowRunStepKind::Command,
+            failure_policy: FailurePolicy::Required,
+            state: StepState::Failed { detail },
+            timing: Some(WorkflowStepTiming {
+                started_at: OffsetDateTime::UNIX_EPOCH,
+                duration: Duration::from_millis(1),
+            }),
+            command_output: Some(diagnostic),
+            recovery: None,
+            invocations: Vec::new(),
+        };
+        retain_result_publication_failure(
+            private_root.path(),
+            &RunOutcome::Failed {
+                primary_issue: issue,
+                later_cancellation: None,
+            },
+            &[step],
+            None,
+            ("serialization", "invalid_run_result", Some("step_metadata")),
+        )
+        .unwrap();
+
+        let path = private_root.path().join("result-publication-failure.json");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["primaryIssue"]["node"]["id"], "finish");
+        assert_eq!(record["primaryIssue"]["detail"]["exitCode"], 42);
+        assert_eq!(record["publicationFailure"]["invariant"], "step_metadata");
+        assert_eq!(record["stepMetadata"][0]["state"], "failed");
+        let stderr = record["failedCommandOutput"]["stderr"]["data"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            BASE64_STANDARD.decode(stderr).unwrap(),
+            b"publication failed"
         );
     }
 }

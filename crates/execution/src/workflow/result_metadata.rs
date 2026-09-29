@@ -998,7 +998,6 @@ fn validate_step_recovery(
                 != invocation.target_execution.is_some()
             || parse_canonical_utc_timestamp(&invocation.started_at).is_none()
             || parse_canonical_utc_timestamp(&invocation.finished_at).is_none()
-            || !valid_invocation_duration(invocation)
             || invocation
                 .diagnostic_reference
                 .as_deref()
@@ -1212,16 +1211,6 @@ fn failure_detail_from_recovery(failure: &FailureV1) -> Option<FailureDetail> {
         serde_json::to_value(failure.phase).ok()?,
     );
     serde_json::from_value(Value::Object(cause)).ok()
-}
-
-fn valid_invocation_duration(invocation: &super::publication::RecoveryInvocationV1) -> bool {
-    let Some(started) = parse_canonical_utc_timestamp(&invocation.started_at) else {
-        return false;
-    };
-    let Some(finished) = parse_canonical_utc_timestamp(&invocation.finished_at) else {
-        return false;
-    };
-    u64::try_from((finished - started).whole_milliseconds()) == Ok(invocation.duration_milliseconds)
 }
 
 fn validate_handler_summary(

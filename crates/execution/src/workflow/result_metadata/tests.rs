@@ -813,6 +813,17 @@ fn recovered_result_fixture() -> Value {
 }
 
 #[test]
+fn recovery_duration_uses_monotonic_time_even_when_wall_clock_moves() {
+    let mut result = recovered_result_fixture();
+    // The runner records UTC timestamps and elapsed time from separate clocks.
+    result["steps"][0]["invocations"][0]["finishedAt"] = json!("2026-08-02T12:01:43.9Z");
+
+    let decoded = decode(&encode(&result)).unwrap();
+    assert_eq!(validate_with_invariant(&decoded), Ok(()));
+    assert_eq!(decoded.steps[0].invocations[0].duration_milliseconds, 100);
+}
+
+#[test]
 fn launch_failure_with_terminal_recovery_validates_for_publication() {
     for termination in ["gave_up", "handler_failed"] {
         let mut result = recovered_result_fixture();

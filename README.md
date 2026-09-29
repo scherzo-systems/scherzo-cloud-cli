@@ -1860,6 +1860,14 @@ their closed response code and `scherzo.protocol.request_message_id` for correla
 with protocol frame logs. These diagnostics exclude upload URLs, artifact contents,
 and raw errors.
 
+If a Cloud workflow result cannot be serialized for Artifact Set delivery, the
+runner retains `result-publication-failure.json` under that assignment's private
+run directory. It records the original workflow issue, structural step metadata,
+the publication failure code, and the failed command's bounded output when
+available. The file is mode `0600` and stays on the runner with the failed
+workspace; it is not a portable Artifact Set or a publication receipt. Command
+output may contain sensitive data, so inspect it only through operator access.
+
 ## Release policy
 
 `release.toml` schema 2 contains only static policy: the initial release is `0.1.0`, the
