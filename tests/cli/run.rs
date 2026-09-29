@@ -5046,9 +5046,12 @@ fn show_wait_bounds_expiring_and_rejected_credential_refresh() {
             });
             let mut requests = Vec::new();
             if !expiring {
-                requests.push(server.next_request());
+                requests.push(server.wait_for_request());
             }
-            requests.push(server.next_request());
+            // The request is the synchronization point; a wall-clock receive
+            // deadline can race the child scheduler before it reaches the
+            // refresh endpoint.
+            requests.push(server.wait_for_request());
             (invocation.join().unwrap(), requests)
         });
         server.release_paused_response();
