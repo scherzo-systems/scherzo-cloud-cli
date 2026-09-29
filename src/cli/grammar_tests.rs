@@ -1,4 +1,4 @@
-//! Structural CLI grammar ratchet. Paths, not rendered help, identify debt.
+//! Structural CLI grammar conformance. Paths, not rendered help, identify violations.
 use std::collections::{BTreeMap, BTreeSet};
 
 use clap::{Arg, ArgAction, Command, CommandFactory};
@@ -245,50 +245,15 @@ fn violations(root: &Command) -> BTreeSet<String> {
     failures
 }
 
-// A ratchet: entries must be unique, sorted, and observed. Each entry has one burn-down owner.
-const BASELINE: &[(&str, &str)] = &[];
-
-fn check_baseline(observed: &BTreeSet<String>, baseline: &[(&str, &str)]) -> Result<(), String> {
-    let mut allowed = BTreeSet::new();
-    let mut previous = None;
-    for &(id, owner) in baseline {
-        if previous.is_some_and(|last| last >= id) || !allowed.insert(id.to_owned()) {
-            return Err(format!("unordered-or-duplicate|{id}"));
-        }
-        let expected_owner = if id.starts_with("placeholder|") {
-            "LIV-2422"
-        } else if id.starts_with("leaf-token|") {
-            "LIV-2426"
-        } else if id.starts_with("confirmation|") || id.starts_with("option-help|yes|") {
-            "LIV-2427"
-        } else if id.starts_with("description|") {
-            "LIV-2428"
-        } else {
-            return Err(format!("unmapped-category|{id}"));
-        };
-        if owner != expected_owner {
-            return Err(format!("wrong-owner|{id}|{owner}"));
-        }
-        previous = Some(id);
-    }
-    let unexpected: Vec<_> = observed.difference(&allowed).collect();
-    let stale: Vec<_> = allowed.difference(observed).collect();
-    if unexpected.is_empty() && stale.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("unexpected: {unexpected:?}\nstale: {stale:?}"))
-    }
-}
-
 #[test]
-fn cli_grammar_conforms_with_mapped_debt() {
+fn cli_grammar_conforms() {
     let mut root = Cli::command();
     root.build();
     let observed = violations(&root);
     assert!(
-        check_baseline(&observed, BASELINE).is_ok(),
-        "{}",
-        check_baseline(&observed, BASELINE).unwrap_err()
+        observed.is_empty(),
+        "CLI grammar violations:\n{}",
+        observed.into_iter().collect::<Vec<_>>().join("\n")
     );
 }
 
@@ -836,31 +801,5 @@ fn parameterized_option_classes_are_isolated_but_ratchet_within_each_class() {
         violations(&streaming)
             .iter()
             .any(|id| id.starts_with("option-help|json:streaming-events"))
-    );
-}
-
-#[test]
-fn baseline_rejects_unexpected_stale_and_duplicate_ids() {
-    let observed = BTreeSet::from(["confirmation|entity remove".to_owned()]);
-    assert!(
-        check_baseline(&observed, &[])
-            .unwrap_err()
-            .contains("confirmation|entity remove")
-    );
-    assert!(
-        check_baseline(&observed, &[("confirmation|other remove", "LIV-2427")])
-            .unwrap_err()
-            .contains("stale")
-    );
-    assert_eq!(
-        check_baseline(
-            &observed,
-            &[
-                ("confirmation|entity remove", "LIV-2427"),
-                ("confirmation|entity remove", "LIV-2427")
-            ]
-        )
-        .unwrap_err(),
-        "unordered-or-duplicate|confirmation|entity remove"
     );
 }
