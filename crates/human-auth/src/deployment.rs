@@ -6,10 +6,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const PRODUCTION_API_URL: &str = "https://api.scherzo.dev";
-const PRODUCTION_ISSUER: &str = "https://auth.scherzo.dev/";
-const PRODUCTION_AUDIENCE: &str = "https://api.scherzo.dev";
-const PRODUCTION_CLIENT_ID: &str = "ly5kw9CZ8n0ntuMBeCoSFM4Sdj81tInx";
+const PRODUCTION_API_URL: &str = "https://api.usefulmachinery.com";
+const PRODUCTION_ISSUER: &str = "https://auth.usefulmachinery.com/";
+const PRODUCTION_AUDIENCE: &str = "https://api.usefulmachinery.com";
+const PRODUCTION_CLIENT_ID: &str = "4bLHkBx0rUaldAla2lKCABQ37C4BcxQM";
 
 const API_URL_VARIABLE: &str = "SCHERZO_CLOUD_API_URL";
 const ISSUER_VARIABLE: &str = "SCHERZO_CLOUD_AUTH_ISSUER";
