@@ -305,7 +305,7 @@ async fn fail_after_settlement(
     settlement
         .map_err(anyhow::Error::new)?
         .map_err(anyhow::Error::new)?;
-    super::run::diagnose(message)
+    Err(anyhow::anyhow!(message).into())
 }
 
 async fn reject_after_settlement(

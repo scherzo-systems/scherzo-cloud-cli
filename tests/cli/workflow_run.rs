@@ -4374,7 +4374,7 @@ fn invalid_local_input_fails_before_resolution_presentation_or_publication() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("InvalidUtf8"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("input is not valid UTF-8"));
     assert!(!destination.exists());
 }
 

@@ -50,7 +50,7 @@ impl Command {
             Ok(opened) => opened,
             Err(_) => {
                 signal_task.abort();
-                return super::run::diagnose("inspect local workflow retry state");
+                return Err(anyhow::anyhow!("inspect local workflow retry state").into());
             }
         };
         let pending = match opened {
@@ -93,7 +93,7 @@ impl Command {
             }
             Err(super::run::BlockingOperationError::WorkerUnavailable) => {
                 signal_task.abort();
-                return super::run::diagnose("prepare local workflow retry context");
+                return Err(anyhow::anyhow!("prepare local workflow retry context").into());
             }
         };
         if workflow.requires_git_capture() {
@@ -117,14 +117,14 @@ impl Command {
             }
             Err(super::run::BlockingOperationError::WorkerUnavailable) => {
                 signal_task.abort();
-                return super::run::diagnose("admit local workflow retry");
+                return Err(anyhow::anyhow!("admit local workflow retry").into());
             }
         };
         if workflow.source.source_root.to_str().is_none()
             || admitted.execution().root().to_str().is_none()
         {
             signal_task.abort();
-            return super::run::diagnose("prepare local workflow retry paths");
+            return Err(anyhow::anyhow!("prepare local workflow retry paths").into());
         }
 
         let reused_attempts = match pending.reused_execution_root_attempts(&admitted) {
@@ -138,7 +138,9 @@ impl Command {
             && let Err(error) = write_reuse_warning(admitted.execution().root(), &reused_attempts)
         {
             signal_task.abort();
-            return super::run::diagnose(format_args!("write workflow retry warning: {error}"));
+            return Err(anyhow::Error::new(error)
+                .context("write workflow retry warning")
+                .into());
         }
 
         let admitted_for_begin = admitted.clone();
@@ -155,7 +157,7 @@ impl Command {
                 }
                 Err(_) => {
                     signal_task.abort();
-                    return super::run::diagnose("commit local workflow retry attempt");
+                    return Err(anyhow::anyhow!("commit local workflow retry attempt").into());
                 }
             };
         super::run::execute_owned_attempt(

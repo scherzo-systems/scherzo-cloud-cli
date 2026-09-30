@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::error::Error;
 use std::ffi::OsString;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read};
 use std::ops::Add;
-use std::os::fd::AsFd as _;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -112,24 +113,22 @@ impl Command {
         })?;
         let presentation_config = self.presentation_config_with_input_plan(&input_plan);
         let cancellation = CancellationSource::new();
-        let signal_task = start_signal_observation(cancellation.clone(), UnixSignals::new()?);
+        let mut signal_task = AbortOnDrop(Some(start_signal_observation(
+            cancellation.clone(),
+            UnixSignals::new()?,
+        )));
 
-        let inputs = match acquire_inputs(&input_plan, &cancellation).await {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                signal_task.abort();
-                let failure = match cancellation.cancellation_reason() {
-                    Some(CancellationReason::UserRequest) => {
-                        super::super::CommandFailure::for_outcome(error, OutcomeClass::Interrupted)
-                    }
-                    Some(CancellationReason::TerminationRequest) => {
-                        super::super::CommandFailure::for_outcome(error, OutcomeClass::Terminated)
-                    }
-                    _ => error.into(),
-                };
-                return Err(failure);
-            }
-        };
+        let inputs = acquire_inputs(&input_plan, &cancellation)
+            .await
+            .map_err(|error| match cancellation.cancellation_reason() {
+                Some(CancellationReason::UserRequest) => {
+                    super::super::CommandFailure::for_outcome(error, OutcomeClass::Interrupted)
+                }
+                Some(CancellationReason::TerminationRequest) => {
+                    super::super::CommandFailure::for_outcome(error, OutcomeClass::Terminated)
+                }
+                _ => error.into(),
+            })?;
         let source_root = self.source.source_root.clone();
         let workflow_file = self.source.workflow_file.clone();
         let workflow =
@@ -138,14 +137,12 @@ impl Command {
             {
                 Ok(workflow) => workflow,
                 Err(BlockingOperationError::Operation(failure)) => {
-                    signal_task.abort();
                     return rejection_output(presentation_config, |output| {
                         output.render_resolution_rejection(&failure)
                     });
                 }
                 Err(BlockingOperationError::WorkerUnavailable) => {
-                    signal_task.abort();
-                    return diagnose("resolve local workflow definition");
+                    return Err(anyhow!("resolve local workflow definition").into());
                 }
             };
         let workflow_for_context = workflow.clone();
@@ -164,14 +161,12 @@ impl Command {
         {
             Ok(context) => context,
             Err(BlockingOperationError::Operation(failure)) => {
-                signal_task.abort();
                 return rejection_output(presentation_config, |output| {
                     output.render_agent_harness_installation_rejection(&workflow, &failure)
                 });
             }
             Err(BlockingOperationError::WorkerUnavailable) => {
-                signal_task.abort();
-                return diagnose("prepare local workflow execution context");
+                return Err(anyhow!("prepare local workflow execution context").into());
             }
         };
         let workflow_for_admission = workflow.clone();
@@ -182,47 +177,41 @@ impl Command {
         {
             Ok(admitted) => admitted,
             Err(BlockingOperationError::Operation(failure)) => {
-                signal_task.abort();
                 return rejection_output(presentation_config, |output| {
                     output.render_admission_rejection(&workflow, &failure)
                 });
             }
             Err(BlockingOperationError::WorkerUnavailable) => {
-                signal_task.abort();
-                return diagnose("admit local workflow");
+                return Err(anyhow!("admit local workflow").into());
             }
         };
 
         if workflow.source.source_root.to_str().is_none()
             || admitted.execution().root().to_str().is_none()
         {
-            signal_task.abort();
-            return diagnose(
-                "prepare local workflow paths: an authoritative path is not valid UTF-8",
-            );
+            return Err(anyhow!(
+                "prepare local workflow paths: an authoritative path is not valid UTF-8"
+            )
+            .into());
         }
         let run_directory = self.run_dir.clone();
         let admitted_for_creation = admitted.clone();
-        let owned_run = match tokio::task::spawn_blocking(move || {
+        let owned_run = tokio::task::spawn_blocking(move || {
             InitialLocalRun::create(&run_directory, &admitted_for_creation)
         })
         .await
         .map_err(anyhow::Error::new)
         .and_then(|result| result.map_err(anyhow::Error::new))
-        .with_context(|| format!("create workflow run {}", self.run_dir.display()))
-        {
-            Ok(run) => run,
-            Err(error) => {
-                signal_task.abort();
-                return Err(error.into());
-            }
-        };
+        .with_context(|| format!("create workflow run {}", self.run_dir.display()))?;
         execute_owned_attempt(
             workflow,
             admitted,
             owned_run,
             cancellation,
-            signal_task,
+            signal_task
+                .0
+                .take()
+                .ok_or_else(|| anyhow!("local workflow signal observation unavailable"))?,
             presentation_config,
             ExecutionLeaf::Run,
         )
@@ -338,6 +327,197 @@ where
     Ok(prepared)
 }
 
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+struct AttemptTeardown {
+    run: Option<LocalAttemptOwner>,
+    signal_task: Option<tokio::task::JoinHandle<()>>,
+    private_staging: Option<scherzo_cloud_execution::AttemptPrivateStaging>,
+    artifacts: Option<ArtifactStaging>,
+    inputs: Option<InputStaging>,
+    agents: Option<AgentInputStaging>,
+    host: Option<ActiveRunHost>,
+    execution_started: bool,
+    armed: bool,
+}
+
+impl AttemptTeardown {
+    fn new(run: LocalAttemptOwner, signal_task: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            run: Some(run),
+            signal_task: Some(signal_task),
+            private_staging: None,
+            artifacts: None,
+            inputs: None,
+            agents: None,
+            host: None,
+            execution_started: false,
+            armed: true,
+        }
+    }
+
+    fn run(&self) -> anyhow::Result<&LocalAttemptOwner> {
+        self.run
+            .as_ref()
+            .ok_or_else(|| anyhow!("local attempt ownership unavailable"))
+    }
+
+    fn host(&mut self) -> anyhow::Result<&mut ActiveRunHost> {
+        self.host
+            .as_mut()
+            .ok_or_else(|| anyhow!("local attempt presentation unavailable"))
+    }
+
+    fn disarm(&mut self) {
+        if let Some(signal_task) = self.signal_task.take() {
+            signal_task.abort();
+        }
+        self.armed = false;
+    }
+
+    async fn teardown(&mut self) {
+        if let Some(signal_task) = self.signal_task.take() {
+            signal_task.abort();
+        }
+        if !self.execution_started
+            && let Some(run) = self.run.as_ref()
+        {
+            settle_before_execution_failure(run).await;
+        }
+        let inputs = self.inputs.take();
+        let agents = self.agents.take();
+        let artifacts = self.artifacts.take();
+        let private_staging = self.private_staging.take();
+        let cleanup = blocking_operation(move || {
+            let staging_failed = match (inputs.as_ref(), artifacts.as_ref()) {
+                (Some(inputs), Some(artifacts)) => {
+                    release_execution_staging(inputs, agents.as_ref(), artifacts)
+                }
+                (None, Some(artifacts)) => artifacts.release().is_err(),
+                (Some(inputs), None) => inputs.release().is_err(),
+                (None, None) => false,
+            };
+            let agent_failed = if inputs.is_none() || artifacts.is_none() {
+                agents
+                    .as_ref()
+                    .is_some_and(|agents| agents.release().is_err())
+            } else {
+                false
+            };
+            Ok::<_, std::convert::Infallible>(
+                staging_failed
+                    | agent_failed
+                    | private_staging.is_some_and(|staging| staging.release().is_err()),
+            )
+        })
+        .await;
+        if let Some(run) = self.run.take() {
+            let cleanup_failed = !matches!(cleanup, Ok(false));
+            if let Ok(run) = blocking_operation(move || {
+                record_private_cleanup_failure(&run, cleanup_failed);
+                Ok::<_, std::convert::Infallible>(run)
+            })
+            .await
+            {
+                self.run = Some(run);
+            }
+        }
+        if let Some(host) = self.host.as_mut() {
+            host.stop_terminal().await;
+        }
+        self.disarm();
+    }
+}
+
+impl Drop for AttemptTeardown {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // A cancelled attempt cannot await its cleanup. Transfer the owned resources to
+        // a task; the same teardown ordering applies as for an ordinary phase failure.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let mut pending = Self {
+                run: self.run.take(),
+                signal_task: self.signal_task.take(),
+                private_staging: self.private_staging.take(),
+                artifacts: self.artifacts.take(),
+                inputs: self.inputs.take(),
+                agents: self.agents.take(),
+                host: self.host.take(),
+                execution_started: self.execution_started,
+                armed: false,
+            };
+            runtime.spawn(async move { pending.teardown().await });
+        } else if let Some(signal_task) = self.signal_task.take() {
+            signal_task.abort();
+            // The staging owners' Drop implementations are the last-resort cleanup
+            // when no executor remains to drive an asynchronous terminal shutdown.
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttemptCheckpoint {
+    ArtifactsStaged,
+    InputsStaged,
+    BeforeHostStart,
+    AfterHostStart,
+}
+
+struct AttemptSettings<Hooks> {
+    presentation_config: PresentationConfig,
+    leaf: ExecutionLeaf,
+    hooks: Hooks,
+}
+
+trait AttemptHooks {
+    fn checkpoint(&self, point: AttemptCheckpoint) -> anyhow::Result<()>;
+    fn start_terminal(
+        &self,
+        view: WorkflowRunViewModel<SystemObservationClock>,
+        cancellation: CancellationSource,
+        color: bool,
+    ) -> Result<WorkflowTerminalHost, PresentationFailure>;
+    fn execution_failure(&mut self) -> Option<CoordinationError>;
+}
+
+impl<Check, Start, Fail> AttemptHooks for (Check, Start, Fail)
+where
+    Check: Fn(AttemptCheckpoint) -> anyhow::Result<()>,
+    Start: Fn(
+        WorkflowRunViewModel<SystemObservationClock>,
+        CancellationSource,
+        bool,
+    ) -> Result<WorkflowTerminalHost, PresentationFailure>,
+    Fail: FnMut() -> Option<CoordinationError>,
+{
+    fn checkpoint(&self, point: AttemptCheckpoint) -> anyhow::Result<()> {
+        self.0(point)
+    }
+
+    fn start_terminal(
+        &self,
+        view: WorkflowRunViewModel<SystemObservationClock>,
+        cancellation: CancellationSource,
+        color: bool,
+    ) -> Result<WorkflowTerminalHost, PresentationFailure> {
+        self.1(view, cancellation, color)
+    }
+
+    fn execution_failure(&mut self) -> Option<CoordinationError> {
+        self.2()
+    }
+}
+
 pub(super) async fn execute_owned_attempt(
     workflow: ResolvedWorkflow,
     admitted: AdmittedWorkflow,
@@ -347,91 +527,104 @@ pub(super) async fn execute_owned_attempt(
     presentation_config: PresentationConfig,
     leaf: ExecutionLeaf,
 ) -> super::super::CommandResult {
-    let run_directory = match owned_run.run_directory().to_str() {
-        Some(path) => path.to_owned(),
-        None => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            return diagnose(
-                "prepare local workflow paths: an authoritative path is not valid UTF-8",
-            );
-        }
-    };
-    let destination = match prepare_attempt_result_destination(
-        owned_run.result_directory(),
-        owned_run.private_directory(),
-        owned_run.attempt_directory_handle(),
-        owned_run.private_directory_handle(),
-    ) {
-        Ok(destination) => destination,
-        Err(error) => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            return diagnose(error);
-        }
-    };
-    let private_staging = match owned_run.create_private_staging() {
-        Ok(staging) => staging,
-        Err(_) => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            return diagnose("prepare private local workflow staging");
-        }
-    };
-    let artifacts = match ArtifactStaging::create_bound(
-        admitted.execution(),
-        private_staging.path(),
-        private_staging.root_handle(),
-    ) {
-        Ok(artifacts) => artifacts,
-        Err(error) => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            return diagnose(error);
-        }
-    };
-    let inputs = match InputStaging::create_bound(
-        admitted.execution(),
-        private_staging.path(),
-        private_staging.root_handle(),
-    ) {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            let cleanup_failed = artifacts.release().is_err();
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            return diagnose(error);
-        }
-    };
+    execute_owned_attempt_with(
+        workflow,
+        admitted,
+        owned_run,
+        cancellation,
+        signal_task,
+        AttemptSettings {
+            presentation_config,
+            leaf,
+            hooks: (|_| Ok(()), WorkflowTerminalHost::start, || None),
+        },
+    )
+    .await
+}
+
+async fn execute_owned_attempt_with(
+    workflow: ResolvedWorkflow,
+    admitted: AdmittedWorkflow,
+    owned_run: LocalAttemptOwner,
+    cancellation: CancellationSource,
+    signal_task: tokio::task::JoinHandle<()>,
+    settings: AttemptSettings<impl AttemptHooks>,
+) -> super::super::CommandResult {
+    let mut attempt = AttemptTeardown::new(owned_run, signal_task);
+    let result =
+        execute_attempt_phases(&workflow, &admitted, &cancellation, &mut attempt, settings).await;
+    let result = result.unwrap_or_else(|error| Err(error.into()));
+    if result.is_err() {
+        attempt.teardown().await;
+    }
+    result
+}
+
+async fn execute_attempt_phases(
+    workflow: &ResolvedWorkflow,
+    admitted: &AdmittedWorkflow,
+    cancellation: &CancellationSource,
+    attempt: &mut AttemptTeardown,
+    settings: AttemptSettings<impl AttemptHooks>,
+) -> anyhow::Result<super::super::CommandResult> {
+    let AttemptSettings {
+        presentation_config,
+        leaf,
+        mut hooks,
+    } = settings;
+    let run_directory = attempt
+        .run()?
+        .run_directory()
+        .to_str()
+        .ok_or_else(|| {
+            anyhow!("prepare local workflow paths: an authoritative path is not valid UTF-8")
+        })?
+        .to_owned();
+    let destination = prepare_attempt_result_destination(
+        attempt.run()?.result_directory(),
+        attempt.run()?.private_directory(),
+        attempt.run()?.attempt_directory_handle(),
+        attempt.run()?.private_directory_handle(),
+    )?;
+    attempt.private_staging = Some(attempt.run()?.create_private_staging()?);
+    let staging = attempt
+        .private_staging
+        .as_ref()
+        .ok_or_else(|| anyhow!("prepare private local workflow staging"))?;
+    let artifacts =
+        ArtifactStaging::create_bound(admitted.execution(), staging.path(), staging.root_handle())?;
+    attempt.artifacts = Some(artifacts.clone());
+    hooks.checkpoint(AttemptCheckpoint::ArtifactsStaged)?;
+    let inputs =
+        InputStaging::create_bound(admitted.execution(), staging.path(), staging.root_handle())?;
+    attempt.inputs = Some(inputs.clone());
+    hooks.checkpoint(AttemptCheckpoint::InputsStaged)?;
     let agent_staging = if admitted.agent_steps().is_empty() {
         None
     } else {
-        match AgentInputStaging::create(admitted.execution(), private_staging.path()) {
-            Ok(staging) => Some(staging),
-            Err(error) => {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run).await;
-                let cleanup_failed = inputs.release().is_err() | artifacts.release().is_err();
-                record_private_cleanup_failure(&owned_run, cleanup_failed);
-                return diagnose(format_args!("prepare private local agent staging: {error}"));
-            }
-        }
+        Some(
+            AgentInputStaging::create(admitted.execution(), staging.path())
+                .map_err(anyhow::Error::new)
+                .context("prepare private local agent staging")?,
+        )
     };
+    attempt.agents = agent_staging.clone();
+    hooks.checkpoint(AttemptCheckpoint::BeforeHostStart)?;
 
     let run_clock = SystemObservationClock;
+    let run_for_output = attempt.run()?;
     let prepared =
         initialize_execution_presentation(run_clock, || match presentation_config.mode() {
             PresentationMode::Tui => {
                 let presentation_opened = run_clock.sample();
                 let timing_observation = RunTimingObservation::new(presentation_opened);
                 let view = WorkflowRunViewModel::new(
-                    &workflow,
+                    workflow,
                     admitted.execution().limits().maximum_parallel_steps().get(),
                     timing_observation.clone(),
                     run_clock,
                 );
-                let terminal = WorkflowTerminalHost::start(
+                let terminal = hooks.start_terminal(
                     view.clone(),
                     cancellation.clone(),
                     presentation_config.color_enabled(),
@@ -449,9 +642,9 @@ pub(super) async fn execute_owned_attempt(
                 })
             }
             PresentationMode::Plain | PresentationMode::Json => {
-                let output = execution_output(presentation_config, &owned_run, leaf);
+                let output = execution_output(presentation_config, run_for_output, leaf);
                 let presentation = output.start_for_result(
-                    &workflow,
+                    workflow,
                     &run_directory,
                     admitted.execution().limits().maximum_parallel_steps().get(),
                     run_clock,
@@ -469,35 +662,14 @@ pub(super) async fn execute_owned_attempt(
                     timing: timing_observation,
                 })
             }
-        });
-    let PreparedExecutionPresentation {
-        observer, mut host, ..
-    } = match prepared {
-        Ok(prepared) => prepared,
-        Err(failure) => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            let cleanup_failed =
-                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            return diagnose(failure);
-        }
-    };
+        })?;
+    let observer = prepared.observer;
+    attempt.host = Some(prepared.host);
+    attempt.host()?.await_ready().await?;
+    attempt.host()?.activate_execution()?;
+    hooks.checkpoint(AttemptCheckpoint::AfterHostStart)?;
 
-    if let Err(failure) = host
-        .await_ready()
-        .await
-        .and_then(|()| host.activate_execution())
-    {
-        signal_task.abort();
-        settle_before_execution_failure(&owned_run).await;
-        let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-        record_private_cleanup_failure(&owned_run, cleanup_failed);
-        host.stop_terminal().await;
-        return diagnose(failure);
-    }
-
-    if let ActiveRunHost::Standard(presentation) = &host {
+    if let Some(ActiveRunHost::Standard(presentation)) = attempt.host.as_ref() {
         let mut failures = presentation.subscribe_failures();
         let output_cancellation = cancellation.clone();
         tokio::spawn(async move {
@@ -513,43 +685,23 @@ pub(super) async fn execute_owned_attempt(
             }
         });
     }
-
     let agent_diagnostic_sessions = if agent_staging.is_some() {
-        match owned_run.create_agent_diagnostic_sessions() {
-            Ok(sessions) => Some(sessions),
-            Err(_) => {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run).await;
-                let cleanup_failed =
-                    release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                record_private_cleanup_failure(&owned_run, cleanup_failed);
-                host.stop_terminal().await;
-                return diagnose("prepare local agent diagnostic retention");
-            }
-        }
+        Some(attempt.run()?.create_agent_diagnostic_sessions()?)
     } else {
         None
     };
     let diagnostics = StepDiagnosticLog::default();
     let accounting = InvocationAccountingLog::default();
-    let agents = match (&agent_staging, agent_diagnostic_sessions) {
+    let agents = match (agent_staging.as_ref(), agent_diagnostic_sessions) {
         (Some(staging), Some(diagnostic_sessions)) => {
-            let maximum_log_bytes = admitted.execution().limits().maximum_step_log_bytes();
-            let Ok(dispatcher) = production_agent_dispatcher(
+            let dispatcher = production_agent_dispatcher(
                 diagnostics.clone(),
-                maximum_log_bytes,
+                admitted.execution().limits().maximum_step_log_bytes(),
                 SystemExecutionClock,
                 observer.clone(),
                 crate::build_info::VERSION,
-            ) else {
-                signal_task.abort();
-                settle_before_execution_failure(&owned_run).await;
-                let cleanup_failed =
-                    release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-                record_private_cleanup_failure(&owned_run, cleanup_failed);
-                host.stop_terminal().await;
-                return diagnose("prepare local agent runtimes");
-            };
+            )
+            .map_err(|error| anyhow!("prepare local agent runtimes: {error:?}"))?;
             AgentExecution::enabled_with_accounting(
                 WorkflowRunId::from(Arc::from(run_directory.as_str())),
                 staging.clone(),
@@ -559,86 +711,57 @@ pub(super) async fn execute_owned_attempt(
             )
         }
         (None, None) => AgentExecution::Disabled,
-        (Some(_), None) | (None, Some(_)) => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            let cleanup_failed =
-                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            host.stop_terminal().await;
-            return diagnose("prepare local agent diagnostic retention");
-        }
+        _ => return Err(anyhow!("prepare local agent diagnostic retention")),
     };
-    let seed = match owned_run
+    let seed = attempt
+        .run()?
         .execution_seed(admitted.clone(), artifacts.clone())
         .await
-    {
-        Ok(seed) => seed,
-        // Each pre-execution failure owns its diagnostic and terminal shutdown, while sharing
-        // the required settle-before-cleanup ordering with the adjacent preparation failures.
-        // jscpd:ignore-start
-        Err(error) => {
-            signal_task.abort();
-            settle_before_execution_failure(&owned_run).await;
-            let cleanup_failed =
-                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            host.stop_terminal().await;
-            return diagnose(format_args!("load retained workflow values: {error}"));
-        } // jscpd:ignore-end
+        .map_err(anyhow::Error::new)
+        .context("load retained workflow values")?;
+    let execution_start =
+        WorkflowExecutionStart::seeded(attempt.run()?.process_guard_registry(), seed);
+    attempt.execution_started = true;
+    let execution = if let Some(error) = hooks.execution_failure() {
+        Err(error)
+    } else {
+        execute_workflow(
+            admitted.clone(),
+            &artifacts,
+            &inputs,
+            &diagnostics,
+            agents,
+            SystemExecutionClock,
+            attempt
+                .run()?
+                .commit_port(diagnostics.clone(), accounting, artifacts.clone()),
+            observer.clone(),
+            execution_start,
+        )
+        .await
     };
-    let execution_start = WorkflowExecutionStart::seeded(owned_run.process_guard_registry(), seed);
-    let execution = execute_workflow(
-        admitted.clone(),
-        &artifacts,
-        &inputs,
-        &diagnostics,
-        agents,
-        SystemExecutionClock,
-        owned_run.commit_port(diagnostics.clone(), accounting, artifacts.clone()),
-        observer.clone(),
-        execution_start,
-    )
-    .await;
-    signal_task.abort();
-
+    if let Some(signal_task) = attempt.signal_task.take() {
+        signal_task.abort();
+    }
     let execution = match execution {
         Ok(execution) => execution,
         Err(error) => {
             if error == CoordinationError::CommitFailed {
-                let _ = owned_run.record_state_persistence_failure_async().await;
+                let _ = attempt
+                    .run()?
+                    .record_state_persistence_failure_async()
+                    .await;
             }
-            let cleanup_failed =
-                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            host.stop_terminal().await;
-            return diagnose(format_args!("execute admitted local workflow: {error:?}"));
+            return Err(anyhow!("execute admitted local workflow: {error:?}"));
         }
     };
-    let durable_invocations = match owned_run.durable_invocations() {
-        Ok(invocations) => invocations,
-        Err(error) => {
-            let cleanup_failed =
-                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            host.stop_terminal().await;
-            return diagnose(error);
-        }
-    };
+    let durable_invocations = attempt.run()?.durable_invocations()?;
     let observed_timing = observer.snapshot();
-    let run_timing = match observed_run_timing(&observed_timing) {
-        Some(timing) => timing,
-        None => {
-            let cleanup_failed =
-                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            host.stop_terminal().await;
-            return diagnose("prepare authoritative local workflow terminal result");
-        }
-    };
-    let run = match build_run_result(
-        &workflow,
-        &admitted,
+    let run_timing = observed_run_timing(&observed_timing)
+        .ok_or_else(|| anyhow!("prepare authoritative local workflow terminal result"))?;
+    let run = build_run_result(
+        workflow,
+        admitted,
         execution,
         LocalRunEvidence {
             diagnostics: &diagnostics,
@@ -646,27 +769,16 @@ pub(super) async fn execute_owned_attempt(
             timing: observed_timing,
         },
         run_timing,
-        &owned_run,
-    ) {
-        Ok(run) => run,
-        Err(error) => {
-            let cleanup_failed =
-                release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-            record_private_cleanup_failure(&owned_run, cleanup_failed);
-            host.stop_terminal().await;
-            return Err(error.into());
-        }
-    };
-    if let Err(error) = host.reconcile_and_mark_quiescent(&run) {
-        let cleanup_failed = release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
-        record_private_cleanup_failure(&owned_run, cleanup_failed);
-        host.stop_terminal().await;
-        return Err(error.into());
-    }
-
-    host.begin_publication();
+        attempt.run()?,
+    )?;
+    attempt.host()?.reconcile_and_mark_quiescent(&run)?;
+    attempt.host()?.begin_publication();
     let publication_run = run.clone();
     let publication_artifacts = artifacts.clone();
+    let owned_run = attempt
+        .run
+        .take()
+        .ok_or_else(|| anyhow!("local attempt ownership unavailable"))?;
     let (owned_run, publication, state_publication) = complete_blocking_phase(
         blocking_operation(move || {
             let mut publication = publish_prepared_workflow_result(
@@ -691,12 +803,21 @@ pub(super) async fn execute_owned_attempt(
             Ok::<_, std::convert::Infallible>((owned_run, publication, state_publication))
         })
         .await,
-        &mut host,
+        attempt.host()?,
         "publish terminal local workflow result",
     )
     .await?;
-    host.complete_publication(&publication);
-    host.begin_cleanup();
+    attempt.run = Some(owned_run);
+    attempt.host()?.complete_publication(&publication);
+    attempt.host()?.begin_cleanup();
+    let private_staging = attempt
+        .private_staging
+        .take()
+        .ok_or_else(|| anyhow!("private local workflow staging unavailable"))?;
+    let owned_run = attempt
+        .run
+        .take()
+        .ok_or_else(|| anyhow!("local attempt ownership unavailable"))?;
     let (cleanup_failed, cleanup_state, released_ownership) = complete_blocking_phase(
         blocking_operation(move || {
             let execution_staging_failed =
@@ -712,35 +833,39 @@ pub(super) async fn execute_owned_attempt(
             Ok::<_, std::convert::Infallible>((cleanup_failed, cleanup_state, released_ownership))
         })
         .await,
-        &mut host,
+        attempt.host()?,
         "release private local workflow staging",
     )
     .await?;
-    host.complete_cleanup(cleanup_failed);
+    attempt.host()?.complete_cleanup(cleanup_failed);
     let state_commit_failed = state_publication.is_err() || cleanup_state.is_err();
-
-    host.mark_adapter_lifecycle_completed(released_ownership);
-    host.finish(
-        &workflow,
-        &run,
-        &publication,
-        cleanup_failed,
-        state_commit_failed,
-    )
-    .await
+    attempt
+        .host()?
+        .mark_adapter_lifecycle_completed(released_ownership);
+    attempt.disarm();
+    Ok(attempt
+        .host()?
+        .finish(
+            workflow,
+            &run,
+            &publication,
+            cleanup_failed,
+            state_commit_failed,
+        )
+        .await)
 }
 
 async fn complete_blocking_phase<Value>(
     completion: Result<Value, BlockingOperationError<std::convert::Infallible>>,
     host: &mut ActiveRunHost,
     failure_context: &str,
-) -> Result<Value, super::super::CommandFailure> {
+) -> anyhow::Result<Value> {
     match completion {
         Ok(value) => Ok(value),
         Err(BlockingOperationError::Operation(never)) => match never {},
         Err(BlockingOperationError::WorkerUnavailable) => {
             host.stop_terminal().await;
-            Err(anyhow!(failure_context.to_owned()).into())
+            Err(anyhow!(failure_context.to_owned()))
         }
     }
 }
@@ -1090,7 +1215,7 @@ fn plan_inputs(
         insert_scalar_input(&mut values, name, PlannedInput::Attachments(Vec::new()))?;
     }
     if values.len() > MAXIMUM_INPUTS {
-        return Err(anyhow!("named input count exceeds 256"));
+        return Err(anyhow!("named input count exceeds {MAXIMUM_INPUTS}"));
     }
     Ok(InputPlan {
         values,
@@ -1286,7 +1411,7 @@ fn input_error(
         || format!("acquire local workflow input {name}"),
         |path| format!("acquire local workflow input {name} from {path:?}"),
     );
-    anyhow!("{kind:?}").context(context)
+    anyhow::Error::new(kind).context(context)
 }
 
 fn input_bytes_error() -> anyhow::Error {
@@ -1338,18 +1463,30 @@ async fn read_stdin_bounded(
     maximum: u64,
     cancellation: &CancellationSource,
 ) -> Result<Vec<u8>, InputAcquisitionFailureKind> {
-    let standard_input = io::stdin();
+    read_stdin_from(&io::stdin(), maximum, cancellation).await
+}
+
+async fn read_stdin_from(
+    standard_input: &impl AsFd,
+    maximum: u64,
+    cancellation: &CancellationSource,
+) -> Result<Vec<u8>, InputAcquisitionFailureKind> {
     let input = rustix::io::dup(standard_input.as_fd())
         .map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
     let original_flags =
-        fcntl_getfl(&standard_input).map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
-    fcntl_setfl(&standard_input, original_flags | OFlags::NONBLOCK)
+        fcntl_getfl(standard_input).map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
+    fcntl_setfl(standard_input, original_flags | OFlags::NONBLOCK)
         .map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
+    let flags = StdinFlags {
+        input: &standard_input,
+        original_flags,
+    };
     let input = File::from(input);
     let async_input = match AsyncFd::new(input) {
         Ok(input) => input,
         Err(_) => {
-            fcntl_setfl(&standard_input, original_flags)
+            flags
+                .restore()
                 .map_err(|_| InputAcquisitionFailureKind::Read)?;
             let input = rustix::io::dup(standard_input.as_fd())
                 .map_err(|_| InputAcquisitionFailureKind::Unavailable)?;
@@ -1390,8 +1527,27 @@ async fn read_stdin_bounded(
         }
     };
     drop(async_input);
-    fcntl_setfl(&standard_input, original_flags).map_err(|_| InputAcquisitionFailureKind::Read)?;
+    flags
+        .restore()
+        .map_err(|_| InputAcquisitionFailureKind::Read)?;
     result
+}
+
+struct StdinFlags<'a, T: AsFd> {
+    input: &'a T,
+    original_flags: OFlags,
+}
+
+impl<T: AsFd> StdinFlags<'_, T> {
+    fn restore(&self) -> rustix::io::Result<()> {
+        fcntl_setfl(self.input, self.original_flags)
+    }
+}
+
+impl<T: AsFd> Drop for StdinFlags<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 pub(super) struct UnixSignals {
@@ -2288,8 +2444,24 @@ pub(super) enum InputAcquisitionFailureKind {
     InvalidJson,
 }
 
-pub(super) fn diagnose(error: impl std::fmt::Display) -> super::super::CommandResult {
-    Err(anyhow!(error.to_string()).into())
+impl std::fmt::Display for InputAcquisitionFailureKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "input is unavailable",
+            Self::NotRegularFile => "input is not a regular file",
+            Self::Interrupted => "input acquisition was interrupted",
+            Self::Read => "input read unavailable",
+            Self::TooLarge => "input exceeds the byte limit",
+            Self::InvalidUtf8 => "input is not valid UTF-8",
+            Self::InvalidJson => "input is not valid JSON",
+        })
+    }
+}
+
+impl Error for InputAcquisitionFailureKind {}
+
+pub(super) fn diagnose(error: impl Error + Send + Sync + 'static) -> super::super::CommandResult {
+    Err(anyhow::Error::new(error).into())
 }
 
 #[cfg(test)]
@@ -2405,6 +2577,204 @@ mod tests {
 
     fn os_arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn typed_diagnostic_keeps_its_source_chain() {
+        #[derive(Debug)]
+        struct StageFailure(io::Error);
+        impl std::fmt::Display for StageFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("stage failed")
+            }
+        }
+        impl Error for StageFailure {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let result = diagnose(StageFailure(io::Error::other("underlying cause")));
+        let failure = result.err().unwrap();
+        assert_eq!(failure.error().chain().count(), 2);
+    }
+
+    struct RestoringBoundary(Arc<AtomicBool>);
+
+    impl scherzo_cloud_execution::TerminalBoundary for RestoringBoundary {
+        fn setup(&mut self) -> io::Result<scherzo_cloud_execution::TerminalRect> {
+            Ok(scherzo_cloud_execution::TerminalRect::new(0, 0, 120, 24))
+        }
+        async fn next_event(&mut self) -> io::Result<scherzo_cloud_execution::TerminalInputEvent> {
+            std::future::pending().await
+        }
+        fn resize(&mut self) -> io::Result<scherzo_cloud_execution::TerminalRect> {
+            Ok(scherzo_cloud_execution::TerminalRect::new(0, 0, 120, 24))
+        }
+        fn restore(&mut self) -> io::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl scherzo_cloud_execution::WorkflowTerminalBoundary for RestoringBoundary {
+        fn draw_workflow(
+            &mut self,
+            _snapshot: &scherzo_cloud_execution::WorkflowRunViewSnapshot,
+            _interaction: &mut scherzo_cloud_execution::HostInteraction,
+            _color: bool,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn private_staging_paths(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("workflow-")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn attempt_failure_releases_staging_and_restores_active_terminal() {
+        for (phase, target, start_host) in [
+            (
+                "after artifact staging",
+                Some(AttemptCheckpoint::ArtifactsStaged),
+                false,
+            ),
+            (
+                "after input staging",
+                Some(AttemptCheckpoint::InputsStaged),
+                false,
+            ),
+            (
+                "before host start",
+                Some(AttemptCheckpoint::BeforeHostStart),
+                false,
+            ),
+            (
+                "after host start",
+                Some(AttemptCheckpoint::AfterHostStart),
+                true,
+            ),
+            ("execution failure", None, true),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let execution_root = temporary.path().join("execution");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&execution_root).unwrap();
+            std::fs::write(
+                source.join("workflow.yaml"),
+                "schemaVersion: 1\nsteps:\n  task:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+            ).unwrap();
+            let workflow = resolve(&source, Path::new("workflow.yaml")).unwrap();
+            let admitted = admit_workflow(
+                workflow.clone(),
+                ResolvedInputs::default(),
+                execution_context_for_workflow(
+                    &workflow,
+                    execution_root,
+                    1,
+                    CancellationSource::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let run = InitialLocalRun::create(&temporary.path().join("run"), &admitted).unwrap();
+            let private_root = run.private_directory().to_owned();
+            let reached = Arc::new(AtomicBool::new(false));
+            let reached_checkpoint = reached.clone();
+            let reached_execution = reached.clone();
+            let private_at_checkpoint = private_root.clone();
+            let private_root_for_execution = private_root.clone();
+            let restored = Arc::new(AtomicBool::new(false));
+            let restored_for_terminal = restored.clone();
+            let result = execute_owned_attempt_with(
+                workflow,
+                admitted,
+                run,
+                CancellationSource::new(),
+                tokio::spawn(std::future::pending()),
+                AttemptSettings {
+                    presentation_config: PresentationConfig {
+                        requested_mode: RequestedPresentationMode::Automatic,
+                        color: ColorChoice::Never,
+                        capabilities: TerminalCapabilities {
+                            stdin_is_terminal: true,
+                            stdout_is_terminal: true,
+                            stderr_is_terminal: true,
+                            stdout_width: Some(120),
+                            stderr_width: Some(120),
+                            term: Some("xterm".into()),
+                            no_color: None,
+                        },
+                        standard_input_reserved: false,
+                    },
+                    leaf: ExecutionLeaf::Run,
+                    hooks: (
+                        move |point| {
+                            if Some(point) == target {
+                                assert_eq!(private_staging_paths(&private_at_checkpoint).len(), 1);
+                                reached_checkpoint.store(true, Ordering::SeqCst);
+                                anyhow::bail!("injected phase failure")
+                            }
+                            Ok(())
+                        },
+                        move |view, cancellation, color| {
+                            WorkflowTerminalHost::start_with_boundary(
+                                view,
+                                cancellation,
+                                color,
+                                RestoringBoundary(restored_for_terminal.clone()),
+                            )
+                        },
+                        || {
+                            // Return an execution error after ownership has entered the
+                            // execution phase, without depending on a real child process.
+                            if target.is_none() {
+                                assert_eq!(
+                                    private_staging_paths(&private_root_for_execution).len(),
+                                    1
+                                );
+                                reached_execution.store(true, Ordering::SeqCst);
+                                Some(CoordinationError::ReducerStateUnavailable)
+                            } else {
+                                None
+                            }
+                        },
+                    ),
+                },
+            )
+            .await;
+            assert!(reached.load(Ordering::SeqCst), "{phase} was not reached");
+            assert!(result.is_err(), "{phase} must fail");
+            assert!(private_staging_paths(&private_root).is_empty(), "{phase}");
+            assert_eq!(restored.load(Ordering::SeqCst), start_host, "{phase}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_stdin_read_restores_shared_file_description_flags() {
+        use std::future::Future as _;
+        use std::os::unix::net::UnixStream;
+        use std::task::{Context, Poll, Waker};
+
+        let (input, _writer) = UnixStream::pair().unwrap();
+        let original = fcntl_getfl(&input).unwrap();
+        let cancellation = CancellationSource::new();
+        let mut read = Box::pin(read_stdin_from(&input, 64, &cancellation));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(read.as_mut().poll(&mut context), Poll::Pending));
+        assert!(fcntl_getfl(&input).unwrap().contains(OFlags::NONBLOCK));
+        drop(read);
+        assert_eq!(fcntl_getfl(&input).unwrap(), original);
     }
 
     #[test]
