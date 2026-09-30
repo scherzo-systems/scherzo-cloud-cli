@@ -566,8 +566,7 @@ fn semantic_outputs_text_source_equivalence() {
 
     let json_backing = fixture.capture("result.json").unwrap();
     let retained_json_source = fixture.read(&json_backing);
-    let json_value =
-        Arc::new(scherzo_cloud_support::strict_json_from_slice(&retained_json_source).unwrap());
+    let json_value = Arc::new(um_support::strict_json_from_slice(&retained_json_source).unwrap());
     let canonical = canonical_json::to_bounded_bytes(&json_value, 128).unwrap();
     let schema = retained_json_schema();
     let path_json = CapturedJson::from_bounded_carrier(

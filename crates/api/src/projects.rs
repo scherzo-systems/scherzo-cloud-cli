@@ -629,7 +629,7 @@ fn retry_transport(
             UnreachableCategory::Connection | UnreachableCategory::Timeout
         )
     {
-        scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+        um_support::sleep(um_support::short_retry_delay());
         Ok(category)
     } else {
         Err(ProjectFailure::Unreachable(category))
@@ -790,16 +790,15 @@ fn validate_project(project: Project) -> Result<Project, ProjectFailure> {
         .zip(OffsetDateTime::parse(&project.updated_at, &Rfc3339).ok())
         .is_some_and(|(created, updated)| updated >= created);
     let pool_valid = project.runner_pool.as_deref().is_none_or(|pool| {
-        scherzo_cloud_support::valid_typed_id(&pool.id, "rpl_")
-            && valid_bounded_text(&pool.name, 1, 63)
+        um_support::valid_typed_id(&pool.id, "rpl_") && valid_bounded_text(&pool.name, 1, 63)
     });
     let repository_valid = project
         .repository
         .as_deref()
         .is_none_or(valid_repository_fields);
-    let valid = scherzo_cloud_support::valid_typed_id(&project.id, "prj_")
-        && scherzo_cloud_support::valid_typed_id(&project.organization_id, "org_")
-        && scherzo_cloud_support::valid_url_safe_name(&project.name)
+    let valid = um_support::valid_typed_id(&project.id, "prj_")
+        && um_support::valid_typed_id(&project.organization_id, "org_")
+        && um_support::valid_url_safe_name(&project.name)
         && pool_valid
         && repository_valid
         && project.execution_readiness.blockers == expected_blockers
@@ -821,8 +820,8 @@ fn validate_repository(repository: ProjectRepository) -> Result<ProjectRepositor
 }
 
 fn valid_repository_fields(repository: &ProjectRepository) -> bool {
-    scherzo_cloud_support::valid_typed_id(&repository.connection_id, "rpc_")
-        && scherzo_cloud_support::valid_typed_id(&repository.installation_binding_id, "ghi_")
+    um_support::valid_typed_id(&repository.connection_id, "rpc_")
+        && um_support::valid_typed_id(&repository.installation_binding_id, "ghi_")
         && valid_provider_id(&repository.provider_repository_id)
         && valid_bounded_text(&repository.full_name, 1, 255)
         && valid_bounded_text(&repository.default_branch, 1, 1024)
@@ -855,7 +854,7 @@ fn validate_repository_list(
 }
 
 fn valid_installation(installation: &models::GitHubInstallation) -> bool {
-    scherzo_cloud_support::valid_typed_id(&installation.id, "ghi_")
+    um_support::valid_typed_id(&installation.id, "ghi_")
         && valid_provider_id(&installation.provider_installation_id)
         && valid_provider_id(&installation.provider_account_id)
         && OffsetDateTime::parse(&installation.created_at, &Rfc3339).is_ok()

@@ -2,20 +2,20 @@ macro_rules! impl_organization_human_credential_outcome {
     ($($outcome:ty),+ $(,)?) => {
         $(
             impl super::HumanCredentialOutcome for $outcome {
-                type Error = scherzo_cloud_api::OrganizationError;
+                type Error = um_api::OrganizationError;
 
                 fn unauthenticated() -> Self {
-                    Self::Common(scherzo_cloud_api::CommonOrganizationFailure::Unauthenticated)
+                    Self::Common(um_api::CommonOrganizationFailure::Unauthenticated)
                 }
 
-                fn unreachable(category: scherzo_cloud_api::UnreachableCategory) -> Self {
-                    Self::Common(scherzo_cloud_api::CommonOrganizationFailure::Unreachable(category))
+                fn unreachable(category: um_api::UnreachableCategory) -> Self {
+                    Self::Common(um_api::CommonOrganizationFailure::Unreachable(category))
                 }
 
                 fn is_unauthenticated(&self) -> bool {
                     matches!(
                         self,
-                        Self::Common(scherzo_cloud_api::CommonOrganizationFailure::Unauthenticated)
+                        Self::Common(um_api::CommonOrganizationFailure::Unauthenticated)
                     )
                 }
 
@@ -67,12 +67,12 @@ use serde::Serialize;
 use self::entity::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::service_auth::{ServiceApiKey, read_api_key};
-use scherzo_cloud_api::{
+use um_api::{
     HttpClient, HttpTransportPolicy, MembershipRole, MembershipState, UnreachableCategory,
 };
-use scherzo_cloud_human_auth::Cancellation;
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_human_auth::RequiredOperation;
+use um_human_auth::Cancellation;
+use um_human_auth::Deployment;
+use um_human_auth::RequiredOperation;
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
@@ -604,15 +604,15 @@ impl Cli {
 }
 
 pub(crate) const fn unreachable_outcome_class(
-    category: scherzo_cloud_api::UnreachableCategory,
+    category: um_api::UnreachableCategory,
 ) -> OutcomeClass {
     match category {
-        scherzo_cloud_api::UnreachableCategory::RateLimited => OutcomeClass::RateLimited,
-        scherzo_cloud_api::UnreachableCategory::Dns
-        | scherzo_cloud_api::UnreachableCategory::Timeout
-        | scherzo_cloud_api::UnreachableCategory::Connection
-        | scherzo_cloud_api::UnreachableCategory::Tls
-        | scherzo_cloud_api::UnreachableCategory::Server => OutcomeClass::Unreachable,
+        um_api::UnreachableCategory::RateLimited => OutcomeClass::RateLimited,
+        um_api::UnreachableCategory::Dns
+        | um_api::UnreachableCategory::Timeout
+        | um_api::UnreachableCategory::Connection
+        | um_api::UnreachableCategory::Tls
+        | um_api::UnreachableCategory::Server => OutcomeClass::Unreachable,
     }
 }
 
@@ -833,7 +833,7 @@ fn execute_cancellable_with_signals(
 
 fn execute_cancellable_mutation_with_signals(
     context: &'static str,
-    operation: impl FnOnce(&scherzo_cloud_api::HttpCancellation, &OperationControl<()>) -> CommandResult
+    operation: impl FnOnce(&um_api::HttpCancellation, &OperationControl<()>) -> CommandResult
     + Send
     + 'static,
     interrupt_operation: impl FnOnce() -> bool + 'static,
@@ -841,7 +841,7 @@ fn execute_cancellable_mutation_with_signals(
 ) -> CommandResult {
     run_blocking_signal_runtime(context, async move {
         let mut signals = ProcessSignals::install(context)?;
-        let cancellation = scherzo_cloud_api::HttpCancellation::new();
+        let cancellation = um_api::HttpCancellation::new();
         let control = Arc::new(OperationControl::new(()));
         let operation_cancellation = cancellation.clone();
         let operation_control = Arc::clone(&control);
@@ -951,7 +951,7 @@ struct ObservationTimeout {
 impl ObservationTimeout {
     async fn wait(self) {
         match self.duration {
-            Some(duration) => scherzo_cloud_support::async_sleep(duration).await,
+            Some(duration) => um_support::async_sleep(duration).await,
             None => std::future::pending().await,
         }
     }
@@ -987,7 +987,7 @@ impl DeferredObservationTimeout {
         if self.started.await.is_err() {
             return std::future::pending().await;
         }
-        scherzo_cloud_support::async_sleep(duration).await;
+        um_support::async_sleep(duration).await;
     }
 }
 
@@ -1003,11 +1003,11 @@ struct SystemObservationClock;
 
 impl ObservationClock for SystemObservationClock {
     fn now(&self) -> Instant {
-        scherzo_cloud_support::monotonic_now()
+        um_support::monotonic_now()
     }
 
     fn sleep(&self, duration: Duration) {
-        scherzo_cloud_support::sleep(duration);
+        um_support::sleep(duration);
     }
 }
 
@@ -1537,7 +1537,7 @@ fn finish_read_only_operation(
 
 struct HumanApiOutcomeAdapters<O, E> {
     unauthenticated: fn() -> O,
-    unreachable: fn(scherzo_cloud_api::UnreachableCategory) -> O,
+    unreachable: fn(um_api::UnreachableCategory) -> O,
     operation_error: fn(E) -> anyhow::Error,
 }
 
@@ -1603,7 +1603,7 @@ fn execute_selected_api_observation<T, E>(
             Ok(Err(unreachable(UnreachableCategory::Timeout)))
         }
     } else {
-        match scherzo_cloud_human_auth::execute_required_until(
+        match um_human_auth::execute_required_until(
             context.client,
             context.deployment,
             |access_token, budget| operation(access_token.expose(), budget),
@@ -1629,7 +1629,7 @@ fn observation_http_budget(
 ) -> Result<Option<Duration>, UnreachableCategory> {
     match deadline {
         Some(end) => end
-            .checked_duration_since(scherzo_cloud_support::monotonic_now())
+            .checked_duration_since(um_support::monotonic_now())
             .filter(|duration| !duration.is_zero())
             .map(Some)
             .ok_or(UnreachableCategory::Timeout),
@@ -1668,7 +1668,7 @@ fn execute_required_api_operation_retrying_result<T, E>(
     unreachable: impl Fn(UnreachableCategory) -> E,
     session_context: &'static str,
 ) -> anyhow::Result<Result<T, E>> {
-    match scherzo_cloud_human_auth::execute_required(
+    match um_human_auth::execute_required(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
@@ -1684,14 +1684,14 @@ fn execute_required_api_operation_retrying_result<T, E>(
 }
 
 fn execute_human_api_operation<O, E>(
-    client: &scherzo_cloud_api::HttpClient,
+    client: &um_api::HttpClient,
     deployment: &Deployment,
     mut operation: impl FnMut(&str) -> Result<O, E>,
     credential_rejected: impl Fn(&Result<O, E>) -> bool,
     adapters: HumanApiOutcomeAdapters<O, E>,
     api_context: String,
 ) -> anyhow::Result<O> {
-    match scherzo_cloud_human_auth::execute_required(
+    match um_human_auth::execute_required(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
@@ -1843,7 +1843,7 @@ mod tests {
 
     use super::{Cli, parse, unreachable_outcome_class};
     use crate::exit_code::{ExitCode, OutcomeClass};
-    use scherzo_cloud_api::UnreachableCategory;
+    use um_api::UnreachableCategory;
 
     #[test]
     fn completion_and_cancellation_each_win_one_controlled_output_race() {
@@ -1932,7 +1932,7 @@ mod tests {
         use super::observation_test_support::ControlledObservationClock;
         use std::time::Duration;
 
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
         let clock = ControlledObservationClock::new(started);
         let control = super::OperationControl::new(());
         // The timeout wins after observation starts, before its first GET is admitted.
@@ -1972,7 +1972,7 @@ mod tests {
             }
         }
 
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
         let control = Arc::new(super::OperationControl::new(()));
         let (at_boundary, reached) = mpsc::channel();
         let (resume, continue_read) = mpsc::channel();
@@ -2011,7 +2011,7 @@ mod tests {
         use std::time::Duration;
 
         for signal_after_get in [false, true] {
-            let started = scherzo_cloud_support::monotonic_now();
+            let started = um_support::monotonic_now();
             let clock = ControlledObservationClock::new(started);
             let control = super::OperationControl::new(());
             let mut requests = Vec::new();
@@ -2101,8 +2101,7 @@ mod tests {
             "cli::tests::nested_workflow_fixture_process".to_owned(),
             "--nocapture".to_owned(),
         ];
-        scherzo_cloud_runner::run_nested_workflow_delivery_failure_fixture(&fixture_arguments)
-            .unwrap();
+        um_runner::run_nested_workflow_delivery_failure_fixture(&fixture_arguments).unwrap();
     }
 
     #[test]

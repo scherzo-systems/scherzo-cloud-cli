@@ -383,13 +383,13 @@ impl TryFrom<models::Invitation> for Invitation {
     type Error = &'static str;
 
     fn try_from(value: models::Invitation) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&value.id, "inv_") {
+        if !um_support::valid_typed_id(&value.id, "inv_") {
             return Err("the invitation ID is invalid");
         }
-        if !scherzo_cloud_support::valid_typed_id(&value.organization_id, "org_") {
+        if !um_support::valid_typed_id(&value.organization_id, "org_") {
             return Err("the invitation organization ID is invalid");
         }
-        if !scherzo_cloud_support::valid_typed_id(&value.issuer_principal_id, "prn_") {
+        if !um_support::valid_typed_id(&value.issuer_principal_id, "prn_") {
             return Err("the invitation issuer principal ID is invalid");
         }
         parse_timestamp(&value.issued_at, "the invitation issue time is invalid")?;
@@ -407,7 +407,7 @@ impl TryFrom<models::Invitation> for Invitation {
         .into_iter()
         .flatten()
         {
-            if !scherzo_cloud_support::valid_typed_id(related_id, "inv_") {
+            if !um_support::valid_typed_id(related_id, "inv_") {
                 return Err("an invitation replacement ID is invalid");
             }
         }
@@ -428,7 +428,7 @@ impl TryFrom<models::Invitation> for Invitation {
                 value
                     .target_principal_id
                     .as_deref()
-                    .is_some_and(|id| scherzo_cloud_support::valid_typed_id(id, "prn_"))
+                    .is_some_and(|id| um_support::valid_typed_id(id, "prn_"))
                     && value.target_email.is_none()
             }
             (InvitationState::Outstanding, InvitationTargetKind::Email) => {
@@ -486,11 +486,11 @@ impl TryFrom<models::InvitationInboxEntry> for InvitationInboxEntry {
     type Error = &'static str;
 
     fn try_from(value: models::InvitationInboxEntry) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&value.id, "inv_")
-            || !scherzo_cloud_support::valid_typed_id(&value.organization_id, "org_")
-            || !scherzo_cloud_support::valid_typed_id(&value.issuer_principal_id, "prn_")
+        if !um_support::valid_typed_id(&value.id, "inv_")
+            || !um_support::valid_typed_id(&value.organization_id, "org_")
+            || !um_support::valid_typed_id(&value.issuer_principal_id, "prn_")
             || !valid_bounded_text(&value.organization_display_name, 1, 200)
-            || !scherzo_cloud_support::valid_url_safe_name(&value.organization_slug)
+            || !um_support::valid_url_safe_name(&value.organization_slug)
         {
             return Err("the invitation inbox entry is invalid");
         }
@@ -513,10 +513,10 @@ impl TryFrom<models::InvitationPreview> for InvitationPreview {
     type Error = &'static str;
 
     fn try_from(value: models::InvitationPreview) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&value.id, "inv_")
-            || !scherzo_cloud_support::valid_typed_id(&value.organization_id, "org_")
+        if !um_support::valid_typed_id(&value.id, "inv_")
+            || !um_support::valid_typed_id(&value.organization_id, "org_")
             || !valid_bounded_text(&value.organization_display_name, 1, 200)
-            || !scherzo_cloud_support::valid_url_safe_name(&value.organization_slug)
+            || !um_support::valid_url_safe_name(&value.organization_slug)
         {
             return Err("the invitation preview is invalid");
         }
@@ -544,9 +544,9 @@ impl TryFrom<models::AcceptedInvitationMembership> for AcceptedInvitationMembers
     type Error = &'static str;
 
     fn try_from(value: models::AcceptedInvitationMembership) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&value.id, "mem_")
-            || !scherzo_cloud_support::valid_typed_id(&value.organization_id, "org_")
-            || !scherzo_cloud_support::valid_typed_id(&value.principal_id, "prn_")
+        if !um_support::valid_typed_id(&value.id, "mem_")
+            || !um_support::valid_typed_id(&value.organization_id, "org_")
+            || !um_support::valid_typed_id(&value.principal_id, "prn_")
         {
             return Err("the accepted invitation membership is invalid");
         }
@@ -592,10 +592,10 @@ impl TryFrom<models::CurrentPrincipalMembershipEntry> for CurrentPrincipalMember
     type Error = &'static str;
 
     fn try_from(value: models::CurrentPrincipalMembershipEntry) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&value.id, "mem_") {
+        if !um_support::valid_typed_id(&value.id, "mem_") {
             return Err("the current-principal membership ID is invalid");
         }
-        if !scherzo_cloud_support::valid_typed_id(&value.organization_id, "org_") {
+        if !um_support::valid_typed_id(&value.organization_id, "org_") {
             return Err("the current-principal membership organization ID is invalid");
         }
 
@@ -628,8 +628,7 @@ impl TryFrom<models::CurrentPrincipalMembershipEntry> for CurrentPrincipalMember
             value.organization_slug.as_deref(),
         ) {
             (true, Some(name), Some(slug))
-                if valid_bounded_text(name, 1, 200)
-                    && scherzo_cloud_support::valid_url_safe_name(slug) => {}
+                if valid_bounded_text(name, 1, 200) && um_support::valid_url_safe_name(slug) => {}
             (true, _, _) => {
                 return Err("an active membership is missing its organization profile");
             }
@@ -744,13 +743,13 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
     type Error = &'static str;
 
     fn try_from(value: models::OrganizationMembershipHistoryEntry) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&value.id, "mem_") {
+        if !um_support::valid_typed_id(&value.id, "mem_") {
             return Err("the organization membership history ID is invalid");
         }
-        if !scherzo_cloud_support::valid_typed_id(&value.organization_id, "org_") {
+        if !um_support::valid_typed_id(&value.organization_id, "org_") {
             return Err("the organization membership history organization ID is invalid");
         }
-        if !scherzo_cloud_support::valid_typed_id(&value.principal_id, "prn_") {
+        if !um_support::valid_typed_id(&value.principal_id, "prn_") {
             return Err("the organization membership history principal ID is invalid");
         }
         if value
@@ -854,7 +853,7 @@ impl TryFrom<models::OrganizationAuditRecord> for OrganizationAuditRecord {
                 if details
                     .delegating_principal_id
                     .as_deref()
-                    .is_some_and(|id| !scherzo_cloud_support::valid_typed_id(id, "prn_"))
+                    .is_some_and(|id| !um_support::valid_typed_id(id, "prn_"))
                 {
                     return Err("the organization audit delegating principal ID is invalid");
                 }
@@ -914,12 +913,12 @@ impl TryFrom<models::AuditActor> for AuditActor {
     fn try_from(value: models::AuditActor) -> Result<Self, Self::Error> {
         match (value.kind, value.principal_id, value.runner_id) {
             (models::audit_actor::Kind::Principal, Some(principal_id), None)
-                if scherzo_cloud_support::valid_typed_id(&principal_id, "prn_") =>
+                if um_support::valid_typed_id(&principal_id, "prn_") =>
             {
                 Ok(Self::Principal { principal_id })
             }
             (models::audit_actor::Kind::Runner, None, Some(runner_id))
-                if scherzo_cloud_support::valid_typed_id(&runner_id, "rnr_") =>
+                if um_support::valid_typed_id(&runner_id, "rnr_") =>
             {
                 Ok(Self::Runner { runner_id })
             }
@@ -963,7 +962,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             }
             Kind::Assignment => (OrganizationAuditSubjectKind::Assignment, "asn_"),
         };
-        if !scherzo_cloud_support::valid_typed_id(&value.id, prefix) {
+        if !um_support::valid_typed_id(&value.id, prefix) {
             return Err("the organization audit subject is invalid");
         }
         Ok(Self { kind, id: value.id })
@@ -1030,7 +1029,7 @@ impl TryFrom<models::AuditProjectionWarning> for AuditProjectionWarning {
     type Error = &'static str;
 
     fn try_from(value: models::AuditProjectionWarning) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&value.record_id, "aud_") {
+        if !um_support::valid_typed_id(&value.record_id, "aud_") {
             return Err("the organization audit warning record ID is invalid");
         }
         Ok(Self {
@@ -1048,7 +1047,7 @@ impl TryFrom<models::AuditProjectionWarning> for AuditProjectionWarning {
 }
 
 fn validate_audit_record_metadata(id: &str, occurred_at: &str) -> Result<(), &'static str> {
-    if !scherzo_cloud_support::valid_typed_id(id, "aud_") {
+    if !um_support::valid_typed_id(id, "aud_") {
         return Err("the organization audit record ID is invalid");
     }
     parse_timestamp(
@@ -1059,7 +1058,7 @@ fn validate_audit_record_metadata(id: &str, occurred_at: &str) -> Result<(), &'s
 }
 
 fn valid_audit_retention_identifier(value: &str) -> bool {
-    scherzo_cloud_support::valid_lowercase_hyphenated(value, 64)
+    um_support::valid_lowercase_hyphenated(value, 64)
 }
 
 fn convert_page<T, U>(

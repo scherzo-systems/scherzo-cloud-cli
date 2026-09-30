@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_execution::{
+use um_execution::{
     ColorChoice, LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot,
     LocalStatusError, LocalStatusResult, PresentationConfig, RequestedPresentationMode,
     RetryIneligibilityReason, TerminalCapabilities, load_local_archived_attempt,

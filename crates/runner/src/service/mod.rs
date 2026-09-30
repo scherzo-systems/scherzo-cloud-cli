@@ -42,7 +42,7 @@ use connection::{
 };
 use control::{ControlServer, ControlServerError, ControlTimeouts, LiveStatus, ReloadRequest};
 use lease_clock::{LeaseClock, LeaseClockError};
-use scherzo_cloud_execution::MAXIMUM_CANCELLATION_GRACE;
+use um_execution::MAXIMUM_CANCELLATION_GRACE;
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type ConnectionFuture<'a> =
@@ -144,7 +144,7 @@ impl Sleeper for TokioSleeper {
     }
 
     fn utc_now(&self) -> time::OffsetDateTime {
-        scherzo_cloud_support::utc_now()
+        um_support::utc_now()
     }
 
     #[expect(
@@ -1572,7 +1572,7 @@ mod tests {
     use crate::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
     use crate::service::config::RepositoryUrlPolicy;
     use crate::telemetry::{TestCapture, test_recorder};
-    use scherzo_cloud_execution::resolve;
+    use um_execution::resolve;
 
     #[test]
     fn recovery_required_failures_are_closed_to_work_root_ownership() {
@@ -2666,7 +2666,7 @@ mod tests {
     }
 
     fn fixture_git(repository: &Path, arguments: &[&str]) -> String {
-        let output = scherzo_cloud_test_support::fixture_git_command("git")
+        let output = um_test_support::fixture_git_command("git")
             .current_dir(repository)
             .args(arguments)
             .output()

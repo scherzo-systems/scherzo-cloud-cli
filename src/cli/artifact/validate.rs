@@ -10,7 +10,7 @@ use serde::Serialize;
 // jscpd:ignore-end
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_execution::{
+use um_execution::{
     ArtifactDiagnostic, ArtifactValidationSummary, PortableArtifactValidation,
     PortableArtifactValidationFailure, validate_portable_artifact_set, visible_text,
 };

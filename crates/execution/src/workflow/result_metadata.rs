@@ -6,7 +6,7 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use scherzo_cloud_support::valid_typed_id;
+use um_support::valid_typed_id;
 
 use super::MAXIMUM_PARALLEL_STEPS;
 use super::document::FailurePolicy;

@@ -197,17 +197,17 @@ impl CommandRunner for SystemCommandRunner {
         let stdout_thread =
             thread::spawn(move || drain_stdout(stdout, command.maximum_stdout_bytes));
         let stderr_thread = thread::spawn(move || drain(stderr));
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
 
         let success = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
-                Ok(None) if scherzo_cloud_support::elapsed(started) >= command.timeout => {
+                Ok(None) if um_support::elapsed(started) >= command.timeout => {
                     child.terminate();
                     let _ = join_readers(stdout_thread, stderr_thread);
                     return Err(CommandProbeError::Timeout);
                 }
-                Ok(None) => scherzo_cloud_support::sleep(WAIT_POLL_INTERVAL),
+                Ok(None) => um_support::sleep(WAIT_POLL_INTERVAL),
                 Err(_) => {
                     child.terminate();
                     let _ = join_readers(stdout_thread, stderr_thread);

@@ -272,7 +272,7 @@ fn valid_api_key(value: &str) -> bool {
         return false;
     };
     if secret.contains('.')
-        || !scherzo_cloud_support::valid_typed_id(credential_id, "crd_")
+        || !um_support::valid_typed_id(credential_id, "crd_")
         || secret.len() != 43
     {
         return false;

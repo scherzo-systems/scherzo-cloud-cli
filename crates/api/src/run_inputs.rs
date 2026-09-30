@@ -347,7 +347,7 @@ impl RunApi<'_> {
                     }
                     Ok(())
                 },
-                scherzo_cloud_support::utc_now,
+                um_support::utc_now,
                 || RunFailure::Unreachable(UnreachableCategory::Server),
             )?;
         }
@@ -751,8 +751,8 @@ fn decode_closed_model<T: DeserializeOwned>(
     body: &[u8],
     shape_is_valid: impl FnOnce(&serde_json::Value) -> bool,
 ) -> Result<T, RunFailure> {
-    let value = scherzo_cloud_support::strict_json_from_slice(body)
-        .map_err(|_| RunFailure::protocol(false))?;
+    let value =
+        um_support::strict_json_from_slice(body).map_err(|_| RunFailure::protocol(false))?;
     if !shape_is_valid(&value) {
         return Err(RunFailure::protocol(false));
     }
@@ -961,9 +961,9 @@ fn validate_input_set(
     let objects = &metrics.objects;
     let created_at = parse_timestamp(&set.created_at);
     let open_deadline_at = parse_timestamp(&set.open_deadline_at);
-    let immutable_valid = scherzo_cloud_support::valid_typed_id(&set.id, "ris_")
-        && scherzo_cloud_support::valid_typed_id(&set.organization_id, "org_")
-        && scherzo_cloud_support::valid_typed_id(&set.project_id, "prj_")
+    let immutable_valid = um_support::valid_typed_id(&set.id, "ris_")
+        && um_support::valid_typed_id(&set.organization_id, "org_")
+        && um_support::valid_typed_id(&set.project_id, "prj_")
         && expected_project.is_none_or(|project| project == set.project_id)
         && expected_manifest.is_none_or(|expected| expected == &manifest)
         && set.bounds_profile == 1
@@ -1033,7 +1033,7 @@ fn validate_retained_inputs(inventory: &RetainedRunInputs) -> Result<RunInputMan
     let metrics = manifest_metrics(&manifest).ok_or_else(|| RunFailure::protocol(false))?;
     let sealed_at = parse_timestamp(&inventory.sealed_at);
     let content_expires_at = inventory.content_expires_at.as_deref().map(parse_timestamp);
-    let valid = scherzo_cloud_support::valid_typed_id(&inventory.input_set_id, "ris_")
+    let valid = um_support::valid_typed_id(&inventory.input_set_id, "ris_")
         && inventory.manifest_digest.algorithm
             == models::run_input_digest::Algorithm::RunInputDigestAlgorithmSha256
         && inventory.manifest_digest.value == lowercase_hex(manifest.digest())
@@ -1088,7 +1088,7 @@ fn validated_manifest(wire: &models::RunInputManifestV1) -> Option<RunInputManif
     let mut attachment_count = 0_usize;
     let mut inputs = BTreeMap::new();
     for (name, input) in &wire.inputs {
-        if !scherzo_cloud_support::is_identifier(name) {
+        if !um_support::is_identifier(name) {
             return None;
         }
         let metadata = match input {
@@ -1116,9 +1116,7 @@ fn validated_manifest(wire: &models::RunInputManifestV1) -> Option<RunInputManif
                 let mut items = Vec::with_capacity(collection.items.len());
                 for (index, item) in collection.items.iter().enumerate() {
                     if usize::try_from(item.index).ok() != Some(index)
-                        || !scherzo_cloud_support::is_valid_input_display_name(
-                            item.display_name.as_deref(),
-                        )
+                        || !um_support::is_valid_input_display_name(item.display_name.as_deref())
                     {
                         return None;
                     }
@@ -1163,7 +1161,7 @@ fn file_metadata(
     maximum: u64,
 ) -> Option<InputFileMetadata> {
     let scalar = scalar_metadata(size, sha256, maximum)?;
-    if !scherzo_cloud_support::is_valid_media_type(media_type) {
+    if !um_support::is_valid_media_type(media_type) {
         return None;
     }
     Some(InputFileMetadata {
@@ -1428,11 +1426,11 @@ pub fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
 }
 
 pub(crate) fn lowercase_hex(bytes: [u8; 32]) -> String {
-    scherzo_cloud_support::lowercase_hex(&bytes)
+    um_support::lowercase_hex(&bytes)
 }
 
 fn decode_sha256(value: &str) -> Option<[u8; 32]> {
-    if !scherzo_cloud_support::is_lowercase_hex(value, 64) {
+    if !um_support::is_lowercase_hex(value, 64) {
         return None;
     }
     let mut decoded = [0_u8; 32];

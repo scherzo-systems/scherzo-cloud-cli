@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use super::HttpTransportPolicy;
 use super::artifacts::*;
-use scherzo_cloud_test_support::ScriptedHttpServer;
+use um_test_support::ScriptedHttpServer;
 
 fn http_response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
     let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());

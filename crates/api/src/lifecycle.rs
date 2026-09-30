@@ -409,7 +409,7 @@ fn execute_request(
             Err(_) => last_failure = UnreachableCategory::Timeout,
         }
         if attempt + 1 < MUTATION_ATTEMPTS {
-            scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+            um_support::sleep(um_support::short_retry_delay());
         }
     }
     // jscpd:ignore-end
@@ -789,7 +789,7 @@ fn valid_resource_id(id: &str, kind: LifecycleResourceKind) -> bool {
         LifecycleResourceKind::Principal => "prn_",
         LifecycleResourceKind::Organization => "org_",
     };
-    scherzo_cloud_support::valid_typed_id(id, prefix)
+    um_support::valid_typed_id(id, prefix)
 }
 
 fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {

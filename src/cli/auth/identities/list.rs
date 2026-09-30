@@ -1,8 +1,8 @@
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::list_identities;
-use scherzo_cloud_human_auth::Deployment;
+use um_api::list_identities;
+use um_human_auth::Deployment;
 
 use super::{OutputOptions, output, with_principal_credential};
 use crate::cli::PaginationArgs;

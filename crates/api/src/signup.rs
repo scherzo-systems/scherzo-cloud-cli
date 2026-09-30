@@ -153,7 +153,7 @@ fn signup_human_with_timeout(
             }
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+            um_support::sleep(um_support::short_retry_delay());
         }
     }
 

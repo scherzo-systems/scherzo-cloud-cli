@@ -145,7 +145,7 @@ fn init_repository(path: &Path) {
 }
 
 fn fixture_git_command() -> Command {
-    scherzo_cloud_test_support::fixture_git_command(git_executable())
+    um_test_support::fixture_git_command(git_executable())
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> String {

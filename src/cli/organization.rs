@@ -11,14 +11,14 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::{
+use um_api::{
     CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
     ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
     ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome,
     MembershipTerminationOutcome, OrganizationError, UpdateOrganizationMembershipOutcome,
     UpdateOrganizationOutcome,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud organizations";
 const NAME: &str = "organization";
@@ -102,7 +102,7 @@ impl LeafOptions {
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate organization mutation request identity")?;
         self.execute(
             deployment,

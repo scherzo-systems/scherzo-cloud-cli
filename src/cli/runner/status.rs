@@ -5,8 +5,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_runner::RequestFailure;
-use scherzo_cloud_runner::{AssignmentCounts, Operation, Response, StatusSnapshot};
+use um_runner::RequestFailure;
+use um_runner::{AssignmentCounts, Operation, Response, StatusSnapshot};
 
 pub(super) const ABOUT: &str = "Show live Runner Serve status";
 
@@ -20,21 +20,19 @@ pub(super) struct Command {
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         let config_path = super::operator_config_path(&self.config)?;
-        let socket_path = scherzo_cloud_runner::load_control_socket_path(&config_path)
-            .with_context(|| {
-                format!(
-                    "load runner operator configuration {}",
-                    config_path.display()
-                )
-            })?;
-        let response =
-            scherzo_cloud_runner::request(&socket_path, Operation::Status).map_err(|error| {
-                let outcome = match error {
-                    RequestFailure::NotReachable => OutcomeClass::Unreachable,
-                    RequestFailure::Protocol(_) => OutcomeClass::Protocol,
-                };
-                super::super::CommandFailure::for_outcome(anyhow::Error::new(error), outcome)
-            })?;
+        let socket_path = um_runner::load_control_socket_path(&config_path).with_context(|| {
+            format!(
+                "load runner operator configuration {}",
+                config_path.display()
+            )
+        })?;
+        let response = um_runner::request(&socket_path, Operation::Status).map_err(|error| {
+            let outcome = match error {
+                RequestFailure::NotReachable => OutcomeClass::Unreachable,
+                RequestFailure::Protocol(_) => OutcomeClass::Protocol,
+            };
+            super::super::CommandFailure::for_outcome(anyhow::Error::new(error), outcome)
+        })?;
         let Response::Status(status) = response else {
             return Err(super::super::CommandFailure::for_outcome(
                 anyhow::anyhow!("Runner Serve control protocol is invalid"),
@@ -133,7 +131,7 @@ fn format_assignments(counts: AssignmentCounts) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scherzo_cloud_runner::{ConnectionState, ProcessState};
+    use um_runner::{ConnectionState, ProcessState};
 
     #[test]
     fn renders_idle_and_nonzero_assignment_counts() {

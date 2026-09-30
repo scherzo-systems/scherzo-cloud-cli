@@ -6,8 +6,8 @@ struct RunnerCreationOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    runner: &'a scherzo_cloud_api::RunnerRegistration,
-    activation: &'a scherzo_cloud_api::RunnerActivation,
+    runner: &'a um_api::RunnerRegistration,
+    activation: &'a um_api::RunnerActivation,
     activation_file: &'a str,
 }
 mod cloud;
@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_support::generate_idempotency_key;
+use um_human_auth::Deployment;
+use um_support::generate_idempotency_key;
 
 use super::{OrganizationArg, PaginationArgs, PoolArg};
 
@@ -86,7 +86,7 @@ impl CloudOptions {
     fn write_failure(
         &self,
         deployment: &Deployment,
-        failure: &scherzo_cloud_api::RunnerFailure,
+        failure: &um_api::RunnerFailure,
     ) -> anyhow::Result<ExitCode> {
         cloud::write_failure(
             deployment.fingerprint().api_url(),
@@ -217,7 +217,7 @@ impl Command {
                 execute_cloud(command, |command, deployment| {
                     command.execute(
                         deployment,
-                        scherzo_cloud_api::RunnerRegistrationMode::Enabled,
+                        um_api::RunnerRegistrationMode::Enabled,
                         "enabled",
                         "✓ Runner enabled.",
                     )
@@ -226,7 +226,7 @@ impl Command {
             Some(RunnerCommand::Drain(command)) => execute_cloud(command, |command, deployment| {
                 command.execute(
                     deployment,
-                    scherzo_cloud_api::RunnerRegistrationMode::Draining,
+                    um_api::RunnerRegistrationMode::Draining,
                     "draining",
                     "✓ Runner draining.",
                 )
@@ -235,7 +235,7 @@ impl Command {
                 execute_cloud(command, |command, deployment| {
                     command.execute(
                         deployment,
-                        scherzo_cloud_api::RunnerRegistrationMode::Disabled,
+                        um_api::RunnerRegistrationMode::Disabled,
                         "disabled",
                         "✓ Runner disabled.",
                     )
@@ -258,12 +258,12 @@ fn operator_config_path(path: &Path) -> anyhow::Result<PathBuf> {
 
 enum CreateOutcome {
     Complete {
-        registration: scherzo_cloud_api::RunnerRegistration,
-        issuance: scherzo_cloud_api::RunnerActivationIssuance,
+        registration: um_api::RunnerRegistration,
+        issuance: um_api::RunnerActivationIssuance,
     },
     ActivationFailed {
-        registration: scherzo_cloud_api::RunnerRegistration,
-        failure: scherzo_cloud_api::RunnerFailure,
+        registration: um_api::RunnerRegistration,
+        failure: um_api::RunnerFailure,
     },
 }
 
@@ -386,7 +386,7 @@ impl CreateCommand {
 
 fn completed_cloud_result<T>(
     deployment: &Deployment,
-    result: Result<T, scherzo_cloud_api::RunnerFailure>,
+    result: Result<T, um_api::RunnerFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<Result<T, ExitCode>> {
@@ -412,22 +412,20 @@ fn validate_activation_destination(destination: &str, json: bool) -> anyhow::Res
 
 fn write_activation_issuance(
     destination: &str,
-    issuance: &scherzo_cloud_api::RunnerActivationIssuance,
-) -> anyhow::Result<scherzo_cloud_runner::ActivationArtifact> {
+    issuance: &um_api::RunnerActivationIssuance,
+) -> anyhow::Result<um_runner::ActivationArtifact> {
     let api_artifact = issuance.artifact.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "activation issuance replay omitted its secret; issue a replacement activation with a new command"
         )
     })?;
-    let artifact = scherzo_cloud_runner::ActivationArtifact::from_parts(
-        scherzo_cloud_runner::ActivationArtifactParts {
-            activation_url: api_artifact.activation_url.clone(),
-            activation_token: api_artifact.activation_token.clone(),
-            runner_id: api_artifact.runner_id.clone(),
-            expires_at: api_artifact.expires_at.clone(),
-        },
-    );
-    scherzo_cloud_runner::write_activation_file(destination, &artifact)
+    let artifact = um_runner::ActivationArtifact::from_parts(um_runner::ActivationArtifactParts {
+        activation_url: api_artifact.activation_url.clone(),
+        activation_token: api_artifact.activation_token.clone(),
+        runner_id: api_artifact.runner_id.clone(),
+        expires_at: api_artifact.expires_at.clone(),
+    });
+    um_runner::write_activation_file(destination, &artifact)
         .map_err(|error| anyhow::anyhow!(error))?;
     Ok(artifact)
 }
@@ -497,7 +495,7 @@ impl ModeCommand {
     fn execute(
         self,
         deployment: &Deployment,
-        mode: scherzo_cloud_api::RunnerRegistrationMode,
+        mode: um_api::RunnerRegistrationMode,
         outcome: &'static str,
         heading: &'static str,
     ) -> anyhow::Result<ExitCode> {
@@ -687,8 +685,8 @@ fn execute_deletion_blocking(
         &invocation.options.authentication,
         |api| {
             if !control.begin_dispatch() {
-                return Err(scherzo_cloud_api::RunnerFailure::Unreachable(
-                    scherzo_cloud_api::UnreachableCategory::Connection,
+                return Err(um_api::RunnerFailure::Unreachable(
+                    um_api::UnreachableCategory::Connection,
                 ));
             }
             match invocation.kind {
@@ -708,8 +706,7 @@ fn execute_deletion_blocking(
                 invocation.options.json,
             ),
             Err(
-                failure @ (scherzo_cloud_api::RunnerFailure::Unreachable(_)
-                | scherzo_cloud_api::RunnerFailure::Protocol),
+                failure @ (um_api::RunnerFailure::Unreachable(_) | um_api::RunnerFailure::Protocol),
             ) => {
                 let _ = failure;
                 cloud::write_deletion_unknown(
@@ -740,16 +737,16 @@ fn deletion_target<'a>(kind: DeletionKind, resource_id: &'a str) -> cloud::Delet
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
-    transport_policy: scherzo_cloud_api::HttpTransportPolicy,
+    transport_policy: um_api::HttpTransportPolicy,
     authentication: &super::PrincipalAuthenticationArgs,
-    operation: impl FnMut(&scherzo_cloud_api::RunnerApi) -> Result<T, scherzo_cloud_api::RunnerFailure>,
-) -> anyhow::Result<Result<T, scherzo_cloud_api::RunnerFailure>> {
+    operation: impl FnMut(&um_api::RunnerApi) -> Result<T, um_api::RunnerFailure>,
+) -> anyhow::Result<Result<T, um_api::RunnerFailure>> {
     cloud::with_api(deployment, transport_policy, authentication, operation)
 }
 
 pub(super) fn write_failure(
     deployment: &Deployment,
-    failure: &scherzo_cloud_api::RunnerFailure,
+    failure: &um_api::RunnerFailure,
     authentication: &super::PrincipalAuthenticationArgs,
     json: bool,
 ) -> anyhow::Result<ExitCode> {

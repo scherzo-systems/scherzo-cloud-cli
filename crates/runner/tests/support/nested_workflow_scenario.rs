@@ -8,15 +8,15 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, ensure};
 use ring::digest::{SHA256, digest};
-use scherzo_cloud_execution::{CaptureCancellation, resolve};
-use scherzo_cloud_runner_protocol::{
+use time::OffsetDateTime;
+use um_execution::{CaptureCancellation, resolve};
+use um_runner_protocol::{
     ArtifactRegistrationOutcome, ArtifactRegistrationResponse, ArtifactResultRegistrationOutcome,
     ArtifactResultRegistrationResponse, ExecutionCapacityV1RunnerProjection, ExecutionLeaseGrant,
     ExecutionLeasePolicy, ExecutionLimitsV1RunnerProjection,
     PrimaryWorkspaceSourceV1RunnerProjection, WorkflowDefinitionSourceV1RunnerProjection,
     WorkflowSourceClosureDigestV1RunnerProjection,
 };
-use time::OffsetDateTime;
 use url::Url;
 
 use super::*;
@@ -285,7 +285,7 @@ fn offer() -> AssignmentOffer {
         project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abg".to_owned(),
         attempt_number: 1,
-        execution_spec: scherzo_cloud_runner_protocol::ExecutionSpecV1RunnerProjection {
+        execution_spec: um_runner_protocol::ExecutionSpecV1RunnerProjection {
             execution_spec_id: "xsp_01k0z6r1w8f4jy2m7q9v3x5abg".to_owned(),
             schema_version: 1,
             execution_limits: ExecutionLimitsV1RunnerProjection {

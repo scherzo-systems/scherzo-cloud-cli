@@ -3,7 +3,7 @@ use std::time::Duration;
 use super::*;
 use crate::HttpTransportPolicy;
 use crate::http_util::MAX_RESPONSE_BODY_BYTES;
-use scherzo_cloud_test_support::ScriptedHttpServer;
+use um_test_support::ScriptedHttpServer;
 
 const TOKEN: &str = "organization-unit-test-token-sentinel";
 const KEY: &str = "organization-unit-test-idempotency-key";

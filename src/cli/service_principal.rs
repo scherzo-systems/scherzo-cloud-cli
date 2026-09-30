@@ -6,13 +6,13 @@ use zeroize::Zeroizing;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::service_auth::{ApiKeyCleanup, ApiKeyDestination, ServiceApiKey, ServiceApiKeyError};
-use scherzo_cloud_api::{
+use um_api::{
     CreateServicePrincipalOutcome, HttpClient, IssueServiceCredentialOutcome,
     IssuedServiceCredential, ListServiceCredentialsOutcome, RevokeServiceCredentialOutcome,
     ServiceCredential, ServiceCredentialPage, ServicePrincipalApiError, create_service_principal,
     issue_service_credential, list_service_credentials, revoke_service_credential,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 use super::write_api_failure as write_failure;
 
@@ -166,7 +166,7 @@ impl super::HumanCredentialOutcome for CreateAttemptOutcome {
         Self::Completed(CreateServicePrincipalOutcome::Unauthenticated)
     }
 
-    fn unreachable(category: scherzo_cloud_api::UnreachableCategory) -> Self {
+    fn unreachable(category: um_api::UnreachableCategory) -> Self {
         Self::Completed(CreateServicePrincipalOutcome::Unreachable(category))
     }
 
@@ -201,7 +201,7 @@ impl CreateCommand {
     ) -> super::CommandResult {
         let mut destination = ApiKeyDestination::prepare(&self.api_key_file)
             .context("prepare initial service API-key destination")?;
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate service-principal creation request identity")?;
         let attempt = super::execute_with_human_credential(
             deployment,
@@ -303,7 +303,7 @@ impl IssueCommand {
     ) -> super::CommandResult {
         let mut destination = ApiKeyDestination::prepare(&self.api_key_file)
             .context("prepare issued service API-key destination")?;
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate service-credential issuance request identity")?;
         let client = service_client(deployment, &self.options)?;
         if !control.begin_bounded_dispatch() {
@@ -350,7 +350,7 @@ impl IssueCommand {
 impl RevokeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let api_key = self.options.authentication.api_key()?;
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate service-credential revocation request identity")?;
         let client = service_client(deployment, &self.options)?;
         let outcome = revoke_service_credential(
@@ -407,7 +407,7 @@ fn invalid_returned_api_key(error: ServiceApiKeyError) -> anyhow::Error {
 
 fn deliver_api_key(
     destination: &mut impl ApiKeyDelivery,
-    api_key: &scherzo_cloud_api::IssuedServiceApiKey,
+    api_key: &um_api::IssuedServiceApiKey,
 ) -> Result<(), ApiKeyDeliveryFailure> {
     let api_key = ServiceApiKey::parse(Zeroizing::new(api_key.expose().to_owned()))
         .map_err(ApiKeyDeliveryFailure::Invalid)?;
@@ -445,7 +445,7 @@ fn deliver_issued_key(
 }
 
 fn parse_credential_id(value: &str) -> Result<String, String> {
-    if scherzo_cloud_support::valid_typed_id(value, "crd_") {
+    if um_support::valid_typed_id(value, "crd_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact service credential ID".to_owned())
@@ -458,7 +458,7 @@ struct CreateResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    principal: &'a scherzo_cloud_api::ServicePrincipal,
+    principal: &'a um_api::ServicePrincipal,
     initial_credential: &'a ServiceCredential,
     api_key_file: &'a str,
 }
@@ -507,7 +507,7 @@ struct FailureResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    principal: Option<&'a scherzo_cloud_api::ServicePrincipal>,
+    principal: Option<&'a um_api::ServicePrincipal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential: Option<&'a ServiceCredential>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -620,7 +620,7 @@ fn write_create_outcome(
 
 fn finish_failed_delivery(
     deployment: &str,
-    principal: Option<&scherzo_cloud_api::ServicePrincipal>,
+    principal: Option<&um_api::ServicePrincipal>,
     issued: &IssuedServiceCredential,
     destination: ApiKeyDestination,
     error: &ServiceApiKeyError,
@@ -648,7 +648,7 @@ fn finish_failed_delivery(
 
 struct DeliveryFailure<'a> {
     deployment: &'a str,
-    principal: Option<&'a scherzo_cloud_api::ServicePrincipal>,
+    principal: Option<&'a um_api::ServicePrincipal>,
     issued: &'a IssuedServiceCredential,
     destination: &'a str,
     recovery: &'static str,
@@ -736,7 +736,7 @@ fn write_delivery_failure(failure: DeliveryFailure<'_>, json: bool) -> anyhow::R
 
 fn write_secret_unavailable(
     deployment: &str,
-    principal: Option<&scherzo_cloud_api::ServicePrincipal>,
+    principal: Option<&um_api::ServicePrincipal>,
     issued: &IssuedServiceCredential,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -1008,7 +1008,7 @@ fn idempotency_failure(deployment: &str, json: bool) -> anyhow::Result<ExitCode>
 
 fn unreachable_failure(
     deployment: &str,
-    category: scherzo_cloud_api::UnreachableCategory,
+    category: um_api::UnreachableCategory,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     write_failure(
@@ -1053,7 +1053,7 @@ mod tests {
                 created_at: "2026-01-02T03:04:05Z".to_owned(),
                 current: None,
             },
-            api_key: Some(scherzo_cloud_api::IssuedServiceApiKey::new(Zeroizing::new(
+            api_key: Some(um_api::IssuedServiceApiKey::new(Zeroizing::new(
                 API_KEY.to_owned(),
             ))),
         });
@@ -1066,7 +1066,7 @@ mod tests {
         let IssueServiceCredentialOutcome::Issued(issued) = &outcome else {
             panic!("fixture outcome should be issued");
         };
-        let principal = scherzo_cloud_api::ServicePrincipal {
+        let principal = um_api::ServicePrincipal {
             id: "prn_service".to_owned(),
             r#type: "service",
             state: "active",

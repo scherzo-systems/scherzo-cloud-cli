@@ -46,7 +46,7 @@ impl FromStr for OrganizationArg {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if scherzo_cloud_support::valid_organization_ref(value) {
+        if um_support::valid_organization_ref(value) {
             Ok(Self(value.to_owned()))
         } else {
             Err("must be an organization ID or lowercase organization slug".to_owned())
@@ -71,9 +71,9 @@ impl PoolArg {
 
     pub(super) fn resolve_id(
         &self,
-        api: &scherzo_cloud_api::RunnerApi,
+        api: &um_api::RunnerApi,
         organization: &str,
-    ) -> Result<String, scherzo_cloud_api::RunnerFailure> {
+    ) -> Result<String, um_api::RunnerFailure> {
         api.get_pool(organization, self).map(|pool| pool.id)
     }
 }

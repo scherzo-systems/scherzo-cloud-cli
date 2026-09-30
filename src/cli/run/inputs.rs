@@ -11,11 +11,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::{
+use um_api::{
     RetainedRunInputs, RunFailure, UnreachableCategory, capability_batches, retained_manifest,
     transfer_capability_batch,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage retained run inputs";
 
@@ -259,7 +259,7 @@ enum DownloadTransferFailure {
 fn download_selected(
     deployment: &Deployment,
     command: &DownloadCommand,
-    cancellation: &scherzo_cloud_api::HttpCancellation,
+    cancellation: &um_api::HttpCancellation,
     commit_control: &DownloadCommitControl,
 ) -> anyhow::Result<Result<DownloadedInputs, DownloadFailure>> {
     let (parent, destination_name) = match destination_parent(&command.output) {
@@ -384,7 +384,7 @@ fn download_selected(
                         DownloadTransferFailure::Download(DownloadFailure::StagingUnavailable)
                     })
             },
-            scherzo_cloud_support::utc_now,
+            um_support::utc_now,
             || {
                 DownloadTransferFailure::Download(download_api_failure(
                     RunFailure::Unreachable(UnreachableCategory::Server),
@@ -456,9 +456,9 @@ fn destination_parent(destination: &Path) -> Result<(PathBuf, &std::ffi::OsStr),
 }
 
 fn select_members(
-    all_members: Vec<scherzo_cloud_api::RunInputObjectMetadata>,
+    all_members: Vec<um_api::RunInputObjectMetadata>,
     requested: &[String],
-) -> Result<Vec<scherzo_cloud_api::RunInputObjectMetadata>, RunFailure> {
+) -> Result<Vec<um_api::RunInputObjectMetadata>, RunFailure> {
     if requested.is_empty() {
         return Ok(all_members);
     }
@@ -494,7 +494,7 @@ fn sync_tree(root: &Path) -> io::Result<()> {
 
 impl DeleteCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate retained input deletion identity")?;
         let signal_deployment = deployment.clone();
         let signal_organization = self.run.organization.clone();

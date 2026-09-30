@@ -6,19 +6,17 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, HttpClient,
     HttpTransportPolicy, LifecycleApiError, LifecycleTransition, RequestDeletionOutcome,
     UnreachableCategory, cancel_current_principal_deletion, cancel_organization_deletion,
     request_current_principal_deletion, request_organization_deletion,
 };
-use scherzo_cloud_human_auth::Cancellation;
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_human_auth::{
-    self, LocalCredentialState, RequiredOperationWithBinding, SessionBinding,
-};
-use scherzo_cloud_human_auth::{AuthorizationError, DeviceAuthorization};
-use scherzo_cloud_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
+use um_human_auth::Cancellation;
+use um_human_auth::Deployment;
+use um_human_auth::{self, LocalCredentialState, RequiredOperationWithBinding, SessionBinding};
+use um_human_auth::{AuthorizationError, DeviceAuthorization};
+use um_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 
 use super::OrganizationArg;
 
@@ -155,7 +153,7 @@ impl OrganizationCommand {
 
 impl AccountRequestCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate account deletion request identity")?;
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -176,7 +174,7 @@ impl AccountRequestCommand {
         {
             match binding {
                 Some(binding) => {
-                    match scherzo_cloud_human_auth::remove_bound_credential(deployment, &binding) {
+                    match um_human_auth::remove_bound_credential(deployment, &binding) {
                         Ok(LocalCredentialState::Removed) => {
                             (Some(LocalCredentialDisposition::Removed), None)
                         }
@@ -225,7 +223,7 @@ impl AccountRequestCommand {
 impl OrganizationRequestCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let organization_ref = self.organization_ref.into_string();
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate organization deletion request identity")?;
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -303,7 +301,7 @@ fn request_deletion_with_credential(
         .context(api_context);
     }
 
-    match scherzo_cloud_human_auth::execute_required_with_binding(
+    match um_human_auth::execute_required_with_binding(
         client,
         deployment,
         |access_token| {
@@ -428,7 +426,7 @@ fn execute_cancellation(
         .map_err(|error| anyhow!(error))
         .context("prepare deletion cancellation networking")?;
     let mut output = CancellationOutput::new(json, &target);
-    let proof = scherzo_cloud_human_auth::identity_proof(
+    let proof = um_human_auth::identity_proof(
         &client,
         deployment,
         cancellation,
@@ -464,7 +462,7 @@ fn execute_cancellation(
         }
     };
 
-    let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+    let idempotency_key = um_support::generate_idempotency_key()
         .context("generate deletion cancellation request identity")?;
     let result = match &target {
         DeletionTarget::Account => cancel_current_principal_deletion(
@@ -779,18 +777,18 @@ fn write_schedule_fields(output: &mut impl Write, schedule: &DeletionSchedule) -
     writeln!(output, "updated: {}", schedule.updated_at)
 }
 
-const fn resource_key(kind: scherzo_cloud_api::LifecycleResourceKind) -> &'static str {
+const fn resource_key(kind: um_api::LifecycleResourceKind) -> &'static str {
     match kind {
-        scherzo_cloud_api::LifecycleResourceKind::Principal => "principal",
-        scherzo_cloud_api::LifecycleResourceKind::Organization => "organization",
+        um_api::LifecycleResourceKind::Principal => "principal",
+        um_api::LifecycleResourceKind::Organization => "organization",
     }
 }
 
-const fn lifecycle_state(state: scherzo_cloud_api::LifecycleState) -> &'static str {
+const fn lifecycle_state(state: um_api::LifecycleState) -> &'static str {
     match state {
-        scherzo_cloud_api::LifecycleState::Active => "active",
-        scherzo_cloud_api::LifecycleState::Suspended => "suspended",
-        scherzo_cloud_api::LifecycleState::DeletionPending => "deletion_pending",
+        um_api::LifecycleState::Active => "active",
+        um_api::LifecycleState::Suspended => "suspended",
+        um_api::LifecycleState::DeletionPending => "deletion_pending",
     }
 }
 
@@ -830,7 +828,7 @@ impl<'a> CancellationOutput<'a> {
         // Keep deletion-cancellation presentation and its error context next to this command.
         // jscpd:ignore-start
         if self.json {
-            let event = scherzo_cloud_human_auth::activation_event(
+            let event = um_human_auth::activation_event(
                 deployment,
                 authorization,
                 expires_at,

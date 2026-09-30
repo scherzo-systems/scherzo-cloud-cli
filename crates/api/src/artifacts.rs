@@ -107,7 +107,7 @@ impl ArtifactApi {
         access_token: &str,
         transport_policy: HttpTransportPolicy,
     ) -> Result<Self, ArtifactApiError> {
-        scherzo_cloud_support::install_provider();
+        um_support::install_provider();
         let base = Url::parse(api_url)
             .map_err(|_| ArtifactApiError::Endpoint(HttpEndpointError::Invalid))?;
         if !transport_policy.permits(&base) {
@@ -563,7 +563,7 @@ impl TryFrom<WireInventory> for ArtifactInventoryPage {
     type Error = ArtifactApiError;
 
     fn try_from(page: WireInventory) -> Result<Self, Self::Error> {
-        if !scherzo_cloud_support::valid_typed_id(&page.artifact_set_id, "ats_")
+        if !um_support::valid_typed_id(&page.artifact_set_id, "ats_")
             || page.member_count == 0
             || page.member_count > 4097
             || page.members.len() > 200

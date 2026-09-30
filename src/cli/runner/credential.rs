@@ -5,8 +5,8 @@ use clap::{Args, Subcommand};
 
 use super::{CloudOptions, OrganizationArg, PaginationArgs, cloud};
 use crate::exit_code::ExitCode;
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_support::generate_idempotency_key;
+use um_human_auth::Deployment;
+use um_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner credential lifecycle";
 const COMMAND_PATH: &[&str] = &["runner", "credential"];
@@ -242,7 +242,7 @@ struct CredentialListOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    items: &'a [scherzo_cloud_api::RunnerCredential],
+    items: &'a [um_api::RunnerCredential],
     next_cursor: Option<&'a str>,
 }
 
@@ -252,11 +252,11 @@ struct CredentialMutationOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    credential: &'a scherzo_cloud_api::RunnerCredential,
+    credential: &'a um_api::RunnerCredential,
 }
 
-fn stored_state_label(state: scherzo_cloud_api::RunnerCredentialStoredState) -> &'static str {
-    use scherzo_cloud_api::RunnerCredentialStoredState;
+fn stored_state_label(state: um_api::RunnerCredentialStoredState) -> &'static str {
+    use um_api::RunnerCredentialStoredState;
     match state {
         RunnerCredentialStoredState::Active => "active",
         RunnerCredentialStoredState::Retiring => "retiring",
@@ -264,8 +264,8 @@ fn stored_state_label(state: scherzo_cloud_api::RunnerCredentialStoredState) -> 
     }
 }
 
-fn effective_state_label(state: scherzo_cloud_api::RunnerCredentialEffectiveState) -> &'static str {
-    use scherzo_cloud_api::RunnerCredentialEffectiveState;
+fn effective_state_label(state: um_api::RunnerCredentialEffectiveState) -> &'static str {
+    use um_api::RunnerCredentialEffectiveState;
     match state {
         RunnerCredentialEffectiveState::Active => "active",
         RunnerCredentialEffectiveState::Retiring => "retiring",

@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::Args;
-use scherzo_cloud_execution::{
+use um_execution::{
     CancellationSource, LocalContinuationOpen, PendingLocalContinuation, WorkflowRunOutput,
     WorkflowRunPresentationResult, acquire_local_continuation, admit_local_continuation_workflow,
     reconcile_current_result_publication, resolve_workflow_file,
@@ -105,10 +105,8 @@ impl Command {
         let from = self.from_steps;
         let selection = pending.partition(&workflow, &from);
         let candidate_inputs = pending.candidate_inputs(&workflow);
-        let input_admission_failures = scherzo_cloud_execution::local_continuation_input_failures(
-            &workflow,
-            &candidate_inputs,
-        );
+        let input_admission_failures =
+            um_execution::local_continuation_input_failures(&workflow, &candidate_inputs);
         let inputs: Result<_, Vec<String>> = Ok(candidate_inputs);
         // Graph selection is independent of predecessor dispositions. Continue collecting
         // applicable profile and Git-admission failures even if inheritance was rejected.
@@ -165,7 +163,7 @@ impl Command {
                         .filter(|failure| {
                             installation_failures.is_empty()
                                 || failure.kind()
-                                    != scherzo_cloud_execution::AdmissionFailureKind::AgentStepRuntimeUnsupported
+                                    != um_execution::AdmissionFailureKind::AgentStepRuntimeUnsupported
                         })
                         .collect::<Vec<_>>();
                     let result = continuation_rejection(
@@ -230,7 +228,7 @@ impl Command {
         let attempt_number = owned.attempt_number();
         {
             let mut stderr = io::stderr().lock();
-            if config.mode() == scherzo_cloud_execution::PresentationMode::Json {
+            if config.mode() == um_execution::PresentationMode::Json {
                 let event = serde_json::json!({
                     "event": "continuation_partition", "attemptNumber": attempt_number,
                     "continuation": record,
@@ -250,7 +248,7 @@ impl Command {
         }
         let (owned, admitted) = tokio::task::spawn_blocking(move || {
             let admitted = owned.bind_continuation_context(admitted)?;
-            Ok::<_, scherzo_cloud_execution::LocalRunDirectoryError>((owned, admitted))
+            Ok::<_, um_execution::LocalRunDirectoryError>((owned, admitted))
         })
         .await
         .map_err(anyhow::Error::new)?
@@ -269,15 +267,15 @@ impl Command {
 }
 
 fn continuation_rejection(
-    config: scherzo_cloud_execution::PresentationConfig,
+    config: um_execution::PresentationConfig,
     pending: &PendingLocalContinuation,
     selection: &Result<
         (Vec<String>, Vec<String>),
-        Vec<scherzo_cloud_execution::ContinuationAdmissionViolation>,
+        Vec<um_execution::ContinuationAdmissionViolation>,
     >,
-    inputs: &Result<scherzo_cloud_execution::ResolvedInputs, Vec<String>>,
-    installation: &[scherzo_cloud_execution::AgentHarnessInstallationFailure],
-    admission: &[&scherzo_cloud_execution::AdmissionFailure],
+    inputs: &Result<um_execution::ResolvedInputs, Vec<String>>,
+    installation: &[um_execution::AgentHarnessInstallationFailure],
+    admission: &[&um_execution::AdmissionFailure],
 ) -> WorkflowRunPresentationResult {
     WorkflowRunOutput::new(config, io::stdout(), io::stderr())
         .for_continue(pending.run_directory())

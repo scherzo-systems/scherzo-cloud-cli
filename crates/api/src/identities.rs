@@ -13,7 +13,7 @@ use super::problem::{
     self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
-use scherzo_cloud_support::valid_typed_id;
+use um_support::valid_typed_id;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_ATTEMPTS: usize = 1;
@@ -370,7 +370,7 @@ fn execute_request(
             Err(_) => last_failure = UnreachableCategory::Timeout,
         }
         if attempt + 1 < spec.max_attempts {
-            scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+            um_support::sleep(um_support::short_retry_delay());
         }
     }
     Ok(RequestExecution::Unreachable(last_failure))

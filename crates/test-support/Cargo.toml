@@ -1,5 +1,5 @@
 [package]
-name = "scherzo-cloud-test-support"
+name = "um-test-support"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true

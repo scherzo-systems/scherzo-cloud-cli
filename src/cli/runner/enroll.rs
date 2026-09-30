@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_runner::RequestFailure;
-use scherzo_cloud_runner::{ControlError, Operation, Response};
-use scherzo_cloud_runner::{EnrollmentOutcome, EnrollmentResponse, ReplacementDisposition, enroll};
+use um_runner::RequestFailure;
+use um_runner::{ControlError, Operation, Response};
+use um_runner::{EnrollmentOutcome, EnrollmentResponse, ReplacementDisposition, enroll};
 
 pub(super) const ABOUT: &str = "Enroll a runner credential";
 
@@ -291,10 +291,10 @@ fn promote_replacement(
     config: &std::path::Path,
     enrollment: &ReplacementEnrollment,
 ) -> PromotionOutcome {
-    let Ok(socket) = scherzo_cloud_runner::load_control_socket_path(config) else {
+    let Ok(socket) = um_runner::load_control_socket_path(config) else {
         return PromotionOutcome::Incomplete(PromotionFailure::StateUnavailable);
     };
-    match scherzo_cloud_runner::request(&socket, Operation::ReloadCredential) {
+    match um_runner::request(&socket, Operation::ReloadCredential) {
         Ok(Response::Reloaded { credential_id }) if credential_id == enrollment.credential_id => {
             PromotionOutcome::Promoted
         }
@@ -305,7 +305,7 @@ fn promote_replacement(
             PromotionOutcome::Incomplete(PromotionFailure::InvalidControlResponse)
         }
         Err(RequestFailure::NotReachable) => {
-            match scherzo_cloud_runner::replacement_disposition(
+            match um_runner::replacement_disposition(
                 config,
                 &enrollment.runner_id,
                 &enrollment.credential_id,

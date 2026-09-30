@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::*;
 use anyhow::Context as _;
-use scherzo_cloud_api::MAX_RESPONSE_BODY_BYTES;
+use um_api::MAX_RESPONSE_BODY_BYTES;
 
 struct ScriptedServer {
     issuer: String,

@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use clap::Args;
 
-use scherzo_cloud_execution::{
+use um_execution::{
     CancellationSource, LocalRetryBeginError, LocalRetryOpen, WorkflowRunOutput,
     acquire_local_retry, admit_local_workflow, reconcile_current_result_publication,
 };
@@ -174,8 +174,8 @@ impl Command {
 }
 
 fn render_retry_rejection(
-    config: scherzo_cloud_execution::PresentationConfig,
-    rejection: &scherzo_cloud_execution::LocalRetryRejection,
+    config: um_execution::PresentationConfig,
+    rejection: &um_execution::LocalRetryRejection,
 ) -> super::super::CommandResult {
     let output = WorkflowRunOutput::new(config, io::stdout(), io::stderr())
         .for_retry(rejection.run_directory());

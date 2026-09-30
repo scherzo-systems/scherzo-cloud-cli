@@ -10,7 +10,7 @@ use super::device_authorization::{
     self, AuthorizationError, DeviceAuthorization, IssuedToken, TokenPoll,
 };
 use super::token::SecretToken;
-use scherzo_cloud_api::HttpClient;
+use um_api::HttpClient;
 
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
@@ -121,7 +121,7 @@ fn run<T>(
         return Ok(DeviceFlowOutcome::Cancelled);
     }
     let Some(mut schedule) = PollSchedule::new(
-        scherzo_cloud_support::monotonic_now(),
+        um_support::monotonic_now(),
         authorization.interval(),
         authorization.expires_in(),
     ) else {
@@ -136,13 +136,13 @@ fn run<T>(
         if cancellation.is_cancelled() {
             return Ok(DeviceFlowOutcome::Cancelled);
         }
-        let Some(wait) = schedule.next_wait(scherzo_cloud_support::monotonic_now()) else {
+        let Some(wait) = schedule.next_wait(um_support::monotonic_now()) else {
             return Ok(DeviceFlowOutcome::Expired);
         };
         if cancellation.wait(wait) {
             return Ok(DeviceFlowOutcome::Cancelled);
         }
-        if schedule.expired(scherzo_cloud_support::monotonic_now()) {
+        if schedule.expired(um_support::monotonic_now()) {
             return Ok(DeviceFlowOutcome::Expired);
         }
 
@@ -155,7 +155,7 @@ fn run<T>(
         if cancellation.is_cancelled() {
             return Ok(DeviceFlowOutcome::Cancelled);
         }
-        if schedule.expired(scherzo_cloud_support::monotonic_now()) {
+        if schedule.expired(um_support::monotonic_now()) {
             return Ok(DeviceFlowOutcome::Expired);
         }
         match result {
@@ -200,7 +200,7 @@ impl PollSchedule {
 
 fn expiration_after(duration: Duration) -> Option<OffsetDateTime> {
     let seconds = i64::try_from(duration.as_secs()).ok()?;
-    scherzo_cloud_support::utc_now().checked_add(time::Duration::seconds(seconds))
+    um_support::utc_now().checked_add(time::Duration::seconds(seconds))
 }
 
 #[cfg(test)]
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn poll_schedule_honors_interval_and_slow_down() -> anyhow::Result<()> {
-        let start = scherzo_cloud_support::monotonic_now();
+        let start = um_support::monotonic_now();
         let mut schedule =
             PollSchedule::new(start, Duration::from_secs(2), Duration::from_secs(30))
                 .context("poll schedule should be representable")?;

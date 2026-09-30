@@ -2,8 +2,8 @@ use anyhow::anyhow;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::{create_organization, create_organization_with_delegator};
-use scherzo_cloud_human_auth::Deployment;
+use um_api::{create_organization, create_organization_with_delegator};
+use um_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 
@@ -77,7 +77,7 @@ impl Command {
 }
 
 fn parse_principal_id(value: &str) -> Result<String, String> {
-    if scherzo_cloud_support::valid_typed_id(value, "prn_") {
+    if um_support::valid_typed_id(value, "prn_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact human principal ID".to_owned())

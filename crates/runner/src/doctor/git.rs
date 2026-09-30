@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
-use scherzo_cloud_execution::{
-    CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner,
-};
+use um_execution::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
 
 const MINIMUM_VERSION: GitVersion = GitVersion(2, 29, 0);
 const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -152,9 +150,7 @@ mod tests {
 
     use super::{GitCheck, GitVersion, MINIMUM_VERSION, parse_version};
     use crate::doctor::{DoctorCheck, Outcome, Status};
-    use scherzo_cloud_execution::{
-        CommandOutput, CommandProbeError, CommandRequest, CommandRunner,
-    };
+    use um_execution::{CommandOutput, CommandProbeError, CommandRequest, CommandRunner};
 
     #[derive(Clone)]
     struct FakeRunner {

@@ -5,13 +5,13 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use scherzo_cloud_api::{
+use um_api::{
     ArtifactApiError, ArtifactCapabilityMember, ArtifactInventoryPage, ArtifactMember,
     ArtifactSource,
 };
-use scherzo_cloud_support::valid_typed_id;
+use um_support::valid_typed_id;
 
-use scherzo_cloud_execution::{PortableArtifactValidationFailure, validate_portable_artifact_set};
+use um_execution::{PortableArtifactValidationFailure, validate_portable_artifact_set};
 
 const INVENTORY_PAGE_LIMIT: u16 = 200;
 const CAPABILITY_BATCH_SIZE: usize = 100;
@@ -74,7 +74,7 @@ pub(crate) fn assemble_artifact_set(
         organization,
         run_id,
         destination,
-        scherzo_cloud_support::utc_now,
+        um_support::utc_now,
     )
 }
 
@@ -372,7 +372,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use scherzo_cloud_api::{ArtifactCapabilities, DownloadedMember};
+    use um_api::{ArtifactCapabilities, DownloadedMember};
 
     struct FakeSource {
         inventory: VecDeque<ArtifactInventoryPage>,
@@ -703,7 +703,7 @@ mod tests {
             },
             "commandOutputPolicy": {
                 "encoding": "base64",
-                "maximumRetainedBytesPerStream": scherzo_cloud_execution::MAXIMUM_RETAINED_BYTES_PER_STREAM
+                "maximumRetainedBytesPerStream": um_execution::MAXIMUM_RETAINED_BYTES_PER_STREAM
             },
             "outcome": "succeeded",
             "forceAbort": null,

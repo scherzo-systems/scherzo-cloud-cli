@@ -4,10 +4,10 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::{
+use um_api::{
     CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure, RunnerFailure,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 use super::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
 
@@ -330,7 +330,7 @@ impl CreateCommand {
             },
             None => None,
         };
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate project creation request identity")?;
         let result = with_api(
             deployment,
@@ -408,7 +408,7 @@ impl ShowCommand {
 
 impl RenameCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate project rename request identity")?;
         let result = with_api(
             deployment,
@@ -454,7 +454,7 @@ impl RepositoryShowCommand {
 
 impl RepositorySetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate project repository request identity")?;
         let result = with_api(
             deployment,
@@ -484,7 +484,7 @@ impl RepositorySetCommand {
 
 impl RepositoryUpdateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate project repository update request identity")?;
         let result = with_api(
             deployment,
@@ -512,7 +512,7 @@ impl RepositoryUpdateCommand {
 
 impl RepositoryRemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate project repository detachment request identity")?;
         let result = with_api(
             deployment,
@@ -551,7 +551,7 @@ impl RunnerPoolSetCommand {
                 );
             }
         };
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate project runner pool request identity")?;
         let result = with_api(
             deployment,
@@ -579,7 +579,7 @@ impl RunnerPoolSetCommand {
 
 impl RunnerPoolRemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate project runner pool removal request identity")?;
         let result = with_api(
             deployment,

@@ -1,5 +1,5 @@
 use super::*;
-use scherzo_cloud_test_support::ScriptedHttpServer;
+use um_test_support::ScriptedHttpServer;
 
 const TOKEN: &str = "runner-api-token-sentinel";
 const ORGANIZATION: &str = "acme";

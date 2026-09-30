@@ -4,13 +4,13 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_execution::{
+use um_execution::{
     ClaudeCodeInstallationFailure, CodexInstallationFailure, PiInstallationFailure,
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation,
 };
-use scherzo_cloud_runner::Config;
+use um_runner::Config;
 
 pub(super) const ABOUT: &str = "Serve run assignments";
 
@@ -42,7 +42,7 @@ impl Command {
             claude_code_installation,
             codex_installation,
         );
-        match scherzo_cloud_runner::run(config, crate::build_info::VERSION) {
+        match um_runner::run(config, crate::build_info::VERSION) {
             Ok(()) => Ok(ExitCode::Success),
             Err(error) => {
                 let exit_code = service_exit_code(error.requires_operator_recovery());
@@ -111,7 +111,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use scherzo_cloud_execution::ClaudeCodeIncompatibility;
+    use um_execution::ClaudeCodeIncompatibility;
 
     #[test]
     fn startup_retains_each_available_harness_snapshot_independently() {

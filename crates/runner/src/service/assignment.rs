@@ -27,8 +27,8 @@ use super::workspace::{
 use crate::control_protocol::AssignmentCounts;
 use crate::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 #[cfg(test)]
-use scherzo_cloud_execution::RUNNER_TERMINAL_FRAME_BYTES;
-use scherzo_cloud_execution::{
+use um_execution::RUNNER_TERMINAL_FRAME_BYTES;
+use um_execution::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationReason, CancellationSource, CaptureCancellation, CloudGitCaptureProjection,
     ConditionCapacityBounds, EnvironmentSnapshot, ExecutionContext, MAXIMUM_CANCELLATION_GRACE,
@@ -38,7 +38,7 @@ use scherzo_cloud_execution::{
     WorkflowCapacityBudget, admit_runner_workflow, default_execution_policy_limits,
     valid_condition_capacity,
 };
-use scherzo_cloud_runner_protocol::{
+use um_runner_protocol::{
     AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ExecutionLeaseGrant,
     ExecutionLeasePolicy, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection,
     MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES, MAXIMUM_ORDINARY_FRAME_BYTES,
@@ -4736,33 +4736,30 @@ pub(super) mod test_support {
     ) {
         let digest = &workflow.capacity.source_closure_digest;
         let requirements = workflow.capacity.requirements;
-        let projected_digest =
-            scherzo_cloud_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
-                algorithm: digest.algorithm.as_str().to_owned(),
-                value: digest.value.clone(),
-            };
+        let projected_digest = um_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
+            algorithm: digest.algorithm.as_str().to_owned(),
+            value: digest.value.clone(),
+        };
         execution_spec
             .workflow_definition_source
             .workflow_source_closure_digest = projected_digest.clone();
-        execution_spec.capacity =
-            scherzo_cloud_runner_protocol::ExecutionCapacityV1RunnerProjection {
-                execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
-                source_closure_digest: projected_digest,
-                general_maximum_transitions: requirements.general_maximum_transitions,
-                selected_maximum_transitions: requirements.cloud_maximum_transitions,
-                maximum_invocations: requirements.maximum_invocations,
-                maximum_retained_bytes_per_invocation: requirements
-                    .maximum_retained_bytes_per_invocation,
-                diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
-                native_session_retention_bytes: requirements.native_session_retention_bytes,
-                aggregate_retention_bytes: requirements.aggregate_retention_bytes,
-                condition_transition_count: requirements.condition_transition_count,
-                aggregate_condition_transition_bytes: requirements
-                    .aggregate_condition_transition_bytes,
-                terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
-                portable_result_bytes: requirements.portable_result_bytes,
-                encoded_outbox_bytes: requirements.encoded_outbox_bytes,
-            };
+        execution_spec.capacity = um_runner_protocol::ExecutionCapacityV1RunnerProjection {
+            execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
+            source_closure_digest: projected_digest,
+            general_maximum_transitions: requirements.general_maximum_transitions,
+            selected_maximum_transitions: requirements.cloud_maximum_transitions,
+            maximum_invocations: requirements.maximum_invocations,
+            maximum_retained_bytes_per_invocation: requirements
+                .maximum_retained_bytes_per_invocation,
+            diagnostic_retention_bytes: requirements.diagnostic_retention_bytes,
+            native_session_retention_bytes: requirements.native_session_retention_bytes,
+            aggregate_retention_bytes: requirements.aggregate_retention_bytes,
+            condition_transition_count: requirements.condition_transition_count,
+            aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
+            terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
+            portable_result_bytes: requirements.portable_result_bytes,
+            encoded_outbox_bytes: requirements.encoded_outbox_bytes,
+        };
     }
 }
 // jscpd:ignore-end
@@ -4949,12 +4946,10 @@ fn validate_execution_spec(
             ExecutionSpecInvalidReason::UnsupportedSourceObjectFormat,
         ));
     }
-    let valid_workflow_connection = scherzo_cloud_runner_protocol::valid_repository_connection_id(
-        &workflow.repository_connection_id,
-    );
-    let valid_primary_connection = scherzo_cloud_runner_protocol::valid_repository_connection_id(
-        &primary.repository_connection_id,
-    );
+    let valid_workflow_connection =
+        um_runner_protocol::valid_repository_connection_id(&workflow.repository_connection_id);
+    let valid_primary_connection =
+        um_runner_protocol::valid_repository_connection_id(&primary.repository_connection_id);
     let valid_path = !workflow.workflow_path.is_empty()
         && workflow.workflow_path.chars().count() <= 4096
         && !workflow.workflow_path.starts_with('/')
@@ -5246,11 +5241,11 @@ mod tests {
         CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook,
         WorkspaceFilesystem,
     };
-    use scherzo_cloud_execution::{
+    use um_execution::{
         CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedClaudeCodeInstallation,
         ValidatedCodexInstallation, ValidatedPiInstallation, resolve,
     };
-    use scherzo_cloud_runner_protocol::{
+    use um_runner_protocol::{
         ArtifactRegistrationOutcome, ArtifactRegistrationResponse,
         ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse, CloudFrame,
         ExecutionCapacityV1RunnerProjection, ExecutionLimitsV1RunnerProjection,
@@ -5494,7 +5489,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                 let _ = started.send(());
             }
             while !cancellation.is_cancelled() {
-                scherzo_cloud_support::sleep(Duration::from_millis(5));
+                um_support::sleep(Duration::from_millis(5));
             }
             if let Some(stopped) = self.stopped.lock().unwrap().take() {
                 let _ = stopped.send(());
@@ -6198,7 +6193,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     }
 
     fn run_fixture_git(repository: &Path, arguments: &[&str]) -> String {
-        let output = scherzo_cloud_test_support::fixture_git_command("git")
+        let output = um_test_support::fixture_git_command("git")
             .current_dir(repository)
             .args(arguments)
             .output()
@@ -7219,13 +7214,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     #[tokio::test]
     async fn malformed_run_input_projection_has_the_closed_immutable_decline() {
         let mut execution_spec = offer("bg").execution_spec;
-        execution_spec.run_inputs = Some(scherzo_cloud_runner_protocol::RunInputProjectionV1 {
+        execution_spec.run_inputs = Some(um_runner_protocol::RunInputProjectionV1 {
             input_set_id: "ris_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-            manifest_digest:
-                scherzo_cloud_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
-                    algorithm: "sha256".to_owned(),
-                    value: "A".repeat(64),
-                },
+            manifest_digest: um_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
+                algorithm: "sha256".to_owned(),
+                value: "A".repeat(64),
+            },
         });
         assert_eq!(
             validate_execution_spec(&execution_spec),
@@ -7433,7 +7427,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     #[tokio::test]
     async fn retry_result_upload_preserves_the_cloud_attempt_number() {
         use base64::Engine as _;
-        use scherzo_cloud_runner_protocol::{
+        use um_runner_protocol::{
             ArtifactResultConfirmationOutcome, ArtifactResultConfirmationResponse,
             ArtifactUploadCapability,
         };

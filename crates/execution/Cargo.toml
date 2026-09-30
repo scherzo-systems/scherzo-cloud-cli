@@ -1,5 +1,5 @@
 [package]
-name = "scherzo-cloud-execution"
+name = "um-execution"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true
@@ -27,7 +27,7 @@ nix.workspace = true
 ratatui.workspace = true
 ring.workspace = true
 rustix.workspace = true
-scherzo-cloud-support.workspace = true
+um-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -40,4 +40,4 @@ yaml-rust2.workspace = true
 
 [dev-dependencies]
 rustix = { workspace = true, features = ["event", "pty"] }
-scherzo-cloud-test-support.workspace = true
+um-test-support.workspace = true

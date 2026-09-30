@@ -1,11 +1,11 @@
 use std::io::{self, Write};
 
 use anyhow::Context;
-use scherzo_cloud_api::{
+use serde::Serialize;
+use um_api::{
     Publication, PublicationState, Run, RunArtifactDelivery, RunCancellationReceipt,
     RunPublicationHandoffState,
 };
-use serde::Serialize;
 
 use crate::exit_code::ExitCode;
 
@@ -147,11 +147,12 @@ pub(super) fn write_cloud(
         )?;
     } else {
         if let Some(run) = snapshot.run.as_deref() {
-            let publication_failed = run.publication.as_deref().is_some_and(|handoff| {
-                handoff.state == scherzo_cloud_api::RunPublicationHandoffState::Failed
-            }) || snapshot.publication.as_deref().is_some_and(
-                |publication| publication.state == scherzo_cloud_api::PublicationState::Failed,
-            );
+            let publication_failed =
+                run.publication.as_deref().is_some_and(|handoff| {
+                    handoff.state == um_api::RunPublicationHandoffState::Failed
+                }) || snapshot.publication.as_deref().is_some_and(|publication| {
+                    publication.state == um_api::PublicationState::Failed
+                });
             super::write_run_human(
                 deployment,
                 if publication_failed {
@@ -174,7 +175,7 @@ pub(super) fn write_cloud(
             writeln!(
                 io::stdout().lock(),
                 "  export: {}",
-                scherzo_cloud_execution::visible_text(&publication.export_name)
+                um_execution::visible_text(&publication.export_name)
             )?;
             writeln!(
                 io::stdout().lock(),
@@ -252,7 +253,7 @@ pub(super) fn write_cloud(
             )?;
         }
         if let Some(receipt) = snapshot.cancellation_request.as_deref() {
-            let mode = if receipt.mode == scherzo_cloud_api::RunCancellationReceiptMode::Force {
+            let mode = if receipt.mode == um_api::RunCancellationReceiptMode::Force {
                 "force"
             } else {
                 "graceful"
@@ -294,7 +295,7 @@ fn write_cancel_context(
 ) -> anyhow::Result<()> {
     if let Some(receipt) = snapshot.cancellation_request.as_deref() {
         let requested_mode = mode.unwrap_or_else(|| {
-            if receipt.mode == scherzo_cloud_api::RunCancellationReceiptMode::Force {
+            if receipt.mode == um_api::RunCancellationReceiptMode::Force {
                 "force"
             } else {
                 "graceful"

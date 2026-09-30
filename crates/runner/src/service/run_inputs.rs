@@ -17,11 +17,11 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use url::Url;
 
 use crate::credential::Credential;
-use scherzo_cloud_execution::{
+use um_execution::{
     CaptureCancellation, ResolvedAttachment, ResolvedFile, ResolvedInput, ResolvedInputs,
     ResolvedJsonInput,
 };
-use scherzo_cloud_runner_protocol::RunInputProjectionV1;
+use um_runner_protocol::RunInputProjectionV1;
 
 const MANIFEST_RESPONSE_LIMIT: usize = 1024 * 1024;
 const CAPABILITY_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
@@ -61,7 +61,7 @@ impl PreparationDeadline {
     }
 
     pub(super) fn remaining(self) -> Option<Duration> {
-        self.remaining_at(scherzo_cloud_support::monotonic_now())
+        self.remaining_at(um_support::monotonic_now())
     }
 
     pub(super) fn remaining_at(self, monotonic_now: Instant) -> Option<Duration> {
@@ -74,7 +74,7 @@ impl PreparationDeadline {
     pub(super) fn elapsed_for_test() -> Self {
         Self {
             expires_at: OffsetDateTime::UNIX_EPOCH,
-            monotonic_deadline: scherzo_cloud_support::monotonic_now(),
+            monotonic_deadline: um_support::monotonic_now(),
         }
     }
 
@@ -240,7 +240,7 @@ pub(super) struct HttpRunInputBroker {
 fn broker_operation_runtime(
     deadline: PreparationDeadline,
 ) -> Result<(reqwest::Client, tokio::runtime::Runtime), BrokerFailure> {
-    scherzo_cloud_support::install_provider();
+    um_support::install_provider();
     let timeout = deadline
         .remaining()
         .map(|remaining| remaining.min(PROVIDER_OPERATION_TIMEOUT))
@@ -362,8 +362,7 @@ impl HttpRunInputBroker {
             .await?
             {}
             ensure_current(cancellation, deadline)?;
-            scherzo_cloud_support::strict_json_from_slice(&encoded)
-                .map_err(|_| BrokerFailure::InvalidResponse)
+            um_support::strict_json_from_slice(&encoded).map_err(|_| BrokerFailure::InvalidResponse)
         })
     }
 }
@@ -466,7 +465,7 @@ pub(super) fn materialize(
         deadline,
         cancellation,
         private_root,
-        scherzo_cloud_support::utc_now,
+        um_support::utc_now,
     )
 }
 
@@ -559,11 +558,11 @@ fn materialize_with_clock(
 pub(super) fn validate_projection(
     projection: &RunInputProjectionV1,
 ) -> Result<(), RunInputFailure> {
-    if !scherzo_cloud_runner_protocol::valid_run_input_set_id(&projection.input_set_id) {
+    if !um_runner_protocol::valid_run_input_set_id(&projection.input_set_id) {
         return Err(RunInputFailure::InvalidProjection);
     }
     if projection.manifest_digest.algorithm != "sha256"
-        || !scherzo_cloud_execution::is_lowercase_hex(&projection.manifest_digest.value, 64)
+        || !um_execution::is_lowercase_hex(&projection.manifest_digest.value, 64)
     {
         return Err(RunInputFailure::InvalidProjection);
     }
@@ -597,7 +596,7 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
         || manifest
             .inputs
             .keys()
-            .any(|name| !scherzo_cloud_execution::is_input_name(name))
+            .any(|name| !um_execution::is_input_name(name))
     {
         return Err(RunInputFailure::ManifestMismatch);
     }
@@ -606,17 +605,13 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
     for input in manifest.inputs.values() {
         match input {
             ManifestInput::Text { size_bytes, sha256 } => {
-                if *size_bytes > MAXIMUM_TEXT_BYTES
-                    || !scherzo_cloud_execution::is_lowercase_hex(sha256, 64)
-                {
+                if *size_bytes > MAXIMUM_TEXT_BYTES || !um_execution::is_lowercase_hex(sha256, 64) {
                     return Err(RunInputFailure::ManifestMismatch);
                 }
                 aggregate = add_manifest_bytes(aggregate, *size_bytes)?;
             }
             ManifestInput::Json { size_bytes, sha256 } => {
-                if *size_bytes > MAXIMUM_JSON_BYTES
-                    || !scherzo_cloud_execution::is_lowercase_hex(sha256, 64)
-                {
+                if *size_bytes > MAXIMUM_JSON_BYTES || !um_execution::is_lowercase_hex(sha256, 64) {
                     return Err(RunInputFailure::ManifestMismatch);
                 }
                 aggregate = add_manifest_bytes(aggregate, *size_bytes)?;
@@ -627,8 +622,8 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
                 sha256,
             } => {
                 if *size_bytes > MAXIMUM_ATTACHMENT_BYTES
-                    || !scherzo_cloud_execution::is_valid_media_type(media_type)
-                    || !scherzo_cloud_execution::is_lowercase_hex(sha256, 64)
+                    || !um_execution::is_valid_media_type(media_type)
+                    || !um_execution::is_lowercase_hex(sha256, 64)
                 {
                     return Err(RunInputFailure::ManifestMismatch);
                 }
@@ -642,11 +637,11 @@ fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunInputFailure> {
                 for (index, attachment) in items.iter().enumerate() {
                     if attachment.index != index
                         || attachment.size_bytes > MAXIMUM_ATTACHMENT_BYTES
-                        || !scherzo_cloud_execution::is_lowercase_hex(&attachment.sha256, 64)
-                        || !scherzo_cloud_execution::is_valid_input_display_name(
+                        || !um_execution::is_lowercase_hex(&attachment.sha256, 64)
+                        || !um_execution::is_valid_input_display_name(
                             attachment.display_name.as_deref(),
                         )
-                        || !scherzo_cloud_execution::is_valid_media_type(&attachment.media_type)
+                        || !um_execution::is_valid_media_type(&attachment.media_type)
                     {
                         return Err(RunInputFailure::ManifestMismatch);
                     }
@@ -1139,7 +1134,7 @@ fn download_broker_failure(failure: BrokerFailure) -> RunInputFailure {
 }
 
 fn lowercase_hex_bytes(bytes: &[u8]) -> String {
-    scherzo_cloud_execution::lowercase_hex(bytes)
+    um_execution::lowercase_hex(bytes)
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
@@ -1174,7 +1169,7 @@ mod tests {
     };
 
     use super::*;
-    use scherzo_cloud_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection;
+    use um_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection;
 
     #[derive(Clone, Copy, Debug, Default)]
     enum CapabilityMutation {
@@ -1326,7 +1321,7 @@ mod tests {
                 .format(&Rfc3339)
                 .unwrap()),
             now,
-            scherzo_cloud_support::monotonic_now(),
+            um_support::monotonic_now(),
         )
         .unwrap()
     }
@@ -1461,7 +1456,7 @@ mod tests {
     #[test]
     fn preparation_deadline_is_strict_and_fixed_at_receipt() {
         let now = OffsetDateTime::parse("2099-01-01T00:00:00Z", &Rfc3339).unwrap();
-        let monotonic = scherzo_cloud_support::monotonic_now();
+        let monotonic = um_support::monotonic_now();
         assert!(PreparationDeadline::from_wire("2099-01-01T00:00:00Z", now, monotonic,).is_none());
         let deadline =
             PreparationDeadline::from_wire("2099-01-01T00:15:00Z", now, monotonic).unwrap();

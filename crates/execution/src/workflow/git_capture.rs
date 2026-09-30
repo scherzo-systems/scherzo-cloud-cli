@@ -1738,7 +1738,7 @@ fn wait_managed_child(
     stream_finished: impl Fn() -> bool,
     workers_finished: impl Fn() -> bool,
 ) -> Result<ExitStatus, ProcessFailure> {
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
     let mut status = None;
     let mut stream_closed_at = None;
     loop {
@@ -1763,23 +1763,22 @@ fn wait_managed_child(
             return Ok(status);
         }
         if status.is_none() && stream_finished() {
-            let closed_at =
-                stream_closed_at.get_or_insert_with(scherzo_cloud_support::monotonic_now);
-            if scherzo_cloud_support::elapsed(*closed_at) >= Duration::from_millis(100) {
+            let closed_at = stream_closed_at.get_or_insert_with(um_support::monotonic_now);
+            if um_support::elapsed(*closed_at) >= Duration::from_millis(100) {
                 child.terminate();
                 return Err(ProcessFailure::StreamClosed);
             }
         } else {
             stream_closed_at = None;
         }
-        if scherzo_cloud_support::elapsed(started) >= timeout {
+        if um_support::elapsed(started) >= timeout {
             child.terminate();
             return Err(ProcessFailure::TimedOut {
                 command,
                 limit: timeout,
             });
         }
-        scherzo_cloud_support::sleep(PROCESS_POLL_INTERVAL);
+        um_support::sleep(PROCESS_POLL_INTERVAL);
     }
 }
 

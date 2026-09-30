@@ -536,7 +536,7 @@ fn find_named_resource<T>(
     mut list_page: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), RunnerFailure>,
     name: impl Fn(&T) -> &str,
 ) -> Result<T, RunnerFailure> {
-    if scherzo_cloud_support::valid_typed_id(resource_ref, id_prefix) {
+    if um_support::valid_typed_id(resource_ref, id_prefix) {
         return get_by_id();
     }
     let mut cursor = None;

@@ -3700,7 +3700,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
 // handshake variable or a readiness assertion on rendered terminal text.
 #[tokio::test]
 async fn injected_tui_boundary_handshakes_help_and_quit_lifecycle() {
-    use scherzo_cloud_execution::{
+    use um_execution::{
         CancellationSource, HostInteraction, ObservationClock, RunTimingObservation,
         SystemObservationClock, TerminalBoundary, TerminalHostExit, TerminalInputEvent,
         TerminalLifecycleEvent, TerminalRect, WorkflowRunViewModel, WorkflowRunViewSnapshot,
@@ -4805,7 +4805,7 @@ fn cancellation_settles_with_a_full_unread_presentation_pipe() {
             assert_eq!(ready, [1]);
         }
         let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
         kill_process(pid, Signal::INT).unwrap();
         if force_abort {
             let mut event = [0_u8; 1];
@@ -4820,7 +4820,7 @@ fn cancellation_settles_with_a_full_unread_presentation_pipe() {
         )
         .unwrap();
         assert!(
-            scherzo_cloud_support::monotonic_now().saturating_duration_since(started)
+            um_support::monotonic_now().saturating_duration_since(started)
                 < std::time::Duration::from_secs(10),
             "json={json}, finalizer={finalizer}, shared_pipe={shared_pipe}, force_abort={force_abort}"
         );

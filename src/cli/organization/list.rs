@@ -1,7 +1,7 @@
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 use super::LeafOptions;
 
@@ -23,7 +23,7 @@ impl Command {
         self.options.execute(
             deployment,
             |client, api_url, access_token| {
-                scherzo_cloud_api::list_current_principal_memberships(
+                um_api::list_current_principal_memberships(
                     client,
                     api_url,
                     access_token,

@@ -271,7 +271,7 @@ fn retry_transport_failure(
     *last_failure = category;
     let retry = http_util::can_retry_ambiguous_mutation(attempt, CREATE_ATTEMPTS, category);
     if retry {
-        scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+        um_support::sleep(um_support::short_retry_delay());
     }
     retry
 }
@@ -514,7 +514,7 @@ fn require_media_type(
 }
 
 fn decode_closed_publication(body: &[u8]) -> Result<Publication, PublicationFailure> {
-    let value = scherzo_cloud_support::strict_json_from_slice(body)
+    let value = um_support::strict_json_from_slice(body)
         .map_err(|_| PublicationFailure::protocol(false))?;
     decode_closed_publication_value(value)
 }
@@ -566,7 +566,7 @@ fn decode_closed_publication_list(
     requested_run_id: &str,
     maximum_items: usize,
 ) -> Result<PublicationList, PublicationFailure> {
-    let value = scherzo_cloud_support::strict_json_from_slice(body)
+    let value = um_support::strict_json_from_slice(body)
         .map_err(|_| PublicationFailure::protocol(false))?;
     let object = value
         .as_object()
@@ -689,25 +689,22 @@ fn validate_publication(
         .as_deref()
         .map(timestamp)
         .transpose()?;
-    let identities_valid = scherzo_cloud_support::valid_typed_id(&publication.id, "pub_")
-        && scherzo_cloud_support::valid_typed_id(&publication.organization_id, "org_")
-        && scherzo_cloud_support::valid_typed_id(&publication.project_id, "prj_")
-        && scherzo_cloud_support::valid_typed_id(&publication.run_id, "run_")
-        && scherzo_cloud_support::valid_typed_id(&publication.artifact_set_id, "ats_")
-        && scherzo_cloud_support::valid_typed_id(&publication.actor_principal_id, "prn_")
-        && scherzo_cloud_support::valid_typed_id(
-            &publication.target.repository_connection_id,
-            "rpc_",
-        );
+    let identities_valid = um_support::valid_typed_id(&publication.id, "pub_")
+        && um_support::valid_typed_id(&publication.organization_id, "org_")
+        && um_support::valid_typed_id(&publication.project_id, "prj_")
+        && um_support::valid_typed_id(&publication.run_id, "run_")
+        && um_support::valid_typed_id(&publication.artifact_set_id, "ats_")
+        && um_support::valid_typed_id(&publication.actor_principal_id, "prn_")
+        && um_support::valid_typed_id(&publication.target.repository_connection_id, "rpc_");
     let snapshot_valid = publication.run_id == requested_run_id
         && requested_publication_id.is_none_or(|expected| publication.id == expected)
         && requested_export_name.is_none_or(|expected| publication.export_name == expected)
-        && scherzo_cloud_support::is_identifier(&publication.export_name)
+        && um_support::is_identifier(&publication.export_name)
         && publication.version >= 1
         && publication.artifact.artifact_version == 1
-        && scherzo_cloud_support::is_lowercase_hex(&publication.artifact.base_oid, 40)
-        && scherzo_cloud_support::is_lowercase_hex(&publication.artifact.head_oid, 40)
-        && scherzo_cloud_support::is_lowercase_hex(&publication.artifact.tree_oid, 40)
+        && um_support::is_lowercase_hex(&publication.artifact.base_oid, 40)
+        && um_support::is_lowercase_hex(&publication.artifact.head_oid, 40)
+        && um_support::is_lowercase_hex(&publication.artifact.tree_oid, 40)
         && valid_provider_id(&publication.target.provider_repository_id)
         && valid_repository_full_name(&publication.target.full_name)
         && valid_bounded_string(&publication.target.base_branch, 1, 1024)
@@ -800,7 +797,7 @@ fn validate_publication(
 
 fn valid_branch(branch: &models::PublicationBranch, expected_head: &str) -> bool {
     branch.head_oid == expected_head
-        && scherzo_cloud_support::is_lowercase_hex(&branch.head_oid, 40)
+        && um_support::is_lowercase_hex(&branch.head_oid, 40)
         && valid_https_url(&branch.url)
 }
 

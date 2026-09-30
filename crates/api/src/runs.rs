@@ -184,7 +184,7 @@ impl<'a> RunApi<'a> {
                             category,
                         )
                     {
-                        scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+                        um_support::sleep(um_support::short_retry_delay());
                         continue;
                     }
                     return Err(RunFailure::Unreachable(category));
@@ -210,7 +210,7 @@ impl<'a> RunApi<'a> {
                     let category = classify_reqwest_error(&error);
                     last_transport_failure = category;
                     if http_util::can_retry_ambiguous_mutation(attempt, CREATE_ATTEMPTS, category) {
-                        scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+                        um_support::sleep(um_support::short_retry_delay());
                         continue;
                     }
                     return Err(RunFailure::Unreachable(category));
@@ -340,8 +340,8 @@ impl<'a> RunApi<'a> {
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
         if list.items.len() > 100
             || list.items.iter().any(|item| {
-                !scherzo_cloud_support::valid_typed_id(&item.id, "run_")
-                    || !scherzo_cloud_support::valid_typed_id(&item.project_id, "prj_")
+                !um_support::valid_typed_id(&item.id, "run_")
+                    || !um_support::valid_typed_id(&item.project_id, "prj_")
             })
         {
             return Err(RunFailure::protocol(false));
@@ -509,7 +509,7 @@ fn decode_get_response(
             let pending: RunCreationPending =
                 serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
             if pending.run_id == requested_run_id
-                && scherzo_cloud_support::valid_typed_id(&pending.run_id, "run_")
+                && um_support::valid_typed_id(&pending.run_id, "run_")
             {
                 Ok(RunRead::Pending(pending))
             } else {
@@ -602,7 +602,7 @@ fn validate_acceptance(
     organization: &str,
     locations: &[HeaderValue],
 ) -> Result<RunCreationAcceptance, RunFailure> {
-    if !scherzo_cloud_support::valid_typed_id(&acceptance.run_id, "run_") {
+    if !um_support::valid_typed_id(&acceptance.run_id, "run_") {
         return Err(RunFailure::protocol(false));
     }
     let expected_location = format!(
@@ -624,13 +624,13 @@ fn validate_cancellation_envelope(
     use models::run_cancellation_resolution::Kind;
     let receipt = &envelope.request;
     let resolution = receipt.resolution.as_deref();
-    let valid = scherzo_cloud_support::valid_typed_id(&receipt.id, "cmd_")
-        && scherzo_cloud_support::valid_typed_id(&receipt.organization_id, "org_")
+    let valid = um_support::valid_typed_id(&receipt.id, "cmd_")
+        && um_support::valid_typed_id(&receipt.organization_id, "org_")
         && receipt.run_id == run_id
         && receipt
             .attempt_id
             .as_deref()
-            .is_none_or(|id| scherzo_cloud_support::valid_typed_id(id, "atm_"))
+            .is_none_or(|id| um_support::valid_typed_id(id, "atm_"))
         && valid_timestamp(&receipt.accepted_at)
         && mode.is_none_or(|expected| {
             serde_json::to_value(expected).ok() == serde_json::to_value(receipt.mode).ok()
@@ -641,7 +641,7 @@ fn validate_cancellation_envelope(
                 && resolution
                     .effective_request_id
                     .as_deref()
-                    .is_none_or(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+                    .is_none_or(|id| um_support::valid_typed_id(id, "cmd_"))
                 && resolution.run_version.is_none_or(|version| version > 0)
         })
         && status.is_none_or(|status| match status {
@@ -694,11 +694,11 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
     let workspace_source = &run.primary_workspace_source;
     let inputs = &run.inputs;
     let valid = run.id == requested_run_id
-        && scherzo_cloud_support::valid_typed_id(&run.id, "run_")
-        && scherzo_cloud_support::valid_typed_id(&run.organization_id, "org_")
-        && scherzo_cloud_support::valid_typed_id(&run.project_id, "prj_")
-        && scherzo_cloud_support::valid_typed_id(&run.execution_spec_id, "xsp_")
-        && scherzo_cloud_support::valid_typed_id(&run.current_attempt_id, "atm_")
+        && um_support::valid_typed_id(&run.id, "run_")
+        && um_support::valid_typed_id(&run.organization_id, "org_")
+        && um_support::valid_typed_id(&run.project_id, "prj_")
+        && um_support::valid_typed_id(&run.execution_spec_id, "xsp_")
+        && um_support::valid_typed_id(&run.current_attempt_id, "atm_")
         && run.version >= 1
         && run.current_attempt_number >= 1
         && valid_bounded_string(&run.source_branch, 1, 1024)
@@ -706,19 +706,16 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
             .display_name
             .as_deref()
             .is_none_or(|name| valid_bounded_string(name, 1, 200))
-        && scherzo_cloud_support::valid_typed_id(&workflow_source.repository_connection_id, "rpc_")
+        && um_support::valid_typed_id(&workflow_source.repository_connection_id, "rpc_")
         && lowercase_hex(&workflow_source.commit_oid, 40)
         && valid_canonical_workflow_path(&workflow_source.workflow_path)
         && lowercase_hex(&workflow_source.workflow_source_closure_digest.value, 64)
-        && scherzo_cloud_support::valid_typed_id(
-            &workspace_source.repository_connection_id,
-            "rpc_",
-        )
+        && um_support::valid_typed_id(&workspace_source.repository_connection_id, "rpc_")
         && lowercase_hex(&workspace_source.commit_oid, 40)
         && inputs
             .input_set_id
             .as_deref()
-            .is_none_or(|id| scherzo_cloud_support::valid_typed_id(id, "ris_"))
+            .is_none_or(|id| um_support::valid_typed_id(id, "ris_"))
         && (0..=256).contains(&inputs.attachment_count)
         && (0..=268_435_456).contains(&inputs.aggregate_bytes)
         && valid_integration_context(
@@ -751,18 +748,18 @@ fn valid_cancellation(cancellation: Option<&models::RunCancellation>) -> bool {
             cancellation
                 .graceful_request_id
                 .as_deref()
-                .is_some_and(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+                .is_some_and(|id| um_support::valid_typed_id(id, "cmd_"))
                 && cancellation.force_request_id.is_none()
         }
         models::run_cancellation::Mode::Force => {
             cancellation
                 .force_request_id
                 .as_deref()
-                .is_some_and(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+                .is_some_and(|id| um_support::valid_typed_id(id, "cmd_"))
                 && cancellation
                     .graceful_request_id
                     .as_deref()
-                    .is_none_or(|id| scherzo_cloud_support::valid_typed_id(id, "cmd_"))
+                    .is_none_or(|id| um_support::valid_typed_id(id, "cmd_"))
         }
     }
 }
@@ -895,7 +892,7 @@ fn valid_artifact_delivery(delivery: Option<&models::RunArtifactDelivery>) -> bo
     match delivery {
         None => true,
         Some(models::RunArtifactDelivery::RunArtifactDeliverySucceeded(succeeded)) => {
-            scherzo_cloud_support::valid_typed_id(&succeeded.artifact_set_id, "ats_")
+            um_support::valid_typed_id(&succeeded.artifact_set_id, "ats_")
         }
         Some(models::RunArtifactDelivery::RunArtifactDeliveryRegistrationFailed(_))
         | Some(models::RunArtifactDelivery::RunArtifactDeliveryUploadFailed(_))

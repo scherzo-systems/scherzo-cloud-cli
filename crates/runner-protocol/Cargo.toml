@@ -1,5 +1,5 @@
 [package]
-name = "scherzo-cloud-runner-protocol"
+name = "um-runner-protocol"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true

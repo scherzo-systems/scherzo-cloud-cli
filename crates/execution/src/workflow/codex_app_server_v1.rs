@@ -759,7 +759,7 @@ impl CodexAppServerV1Parser {
         {
             return Err(self.failure_for(CodexAppServerV1RejectionReason::FrameTooLarge));
         }
-        let value = scherzo_cloud_support::strict_json_from_slice(frame)
+        let value = um_support::strict_json_from_slice(frame)
             .map_err(|_| self.failure_for(CodexAppServerV1RejectionReason::FrameDecodeFailed))?;
         let object = value
             .as_object()
@@ -2677,7 +2677,7 @@ impl<'de> Visitor<'de> for WeakResultEnvelopeVisitor {
 
 fn parse_weak_result_envelope(text: &str) -> Result<Value, ()> {
     let envelope = serde_json::from_str::<WeakResultEnvelope>(text).map_err(|_| ())?;
-    scherzo_cloud_support::strict_json_from_str(&envelope.0).map_err(|_| ())
+    um_support::strict_json_from_str(&envelope.0).map_err(|_| ())
 }
 
 fn weak_json_schema() -> Value {

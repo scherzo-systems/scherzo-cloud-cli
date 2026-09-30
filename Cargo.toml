@@ -1,5 +1,5 @@
 [package]
-name = "scherzo-cloud"
+name = "um-cli"
 version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.97"
@@ -7,6 +7,10 @@ description = "Command-line interface and runner for Scherzo Cloud"
 license = "Apache-2.0"
 repository = "https://github.com/useful-machinery/um"
 publish = false
+
+[[bin]]
+name = "scherzo-cloud"
+path = "src/main.rs"
 
 [workspace]
 members = [
@@ -71,13 +75,13 @@ regress = "0.10.4"
 ring = "0.17.14"
 rustix = { version = "1.1.4", features = ["fs", "net", "process", "termios"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
-scherzo-cloud-api = { path = "crates/api" }
-scherzo-cloud-execution = { path = "crates/execution" }
-scherzo-cloud-human-auth = { path = "crates/human-auth" }
-scherzo-cloud-runner = { path = "crates/runner" }
-scherzo-cloud-runner-protocol = { path = "crates/runner-protocol" }
-scherzo-cloud-support = { path = "crates/support" }
-scherzo-cloud-test-support = { path = "crates/test-support" }
+um-api = { path = "crates/api" }
+um-execution = { path = "crates/execution" }
+um-human-auth = { path = "crates/human-auth" }
+um-runner = { path = "crates/runner" }
+um-runner-protocol = { path = "crates/runner-protocol" }
+um-support = { path = "crates/support" }
+um-test-support = { path = "crates/test-support" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision", "unbounded_depth"] }
 tempfile = "3.27.0"
@@ -105,11 +109,11 @@ libc.workspace = true
 nix.workspace = true
 ring.workspace = true
 rustix.workspace = true
-scherzo-cloud-api.workspace = true
-scherzo-cloud-execution.workspace = true
-scherzo-cloud-human-auth.workspace = true
-scherzo-cloud-runner.workspace = true
-scherzo-cloud-support.workspace = true
+um-api.workspace = true
+um-execution.workspace = true
+um-human-auth.workspace = true
+um-runner.workspace = true
+um-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -122,9 +126,9 @@ zeroize.workspace = true
 fs4.workspace = true
 futures-util.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
-scherzo-cloud-execution = { workspace = true, features = ["test-fixtures"] }
-scherzo-cloud-runner = { workspace = true, features = ["test-fixtures"] }
-scherzo-cloud-test-support.workspace = true
+um-execution = { workspace = true, features = ["test-fixtures"] }
+um-runner = { workspace = true, features = ["test-fixtures"] }
+um-test-support.workspace = true
 trycmd.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tokio-tungstenite.workspace = true

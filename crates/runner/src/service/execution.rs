@@ -32,7 +32,7 @@ use super::lease_clock::{
 };
 use super::workspace::{RetentionReason, WorkspaceDisposition};
 use crate::telemetry;
-use scherzo_cloud_execution::{
+use um_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
     AgentInputStaging, AgentInputStagingFailure, ArtifactStaging, ArtifactStagingFailure,
     AuthenticatedProcessGroup, AuthenticatedSignalResult, CancellationReason, CancellationSource,
@@ -56,7 +56,7 @@ use scherzo_cloud_execution::{
     summary_disposition_matches, terminate_authenticated_process_group,
 };
 #[cfg(test)]
-use scherzo_cloud_execution::{
+use um_execution::{
     BlockedDetail, FinalizationTrigger, Prerequisite, RecoveryRoundNumber, TransitionSequence,
     spawn_isolated_command_launch,
 };
@@ -523,7 +523,7 @@ impl GuardProcessControl for FixtureGuardProcessControl {
         }
         if self.alive.load(Ordering::Acquire) {
             ProcessIdentityObservation::Exact {
-                leader: scherzo_cloud_execution::LeaderState::Running,
+                leader: um_execution::LeaderState::Running,
             }
         } else {
             ProcessIdentityObservation::Absent
@@ -4096,9 +4096,7 @@ mod tests {
     use super::*;
     use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
     use crate::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
-    use scherzo_cloud_runner_protocol::{
-        MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame,
-    };
+    use um_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
     // jscpd:ignore-end
 
     #[test]
@@ -4778,8 +4776,8 @@ mod tests {
             },
         );
         let diagnostic = StepDiagnostic::from_streams(
-            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
-            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(
+            um_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
+            um_execution::CapturedDiagnosticStream::from_parts(
                 b"allocation failed".as_slice(),
                 0,
                 true,
@@ -5076,8 +5074,8 @@ mod tests {
         .unwrap();
         let detail = serde_json::from_value(workflow_issue(&issue)["detail"].clone()).unwrap();
         let diagnostic = StepDiagnostic::from_streams(
-            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
-            scherzo_cloud_execution::CapturedDiagnosticStream::from_parts(
+            um_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
+            um_execution::CapturedDiagnosticStream::from_parts(
                 b"publication failed".as_slice(),
                 0,
                 true,

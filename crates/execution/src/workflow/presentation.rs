@@ -213,8 +213,8 @@ pub struct SystemObservationClock;
 impl ObservationClock for SystemObservationClock {
     fn sample(&self) -> ObservationTime {
         ObservationTime {
-            utc: scherzo_cloud_support::utc_now(),
-            monotonic: scherzo_cloud_support::monotonic_now(),
+            utc: um_support::utc_now(),
+            monotonic: um_support::monotonic_now(),
         }
     }
 }

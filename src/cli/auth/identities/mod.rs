@@ -7,12 +7,12 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::{
+use um_api::{
     CommonIdentityFailure, HttpClient, IdentityApiError, LinkIdentityOutcome,
     ListIdentitiesOutcome, RemoveIdentityOutcome, UnreachableCategory,
 };
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_human_auth::{
+use um_human_auth::Deployment;
+use um_human_auth::{
     self, BoundRequiredOperation, LocalCredentialState, RequiredOperationWithBinding,
     SessionBinding,
 };
@@ -156,7 +156,7 @@ fn with_human_session_binding<O>(
 where
     O: HumanIdentityOutcome,
 {
-    match scherzo_cloud_human_auth::execute_required_with_binding(
+    match um_human_auth::execute_required_with_binding(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
@@ -191,7 +191,7 @@ fn with_bound_human_session<O>(
 where
     O: HumanIdentityOutcome,
 {
-    match scherzo_cloud_human_auth::execute_bound_required(
+    match um_human_auth::execute_bound_required(
         client,
         deployment,
         binding,

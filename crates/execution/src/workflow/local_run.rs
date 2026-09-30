@@ -1831,7 +1831,7 @@ impl PendingLocalContinuation {
             AttemptTriggerV1::Continuation,
             Some(prior.attempt_number),
             definition,
-            timestamp(scherzo_cloud_support::utc_now())?,
+            timestamp(um_support::utc_now())?,
         )?;
         attempt.continuation = Some(record);
         for (entry, original) in inherited_steps {
@@ -2494,7 +2494,7 @@ impl StateStore {
         })
         .transpose()?;
         self.update(|state| {
-            let now = timestamp(scherzo_cloud_support::utc_now())?;
+            let now = timestamp(um_support::utc_now())?;
             let attempt_number = state.current_attempt_number;
             {
                 let attempt = current_attempt_mut(state)?;
@@ -2752,7 +2752,7 @@ fn create_with_observer(
     let manifest_bytes = encode_json(&manifest)?;
     write_new_immutable_file(&workflow_directory, WORKFLOW_MANIFEST_FILE, &manifest_bytes)?;
 
-    let created_at = timestamp(scherzo_cloud_support::utc_now())?;
+    let created_at = timestamp(um_support::utc_now())?;
     let local_run_id = generate_uuid()?;
     let run = LocalRunV1 {
         schema_version: 1,
@@ -4484,7 +4484,7 @@ fn settle_interrupted_attempt(
                 AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
             });
     attempt.state = AttemptStateV1::Interrupted;
-    attempt.settled_at = Some(timestamp(scherzo_cloud_support::utc_now())?);
+    attempt.settled_at = Some(timestamp(um_support::utc_now())?);
     attempt.settlement_snapshot = settlement_snapshot;
     attempt.interruption = Some(AttemptInterruptionV1 {
         cause,
@@ -5086,7 +5086,7 @@ fn authenticate_retained_output_producers(
                 .ok_or(LocalRunDirectoryError::StateInvalid)?;
             let bytes =
                 read_regular_file_bounded(&carrier.parent, name, MAXIMUM_RETAINED_FILE_BYTES)?;
-            let value = scherzo_cloud_support::strict_json_from_slice(&bytes)
+            let value = um_support::strict_json_from_slice(&bytes)
                 .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
             if !schema.is_valid(&value) {
                 return Err(LocalRunDirectoryError::StateInvalid);
@@ -5781,7 +5781,7 @@ fn verify_retained_output(
             std::str::from_utf8(&bytes).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
         }
         (RetainedOutputV1::Json { .. }, Some(bytes)) => {
-            let value = scherzo_cloud_support::strict_json_from_slice(&bytes)
+            let value = um_support::strict_json_from_slice(&bytes)
                 .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
             let canonical = super::canonical_json::to_bounded_bytes(&value, carrier.size_bytes)
                 .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
@@ -6458,7 +6458,7 @@ impl LocalQuiescenceAuthority for SystemLocalRecoveryAuthority {
     }
 
     fn wait_for_process_change(&self) {
-        scherzo_cloud_support::sleep(QUIESCENCE_POLL_INTERVAL);
+        um_support::sleep(QUIESCENCE_POLL_INTERVAL);
     }
 }
 
@@ -6591,7 +6591,7 @@ fn retry_attempt(
         AttemptTriggerV1::ExplicitRetry,
         Some(prior_attempt_number),
         definition,
-        timestamp(scherzo_cloud_support::utc_now())?,
+        timestamp(um_support::utc_now())?,
     )
 }
 
@@ -6728,7 +6728,7 @@ fn quiesce_run(
     let recorded =
         u64::try_from(guards.len()).map_err(|_| process_inspection_unproven(Vec::new()))?;
     if guards.is_empty() {
-        let proven_at = timestamp(scherzo_cloud_support::utc_now())
+        let proven_at = timestamp(um_support::utc_now())
             .map_err(|_| process_inspection_unproven(Vec::new()))?;
         return Ok(super::publication::ContinuationQuiescenceV1 {
             groups_recorded: 0,
@@ -6767,8 +6767,8 @@ fn quiesce_run(
         return Err(process_inspection_unproven(unproven));
     }
     prove_groups_absent(&terminated, authority)?;
-    let proven_at = timestamp(scherzo_cloud_support::utc_now())
-        .map_err(|_| process_inspection_unproven(Vec::new()))?;
+    let proven_at =
+        timestamp(um_support::utc_now()).map_err(|_| process_inspection_unproven(Vec::new()))?;
     Ok(super::publication::ContinuationQuiescenceV1 {
         groups_recorded: recorded,
         groups_terminated: u64::try_from(terminated.len())
@@ -8450,7 +8450,7 @@ fn retained_output_set_valid(
     let mut names = BTreeSet::new();
     outputs.iter().all(|output| {
         let name = output.name();
-        scherzo_cloud_support::is_identifier(name)
+        um_support::is_identifier(name)
             && names.insert(name)
             && retained_output_valid(role, node, output)
     })

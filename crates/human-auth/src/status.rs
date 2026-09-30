@@ -1,7 +1,7 @@
 use std::fmt;
 
-use scherzo_cloud_api as api;
-use scherzo_cloud_api::{
+use um_api as api;
+use um_api::{
     AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, HttpClient,
     UnreachableCategory,
 };

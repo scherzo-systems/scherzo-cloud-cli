@@ -2,11 +2,11 @@ use std::io::{self, Write};
 
 use anyhow::Context;
 use clap::Args;
-use scherzo_cloud_support::lowercase_hex;
 use serde::Serialize;
+use um_support::lowercase_hex;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     ArtifactApi, ArtifactApiError, ArtifactInventoryPage, ArtifactMember, ArtifactSource,
     HttpEndpointError,
 };

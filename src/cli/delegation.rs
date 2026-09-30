@@ -7,14 +7,14 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     AcceptDelegationOutcome, CommonDelegationFailure, Delegation, DelegationApiError,
     DelegationPage, DelegationState, DelegationTerminalReason, EndDelegationOutcome,
     GetDelegationOutcome, HttpClient, ListDelegationsOutcome, ProposeDelegationOutcome,
     accept_delegation, end_delegation, get_delegation, list_current_principal_delegations,
     propose_delegation,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 // jscpd:ignore-end
 
 pub(super) const ABOUT: &str = "Manage Scherzo Cloud delegations";
@@ -93,7 +93,7 @@ impl DelegationOptions {
     where
         O: super::HumanCredentialOutcome<Error = DelegationApiError>,
     {
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate delegation mutation request identity")?;
         self.execute(
             deployment,
@@ -216,7 +216,7 @@ impl ListCommand {
 
 impl ProposeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate delegation proposal request identity")?;
         let outcome = super::execute_with_human_credential(
             deployment,
@@ -262,7 +262,7 @@ impl ShowCommand {
 impl AcceptCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let api_key = self.options.authentication.api_key()?;
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate delegation acceptance request identity")?;
         let client = HttpClient::new(self.options.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -306,7 +306,7 @@ impl EndCommand {
 // jscpd:ignore-end
 
 fn parse_principal_id(value: &str) -> Result<String, String> {
-    if scherzo_cloud_support::valid_typed_id(value, "prn_") {
+    if um_support::valid_typed_id(value, "prn_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact service principal ID".to_owned())
@@ -314,7 +314,7 @@ fn parse_principal_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_delegation_id(value: &str) -> Result<String, String> {
-    if scherzo_cloud_support::valid_typed_id(value, "dlg_") {
+    if um_support::valid_typed_id(value, "dlg_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact delegation ID".to_owned())
@@ -331,7 +331,7 @@ macro_rules! impl_delegation_credential_outcome {
                     Self::Common(CommonDelegationFailure::Unauthenticated)
                 }
 
-                fn unreachable(category: scherzo_cloud_api::UnreachableCategory) -> Self {
+                fn unreachable(category: um_api::UnreachableCategory) -> Self {
                     Self::Common(CommonDelegationFailure::Unreachable(category))
                 }
 

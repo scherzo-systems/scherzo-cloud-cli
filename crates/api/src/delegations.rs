@@ -542,7 +542,7 @@ fn execute_request(
             Err(_) => last_failure = UnreachableCategory::Timeout,
         }
         if attempt + 1 < spec.maximum_attempts {
-            scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+            um_support::sleep(um_support::short_retry_delay());
         }
     }
     Ok(RequestExecution::Unreachable(last_failure))
@@ -867,21 +867,21 @@ fn convert_delegation(
     operation: Operation,
     value: generated_models::Delegation,
 ) -> Result<Delegation, DelegationApiError> {
-    if !scherzo_cloud_support::valid_typed_id(&value.id, "dlg_") {
+    if !um_support::valid_typed_id(&value.id, "dlg_") {
         return Err(DelegationApiError::protocol(
             operation,
             "the delegation ID is invalid",
             false,
         ));
     }
-    if !scherzo_cloud_support::valid_typed_id(&value.human_principal_id, "prn_") {
+    if !um_support::valid_typed_id(&value.human_principal_id, "prn_") {
         return Err(DelegationApiError::protocol(
             operation,
             "the human principal ID is invalid",
             false,
         ));
     }
-    if !scherzo_cloud_support::valid_typed_id(&value.service_principal_id, "prn_") {
+    if !um_support::valid_typed_id(&value.service_principal_id, "prn_") {
         return Err(DelegationApiError::protocol(
             operation,
             "the service principal ID is invalid",

@@ -8,10 +8,10 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     HttpClient, LinearApi, LinearConnection, LinearFailure, LinearSession, LinearSessionStatus,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 // jscpd:ignore-end
 
 use super::{OrganizationArg, PrincipalAuthenticationArgs};
@@ -205,7 +205,7 @@ struct Recovery {
 
 impl Start {
     fn start(self, deployment: Deployment) -> super::CommandResult {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate Linear authorization request key")?;
         let timeout = if self.no_wait {
             None
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn poll_wait_honors_cadence_and_server_backoff_without_real_time() {
         let clock = super::super::observation_test_support::ControlledObservationClock::new(
-            scherzo_cloud_support::monotonic_now(),
+            um_support::monotonic_now(),
         );
         let control = super::super::OperationControl::new(Recovery { session: None });
         assert!(wait_for_poll(&control, POLL_INTERVAL, &clock));
@@ -444,7 +444,7 @@ mod tests {
             session: Some("known-session".into()),
         });
         let clock = CancellingClock {
-            now: Cell::new(scherzo_cloud_support::monotonic_now()),
+            now: Cell::new(um_support::monotonic_now()),
             slices: Cell::new(0),
             control: &control,
         };
@@ -542,7 +542,7 @@ impl Target {
                 .map_err(Into::into),
             };
         }
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate Linear lifecycle request key")?;
         let signal_d = d.clone();
         let signal_org = self.organization.to_string();
@@ -664,10 +664,10 @@ impl List {
 #[serde(rename_all = "camelCase")]
 struct SessionView<'a> {
     id: &'a str,
-    operation: &'a scherzo_cloud_api::linear_authorization_session::Operation,
+    operation: &'a um_api::linear_authorization_session::Operation,
     status: &'a LinearSessionStatus,
     connection_id: Option<&'a str>,
-    reason_code: Option<&'a scherzo_cloud_api::linear_authorization_session::ReasonCode>,
+    reason_code: Option<&'a um_api::linear_authorization_session::ReasonCode>,
     authorization_url: Option<&'a str>,
     expires_at: &'a str,
     result_connection: Option<ConnectionView<'a>>,
@@ -676,15 +676,15 @@ struct SessionView<'a> {
 #[serde(rename_all = "camelCase")]
 struct ConnectionView<'a> {
     id: &'a str,
-    status: &'a scherzo_cloud_api::linear_connection::Status,
+    status: &'a um_api::linear_connection::Status,
     workspace_id: Option<&'a str>,
     workspace_name: Option<&'a str>,
     app_user_id: Option<&'a str>,
-    required_scopes: Vec<&'a scherzo_cloud_api::linear_connection::RequiredScopes>,
+    required_scopes: Vec<&'a um_api::linear_connection::RequiredScopes>,
     granted_scopes: &'a [String],
     lifecycle_generation: i64,
     activation_cutoff: Option<&'a str>,
-    last_error: Option<&'a scherzo_cloud_api::linear_connection_error::LinearConnectionError>,
+    last_error: Option<&'a um_api::linear_connection_error::LinearConnectionError>,
 }
 fn connection_view(c: &LinearConnection) -> ConnectionView<'_> {
     ConnectionView {
@@ -712,8 +712,8 @@ fn session_view(s: &LinearSession) -> SessionView<'_> {
         result_connection: s.result_connection.as_deref().map(connection_view),
     }
 }
-fn status(s: &scherzo_cloud_api::linear_connection::Status) -> &'static str {
-    use scherzo_cloud_api::linear_connection::Status::*;
+fn status(s: &um_api::linear_connection::Status) -> &'static str {
+    use um_api::linear_connection::Status::*;
     match s {
         Active => "active",
         Disconnected => "disconnected",

@@ -4,9 +4,7 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
-    Project, ProjectFailure, ProjectList, ProjectReadinessBlocker, ProjectRepository,
-};
+use um_api::{Project, ProjectFailure, ProjectList, ProjectReadinessBlocker, ProjectRepository};
 
 pub(super) fn write_project(
     deployment: &str,

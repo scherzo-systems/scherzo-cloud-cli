@@ -209,7 +209,7 @@ struct RawPackEntry {
 }
 
 fn run_git(repository: Option<&Path>, arguments: &[&str]) {
-    let mut command = scherzo_cloud_test_support::fixture_git_command("git");
+    let mut command = um_test_support::fixture_git_command("git");
     if let Some(repository) = repository {
         command.arg("-C").arg(repository);
     }
@@ -227,7 +227,7 @@ fn run_git(repository: Option<&Path>, arguments: &[&str]) {
 }
 
 fn git_output(repository: &Path, arguments: &[&str]) -> String {
-    let mut command = scherzo_cloud_test_support::fixture_git_command("git");
+    let mut command = um_test_support::fixture_git_command("git");
     let output = command
         .arg("-C")
         .arg(repository)

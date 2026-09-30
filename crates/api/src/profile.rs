@@ -178,7 +178,7 @@ fn update_current_principal_with_timeout(
             Err(_) => last_transport_failure = UnreachableCategory::Timeout,
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+            um_support::sleep(um_support::short_retry_delay());
         }
     }
 

@@ -20,11 +20,11 @@ use zeroize::Zeroize as _;
 
 use crate::credential::Credential;
 use crate::service::config::RepositoryUrlPolicy;
-use scherzo_cloud_execution::ManagedProcessGroup;
-use scherzo_cloud_execution::{
+use um_execution::ManagedProcessGroup;
+use um_execution::{
     CaptureCancellation, CloudGitCaptureProjection, EnvironmentSnapshot, ResolvedWorkflow, resolve,
 };
-use scherzo_cloud_runner_protocol::ExecutionSpecV1RunnerProjection;
+use um_runner_protocol::ExecutionSpecV1RunnerProjection;
 
 const SOURCE_BROKER_RESPONSE_LIMIT: usize = 128 * 1024;
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -90,14 +90,14 @@ impl ProviderRetryWaiter for SystemProviderRetryWaiter {
         retry_after: Duration,
         cancellation: &CaptureCancellation,
     ) -> Result<(), CredentialBrokerFailure> {
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
         loop {
             ensure_broker_current(cancellation)?;
-            let remaining = retry_after.saturating_sub(scherzo_cloud_support::elapsed(started));
+            let remaining = retry_after.saturating_sub(um_support::elapsed(started));
             if remaining.is_zero() {
                 return Ok(());
             }
-            scherzo_cloud_support::sleep(remaining.min(PROVIDER_RETRY_POLL_INTERVAL));
+            um_support::sleep(remaining.min(PROVIDER_RETRY_POLL_INTERVAL));
         }
     }
 }
@@ -323,7 +323,7 @@ impl HttpSourceCredentialBroker {
         mut body: ProviderSecret,
         cancellation: Option<&CaptureCancellation>,
     ) -> Result<BrokerResponse, CredentialBrokerFailure> {
-        scherzo_cloud_support::install_provider();
+        um_support::install_provider();
         let client = reqwest::Client::builder()
             .timeout(PROVIDER_OPERATION_TIMEOUT)
             .build()
@@ -483,9 +483,7 @@ impl HttpSourceCredentialBroker {
         let expires_at = OffsetDateTime::parse(&expires_at, &Rfc3339)
             .ok()
             .filter(|value| {
-                utc_spelling
-                    && value.offset() == UtcOffset::UTC
-                    && *value > scherzo_cloud_support::utc_now()
+                utc_spelling && value.offset() == UtcOffset::UTC && *value > um_support::utc_now()
             })
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
         let repository_url = validate_repository_url(&repository_url, self.repository_url_policy)?;
@@ -524,9 +522,7 @@ impl HttpSourceCredentialBroker {
             .ok()
             .filter(|value| utc_spelling && value.offset() == UtcOffset::UTC)
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
-        if parsed.schema_version != 1
-            || !scherzo_cloud_support::valid_typed_id(&parsed.issuance_id, "gti_")
-        {
+        if parsed.schema_version != 1 || !um_support::valid_typed_id(&parsed.issuance_id, "gti_") {
             return Err(CredentialBrokerFailure::InvalidResponse);
         }
         Ok(WorkflowGitRevocation {
@@ -641,7 +637,7 @@ fn run_broker_worker<T: Send + 'static>(
                 return result;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                scherzo_cloud_support::sleep(PROCESS_POLL_INTERVAL);
+                um_support::sleep(PROCESS_POLL_INTERVAL);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 return Err(CredentialBrokerFailure::Unavailable);
@@ -1457,17 +1453,17 @@ fn run_managed_git(
     cancellation: Option<&CaptureCancellation>,
 ) -> Result<ExitStatus, ManagedGitFailure> {
     let mut child = ManagedProcessGroup::spawn(command).map_err(|_| ManagedGitFailure::Spawn)?;
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
     loop {
         if cancellation.is_some_and(CaptureCancellation::is_cancelled) {
             return Err(ManagedGitFailure::Cancelled);
         }
-        if scherzo_cloud_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
+        if um_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
             return Err(ManagedGitFailure::Timeout);
         }
         match child.try_wait().map_err(|_| ManagedGitFailure::Wait)? {
             Some(status) => return Ok(status),
-            None => scherzo_cloud_support::sleep(PROCESS_POLL_INTERVAL),
+            None => um_support::sleep(PROCESS_POLL_INTERVAL),
         }
     }
 }
@@ -1748,7 +1744,7 @@ mod tests {
     use super::*;
     use crate::credential::test_credential;
     use crate::telemetry::test_recorder;
-    use scherzo_cloud_execution::{
+    use um_execution::{
         ArtifactStaging, CancellationPolicy, CancellationSource, CapturedDiagnosticStream,
         CapturedValue, CloudCarrierBody, ExecutionContext, ExportValue, FailurePolicy,
         ResolvedInputs, RunOutcome, StepDiagnostic, StepState, WorkflowNodeRole, WorkflowRunResult,
@@ -2239,7 +2235,7 @@ mod tests {
     }
 
     fn fixture_git_command() -> Command {
-        scherzo_cloud_test_support::fixture_git_command("git")
+        um_test_support::fixture_git_command("git")
     }
 
     fn run_fixture_git(repository: &Path, arguments: &[&str]) {
@@ -2895,11 +2891,9 @@ mod tests {
                 CloudCarrierBody::Bytes(bytes) => fs::write(destination, bytes).unwrap(),
             }
         }
-        let validation = scherzo_cloud_execution::validate_portable_artifact_set(
-            portable.path(),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        let validation =
+            um_execution::validate_portable_artifact_set(portable.path(), &AtomicBool::new(false))
+                .unwrap();
         assert!(validation.is_valid());
         assert_eq!(
             broker.calls.lock().unwrap().as_slice(),

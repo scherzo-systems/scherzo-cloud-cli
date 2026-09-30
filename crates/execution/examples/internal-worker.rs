@@ -1,12 +1,12 @@
 use std::process::ExitCode;
 
-use scherzo_cloud_execution::ExecutionOutcome;
+use um_execution::ExecutionOutcome;
 
 fn main() -> ExitCode {
-    let outcome = if scherzo_cloud_execution::child_guard_worker_requested() {
-        scherzo_cloud_execution::run_child_guard_worker()
-    } else if scherzo_cloud_execution::result_validation_worker_requested() {
-        scherzo_cloud_execution::run_result_validation_worker()
+    let outcome = if um_execution::child_guard_worker_requested() {
+        um_execution::run_child_guard_worker()
+    } else if um_execution::result_validation_worker_requested() {
+        um_execution::run_result_validation_worker()
     } else {
         ExecutionOutcome::Failed
     };

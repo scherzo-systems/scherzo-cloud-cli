@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::remove_identity;
-use scherzo_cloud_human_auth::Deployment;
+use um_api::remove_identity;
+use um_human_auth::Deployment;
 
 use super::{OutputOptions, output, with_principal_credential};
 
@@ -28,7 +28,7 @@ impl Command {
     pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let client = self.options.client()?;
         // jscpd:ignore-end
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate identity-removal request identity")?;
         let outcome = with_principal_credential(
             &client,

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, MapAccess, Visitor};
 use zeroize::Zeroizing;
 
-use scherzo_cloud_api::{
+use um_api::{
     InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,
     RunInputManifest, RunInputUpload, digest_bytes, valid_integration_context,
 };
@@ -411,7 +411,7 @@ fn acquire_scalar(
         ScalarKind::Text if std::str::from_utf8(&bytes).is_err() => {
             return Err(InputAcquisitionFailure::InvalidUtf8 { path });
         }
-        ScalarKind::Json if scherzo_cloud_support::strict_json_from_slice(&bytes).is_err() => {
+        ScalarKind::Json if um_support::strict_json_from_slice(&bytes).is_err() => {
             return Err(InputAcquisitionFailure::InvalidJson { path });
         }
         ScalarKind::Text | ScalarKind::Json => {}
@@ -532,7 +532,7 @@ fn input_name(value: Option<&OsString>) -> Result<&str, InputAcquisitionFailure>
 }
 
 fn validate_name(name: &str) -> Result<(), InputAcquisitionFailure> {
-    if scherzo_cloud_execution::is_input_name(name) {
+    if um_execution::is_input_name(name) {
         Ok(())
     } else {
         Err(InputAcquisitionFailure::InvalidName)
@@ -541,7 +541,7 @@ fn validate_name(name: &str) -> Result<(), InputAcquisitionFailure> {
 
 fn media_type(value: Option<&OsString>) -> Result<String, InputAcquisitionFailure> {
     let value = string_argument(value)?;
-    if scherzo_cloud_execution::is_valid_media_type(value) {
+    if um_execution::is_valid_media_type(value) {
         Ok(value.to_owned())
     } else {
         Err(InputAcquisitionFailure::InvalidMediaType)

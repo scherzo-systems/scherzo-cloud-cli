@@ -4,8 +4,8 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_human_auth::{LogoutOutcome, RevocationState};
+use um_human_auth::Deployment;
+use um_human_auth::{LogoutOutcome, RevocationState};
 
 pub(super) const ABOUT: &str = "Sign out on this device";
 
@@ -19,7 +19,7 @@ impl Command {
     }
 
     fn run(self, deployment: &Deployment) -> anyhow::Result<()> {
-        let outcome = scherzo_cloud_human_auth::logout(deployment, self.http.transport_policy())
+        let outcome = um_human_auth::logout(deployment, self.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("sign out human session")?;
 

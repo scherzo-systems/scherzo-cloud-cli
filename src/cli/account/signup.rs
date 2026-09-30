@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{HumanPrincipal, SignupError, SignupOutcome};
+use um_api::{HumanPrincipal, SignupError, SignupOutcome};
 
 use super::super::principal::PrincipalResult;
 

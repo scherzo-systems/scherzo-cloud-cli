@@ -1,12 +1,12 @@
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::{
+use um_api::{
     HttpClient, MembershipRole, OrganizationError, end_organization_membership,
     list_organization_membership_history, list_organization_memberships,
     update_organization_membership_role,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 use crate::cli::{OrganizationArg, PaginationArgs};
@@ -146,7 +146,7 @@ struct MembershipTarget {
 }
 
 fn parse_membership_id(value: &str) -> Result<String, String> {
-    if scherzo_cloud_support::valid_typed_id(value, "mem_") {
+    if um_support::valid_typed_id(value, "mem_") {
         Ok(value.to_owned())
     } else {
         Err("membership must be an exact mem_ identifier".to_owned())

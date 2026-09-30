@@ -8,8 +8,8 @@ use super::{
     validate_activation_destination, write_activation_issuance, write_activation_summary,
 };
 use crate::exit_code::ExitCode;
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_support::generate_idempotency_key;
+use um_human_auth::Deployment;
+use um_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner enrollment activations";
 const COMMAND_PATH: &[&str] = &["runner", "activation"];
@@ -20,7 +20,7 @@ struct ActivationCreationOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    activation: &'a scherzo_cloud_api::RunnerActivation,
+    activation: &'a um_api::RunnerActivation,
     activation_file: &'a str,
 }
 
@@ -30,7 +30,7 @@ struct ActivationListOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    items: &'a [scherzo_cloud_api::RunnerActivation],
+    items: &'a [um_api::RunnerActivation],
     next_cursor: Option<&'a str>,
 }
 
@@ -40,7 +40,7 @@ struct ActivationRevocationOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    activation: &'a scherzo_cloud_api::RunnerActivation,
+    activation: &'a um_api::RunnerActivation,
 }
 
 // Pool and activation namespaces keep concrete subcommand enums so Clap owns
@@ -297,8 +297,8 @@ impl RevokeCommand {
     }
 }
 
-fn activation_state_label(state: scherzo_cloud_api::RunnerActivationState) -> &'static str {
-    use scherzo_cloud_api::RunnerActivationState;
+fn activation_state_label(state: um_api::RunnerActivationState) -> &'static str {
+    use um_api::RunnerActivationState;
     match state {
         RunnerActivationState::Issued => "issued",
         RunnerActivationState::Consumed => "consumed",

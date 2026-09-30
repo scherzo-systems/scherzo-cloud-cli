@@ -19,14 +19,14 @@ use std::env;
 use crate::exit_code::ExitCode;
 
 fn main() -> ExitCode {
-    if scherzo_cloud_execution::child_guard_worker_requested() {
-        return scherzo_cloud_execution::run_child_guard_worker().into();
+    if um_execution::child_guard_worker_requested() {
+        return um_execution::run_child_guard_worker().into();
     }
-    if scherzo_cloud_execution::result_validation_worker_requested() {
-        return scherzo_cloud_execution::run_result_validation_worker().into();
+    if um_execution::result_validation_worker_requested() {
+        return um_execution::run_result_validation_worker().into();
     }
-    if scherzo_cloud_runner::workflow_git_helper_requested() {
-        return if scherzo_cloud_runner::run_workflow_git_helper() {
+    if um_runner::workflow_git_helper_requested() {
+        return if um_runner::run_workflow_git_helper() {
             ExitCode::Success
         } else {
             ExitCode::GeneralFailure

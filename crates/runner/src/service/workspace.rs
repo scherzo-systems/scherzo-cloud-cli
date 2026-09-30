@@ -18,9 +18,7 @@ use rustix::fs::{
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitTeardownReport};
-use scherzo_cloud_execution::{
-    RemovalError, open_directory_at, open_regular_file_at, remove_open_tree_at,
-};
+use um_execution::{RemovalError, open_directory_at, open_regular_file_at, remove_open_tree_at};
 
 const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
 const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
@@ -485,9 +483,9 @@ struct AttemptRecord {
 
 impl AttemptRecord {
     fn new(assignment_id: &str, run_id: &str, attempt_id: &str) -> Result<Self, ()> {
-        if !scherzo_cloud_runner_protocol::valid_assignment_id(assignment_id)
-            || !scherzo_cloud_runner_protocol::valid_run_id(run_id)
-            || !scherzo_cloud_runner_protocol::valid_attempt_id(attempt_id)
+        if !um_runner_protocol::valid_assignment_id(assignment_id)
+            || !um_runner_protocol::valid_run_id(run_id)
+            || !um_runner_protocol::valid_attempt_id(attempt_id)
         {
             return Err(());
         }
@@ -618,11 +616,11 @@ fn validate_cleanup_target(relative_path: &str) -> Result<(), ()> {
 }
 
 fn valid_boot_id(value: &str) -> bool {
-    scherzo_cloud_runner_protocol::valid_boot_id(value)
+    um_runner_protocol::valid_boot_id(value)
 }
 
 fn valid_assignment_id(value: &str) -> bool {
-    scherzo_cloud_runner_protocol::valid_assignment_id(value)
+    um_runner_protocol::valid_assignment_id(value)
 }
 
 struct CleanupAuthorityProof {
@@ -1338,7 +1336,7 @@ impl WorkRootLease {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !scherzo_cloud_runner_protocol::valid_boot_id(name) {
+            if !um_runner_protocol::valid_boot_id(name) {
                 continue;
             }
             let path = work_root.join(name);
@@ -2771,11 +2769,9 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let environment = scherzo_cloud_execution::EnvironmentSnapshot::new([(
-            "PATH",
-            std::env::var_os("PATH").unwrap(),
-        )]);
-        let cancellation = scherzo_cloud_execution::CaptureCancellation::default();
+        let environment =
+            um_execution::EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]);
+        let cancellation = um_execution::CaptureCancellation::default();
         let authority = super::super::workflow_git::WorkflowGitAuthority::install(
             super::super::workflow_git::WorkflowGitInstall {
                 broker: super::super::source::test_support::unavailable_source_broker(),

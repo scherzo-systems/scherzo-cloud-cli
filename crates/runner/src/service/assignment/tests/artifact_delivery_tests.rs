@@ -1,11 +1,11 @@
 use super::*;
 use crate::service::artifact_delivery::{ArtifactDeliveryOutcome, ArtifactDeliverySpec};
 use base64::Engine as _;
-use scherzo_cloud_runner_protocol::{
+use um_runner_protocol::{
     ArtifactConfirmationOutcome, ArtifactConfirmationResponse, ArtifactResultConfirmationOutcome,
     ArtifactResultConfirmationResponse, ArtifactUploadCapability,
 };
-use scherzo_cloud_test_support::ScriptedHttpServer;
+use um_test_support::ScriptedHttpServer;
 
 #[tokio::test]
 async fn fenced_artifact_send_keeps_its_late_response_until_transport_retires_it() {

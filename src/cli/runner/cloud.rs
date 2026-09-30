@@ -4,11 +4,11 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     HttpTransportPolicy, RunnerApi, RunnerDeletionBlocker, RunnerFailure, RunnerPool,
     RunnerPoolList, RunnerRegistration, RunnerRegistrationList,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
@@ -32,7 +32,7 @@ pub(super) fn with_api_retrying_rejected_result<T>(
     mut operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
     result_credential_rejected: impl Fn(&T) -> bool,
 ) -> anyhow::Result<Result<T, RunnerFailure>> {
-    let client = scherzo_cloud_api::HttpClient::new(transport_policy)
+    let client = um_api::HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
     super::super::execute_selected_api_operation_retrying_result(
@@ -423,7 +423,7 @@ fn write_runner_human_to(
 
 fn write_assignment_to(
     output: &mut impl Write,
-    assignment: &scherzo_cloud_api::RunnerCurrentAssignment,
+    assignment: &um_api::RunnerCurrentAssignment,
     indent: &str,
 ) -> anyhow::Result<()> {
     writeln!(output, "{indent}Run:         {}", assignment.run_id)?;

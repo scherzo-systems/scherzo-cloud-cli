@@ -7,13 +7,13 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::exit_code::OutcomeClass;
-use scherzo_cloud_api::{HttpClient, UnreachableCategory};
-use scherzo_cloud_human_auth::Cancellation;
-use scherzo_cloud_human_auth::CredentialStore;
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_human_auth::{AuthenticationState, AuthenticationStatus, StatusError};
-use scherzo_cloud_human_auth::{AuthorizationError, DeviceAuthorization, IssuedToken};
-use scherzo_cloud_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
+use um_api::{HttpClient, UnreachableCategory};
+use um_human_auth::Cancellation;
+use um_human_auth::CredentialStore;
+use um_human_auth::Deployment;
+use um_human_auth::{AuthenticationState, AuthenticationStatus, StatusError};
+use um_human_auth::{AuthorizationError, DeviceAuthorization, IssuedToken};
+use um_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 
 use super::status::{StatusResult, write_human_status};
 
@@ -72,7 +72,7 @@ impl Command {
                 .map_err(|error| anyhow!(error))
                 .context("access credential store")?;
         } else {
-            let existing_status = scherzo_cloud_human_auth::check_auth_status(&client, deployment);
+            let existing_status = um_human_auth::check_auth_status(&client, deployment);
             if cancellation.is_cancelled() {
                 output.cancelled(deployment)?;
                 return Ok(OutcomeClass::Interrupted);
@@ -105,7 +105,7 @@ impl Command {
             }
         }
 
-        let flow = scherzo_cloud_human_auth::begin_session(
+        let flow = um_human_auth::begin_session(
             &client,
             deployment,
             cancellation,
@@ -194,7 +194,7 @@ fn finish_login(
         .map_err(|error| anyhow!(error))
         .context("access credential store")?;
 
-    let status = scherzo_cloud_human_auth::check_auth_status(client, deployment);
+    let status = um_human_auth::check_auth_status(client, deployment);
     match status {
         Ok(status) => match status.state() {
             AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {
@@ -302,7 +302,7 @@ type LoginResult<T> = Result<T, super::super::CommandFailure>;
 
 fn expiration_after(duration: Duration) -> Option<OffsetDateTime> {
     let seconds = i64::try_from(duration.as_secs()).ok()?;
-    scherzo_cloud_support::utc_now().checked_add(time::Duration::seconds(seconds))
+    um_support::utc_now().checked_add(time::Duration::seconds(seconds))
 }
 
 #[derive(Clone, Copy)]
@@ -387,13 +387,9 @@ impl LoginOutput {
         // Keep login presentation and its error context next to this command.
         // jscpd:ignore-start
         if self.json {
-            let event = scherzo_cloud_human_auth::activation_event(
-                deployment,
-                authorization,
-                expires_at,
-                None,
-            )
-            .context("format sign-in expiration")?;
+            let event =
+                um_human_auth::activation_event(deployment, authorization, expires_at, None)
+                    .context("format sign-in expiration")?;
             self.json_line(&event)
         // jscpd:ignore-end
         } else {

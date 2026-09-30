@@ -5,7 +5,7 @@ use std::thread;
 use super::*;
 use crate::HttpTransportPolicy;
 use crate::http_util::MAX_RESPONSE_BODY_BYTES;
-use scherzo_cloud_test_support::{ScriptedHttpServer, read_request};
+use um_test_support::{ScriptedHttpServer, read_request};
 
 type TestServer = ScriptedHttpServer;
 

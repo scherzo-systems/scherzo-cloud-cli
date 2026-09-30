@@ -572,7 +572,7 @@ fn execute_request(
             Err(_) => last_failure = UnreachableCategory::Timeout,
         }
         if attempt + 1 < spec.attempts {
-            scherzo_cloud_support::sleep(scherzo_cloud_support::short_retry_delay());
+            um_support::sleep(um_support::short_retry_delay());
         }
     }
     Ok(RequestExecution::Unreachable(last_failure))
@@ -931,7 +931,7 @@ fn validate_credential_metadata(
     created_at: String,
     current: Option<bool>,
 ) -> Result<ServiceCredential, ServicePrincipalApiError> {
-    if !scherzo_cloud_support::valid_typed_id(&id, "crd_") {
+    if !um_support::valid_typed_id(&id, "crd_") {
         return Err(ServicePrincipalApiError::protocol(
             operation,
             "the credential metadata is invalid",
@@ -1089,7 +1089,7 @@ fn unrecognized_problem(operation: Operation, status: u16) -> ServicePrincipalAp
 mod tests {
     use super::*;
     use crate::HttpTransportPolicy;
-    use scherzo_cloud_test_support::{REQUEST_IDEMPOTENCY_KEY_ECHO, ScriptedHttpServer};
+    use um_test_support::{REQUEST_IDEMPOTENCY_KEY_ECHO, ScriptedHttpServer};
 
     const CREDENTIAL_ID: &str = "crd_01k0z6r1w8f4jy2m7q9v3x5abc";
     const API_KEY: &str =

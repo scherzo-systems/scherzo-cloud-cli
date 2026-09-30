@@ -48,13 +48,13 @@ impl ExitCode {
     }
 }
 
-impl From<scherzo_cloud_execution::ExecutionOutcome> for ExitCode {
-    fn from(outcome: scherzo_cloud_execution::ExecutionOutcome) -> Self {
+impl From<um_execution::ExecutionOutcome> for ExitCode {
+    fn from(outcome: um_execution::ExecutionOutcome) -> Self {
         match outcome {
-            scherzo_cloud_execution::ExecutionOutcome::Succeeded => Self::Success,
-            scherzo_cloud_execution::ExecutionOutcome::Failed => Self::GeneralFailure,
-            scherzo_cloud_execution::ExecutionOutcome::Interrupted => Self::Interrupted,
-            scherzo_cloud_execution::ExecutionOutcome::Terminated => Self::Terminated,
+            um_execution::ExecutionOutcome::Succeeded => Self::Success,
+            um_execution::ExecutionOutcome::Failed => Self::GeneralFailure,
+            um_execution::ExecutionOutcome::Interrupted => Self::Interrupted,
+            um_execution::ExecutionOutcome::Terminated => Self::Terminated,
         }
     }
 }
@@ -74,7 +74,7 @@ impl Termination for ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{ExitCode, OutcomeClass};
-    use scherzo_cloud_execution::ExecutionOutcome;
+    use um_execution::ExecutionOutcome;
 
     #[test]
     fn outcome_classes_map_to_registered_exit_codes() {

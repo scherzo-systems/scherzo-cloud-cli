@@ -24,7 +24,7 @@ use super::source::{
     ProviderCredential, SourceCredentialBroker, WorkflowGitRevocation, WorkflowGitRevocationOutcome,
 };
 use super::workspace::ProcessQuiescence;
-use scherzo_cloud_execution::{CaptureCancellation, EnvironmentSnapshot};
+use um_execution::{CaptureCancellation, EnvironmentSnapshot};
 
 const INTERNAL_HELPER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_WORKFLOW_GIT_HELPER";
 const INTERNAL_HELPER_SOCKET_ENVIRONMENT: &str = "SCHERZO_INTERNAL_WORKFLOW_GIT_SOCKET";
@@ -1500,7 +1500,7 @@ mod tests {
     #[test]
     fn exact_origin_helper_is_inactive_before_start_and_refuses_other_repositories_after_start() {
         let fixture = fixture();
-        let expires = scherzo_cloud_support::utc_now() + time::Duration::hours(1);
+        let expires = um_support::utc_now() + time::Duration::hours(1);
         let broker = fixture_broker(
             [(b"current-runtime-token".as_slice(), expires)],
             [WorkflowGitRevocationOutcome::Revoked],
@@ -1603,7 +1603,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let expires = scherzo_cloud_support::utc_now() + time::Duration::hours(1);
+        let expires = um_support::utc_now() + time::Duration::hours(1);
         let broker = fixture_broker(
             [(b"current-runtime-token".as_slice(), expires)],
             [WorkflowGitRevocationOutcome::Revoked],
@@ -1629,8 +1629,8 @@ mod tests {
     #[test]
     fn replacement_issuances_are_revoked_independently_and_report_partial_residual() {
         let fixture = fixture();
-        let first_expiry = scherzo_cloud_support::utc_now() + time::Duration::seconds(5);
-        let second_expiry = scherzo_cloud_support::utc_now() + time::Duration::hours(1);
+        let first_expiry = um_support::utc_now() + time::Duration::seconds(5);
+        let second_expiry = um_support::utc_now() + time::Duration::hours(1);
         let broker = fixture_broker(
             [
                 (b"first-runtime-token".as_slice(), first_expiry),
@@ -1712,7 +1712,7 @@ mod tests {
     #[test]
     fn provider_revocation_failure_still_destroys_local_state_and_reports_residual() {
         let fixture = fixture();
-        let expires = scherzo_cloud_support::utc_now() + time::Duration::hours(1);
+        let expires = um_support::utc_now() + time::Duration::hours(1);
         let broker = fixture_broker([(b"revoke-failure-token".as_slice(), expires)], []);
         let authority = install(&fixture, Arc::clone(&broker));
         activate(&authority);
@@ -1738,7 +1738,7 @@ mod tests {
         let fixture = fixture();
         let workload_credential = fixture.workspace.join("operator-credential.txt");
         fs::write(&workload_credential, b"synthetic workload material").unwrap();
-        let expires = scherzo_cloud_support::utc_now() + time::Duration::hours(1);
+        let expires = um_support::utc_now() + time::Duration::hours(1);
         let broker = fixture_broker(
             [(b"process-loss-token".as_slice(), expires)],
             [WorkflowGitRevocationOutcome::Revoked],
@@ -1769,7 +1769,7 @@ mod tests {
     #[test]
     fn teardown_preserves_workload_replacements_of_runner_injected_material() {
         let fixture = fixture();
-        let expires = scherzo_cloud_support::utc_now() + time::Duration::hours(1);
+        let expires = um_support::utc_now() + time::Duration::hours(1);
         let broker = fixture_broker([(b"unused-token".as_slice(), expires)], []);
         let authority = install(&fixture, broker);
         let _lease = activate(&authority);
@@ -1830,7 +1830,7 @@ mod tests {
 
     #[test]
     fn revocation_summary_distinguishes_replay_expiry_and_unconfirmed_residual() {
-        let expiry = scherzo_cloud_support::utc_now() + time::Duration::hours(1);
+        let expiry = um_support::utc_now() + time::Duration::hours(1);
         let replay = WorkflowGitTeardownReport::from_observations(
             vec![RevocationObservation::Settled(WorkflowGitRevocation {
                 issuance_id: "gti_replay".to_owned(),

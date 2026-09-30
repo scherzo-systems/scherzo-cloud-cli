@@ -436,18 +436,18 @@ fn terminate_unready_guard(child: &mut Child) -> io::Result<()> {
 }
 
 fn wait_for_guard_exit(child: &mut Child) -> io::Result<()> {
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
     loop {
         if child.try_wait()?.is_some() {
             return Ok(());
         }
-        if scherzo_cloud_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+        if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "child process guard did not exit",
             ));
         }
-        scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+        um_support::sleep(WORKER_POLL_INTERVAL);
     }
 }
 
@@ -487,7 +487,7 @@ fn wait_for_boundary<Output>(
     cancellation: &ChildGuardCancellation,
     mut inspect: impl FnMut(&Path) -> io::Result<Option<Output>>,
 ) -> io::Result<Output> {
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
     loop {
         if let Some(output) = inspect(path)? {
             return Ok(output);
@@ -510,13 +510,13 @@ fn check_worker_boundary(
     if child.try_wait()?.is_some() {
         return Err(io::Error::other("child process guard exited early"));
     }
-    if worker_boundary_timed_out(scherzo_cloud_support::elapsed(started)) {
+    if worker_boundary_timed_out(um_support::elapsed(started)) {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "child process guard did not respond",
         ));
     }
-    scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+    um_support::sleep(WORKER_POLL_INTERVAL);
     Ok(())
 }
 
@@ -682,7 +682,7 @@ fn monitor_guarded_child(
                 return Err(());
             }
         }
-        scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+        um_support::sleep(WORKER_POLL_INTERVAL);
     }
 }
 
@@ -934,18 +934,18 @@ fn cleanup_adopted_group(
 
 #[cfg(target_os = "linux")]
 fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
     loop {
         match waitpgid(process_group, WaitOptions::NOHANG) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                if scherzo_cloud_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+                if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "guarded process group did not exit",
                     ));
                 }
-                scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+                um_support::sleep(WORKER_POLL_INTERVAL);
             }
             Err(Errno::CHILD) => return Ok(()),
             Err(Errno::INTR) => {}
@@ -958,7 +958,7 @@ fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
 // surviving descendants become its direct children even when native tools created new sessions.
 #[cfg(target_os = "linux")]
 fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
     loop {
         loop {
             match wait(WaitOptions::NOHANG) {
@@ -986,13 +986,13 @@ fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
             }
         }
 
-        if scherzo_cloud_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+        if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "guarded descendants did not exit",
             ));
         }
-        scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+        um_support::sleep(WORKER_POLL_INTERVAL);
     }
 }
 
@@ -1053,15 +1053,15 @@ fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
 
 #[cfg(target_vendor = "apple")]
 fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
     while !process_group_is_quiescent(process_group) {
-        if scherzo_cloud_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+        if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "guarded process group did not exit",
             ));
         }
-        scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+        um_support::sleep(WORKER_POLL_INTERVAL);
     }
     Ok(())
 }
@@ -1301,12 +1301,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn wait_for_fixture_file(path: &Path) {
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
         while !path.is_file() {
-            assert!(scherzo_cloud_support::elapsed(started) < Duration::from_secs(5));
+            assert!(um_support::elapsed(started) < Duration::from_secs(5));
             // Files are the synchronization ABI between independently executing test binaries;
             // there is no in-process notification primitive at this operating-system boundary.
-            scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+            um_support::sleep(WORKER_POLL_INTERVAL);
         }
     }
 
@@ -1387,12 +1387,12 @@ mod tests {
 
             kill_process_group(leader_pid, Signal::KILL).unwrap();
             assert!(!leader.wait().unwrap().success());
-            let started = scherzo_cloud_support::monotonic_now();
+            let started = um_support::monotonic_now();
             while !process_group_is_quiescent(leader_pid) {
-                assert!(scherzo_cloud_support::elapsed(started) < Duration::from_secs(5));
+                assert!(um_support::elapsed(started) < Duration::from_secs(5));
                 // Process-group disappearance has no event descriptor, so this bounded poll is
                 // the unavoidable kernel-observation boundary for the regression fixture.
-                scherzo_cloud_support::sleep(WORKER_POLL_INTERVAL);
+                um_support::sleep(WORKER_POLL_INTERVAL);
             }
             reports.push(serde_json::json!({
                 "processGroup": leader_pid.as_raw_pid(),
@@ -1576,7 +1576,7 @@ mod tests {
             });
             let waited = tokio::select! {
                 result = outer.wait() => Some(result),
-                () = scherzo_cloud_support::async_sleep(Duration::from_secs(10)) => None,
+                () = um_support::async_sleep(Duration::from_secs(10)) => None,
             };
             if waited.is_none() {
                 let _ = outer.force_stop().await;
@@ -1652,7 +1652,7 @@ mod tests {
             if descendant_file.is_file() {
                 break;
             }
-            scherzo_cloud_support::sleep(Duration::from_millis(10));
+            um_support::sleep(Duration::from_millis(10));
         }
         let (_owner_event, owner_events) = mpsc::channel();
 

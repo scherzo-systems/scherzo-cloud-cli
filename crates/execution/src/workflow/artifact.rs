@@ -1416,7 +1416,7 @@ impl ArtifactStaging {
                         CaptureFailureKind::InvalidJson,
                     ))
                 })?;
-                if scherzo_cloud_support::strict_json_from_slice(&source).is_err() {
+                if um_support::strict_json_from_slice(&source).is_err() {
                     return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
                         Arc::clone(output_identity),
                         CaptureFailureKind::DuplicateJsonMember,

@@ -20,8 +20,8 @@ use tokio::io::unix::AsyncFd;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 #[cfg(test)]
-use scherzo_cloud_execution::admit_workflow;
-use scherzo_cloud_execution::{
+use um_execution::admit_workflow;
+use um_execution::{
     ActionId, AdmittedWorkflow, AgentExecution, AgentHarnessInstallationFailure, AgentInputStaging,
     ArtifactStaging, CancellationPolicy, CancellationReason, CancellationSource, ColorChoice,
     CoordinationError, CoordinatorClock, DisplayDeadline, DurableDeadline,
@@ -340,7 +340,7 @@ impl Drop for AbortOnDrop {
 struct AttemptTeardown {
     run: Option<LocalAttemptOwner>,
     signal_task: Option<tokio::task::JoinHandle<()>>,
-    private_staging: Option<scherzo_cloud_execution::AttemptPrivateStaging>,
+    private_staging: Option<um_execution::AttemptPrivateStaging>,
     artifacts: Option<ArtifactStaging>,
     inputs: Option<InputStaging>,
     agents: Option<AgentInputStaging>,
@@ -1247,7 +1247,7 @@ fn input_argument<'a>(value: Option<&'a OsString>, description: &str) -> anyhow:
 }
 
 fn validate_input_name(name: &str) -> anyhow::Result<()> {
-    if !scherzo_cloud_execution::is_input_name(name) {
+    if !um_execution::is_input_name(name) {
         return Err(anyhow!("invalid Workflow V1 input name"));
     }
     Ok(())
@@ -2480,7 +2480,7 @@ mod tests {
     use time::format_description::well_known::Rfc3339;
 
     use super::*;
-    use scherzo_cloud_execution::{
+    use um_execution::{
         ObservationTime, SchedulingGate, StepStateKind, TransitionEvent, TransitionObservation,
         TransitionSequence, WorkflowState, resolve,
     };
@@ -2600,15 +2600,15 @@ mod tests {
 
     struct RestoringBoundary(Arc<AtomicBool>);
 
-    impl scherzo_cloud_execution::TerminalBoundary for RestoringBoundary {
-        fn setup(&mut self) -> io::Result<scherzo_cloud_execution::TerminalRect> {
-            Ok(scherzo_cloud_execution::TerminalRect::new(0, 0, 120, 24))
+    impl um_execution::TerminalBoundary for RestoringBoundary {
+        fn setup(&mut self) -> io::Result<um_execution::TerminalRect> {
+            Ok(um_execution::TerminalRect::new(0, 0, 120, 24))
         }
-        async fn next_event(&mut self) -> io::Result<scherzo_cloud_execution::TerminalInputEvent> {
+        async fn next_event(&mut self) -> io::Result<um_execution::TerminalInputEvent> {
             std::future::pending().await
         }
-        fn resize(&mut self) -> io::Result<scherzo_cloud_execution::TerminalRect> {
-            Ok(scherzo_cloud_execution::TerminalRect::new(0, 0, 120, 24))
+        fn resize(&mut self) -> io::Result<um_execution::TerminalRect> {
+            Ok(um_execution::TerminalRect::new(0, 0, 120, 24))
         }
         fn restore(&mut self) -> io::Result<()> {
             self.0.store(true, Ordering::SeqCst);
@@ -2616,11 +2616,11 @@ mod tests {
         }
     }
 
-    impl scherzo_cloud_execution::WorkflowTerminalBoundary for RestoringBoundary {
+    impl um_execution::WorkflowTerminalBoundary for RestoringBoundary {
         fn draw_workflow(
             &mut self,
-            _snapshot: &scherzo_cloud_execution::WorkflowRunViewSnapshot,
-            _interaction: &mut scherzo_cloud_execution::HostInteraction,
+            _snapshot: &um_execution::WorkflowRunViewSnapshot,
+            _interaction: &mut um_execution::HostInteraction,
             _color: bool,
         ) -> io::Result<()> {
             Ok(())
@@ -3280,7 +3280,7 @@ mod tests {
         )
         .unwrap();
         let workflow = resolve(&source_root, Path::new("workflow.yaml")).unwrap();
-        let monotonic = scherzo_cloud_support::monotonic_now();
+        let monotonic = um_support::monotonic_now();
         let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
         let initialized = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
         let terminal = timing_point(monotonic, "2026-08-02T12:01:44.03Z", 530);
@@ -3340,7 +3340,7 @@ mod tests {
 
     #[tokio::test]
     async fn timing_observer_excludes_presentation_opening_and_uses_terminal_transition() {
-        let monotonic = scherzo_cloud_support::monotonic_now();
+        let monotonic = um_support::monotonic_now();
         let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
         let started = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
         let step_started = timing_point(monotonic, "2026-08-02T12:01:44.01Z", 510);
@@ -3387,7 +3387,7 @@ mod tests {
 
     #[tokio::test]
     async fn presentation_failure_requests_cancellation_without_replacing_a_signal() {
-        let monotonic = scherzo_cloud_support::monotonic_now();
+        let monotonic = um_support::monotonic_now();
         let cancellation = CancellationSource::new();
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         let observed_at = timing_point(monotonic, "2026-08-02T12:01:44Z", 0);

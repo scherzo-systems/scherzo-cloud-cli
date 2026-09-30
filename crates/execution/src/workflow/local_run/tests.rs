@@ -1357,7 +1357,7 @@ fn inherited_seed_loads_required_values_and_preserves_full_durable_references() 
         AttemptTriggerV1::Continuation,
         Some(1),
         attempt_definition_for_run(&run_metadata),
-        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+        timestamp(um_support::utc_now()).unwrap(),
     )
     .unwrap();
     second.progress.steps[0].state = AttemptStepStateV1::Inherited;
@@ -1379,7 +1379,7 @@ fn inherited_seed_loads_required_values_and_preserves_full_durable_references() 
         AttemptTriggerV1::Continuation,
         Some(2),
         attempt_definition_for_run(&run_metadata),
-        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+        timestamp(um_support::utc_now()).unwrap(),
     )
     .unwrap();
     third.progress.steps[0].state = AttemptStepStateV1::Inherited;
@@ -1526,7 +1526,7 @@ steps:
         AttemptTriggerV1::ExplicitRetry,
         Some(1),
         attempt_definition_for_run(&run_metadata),
-        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+        timestamp(um_support::utc_now()).unwrap(),
     )
     .unwrap();
     let second_settled = second.created_at.clone();
@@ -1559,7 +1559,7 @@ steps:
         AttemptTriggerV1::Continuation,
         Some(2),
         attempt_definition_for_run(&run_metadata),
-        timestamp(scherzo_cloud_support::utc_now()).unwrap(),
+        timestamp(um_support::utc_now()).unwrap(),
     )
     .unwrap();
     third.progress.steps[0].state = AttemptStepStateV1::Inherited;

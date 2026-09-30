@@ -6,11 +6,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     RunFailure, RunInputSet, RunInputUpload, RunInputUploadOutcome, input_set_is_open,
     input_set_state_name,
 };
-use scherzo_cloud_human_auth::Deployment;
+use um_human_auth::Deployment;
 
 use super::super::{OrganizationArg, ProjectArg};
 use super::acquisition::{self, AcquiredInputs};
@@ -94,7 +94,7 @@ impl InputSetReference {
     fn get(
         &self,
         deployment: &Deployment,
-        policy: scherzo_cloud_api::HttpTransportPolicy,
+        policy: um_api::HttpTransportPolicy,
         authentication: &super::super::PrincipalAuthenticationArgs,
     ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
         super::with_api(deployment, policy, authentication, |api| {
@@ -105,7 +105,7 @@ impl InputSetReference {
     fn get_open(
         &self,
         deployment: &Deployment,
-        policy: scherzo_cloud_api::HttpTransportPolicy,
+        policy: um_api::HttpTransportPolicy,
         authentication: &super::super::PrincipalAuthenticationArgs,
     ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
         Ok(match self.get(deployment, policy, authentication)? {
@@ -300,14 +300,14 @@ impl CreateCommand {
 
 fn create_input_set(
     deployment: &Deployment,
-    transport_policy: scherzo_cloud_api::HttpTransportPolicy,
+    transport_policy: um_api::HttpTransportPolicy,
     authentication: &super::super::PrincipalAuthenticationArgs,
     organization: &str,
     project_id: &str,
     acquired: &AcquiredInputs,
     begin_dispatch: impl Fn() -> bool,
 ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
-    let create_key = scherzo_cloud_support::generate_idempotency_key()
+    let create_key = um_support::generate_idempotency_key()
         .context("generate Run Input Set request identity")?;
     super::with_api(deployment, transport_policy, authentication, |api| {
         api.create_input_set(
@@ -364,15 +364,15 @@ fn report_input_set_mutation_unknown(
 
 pub(super) fn stage_and_seal(
     deployment: &Deployment,
-    transport_policy: scherzo_cloud_api::HttpTransportPolicy,
+    transport_policy: um_api::HttpTransportPolicy,
     authentication: &super::super::PrincipalAuthenticationArgs,
     organization: &str,
     project_id: &str,
     acquired: &AcquiredInputs,
     control: &super::super::OperationControl<super::CreateRecoveryState>,
 ) -> anyhow::Result<Result<RunInputSet, RunFailure>> {
-    let seal_key = scherzo_cloud_support::generate_idempotency_key()
-        .context("generate Run Input Set seal identity")?;
+    let seal_key =
+        um_support::generate_idempotency_key().context("generate Run Input Set seal identity")?;
     let input_set = match create_input_set(
         deployment,
         transport_policy,
@@ -570,8 +570,8 @@ fn seal(
         command.options.http.transport_policy(),
         &command.options.authentication,
     )?);
-    let key = scherzo_cloud_support::generate_idempotency_key()
-        .context("generate Run Input Set seal identity")?;
+    let key =
+        um_support::generate_idempotency_key().context("generate Run Input Set seal identity")?;
     super::with_api(
         deployment,
         command.options.http.transport_policy(),
@@ -586,7 +586,7 @@ fn seal(
 
 impl DeleteCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
-        let key = scherzo_cloud_support::generate_idempotency_key()
+        let key = um_support::generate_idempotency_key()
             .context("generate Run Input Set deletion identity")?;
         let signal_deployment = deployment.clone();
         let signal_input_set = self.input_set.clone();

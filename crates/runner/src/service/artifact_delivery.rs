@@ -12,18 +12,16 @@ use reqwest::header::{
     CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, IF_NONE_MATCH,
 };
 use ring::digest::{SHA256, digest};
-use scherzo_cloud_support::lowercase_hex;
 use tokio::sync::{mpsc, oneshot};
+use um_support::lowercase_hex;
 
 use super::Sleeper;
 use super::assignment::{
     ArtifactRequest, ArtifactRequestKind, AssignmentObservation, ObservationOutbox, OutboxFailure,
 };
 use super::backoff::Backoff;
-use scherzo_cloud_execution::{
-    ArtifactStaging, CloudCarrierBody, CloudResultCarrier, StagedCarrier,
-};
-use scherzo_cloud_runner_protocol::{
+use um_execution::{ArtifactStaging, CloudCarrierBody, CloudResultCarrier, StagedCarrier};
+use um_runner_protocol::{
     ArtifactConfirmationOutcome, ArtifactConfirmationResponse, ArtifactRegistrationOutcome,
     ArtifactRegistrationResponse, ArtifactResultConfirmationOutcome,
     ArtifactResultConfirmationResponse, ArtifactResultRegistrationOutcome,
@@ -1117,7 +1115,7 @@ impl UploadWork {
             let value = HeaderValue::from_str(value).map_err(|_| ())?;
             headers.insert(name, value);
         }
-        scherzo_cloud_support::install_provider();
+        um_support::install_provider();
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))

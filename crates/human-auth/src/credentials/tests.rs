@@ -506,12 +506,12 @@ fn busy_lock_respects_the_configured_deadline() -> anyhow::Result<()> {
     let lock = open_or_create_private_file(&fixture.store.lock_path)
         .context("fixture value should exist")?;
     FileExt::lock(&lock).context("fixture value should exist")?;
-    let started = scherzo_cloud_support::monotonic_now();
+    let started = um_support::monotonic_now();
 
     let result = fixture.store.remove(&fingerprint("primary"));
 
     check!(matches!(result, Err(CredentialError::LockTimeout)));
-    check!(scherzo_cloud_support::elapsed(started) >= fixture.store.lock_timeout);
+    check!(um_support::elapsed(started) >= fixture.store.lock_timeout);
     FileExt::unlock(&lock).context("fixture value should exist")?;
     Ok(())
 }

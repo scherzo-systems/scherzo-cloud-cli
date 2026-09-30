@@ -167,23 +167,23 @@ fn structural_validator() -> Option<&'static Validator> {
 }
 
 pub fn is_input_name(value: &str) -> bool {
-    scherzo_cloud_support::is_identifier(value)
+    um_support::is_identifier(value)
 }
 
 pub fn is_valid_input_display_name(value: Option<&str>) -> bool {
-    scherzo_cloud_support::is_valid_input_display_name(value)
+    um_support::is_valid_input_display_name(value)
 }
 
 pub fn is_lowercase_hex(value: &str, length: usize) -> bool {
-    scherzo_cloud_support::is_lowercase_hex(value, length)
+    um_support::is_lowercase_hex(value, length)
 }
 
 pub fn lowercase_hex(bytes: &[u8]) -> String {
-    scherzo_cloud_support::lowercase_hex(bytes)
+    um_support::lowercase_hex(bytes)
 }
 
 pub fn is_valid_media_type(value: &str) -> bool {
-    scherzo_cloud_support::is_valid_media_type(value)
+    um_support::is_valid_media_type(value)
 }
 
 #[cfg(test)]

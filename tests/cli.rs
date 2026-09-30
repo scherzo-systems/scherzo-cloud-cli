@@ -27,7 +27,7 @@ mod account_signup;
 #[path = "cli/account_update.rs"]
 mod account_update;
 use api_test_support::read_request;
-use scherzo_cloud_test_support as api_test_support;
+use um_test_support as api_test_support;
 #[path = "cli/artifact_remote.rs"]
 mod artifact_remote;
 #[path = "cli/artifact_validate.rs"]

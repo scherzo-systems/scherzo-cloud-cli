@@ -27,14 +27,14 @@ use std::process::Command;
 use serde_json::Value;
 
 const INTERNAL_PACKAGES: [&str; 8] = [
-    "scherzo-cloud",
-    "scherzo-cloud-api",
-    "scherzo-cloud-execution",
-    "scherzo-cloud-human-auth",
-    "scherzo-cloud-runner",
-    "scherzo-cloud-runner-protocol",
-    "scherzo-cloud-support",
-    "scherzo-cloud-test-support",
+    "um-cli",
+    "um-api",
+    "um-execution",
+    "um-human-auth",
+    "um-runner",
+    "um-runner-protocol",
+    "um-support",
+    "um-test-support",
 ];
 
 #[test]
@@ -52,20 +52,14 @@ fn workspace_members_and_edges_match_final_graph() {
         .collect::<BTreeSet<_>>();
 
     let expected_manifests = BTreeMap::from([
-        ("scherzo-cloud", "Cargo.toml"),
-        ("scherzo-cloud-api", "crates/api/Cargo.toml"),
-        ("scherzo-cloud-execution", "crates/execution/Cargo.toml"),
-        ("scherzo-cloud-human-auth", "crates/human-auth/Cargo.toml"),
-        ("scherzo-cloud-runner", "crates/runner/Cargo.toml"),
-        (
-            "scherzo-cloud-runner-protocol",
-            "crates/runner-protocol/Cargo.toml",
-        ),
-        ("scherzo-cloud-support", "crates/support/Cargo.toml"),
-        (
-            "scherzo-cloud-test-support",
-            "crates/test-support/Cargo.toml",
-        ),
+        ("um-cli", "Cargo.toml"),
+        ("um-api", "crates/api/Cargo.toml"),
+        ("um-execution", "crates/execution/Cargo.toml"),
+        ("um-human-auth", "crates/human-auth/Cargo.toml"),
+        ("um-runner", "crates/runner/Cargo.toml"),
+        ("um-runner-protocol", "crates/runner-protocol/Cargo.toml"),
+        ("um-support", "crates/support/Cargo.toml"),
+        ("um-test-support", "crates/test-support/Cargo.toml"),
     ]);
     let workspace_packages = packages
         .iter()
@@ -136,37 +130,25 @@ fn workspace_members_and_edges_match_final_graph() {
         }
     }
     let expected_edges = BTreeSet::from([
-        ("scherzo-cloud", "scherzo-cloud-api", "normal"),
-        ("scherzo-cloud", "scherzo-cloud-execution", "normal"),
-        ("scherzo-cloud", "scherzo-cloud-execution", "dev"),
-        ("scherzo-cloud", "scherzo-cloud-human-auth", "normal"),
-        ("scherzo-cloud", "scherzo-cloud-runner", "normal"),
-        ("scherzo-cloud", "scherzo-cloud-runner", "dev"),
-        ("scherzo-cloud", "scherzo-cloud-support", "normal"),
-        ("scherzo-cloud", "scherzo-cloud-test-support", "dev"),
-        ("scherzo-cloud-api", "scherzo-cloud-support", "normal"),
-        ("scherzo-cloud-api", "scherzo-cloud-test-support", "dev"),
-        ("scherzo-cloud-human-auth", "scherzo-cloud-api", "normal"),
-        (
-            "scherzo-cloud-human-auth",
-            "scherzo-cloud-support",
-            "normal",
-        ),
-        ("scherzo-cloud-execution", "scherzo-cloud-support", "normal"),
-        (
-            "scherzo-cloud-execution",
-            "scherzo-cloud-test-support",
-            "dev",
-        ),
-        ("scherzo-cloud-runner", "scherzo-cloud-execution", "normal"),
-        ("scherzo-cloud-runner", "scherzo-cloud-execution", "dev"),
-        (
-            "scherzo-cloud-runner",
-            "scherzo-cloud-runner-protocol",
-            "normal",
-        ),
-        ("scherzo-cloud-runner", "scherzo-cloud-support", "normal"),
-        ("scherzo-cloud-runner", "scherzo-cloud-test-support", "dev"),
+        ("um-cli", "um-api", "normal"),
+        ("um-cli", "um-execution", "normal"),
+        ("um-cli", "um-execution", "dev"),
+        ("um-cli", "um-human-auth", "normal"),
+        ("um-cli", "um-runner", "normal"),
+        ("um-cli", "um-runner", "dev"),
+        ("um-cli", "um-support", "normal"),
+        ("um-cli", "um-test-support", "dev"),
+        ("um-api", "um-support", "normal"),
+        ("um-api", "um-test-support", "dev"),
+        ("um-human-auth", "um-api", "normal"),
+        ("um-human-auth", "um-support", "normal"),
+        ("um-execution", "um-support", "normal"),
+        ("um-execution", "um-test-support", "dev"),
+        ("um-runner", "um-execution", "normal"),
+        ("um-runner", "um-execution", "dev"),
+        ("um-runner", "um-runner-protocol", "normal"),
+        ("um-runner", "um-support", "normal"),
+        ("um-runner", "um-test-support", "dev"),
     ]);
     assert_eq!(
         actual_edges, expected_edges,
@@ -299,15 +281,13 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
     for source in all_package_sources(&root) {
         let relative = source.strip_prefix(&root).unwrap();
         let text = read_source(&source);
-        if text.contains("crate::human_auth")
-            || text.contains("scherzo_cloud_human_auth::credentials::")
-        {
+        if text.contains("crate::human_auth") || text.contains("um_human_auth::credentials::") {
             violations.push(format!(
                 "{} bypasses the human-auth facade",
                 relative.display()
             ));
         }
-        if text.contains("scherzo_cloud_api::generated") {
+        if text.contains("um_api::generated") {
             violations.push(format!(
                 "{} names the private generated API module",
                 relative.display()
@@ -469,7 +449,7 @@ fn execution_facade_and_process_ownership_match_slice_two_b() {
             }
         }
         for module in EXECUTION_IMPLEMENTATION_MODULES {
-            let deep_path = format!("scherzo_cloud_execution::{module}");
+            let deep_path = format!("um_execution::{module}");
             if text.contains(&deep_path) {
                 violations.push(format!(
                     "{} names private execution module `{module}`",

@@ -5,13 +5,13 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     CommonIdentityFailure, LinkIdentityOutcome, ListIdentitiesOutcome, OidcIdentity,
     RemoveIdentityOutcome, UnreachableCategory,
 };
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_human_auth::DeviceAuthorization;
-use scherzo_cloud_human_auth::LocalCredentialState;
+use um_human_auth::Deployment;
+use um_human_auth::DeviceAuthorization;
+use um_human_auth::LocalCredentialState;
 
 pub(super) fn write_list(
     deployment: &str,
@@ -169,7 +169,7 @@ impl LinkOutput {
         // Keep identity-link presentation and its error context next to this command.
         // jscpd:ignore-start
         if self.json {
-            let event = scherzo_cloud_human_auth::activation_event(
+            let event = um_human_auth::activation_event(
                 deployment,
                 authorization,
                 expires_at,

@@ -60,7 +60,7 @@ Serve connectivity. Bare `scherzo-cloud workflow` prints composed help rather th
 selecting a workflow or inferring a source boundary.
 
 The pure lexical and JSON decoding rules shared by Workflow V1 inputs and Cloud Run
-Input manifests live in the private `scherzo-cloud-support` package beneath
+Input manifests live in the private `um-support` package beneath
 `crates/support/`. The public API, command, runner, and execution components may depend
 on its explicit facade for duplicate-aware strict JSON decoding, input identifiers,
 diagnostic display names, media types, and hexadecimal digests; the leaf owns no
@@ -363,21 +363,21 @@ second ID policy inside the API boundary.
 `cli/Cargo.toml` is both the workspace root and the sole binary package. Seven unpublished
 library members occupy their final roots:
 
-- `scherzo-cloud-support` owns shared public-ID, timing, TLS-provider, and Workflow
+- `um-support` owns shared public-ID, timing, TLS-provider, and Workflow
   contract leaves and has no internal dependency;
-- `scherzo-cloud-test-support` owns the HTTP and hermetic Git fixtures and is reachable
+- `um-test-support` owns the HTTP and hermetic Git fixtures and is reachable
   only through dev dependencies;
-- `scherzo-cloud-runner-protocol` owns runner wire DTOs, its generated codec, and its
+- `um-runner-protocol` owns runner wire DTOs, its generated codec, and its
   embedded schema and has no internal dependency;
-- `scherzo-cloud-api` owns the handwritten API and private generated client, depends on
+- `um-api` owns the handwritten API and private generated client, depends on
   support in production, and uses test-support only for tests; and
-- `scherzo-cloud-execution` owns execution, harness adapters, process containment,
+- `um-execution` owns execution, harness adapters, process containment,
   workflow assets, and their tests, depends on support in production, and uses
   test-support only for tests. Its test-only internal-worker example keeps package
   suites independent of a previously built root executable;
-- `scherzo-cloud-human-auth` owns human OAuth sessions and credential storage, depends
+- `um-human-auth` owns human OAuth sessions and credential storage, depends
   on support and API, and exposes only the command-facing facade; and
-- `scherzo-cloud-runner` owns Runner Serve, enrollment, doctor, local control,
+- `um-runner` owns Runner Serve, enrollment, doctor, local control,
   assignment execution, artifact delivery, and telemetry. It depends only on support,
   runner-protocol, and execution in production and uses test-support only for tests.
 
@@ -404,7 +404,7 @@ member's inherited lint policy, the residual root-module graph, private generate
 the final execution, process, runner, human-auth, and idempotency ownership, and confinement of
 command parsing, HTTP, WebSocket, telemetry, and terminal dependencies to their owning
 packages. The dev-only
-`scherzo-cloud-test-support` facade supplies the Git fixture to execution and runner tests
+`um-test-support` facade supplies the Git fixture to execution and runner tests
 without entering the production graph. The `src/service_auth.rs` boundary depends only
 on support's public-ID syntax and remains a root-owned policy for caller-managed service
 secrets. The API returns issued secrets in

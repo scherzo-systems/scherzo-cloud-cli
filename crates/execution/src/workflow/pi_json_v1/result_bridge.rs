@@ -498,7 +498,7 @@ async fn read_request_frame<Clock: CoordinatorClock>(
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
         Ok(_) | Err(_) => return FrameRead::ProtocolFailure,
     }
-    scherzo_cloud_support::strict_json_from_slice(&payload)
+    um_support::strict_json_from_slice(&payload)
         .and_then(serde_json::from_value)
         .map(FrameRead::Request)
         .unwrap_or(FrameRead::ProtocolFailure)

@@ -1,5 +1,5 @@
 [package]
-name = "scherzo-cloud-human-auth"
+name = "um-human-auth"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true
@@ -16,8 +16,8 @@ fs4.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustix.workspace = true
-scherzo-cloud-api.workspace = true
-scherzo-cloud-support.workspace = true
+um-api.workspace = true
+um-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

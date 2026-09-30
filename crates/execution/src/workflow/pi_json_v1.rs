@@ -487,8 +487,8 @@ impl PiJsonV1Parser {
             );
         }
         self.rejection_context.stage = PiJsonV1ProtocolStage::FrameDecode;
-        let value = scherzo_cloud_support::strict_json_from_slice(frame)
-            .map_err(|_| self.protocol_failure())?;
+        let value =
+            um_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;
         let Some(object) = value.as_object() else {
             return self.reject(
                 PiJsonV1RejectionReason::FrameNotObject,

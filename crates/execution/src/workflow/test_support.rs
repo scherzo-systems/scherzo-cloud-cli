@@ -90,15 +90,15 @@ pub(super) async fn run_with_stalled_child_guard(
 pub(super) async fn wait_for_stalled_child_guard(worker_pid_variable: &str) -> i32 {
     let pid_path = std::path::PathBuf::from(std::env::var_os(worker_pid_variable).unwrap());
     tokio::task::spawn_blocking(move || {
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
         loop {
             if let Ok(pid) = fs::read_to_string(&pid_path)
                 && let Ok(pid) = pid.trim().parse::<i32>()
             {
                 return pid;
             }
-            assert!(scherzo_cloud_support::elapsed(started) < Duration::from_secs(5));
-            scherzo_cloud_support::sleep(Duration::from_millis(10));
+            assert!(um_support::elapsed(started) < Duration::from_secs(5));
+            um_support::sleep(Duration::from_millis(10));
         }
     })
     .await

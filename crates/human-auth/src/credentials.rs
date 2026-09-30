@@ -356,14 +356,14 @@ impl CredentialStore {
         let directory = self.directory()?;
         ensure_private_directory(directory)?;
         let file = open_or_create_private_file(path)?;
-        let start = scherzo_cloud_support::monotonic_now();
+        let start = um_support::monotonic_now();
 
         loop {
-            let elapsed = scherzo_cloud_support::elapsed(start);
+            let elapsed = um_support::elapsed(start);
             let remaining = timeout
                 .saturating_sub(elapsed)
                 .min(deadline.map_or(timeout, |end| {
-                    end.saturating_duration_since(scherzo_cloud_support::monotonic_now())
+                    end.saturating_duration_since(um_support::monotonic_now())
                 }));
             if remaining.is_zero() {
                 return Err(if refresh {
@@ -375,7 +375,7 @@ impl CredentialStore {
             match FileExt::try_lock(&file) {
                 Ok(()) => return Ok(CredentialLock { file }),
                 Err(TryLockError::WouldBlock) => {
-                    scherzo_cloud_support::sleep(LOCK_RETRY_INTERVAL.min(remaining));
+                    um_support::sleep(LOCK_RETRY_INTERVAL.min(remaining));
                 }
                 Err(TryLockError::Error(source)) => {
                     return Err(CredentialError::Io {

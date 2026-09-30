@@ -6,7 +6,7 @@ use url::Url;
 
 use crate::credential::Credential;
 use crate::enrollment::{PendingCredential, RunnerStateAccess};
-use scherzo_cloud_execution::{
+use um_execution::{
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
 };
 

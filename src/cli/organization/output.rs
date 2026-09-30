@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     AuditActor, AuditProjectionWarning, AuditProjectionWarningReason, CommonOrganizationFailure,
     CreateOrganizationOutcome, CurrentPrincipalMembership, GetOrganizationOutcome,
     ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
@@ -615,7 +615,7 @@ fn write_common_organization_operation_failure(
 
 fn organization_operation_unreachable(
     deployment: &str,
-    category: scherzo_cloud_api::UnreachableCategory,
+    category: um_api::UnreachableCategory,
 ) -> (&'static str, Option<&'static str>, String, OutcomeClass) {
     (
         "unreachable",

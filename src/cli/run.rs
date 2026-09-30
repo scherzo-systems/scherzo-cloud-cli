@@ -7,14 +7,14 @@ use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunCancellationMode,
     RunCancellationResolutionKind, RunFailure, RunList, RunListFilter, RunObservation, RunState,
 };
 #[cfg(test)]
-use scherzo_cloud_api::{HttpClient, RunRead};
-use scherzo_cloud_execution::visible_text;
-use scherzo_cloud_human_auth::Deployment;
+use um_api::{HttpClient, RunRead};
+use um_execution::visible_text;
+use um_human_auth::Deployment;
 
 use super::{OrganizationArg, ProjectArg};
 
@@ -371,10 +371,7 @@ fn start_cloud_observation(
     timeout_start: &super::DeferredObservationTimeoutStart,
 ) -> (super::SystemObservationClock, std::time::Instant) {
     timeout_start.start();
-    (
-        super::SystemObservationClock,
-        scherzo_cloud_support::monotonic_now(),
-    )
+    (super::SystemObservationClock, um_support::monotonic_now())
 }
 
 fn finish_accepted<R>(
@@ -549,7 +546,7 @@ impl CreateCommand {
                 }
             }
         };
-        let run_idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let run_idempotency_key = um_support::generate_idempotency_key()
             .context("generate Cloud run request identity")?;
         if control.is_cancelled() {
             return Ok(ExitCode::GeneralFailure);
@@ -770,7 +767,7 @@ impl ShowCommand {
             move |control, timeout_start| {
                 timeout_start.start();
                 let clock = super::SystemObservationClock;
-                let started = scherzo_cloud_support::monotonic_now();
+                let started = um_support::monotonic_now();
                 let snapshot = control.recovery();
                 if self.wait.wait {
                     let result = observation::wait_run(
@@ -889,7 +886,7 @@ impl CancelCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         let key = match self.idempotency_key.clone() {
             Some(key) => key,
-            None => scherzo_cloud_support::generate_idempotency_key()
+            None => um_support::generate_idempotency_key()
                 .context("generate Cloud cancellation request identity")?,
         };
         let mode = if self.force { "force" } else { "graceful" };
@@ -1119,10 +1116,10 @@ fn finish_cloud_observation<R, S>(
                 && resource.run.as_deref().is_some_and(|run| {
                     run.state != RunState::Succeeded
                         || run.publication.as_deref().is_some_and(|handoff| {
-                            handoff.state != scherzo_cloud_api::RunPublicationHandoffState::Started
+                            handoff.state != um_api::RunPublicationHandoffState::Started
                         })
                         || resource.publication.as_deref().is_some_and(|publication| {
-                            publication.state != scherzo_cloud_api::PublicationState::Succeeded
+                            publication.state != um_api::PublicationState::Succeeded
                         })
                 }) {
                 ExitCode::GeneralFailure
@@ -1218,7 +1215,7 @@ fn write_cancel_failure(
     let (outcome, code, exit) = if dispatched
         && (matches!(
             failure,
-            RunFailure::Unreachable(category) if *category != scherzo_cloud_api::UnreachableCategory::RateLimited
+            RunFailure::Unreachable(category) if *category != um_api::UnreachableCategory::RateLimited
         ) || matches!(failure, RunFailure::Protocol { .. }))
     {
         (
@@ -1319,7 +1316,7 @@ const fn terminal_run_state(state: RunState) -> Option<TerminalRunState> {
 }
 
 fn parse_input_set_id(value: &str) -> Result<String, String> {
-    if scherzo_cloud_support::valid_typed_id(value, "ris_") {
+    if um_support::valid_typed_id(value, "ris_") {
         Ok(value.to_owned())
     } else {
         Err(
@@ -1330,7 +1327,7 @@ fn parse_input_set_id(value: &str) -> Result<String, String> {
 }
 
 fn run_api<'a>(
-    client: &'a scherzo_cloud_api::HttpClient,
+    client: &'a um_api::HttpClient,
     deployment: &Deployment,
     access_token: &str,
     transport_policy: HttpTransportPolicy,
@@ -1433,7 +1430,7 @@ fn write_create(
     organization: &str,
     input_set_id: Option<&str>,
     submission: (Option<&str>, bool),
-    result: Result<scherzo_cloud_api::RunCreationAcceptance, RunFailure>,
+    result: Result<um_api::RunCreationAcceptance, RunFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -1477,14 +1474,14 @@ fn write_create(
             if json
                 || (run_dispatched
                     && matches!(failure,
-                        RunFailure::Unreachable(category) if category != scherzo_cloud_api::UnreachableCategory::RateLimited
+                        RunFailure::Unreachable(category) if category != um_api::UnreachableCategory::RateLimited
                     ))
                 || (run_dispatched && matches!(failure, RunFailure::Protocol { .. })) =>
         {
             let (code, exit) = failure_code(&failure, authentication);
             let uncertain = run_dispatched
                 && (matches!(failure,
-                RunFailure::Unreachable(category) if category != scherzo_cloud_api::UnreachableCategory::RateLimited)
+                RunFailure::Unreachable(category) if category != um_api::UnreachableCategory::RateLimited)
                     || matches!(failure, RunFailure::Protocol { .. }));
             if let Some(input_set_id) = input_set_id {
                 write_staging_guidance(organization, input_set_id)?;
@@ -2132,7 +2129,7 @@ mod tests {
 
     use super::super::observation_test_support::ControlledObservationClock as ControlledWaitClock;
     use super::*;
-    use scherzo_cloud_api::{
+    use um_api::{
         HttpTransportPolicy, InputScalarMetadata, NamedInputMetadata, RunCreationAcceptance,
         RunInputManifest, UnreachableCategory,
     };
@@ -2353,7 +2350,7 @@ mod tests {
 
     #[test]
     fn publication_wait_uses_one_budget_across_run_handoff_and_linked_attempt() {
-        let started = scherzo_cloud_support::monotonic_now();
+        let started = um_support::monotonic_now();
         let clock = ControlledWaitClock::new(started);
         let mut pending = serde_json::to_value(run(RunState::Succeeded)).unwrap();
         pending["publication"] = serde_json::json!({
@@ -2631,7 +2628,7 @@ mod tests {
         assert_no_pending_request(&listener);
     }
 
-    fn receipt(state: &str, run: Option<Run>) -> scherzo_cloud_api::RunCancellationEnvelope {
+    fn receipt(state: &str, run: Option<Run>) -> um_api::RunCancellationEnvelope {
         let resolution = if state == "resolved" {
             serde_json::json!({"kind":"applied", "resolvedAt":"2026-08-10T12:05:00Z",
                 "effectiveRequestId":"cmd_01k0z6r1w8f4jy2m7q9v3x5abc", "runVersion":1})
@@ -2650,9 +2647,7 @@ mod tests {
     }
 
     fn scripted_cancellation(
-        responses: impl IntoIterator<
-            Item = Result<scherzo_cloud_api::RunCancellationEnvelope, RunFailure>,
-        >,
+        responses: impl IntoIterator<Item = Result<um_api::RunCancellationEnvelope, RunFailure>>,
         mut record: impl FnMut(CloudSnapshot),
     ) -> (
         Result<super::super::TerminalObservation<CloudSnapshot, ()>, RunFailure>,
@@ -2662,12 +2657,12 @@ mod tests {
         let mut snapshot = CloudSnapshot::for_run("run_01k0z6r1w8f4jy2m7q9v3x5abc");
         snapshot.cancellation_request = Some(receipt("pending", None).request);
         let responses = RefCell::new(responses.into_iter().collect::<VecDeque<_>>());
-        let clock = ControlledWaitClock::new(scherzo_cloud_support::monotonic_now());
+        let clock = ControlledWaitClock::new(um_support::monotonic_now());
         let result = observation::wait_receipt_with(
             |_| responses.borrow_mut().pop_front().unwrap(),
             &snapshot,
             None,
-            scherzo_cloud_support::monotonic_now(),
+            um_support::monotonic_now(),
             &super::super::BlockingObservationControl::new(),
             &clock,
             &mut record,
@@ -2737,7 +2732,7 @@ mod tests {
                 .chain([terminal_state])
                 .map(|state| Ok(run(state)));
             let api = ScriptedObservationApi::new(responses);
-            let started_at = scherzo_cloud_support::monotonic_now();
+            let started_at = um_support::monotonic_now();
             let clock = ControlledWaitClock::new(started_at);
 
             let result = observe(&api, None, &clock).expect("the polling scenario should complete");
@@ -2762,15 +2757,13 @@ mod tests {
     fn wait_treats_admitted_creation_as_nonterminal() {
         let api = ScriptedObservationApi {
             responses: RefCell::new(VecDeque::from([
-                Ok(RunRead::Pending(
-                    scherzo_cloud_api::RunCreationPending::new(
-                        "run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                    ),
-                )),
+                Ok(RunRead::Pending(um_api::RunCreationPending::new(
+                    "run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                ))),
                 Ok(RunRead::Materialized(Box::new(run(RunState::Succeeded)))),
             ])),
         };
-        let clock = ControlledWaitClock::new(scherzo_cloud_support::monotonic_now());
+        let clock = ControlledWaitClock::new(um_support::monotonic_now());
 
         assert_succeeded_after_single_poll(
             observe(&api, None, &clock),
@@ -2785,7 +2778,7 @@ mod tests {
             Err(RunFailure::Unreachable(UnreachableCategory::Server)),
             Ok(run(RunState::Succeeded)),
         ]);
-        let started_at = scherzo_cloud_support::monotonic_now();
+        let started_at = um_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         assert_succeeded_after_single_poll(
@@ -2802,7 +2795,7 @@ mod tests {
             Ok(run(RunState::Assigned)),
             Ok(run(RunState::Running)),
         ]);
-        let started_at = scherzo_cloud_support::monotonic_now();
+        let started_at = um_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         let result = observe(&api, Some(Duration::from_secs(5)), &clock)
@@ -2817,7 +2810,7 @@ mod tests {
     fn wait_bounds_retries_and_preserves_the_transport_failure() {
         let failure = RunFailure::Unreachable(UnreachableCategory::Connection);
         let api = ScriptedObservationApi::new([Err(failure), Err(failure)]);
-        let started_at = scherzo_cloud_support::monotonic_now();
+        let started_at = um_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         let result = observe(&api, None, &clock);

@@ -2071,172 +2071,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scherzo-cloud"
-version = "0.0.0-dev"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "flate2",
- "fs4",
- "futures-util",
- "jsonschema",
- "libc",
- "nix",
- "ring",
- "rustix",
- "scherzo-cloud-api",
- "scherzo-cloud-execution",
- "scherzo-cloud-human-auth",
- "scherzo-cloud-runner",
- "scherzo-cloud-support",
- "scherzo-cloud-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "tokio",
- "tokio-tungstenite",
- "trycmd",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "scherzo-cloud-api"
-version = "0.0.0-dev"
-dependencies = [
- "anyhow",
- "base64",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "reqwest",
- "ring",
- "rustls",
- "scherzo-cloud-support",
- "scherzo-cloud-test-support",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "scherzo-cloud-execution"
-version = "0.0.0-dev"
-dependencies = [
- "base64",
- "crossterm",
- "flate2",
- "fs4",
- "futures-util",
- "getrandom 0.4.3",
- "jsonschema",
- "libc",
- "nix",
- "ratatui",
- "ring",
- "rustix",
- "scherzo-cloud-support",
- "scherzo-cloud-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "tokio",
- "tracing",
- "ulid",
- "unicode-segmentation",
- "unicode-width",
- "yaml-rust2",
-]
-
-[[package]]
-name = "scherzo-cloud-human-auth"
-version = "0.0.0-dev"
-dependencies = [
- "anyhow",
- "fs4",
- "reqwest",
- "ring",
- "rustix",
- "scherzo-cloud-api",
- "scherzo-cloud-support",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "scherzo-cloud-runner"
-version = "0.0.0-dev"
-dependencies = [
- "anyhow",
- "base64",
- "fs4",
- "futures-util",
- "getrandom 0.4.3",
- "jsonschema",
- "libc",
- "nix",
- "opentelemetry",
- "opentelemetry-proto",
- "opentelemetry_sdk",
- "prost",
- "reqwest",
- "ring",
- "rustix",
- "scherzo-cloud-execution",
- "scherzo-cloud-runner-protocol",
- "scherzo-cloud-support",
- "scherzo-cloud-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "tokio",
- "tokio-tungstenite",
- "ulid",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "scherzo-cloud-runner-protocol"
-version = "0.0.0-dev"
-dependencies = [
- "jsonschema",
- "regress",
- "serde",
- "serde_json",
- "time",
-]
-
-[[package]]
-name = "scherzo-cloud-support"
-version = "0.0.0-dev"
-dependencies = [
- "getrandom 0.4.3",
- "jsonschema",
- "rustls",
- "serde",
- "serde_json",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "scherzo-cloud-test-support"
-version = "0.0.0-dev"
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2847,6 +2681,172 @@ dependencies = [
  "rand 0.10.2",
  "web-time",
 ]
+
+[[package]]
+name = "um-api"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "base64",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "reqwest",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "um-support",
+ "um-test-support",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "um-cli"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "flate2",
+ "fs4",
+ "futures-util",
+ "jsonschema",
+ "libc",
+ "nix",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "trycmd",
+ "um-api",
+ "um-execution",
+ "um-human-auth",
+ "um-runner",
+ "um-support",
+ "um-test-support",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "um-execution"
+version = "0.0.0-dev"
+dependencies = [
+ "base64",
+ "crossterm",
+ "flate2",
+ "fs4",
+ "futures-util",
+ "getrandom 0.4.3",
+ "jsonschema",
+ "libc",
+ "nix",
+ "ratatui",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+ "ulid",
+ "um-support",
+ "um-test-support",
+ "unicode-segmentation",
+ "unicode-width",
+ "yaml-rust2",
+]
+
+[[package]]
+name = "um-human-auth"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "reqwest",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "um-api",
+ "um-support",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "um-runner"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "base64",
+ "fs4",
+ "futures-util",
+ "getrandom 0.4.3",
+ "jsonschema",
+ "libc",
+ "nix",
+ "opentelemetry",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "ulid",
+ "um-execution",
+ "um-runner-protocol",
+ "um-support",
+ "um-test-support",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "um-runner-protocol"
+version = "0.0.0-dev"
+dependencies = [
+ "jsonschema",
+ "regress",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
+name = "um-support"
+version = "0.0.0-dev"
+dependencies = [
+ "getrandom 0.4.3",
+ "jsonschema",
+ "rustls",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "um-test-support"
+version = "0.0.0-dev"
 
 [[package]]
 name = "unicode-general-category"

@@ -11,15 +11,15 @@ use clap::{ArgGroup, Args, Subcommand, builder::NonEmptyStringValueParser};
 use zeroize::Zeroizing;
 
 use crate::exit_code::ExitCode;
-use scherzo_cloud_api::{
+use um_api::{
     AcceptInvitationOutcome, HttpClient, InvitationTarget, InvitationTerminationOutcome,
     IssueInvitationOutcome, ListInvitationInboxOutcome, ListOrganizationInvitationsOutcome,
     OrganizationError, PreviewInvitationOutcome, accept_invitation, decline_invitation,
     issue_invitation, list_invitation_inbox, list_organization_invitations, preview_invitation,
     revoke_invitation,
 };
-use scherzo_cloud_human_auth::Deployment;
-use scherzo_cloud_human_auth::SecretToken;
+use um_human_auth::Deployment;
+use um_human_auth::SecretToken;
 
 use super::{OrganizationArg, PaginationArgs};
 
@@ -115,7 +115,7 @@ impl InvitationOptions {
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        let idempotency_key = scherzo_cloud_support::generate_idempotency_key()
+        let idempotency_key = um_support::generate_idempotency_key()
             .context("generate invitation mutation request identity")?;
         self.execute(
             deployment,
@@ -556,7 +556,7 @@ fn parse_principal_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_typed_id(value: &str, prefix: &str, name: &str) -> Result<String, String> {
-    if scherzo_cloud_support::valid_typed_id(value, prefix) {
+    if um_support::valid_typed_id(value, prefix) {
         Ok(value.to_owned())
     } else {
         Err(format!("{name} must be an exact {prefix} identifier"))
@@ -661,7 +661,7 @@ fn valid_capability(value: &str, invitation_id: &str) -> bool {
         return false;
     };
     embedded_id == invitation_id
-        && scherzo_cloud_support::valid_typed_id(embedded_id, "inv_")
+        && um_support::valid_typed_id(embedded_id, "inv_")
         && secret.len() == 43
         && secret
             .bytes()

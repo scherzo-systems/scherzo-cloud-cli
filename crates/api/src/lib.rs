@@ -190,7 +190,7 @@ mod generated;
 )]
 mod tests {
     use super::generated;
-    use scherzo_cloud_test_support::ScriptedHttpServer;
+    use um_test_support::ScriptedHttpServer;
 
     #[test]
     fn generated_webhook_response_preserves_secret_once_and_complete_selectors() {

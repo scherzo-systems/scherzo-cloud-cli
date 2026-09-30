@@ -153,7 +153,7 @@ fn capture_with(
     let result = capture_digest(execution_root, runner, observer);
     match result {
         Ok(value) => {
-            let taken_at = utc_timestamp(scherzo_cloud_support::utc_now()).ok();
+            let taken_at = utc_timestamp(um_support::utc_now()).ok();
             match taken_at {
                 Some(taken_at) => WorkspaceSnapshotV1 {
                     algorithm: WORKSPACE_SNAPSHOT_ALGORITHM.to_owned(),

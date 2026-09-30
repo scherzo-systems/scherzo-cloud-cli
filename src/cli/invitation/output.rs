@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, CommonOrganizationFailure, Invitation,
     InvitationDeliveryState, InvitationInboxEntry, InvitationState, InvitationTargetKind,
     InvitationTerminationOutcome, IssueInvitationOutcome, ListInvitationInboxOutcome,
@@ -547,7 +547,7 @@ struct PreviewResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    invitation: &'a scherzo_cloud_api::InvitationPreview,
+    invitation: &'a um_api::InvitationPreview,
 }
 
 #[derive(Serialize)]

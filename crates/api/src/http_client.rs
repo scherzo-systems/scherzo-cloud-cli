@@ -90,7 +90,7 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(transport_policy: HttpTransportPolicy) -> Result<Self, HttpClientError> {
-        scherzo_cloud_support::install_provider();
+        um_support::install_provider();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -313,7 +313,7 @@ pub(super) fn generated_configuration(
     transport_policy: HttpTransportPolicy,
     timeout: Duration,
 ) -> Result<apis::configuration::Configuration, reqwest::Error> {
-    scherzo_cloud_support::install_provider();
+    um_support::install_provider();
     let client = blocking_client_builder(transport_policy, timeout).build()?;
     let mut configuration = apis::configuration::Configuration::new();
     configuration.base_path = api_url.trim_end_matches('/').to_owned();

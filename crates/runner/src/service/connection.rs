@@ -28,7 +28,7 @@ use crate::service::config::Config;
 use crate::service::control::LiveStatus;
 use crate::service::{Sequence, Sleeper};
 use crate::telemetry::{self, Event, Outcome, Recorder};
-use scherzo_cloud_runner_protocol::{
+use um_runner_protocol::{
     CloudFrame, MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES, RunnerEnvelope,
     RunnerFrame, decode_cloud_frame, encode_runner_frame,
 };
@@ -1059,7 +1059,7 @@ async fn connect_gateway(
 ) -> Result<RunnerSocket, ConnectionError> {
     let config = dependencies.config;
     let sleeper = dependencies.sleeper;
-    scherzo_cloud_support::install_provider();
+    um_support::install_provider();
     let unacknowledged = ConnectionProgress::unacknowledged();
     let mut request = config
         .endpoint()
@@ -2853,7 +2853,7 @@ mod tests {
     use crate::service::workspace::{AssignmentRoot, AssignmentRootCreationError};
     use crate::service::{Sequence, Sleeper};
     use crate::telemetry::{Event, Outcome, Recorder, TestCapture, test_recorder};
-    use scherzo_cloud_runner_protocol::{
+    use um_runner_protocol::{
         AssignmentDecline, CloudFrame, ExecutionSpecInvalidReason, RunnerEnvelope, RunnerFrame,
         RunnerUnableReason, decode_cloud_frame,
     };
@@ -4126,7 +4126,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_delivery_still_requires_exact_request_and_response_kind() {
-        use scherzo_cloud_runner_protocol::{
+        use um_runner_protocol::{
             ArtifactResultRegistrationOutcome, ArtifactResultRegistrationResponse,
         };
         let context =

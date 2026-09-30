@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use scherzo_cloud_api::{
+use um_api::{
     GitHubAccountType, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };

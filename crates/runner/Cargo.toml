@@ -1,5 +1,5 @@
 [package]
-name = "scherzo-cloud-runner"
+name = "um-runner"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true
@@ -28,9 +28,9 @@ prost.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustix.workspace = true
-scherzo-cloud-execution.workspace = true
-scherzo-cloud-runner-protocol.workspace = true
-scherzo-cloud-support.workspace = true
+um-execution.workspace = true
+um-runner-protocol.workspace = true
+um-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -44,5 +44,5 @@ zeroize.workspace = true
 [dev-dependencies]
 jsonschema.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
-scherzo-cloud-execution = { workspace = true, features = ["test-fixtures"] }
-scherzo-cloud-test-support.workspace = true
+um-execution = { workspace = true, features = ["test-fixtures"] }
+um-test-support.workspace = true
