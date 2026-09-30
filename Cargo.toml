@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.97"
 description = "Command-line interface and runner for Scherzo Cloud"
 license = "Apache-2.0"
-repository = "https://github.com/useful-machinery/scherzo-cloud-cli"
+repository = "https://github.com/useful-machinery/um"
 publish = false
 
 [workspace]
@@ -25,7 +25,7 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
-repository = "https://github.com/useful-machinery/scherzo-cloud-cli"
+repository = "https://github.com/useful-machinery/um"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

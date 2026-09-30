@@ -1891,7 +1891,7 @@ three native builds always check out the original allocated mirror for x86-64 an
 Linux and for Apple Silicon macOS. The final write-scoped job creates or
 reconciles only matching tag and draft state, then publishes the exact archives,
 `SHA256SUMS`, and GitHub build-provenance attestations on the
-[Releases](https://github.com/useful-machinery/scherzo-cloud-cli/releases) page. Exact
+[Releases](https://github.com/useful-machinery/um/releases) page. Exact
 published state and repeated valid recovery are no-ops.
 
 Release binaries are not currently signed or notarized. Verify a downloaded archive
@@ -1907,7 +1907,7 @@ sha256sum --ignore-missing --check SHA256SUMS
 shasum -a 256 --ignore-missing --check SHA256SUMS
 
 gh attestation verify "$archive" \
-  --repo useful-machinery/scherzo-cloud-cli
+  --repo useful-machinery/um
 ```
 
 ## Source boundary
