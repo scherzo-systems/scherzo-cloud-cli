@@ -2990,7 +2990,6 @@ mod tests {
             capture.span_count("runner.effect_acknowledgement"),
             expected_effect_count
         );
-        assert_eq!(capture.span_count("runner.gateway_connection"), 1);
         events
             .into_iter()
             .find(|event| event["event.name"] == "runner.gateway_connection")
@@ -3307,22 +3306,27 @@ mod tests {
 
             let close = expect_close_frame(&mut socket).await;
             assert_eq!(close.code, CloseCode::Away);
-            backoff_request(&mut sleep_requests).await.1
+            (backoff_request(&mut sleep_requests).await.1, sleep_requests)
         });
 
         let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
-        let release_backoff = with_watchdog(server)
+        let (release_backoff, sleep_requests) = with_watchdog(server)
             .await
             .expect("runner did not time out the pending acknowledgement")
             .expect("fixture server failed");
+
+        // The runner may start its next connection span while entering backoff.
+        // Stop it before inspecting the completed attempt and keep the sleeper
+        // receiver alive until it has stopped.
+        abort_service(service).await;
 
         let connection =
             assert_attempt_event_pair(&capture, "timeout", Some("gateway_liveness_timeout"), 1, 2);
         assert_eq!(connection["scherzo.outcome"], "timeout");
         assert_eq!(connection["error.type"], "gateway_liveness_timeout");
 
-        abort_service(service).await;
         drop(release_backoff);
+        drop(sleep_requests);
     }
 
     #[tokio::test]
