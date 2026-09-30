@@ -593,6 +593,7 @@ pub(crate) fn integer_u128(value: u128) -> i64 {
 pub(crate) struct TestCapture {
     events: Arc<Mutex<Vec<Map<String, Value>>>>,
     spans: Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+    event_notification: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
@@ -625,6 +626,18 @@ impl TestCapture {
             .expect("captured event should exist")
     }
 
+    pub(crate) async fn wait_for_event(&self, name: &str) {
+        loop {
+            let notified = self.event_notification.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.events().iter().any(|event| event[EVENT_NAME] == name) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub(crate) fn span_count(&self, name: &str) -> usize {
         self.spans
             .lock()
@@ -642,6 +655,7 @@ impl EventWriter for TestCapture {
             .lock()
             .expect("event capture mutex poisoned")
             .push(event.clone());
+        self.event_notification.notify_waiters();
         Ok(())
     }
 }

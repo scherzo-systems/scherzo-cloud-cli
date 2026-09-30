@@ -3306,18 +3306,21 @@ mod tests {
 
             let close = expect_close_frame(&mut socket).await;
             assert_eq!(close.code, CloseCode::Away);
-            (backoff_request(&mut sleep_requests).await.1, sleep_requests)
+            sleep_requests
         });
 
         let (service, capture, _shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
-        let (release_backoff, sleep_requests) = with_watchdog(server)
+        let sleep_requests = with_watchdog(server)
             .await
-            .expect("runner did not time out the pending acknowledgement")
+            .expect("runner did not close after the pending acknowledgement timed out")
             .expect("fixture server failed");
 
-        // The runner may start its next connection span while entering backoff.
-        // Stop it before inspecting the completed attempt and keep the sleeper
-        // receiver alive until it has stopped.
+        // The connection event is finished before the runner chooses whether to
+        // sleep for backoff or immediately handle an assignment notification.
+        // Observe that event directly; backoff is not guaranteed in this path.
+        with_watchdog(capture.wait_for_event("runner.gateway_connection"))
+            .await
+            .expect("runner did not record the timed-out connection");
         abort_service(service).await;
 
         let connection =
@@ -3325,7 +3328,6 @@ mod tests {
         assert_eq!(connection["scherzo.outcome"], "timeout");
         assert_eq!(connection["error.type"], "gateway_liveness_timeout");
 
-        drop(release_backoff);
         drop(sleep_requests);
     }
 
