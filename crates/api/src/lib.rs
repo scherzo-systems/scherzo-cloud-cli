@@ -236,7 +236,7 @@ mod tests {
             }]
         }))
         .expect("delivery detail fixture");
-        assert_eq!(detail.sequence, 12);
+        assert_eq!(detail.sequence, Some(12));
         assert_eq!(
             detail.cycles.as_ref().unwrap()[0].attempts[0].http_status,
             Some(403)

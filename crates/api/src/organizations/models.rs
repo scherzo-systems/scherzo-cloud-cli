@@ -183,6 +183,7 @@ pub enum OrganizationAuditSubjectKind {
     LinearConnection,
     Project,
     WebhookSubscription,
+    WebhookDelivery,
     RepositoryConnection,
     Assignment,
 }
@@ -956,6 +957,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             Kind::WebhookSubscription => {
                 (OrganizationAuditSubjectKind::WebhookSubscription, "whs_")
             }
+            Kind::WebhookDelivery => (OrganizationAuditSubjectKind::WebhookDelivery, "whd_"),
             Kind::RepositoryConnection => {
                 (OrganizationAuditSubjectKind::RepositoryConnection, "rpc_")
             }
