@@ -17,57 +17,56 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunPublicationHandoffFailure {
-    #[serde(rename = "phase")]
-    pub phase: Phase,
+pub struct RunPlacementDecline {
     #[serde(rename = "code")]
     pub code: Code,
-    #[serde(rename = "retryable")]
-    pub retryable: bool,
+    /// Present only when code is runner_unable.
+    #[serde(rename = "reason", skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
+    #[serde(rename = "runnerId")]
+    pub runner_id: String,
+    #[serde(rename = "declinedAt")]
+    pub declined_at: String,
 }
 
-impl RunPublicationHandoffFailure {
-    pub fn new(phase: Phase, code: Code, retryable: bool) -> RunPublicationHandoffFailure {
-        RunPublicationHandoffFailure {
-            phase,
+impl RunPlacementDecline {
+    pub fn new(code: Code, runner_id: String, declined_at: String) -> RunPlacementDecline {
+        RunPlacementDecline {
             code,
-            retryable,
+            reason: None,
+            runner_id,
+            declined_at,
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Phase {
-    #[serde(rename = "artifact")]
-    Artifact,
-    #[serde(rename = "preflight")]
-    Preflight,
-}
-
-impl Default for Phase {
-    fn default() -> Phase {
-        Self::Artifact
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Code {
-    #[serde(rename = "artifact_unavailable")]
-    ArtifactUnavailable,
-    #[serde(rename = "artifact_expired")]
-    ArtifactExpired,
-    #[serde(rename = "artifact_invalid")]
-    ArtifactInvalid,
-    #[serde(rename = "export_not_publishable")]
-    ExportNotPublishable,
-    #[serde(rename = "actor_authority_lost")]
-    ActorAuthorityLost,
-    #[serde(rename = "project_repository_changed")]
-    ProjectRepositoryChanged,
-    #[serde(rename = "internal_publication_failure")]
-    InternalPublicationFailure,
+    #[serde(rename = "capacity_unavailable")]
+    CapacityUnavailable,
+    #[serde(rename = "runner_unable")]
+    RunnerUnable,
 }
 
 impl Default for Code {
     fn default() -> Code {
-        Self::ArtifactUnavailable
+        Self::CapacityUnavailable
+    }
+}
+/// Present only when code is runner_unable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Reason {
+    #[serde(rename = "execution_environment_unavailable")]
+    ExecutionEnvironmentUnavailable,
+    #[serde(rename = "source_service_unavailable")]
+    SourceServiceUnavailable,
+    #[serde(rename = "input_service_unavailable")]
+    InputServiceUnavailable,
+    #[serde(rename = "workflow_environment_unsupported")]
+    WorkflowEnvironmentUnsupported,
+}
+
+impl Default for Reason {
+    fn default() -> Reason {
+        Self::ExecutionEnvironmentUnavailable
     }
 }

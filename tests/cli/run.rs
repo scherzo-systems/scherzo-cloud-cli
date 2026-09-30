@@ -4780,7 +4780,8 @@ fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
                 "runnerConnected": true, "runnerLastSeenAt": null},
             "lastTransition": {"attemptId": "attempt-a", "eventSequence": 3,
                 "transitionSequence": 2, "recordedAt": "2026-08-03T11:00:00Z",
-                "kind": "step_state_changed", "stepId": "build", "targetState": "running"}
+                "kind": "step_state_changed", "stepId": "build", "targetState": "running"},
+            "lastDecline": null
         });
         let (server, _directory, credential_path) = prepared_run(vec![run_response(body.clone())]);
         let environment = deployment_environment(&server.api_url, &credential_path);

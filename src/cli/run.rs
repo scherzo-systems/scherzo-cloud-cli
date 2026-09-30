@@ -1535,6 +1535,15 @@ fn write_observation_human(
     } else {
         writeln!(out, "  none")?;
     }
+    if let Some(decline) = observation.last_decline.as_deref() {
+        writeln!(out, "last placement decline:")?;
+        writeln!(out, "  code: {}", enum_text(&decline.code)?)?;
+        if let Some(reason) = &decline.reason {
+            writeln!(out, "  reason: {}", enum_text(reason)?)?;
+        }
+        writeln!(out, "  runner: {}", decline.runner_id)?;
+        writeln!(out, "  declined at: {}", decline.declined_at)?;
+    }
     writeln!(out, "Cloud assignment and runner connection:")?;
     if let Some(assignment) = observation.assignment.as_deref() {
         writeln!(
@@ -2135,7 +2144,7 @@ mod tests {
     };
 
     #[test]
-    fn run_show_keeps_placement_and_reported_progress_separate() {
+    fn run_show_renders_latest_decline_beside_placement_and_progress() {
         let observation: RunObservation = serde_json::from_value(serde_json::json!({
             "observedAt": "2026-08-03T12:00:00Z",
             "placement": {"runnerId": "runner-b", "runnerName": "second",
@@ -2144,6 +2153,8 @@ mod tests {
                 "bootId": "boot-b", "presenceGeneration": 2, "leaseSequence": 9,
                 "leaseExpiresAt": "2026-08-03T13:00:00Z", "leaseValid": false,
                 "runnerConnected": true, "runnerLastSeenAt": null},
+            "lastDecline": {"code": "runner_unable", "reason": "source_service_unavailable",
+                "runnerId": "runner-c", "declinedAt": "2026-08-03T11:59:00Z"},
             "lastTransition": {"attemptId": "attempt-a", "eventSequence": 3,
                 "transitionSequence": 2, "recordedAt": "2026-08-03T11:00:00Z",
                 "kind": "step_state_changed", "stepId": "build", "targetState": "running"}
@@ -2152,7 +2163,17 @@ mod tests {
         let mut output = Vec::new();
         write_observation_human(&mut output, &observation).expect("render observation");
         let output = String::from_utf8(output).expect("human report is UTF-8");
-        for identifier in ["runner-b", "pool-b", "assignment-b", "attempt-a", "build"] {
+        for identifier in [
+            "runner-b",
+            "pool-b",
+            "assignment-b",
+            "attempt-a",
+            "build",
+            "runner_unable",
+            "source_service_unavailable",
+            "runner-c",
+            "2026-08-03T11:59:00Z",
+        ] {
             assert!(output.contains(identifier), "missing {identifier}");
         }
         // The public projection is serialized by the run-show command; the human
