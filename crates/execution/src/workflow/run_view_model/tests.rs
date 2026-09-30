@@ -517,6 +517,23 @@ async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     let consume = &step(&render_snapshot, "consume").log;
     assert_eq!(consume.records.len(), 1);
     assert_eq!(consume.records[0].payload.as_ref(), "other");
+    let next_render = view.snapshot_for_render(1);
+    assert!(Arc::ptr_eq(
+        &consume.records,
+        &step(&next_render, "consume").log.records
+    ));
+
+    view.observe(output(
+        "consume",
+        CommandOutputSource::StandardOutput,
+        SourceSequence::first().next(),
+        Arc::<[u8]>::from("界e\u{301}\n".as_bytes()),
+    ))
+    .await;
+    let updated = view.snapshot_for_render(1);
+    let updated_records = &step(&updated, "consume").log.records;
+    assert!(!Arc::ptr_eq(&consume.records, updated_records));
+    assert_eq!(updated_records[1].display_width, 3);
 }
 
 #[tokio::test]

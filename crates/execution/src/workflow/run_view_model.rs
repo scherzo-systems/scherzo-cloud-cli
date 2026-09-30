@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 use tokio::sync::watch;
+use unicode_width::UnicodeWidthStr;
 
 use super::admission::CancellationReason;
 use super::observation::{
@@ -82,12 +83,13 @@ pub(crate) struct WorkflowRunLogRecord {
     pub(crate) source: WorkflowRunLogSource,
     pub(crate) source_sequence: u64,
     pub(crate) payload: Arc<str>,
+    pub(crate) display_width: usize,
     pub(crate) continuation: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowRunStepLog {
-    pub(crate) records: Vec<WorkflowRunLogRecord>,
+    pub(crate) records: Arc<VecDeque<WorkflowRunLogRecord>>,
     pub(crate) observed_records: u64,
     pub(crate) retained_records: u64,
     pub(crate) retained_bytes: u64,
@@ -853,7 +855,7 @@ impl WorkflowRunStepViewState {
 
 #[derive(Default)]
 struct StepLogRing {
-    records: VecDeque<WorkflowRunLogRecord>,
+    records: Arc<VecDeque<WorkflowRunLogRecord>>,
     retained_bytes: u64,
     observed_records: u64,
     discarded_records: u64,
@@ -925,19 +927,21 @@ impl StepLogRing {
 
         self.observed_records = self.observed_records.saturating_add(1);
         self.retained_bytes = self.retained_bytes.saturating_add(payload_bytes);
-        self.records.push_back(WorkflowRunLogRecord {
+        let display_width = UnicodeWidthStr::width(payload.as_str());
+        Arc::make_mut(&mut self.records).push_back(WorkflowRunLogRecord {
             accepted_order,
             observed_at,
             invocation,
             source,
             source_sequence,
             payload: Arc::from(payload),
+            display_width,
             continuation,
         });
     }
 
     fn discard_oldest(&mut self) {
-        let Some(discarded) = self.records.pop_front() else {
+        let Some(discarded) = Arc::make_mut(&mut self.records).pop_front() else {
             return;
         };
         let discarded_bytes = u64::try_from(discarded.payload.len()).unwrap_or(u64::MAX);
@@ -949,9 +953,9 @@ impl StepLogRing {
     fn snapshot(&self, include_records: bool) -> WorkflowRunStepLog {
         WorkflowRunStepLog {
             records: if include_records {
-                self.records.iter().cloned().collect()
+                Arc::clone(&self.records)
             } else {
-                Vec::new()
+                Arc::new(VecDeque::new())
             },
             observed_records: self.observed_records,
             retained_records: u64::try_from(self.records.len()).unwrap_or(u64::MAX),

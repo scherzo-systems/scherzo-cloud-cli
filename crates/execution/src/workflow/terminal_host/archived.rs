@@ -269,6 +269,8 @@ struct ArchivedTerminalStepView {
     timing: Option<super::super::run_view_model::WorkflowRunElapsed>,
     detail: ArchivedStepDetail,
     output: ArchivedCommandOutputView,
+    document: Vec<ArchivedOutputRow>,
+    maximum_document_width: usize,
     recovery: Option<super::super::publication::StepRecoverySummaryV1>,
     invocations: Vec<super::super::publication::RecoveryInvocationV1>,
 }
@@ -355,7 +357,15 @@ impl ArchivedTerminalStepView {
                         ),
                     }
                 });
+        let document = output_document(&output);
+        let maximum_document_width = document
+            .iter()
+            .map(|row| display_width(&row.text))
+            .max()
+            .unwrap_or(0);
         Self {
+            document,
+            maximum_document_width,
             id: safe_text(&step.id),
             role: step.role,
             definition: safe_definition(definition),
@@ -910,8 +920,11 @@ impl ArchivedHostInteraction {
                 self.output.horizontal_offset = self.output.horizontal_offset.saturating_sub(1);
             }
             TerminalInputEvent::PanRight if self.surface == HostSurface::FullLog => {
-                let document = self.selected_document(view);
-                self.output.pan_right(&document);
+                let width = view
+                    .steps
+                    .get(self.selected)
+                    .map_or(0, |step| step.maximum_document_width);
+                self.output.pan_right(width);
             }
             _ => {}
         }
@@ -923,13 +936,18 @@ impl ArchivedHostInteraction {
             return;
         };
         let (width, rows) = archived_output_dimensions(self.terminal_area, step);
-        self.output.synchronize(&output_document(step), width, rows);
+        self.output.synchronize(
+            step.document.len(),
+            step.maximum_document_width,
+            width,
+            rows,
+        );
     }
 
-    fn selected_document(&self, view: &ArchivedTerminalView) -> Vec<ArchivedOutputRow> {
+    fn selected_document<'a>(&self, view: &'a ArchivedTerminalView) -> &'a [ArchivedOutputRow] {
         view.steps
             .get(self.selected)
-            .map_or_else(Vec::new, output_document)
+            .map_or(&[], |step| step.document.as_slice())
     }
 }
 
@@ -942,13 +960,13 @@ struct ArchivedOutputInteraction {
 }
 
 impl ArchivedOutputInteraction {
-    fn synchronize(&mut self, document: &[ArchivedOutputRow], width: usize, rows: usize) {
+    fn synchronize(&mut self, row_count: usize, document_width: usize, width: usize, rows: usize) {
         self.available_width = width;
         self.available_rows = rows;
-        self.top = self.top.min(maximum_document_top(document.len(), rows));
+        self.top = self.top.min(maximum_document_top(row_count, rows));
         self.horizontal_offset = self
             .horizontal_offset
-            .min(maximum_document_horizontal_offset(document, width));
+            .min(document_width.saturating_sub(width));
     }
 
     fn navigate(&mut self, row_count: usize, navigation: VerticalNavigation) {
@@ -967,30 +985,16 @@ impl ArchivedOutputInteraction {
         };
     }
 
-    fn pan_right(&mut self, document: &[ArchivedOutputRow]) {
-        self.horizontal_offset =
-            self.horizontal_offset
-                .saturating_add(1)
-                .min(maximum_document_horizontal_offset(
-                    document,
-                    self.available_width,
-                ));
+    fn pan_right(&mut self, document_width: usize) {
+        self.horizontal_offset = self
+            .horizontal_offset
+            .saturating_add(1)
+            .min(document_width.saturating_sub(self.available_width));
     }
 }
 
 fn maximum_document_top(row_count: usize, available_rows: usize) -> usize {
     row_count.saturating_sub(available_rows)
-}
-
-fn maximum_document_horizontal_offset(
-    document: &[ArchivedOutputRow],
-    available_width: usize,
-) -> usize {
-    document
-        .iter()
-        .map(|row| display_width(&row.text).saturating_sub(available_width))
-        .max()
-        .unwrap_or(0)
 }
 
 fn render_archived(
@@ -1303,8 +1307,8 @@ struct ArchivedOutputRow {
     tone: Tone,
 }
 
-fn output_document(step: &ArchivedTerminalStepView) -> Vec<ArchivedOutputRow> {
-    let ArchivedCommandOutputView::Present { stdout, stderr } = &step.output else {
+fn output_document(output: &ArchivedCommandOutputView) -> Vec<ArchivedOutputRow> {
+    let ArchivedCommandOutputView::Present { stdout, stderr } = output else {
         return vec![ArchivedOutputRow {
             text: "No durable command-stream prefixes exist for this step.".to_owned(),
             tone: Tone::Muted,
@@ -1392,8 +1396,8 @@ fn render_archived_full_output(
         frame.render_widget(Paragraph::new("No workflow steps."), sections[1]);
         return;
     };
-    let document = output_document(step);
-    let lines = document
+    let lines = step
+        .document
         .iter()
         .skip(interaction.top)
         .take(usize::from(sections[1].height))
@@ -1554,7 +1558,7 @@ mod tests {
     fn retained_prefixes_are_independent_safe_documents_with_exact_facts() {
         let view = ArchivedTerminalView::new(archived_attempt(Some(hostile_output())));
         let step = &view.steps[0];
-        let document = output_document(step);
+        let document = &step.document;
         let text = document
             .iter()
             .map(|row| row.text.as_str())
@@ -1616,7 +1620,7 @@ mod tests {
             stderr: stream(Vec::new(), 0, true),
         };
         let empty_view = ArchivedTerminalView::new(archived_attempt(Some(empty)));
-        let empty_document = output_document(&empty_view.steps[0]);
+        let empty_document = &empty_view.steps[0].document;
         let empty_text = empty_document
             .iter()
             .map(|row| row.text.as_str())
@@ -1629,7 +1633,7 @@ mod tests {
         assert_eq!(empty_text.matches("empty retained prefix").count(), 2);
 
         let missing_view = ArchivedTerminalView::new(archived_attempt(None));
-        let missing = output_document(&missing_view.steps[0]);
+        let missing = &missing_view.steps[0].document;
         assert_eq!(missing.len(), 1);
         assert!(
             missing[0]

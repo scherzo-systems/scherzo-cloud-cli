@@ -1025,23 +1025,51 @@ impl LogFilterState {
     }
 }
 
-struct FilteredLog<'a> {
-    records: Vec<&'a WorkflowRunLogRecord>,
+#[derive(Default)]
+struct FilteredLog {
+    records: VecDeque<WorkflowRunLogRecord>,
     hidden_records: usize,
+    last_seen: Option<AcceptedRecordOrder>,
 }
 
-impl<'a> FilteredLog<'a> {
-    fn new(log: &'a WorkflowRunStepLog, filters: LogFilterState) -> Self {
+impl FilteredLog {
+    fn new(log: &WorkflowRunStepLog, filters: LogFilterState) -> Self {
         let records = log
             .records
             .iter()
             .filter(|record| filters.includes(LogChannel::for_source(record.source)))
-            .collect::<Vec<_>>();
+            .cloned()
+            .collect::<VecDeque<_>>();
         let hidden_records = log.records.len().saturating_sub(records.len());
         Self {
             records,
             hidden_records,
+            last_seen: log.records.back().map(|record| record.accepted_order),
         }
+    }
+
+    fn extend(&mut self, log: &WorkflowRunStepLog, filters: LogFilterState) {
+        let first = log.records.front().map(|record| record.accepted_order);
+        while self
+            .records
+            .front()
+            .is_some_and(|record| first.is_none_or(|first| record.accepted_order < first))
+        {
+            self.records.pop_front();
+        }
+        let last = self.last_seen;
+        let new_start = log
+            .records
+            .partition_point(|record| last.is_some_and(|last| record.accepted_order <= last));
+        self.records.extend(
+            log.records
+                .iter()
+                .skip(new_start)
+                .filter(|record| filters.includes(LogChannel::for_source(record.source)))
+                .cloned(),
+        );
+        self.hidden_records = log.records.len().saturating_sub(self.records.len());
+        self.last_seen = log.records.back().map(|record| record.accepted_order);
     }
 }
 
@@ -1053,6 +1081,38 @@ pub struct HostInteraction {
     terminal_area: Rect,
     full_log: FullLogInteraction,
     log_filters: LogFilterState,
+    filtered_log: FilteredLog,
+    filtered_key: Option<(usize, LogFilterState, u64, Option<AcceptedRecordOrder>, u64)>,
+}
+
+impl HostInteraction {
+    fn prepare_filtered_log(&mut self, log: &WorkflowRunStepLog, selected: usize, generation: u64) {
+        let first = log.records.front().map(|record| record.accepted_order);
+        let key = (
+            selected,
+            self.log_filters,
+            generation,
+            first,
+            log.observed_records,
+        );
+        match self.filtered_key {
+            Some((step, filters, ..)) if step == selected && filters == self.log_filters => {
+                if self
+                    .filtered_key
+                    .is_some_and(|(_, _, _, old_first, old_observed)| {
+                        old_first != first || old_observed != log.observed_records
+                    })
+                {
+                    self.filtered_log.extend(log, self.log_filters);
+                }
+            }
+            _ => {
+                self.filtered_log = FilteredLog::new(log, self.log_filters);
+                self.full_log.maximum_width = None;
+            }
+        }
+        self.filtered_key = Some(key);
+    }
 }
 
 struct FullLogInteraction {
@@ -1062,6 +1122,10 @@ struct FullLogInteraction {
     horizontal_offset: usize,
     available_width: usize,
     available_rows: usize,
+    maximum_width: Option<usize>,
+    maximum_last: Option<AcceptedRecordOrder>,
+    // Decreasing offsets: an evicted maximum exposes the next surviving bound.
+    maximum_queue: VecDeque<(AcceptedRecordOrder, usize)>,
 }
 
 impl Default for FullLogInteraction {
@@ -1073,6 +1137,9 @@ impl Default for FullLogInteraction {
             horizontal_offset: 0,
             available_width: 0,
             available_rows: 0,
+            maximum_width: None,
+            maximum_last: None,
+            maximum_queue: VecDeque::new(),
         }
     }
 }
@@ -1090,7 +1157,7 @@ enum VerticalNavigation {
 }
 
 impl FullLogInteraction {
-    fn synchronize(&mut self, log: &FilteredLog<'_>, available_width: usize, rows: usize) {
+    fn synchronize(&mut self, log: &FilteredLog, available_width: usize, rows: usize) {
         self.available_width = available_width;
         self.available_rows = rows;
         if self.follow {
@@ -1106,19 +1173,18 @@ impl FullLogInteraction {
                 self.anchor = log
                     .records
                     .get(insertion)
-                    .or_else(|| log.records.last())
+                    .or_else(|| log.records.back())
                     .map(|record| record.accepted_order);
                 self.anchor_clamped = true;
             }
         } else {
-            self.anchor = log.records.first().map(|record| record.accepted_order);
+            self.anchor = log.records.front().map(|record| record.accepted_order);
         }
-        self.horizontal_offset = self
-            .horizontal_offset
-            .min(maximum_horizontal_offset(&log.records, available_width));
+        let maximum = self.maximum_offset(log, available_width);
+        self.horizontal_offset = self.horizontal_offset.min(maximum);
     }
 
-    fn navigate(&mut self, log: &FilteredLog<'_>, navigation: VerticalNavigation) {
+    fn navigate(&mut self, log: &FilteredLog, navigation: VerticalNavigation) {
         self.synchronize(log, self.available_width, self.available_rows);
         let current = self.top_index(log);
         let viewport_rows = self.available_rows.max(1);
@@ -1158,19 +1224,51 @@ impl FullLogInteraction {
         self.anchor_clamped = false;
     }
 
-    fn pan(&mut self, log: &FilteredLog<'_>, right: bool) {
+    fn pan(&mut self, log: &FilteredLog, right: bool) {
         self.synchronize(log, self.available_width, self.available_rows);
         if right {
-            self.horizontal_offset =
-                self.horizontal_offset
-                    .saturating_add(1)
-                    .min(maximum_horizontal_offset(
-                        &log.records,
-                        self.available_width,
-                    ));
+            self.horizontal_offset = self
+                .horizontal_offset
+                .saturating_add(1)
+                .min(self.maximum_offset(log, self.available_width));
         } else {
             self.horizontal_offset = self.horizontal_offset.saturating_sub(1);
         }
+    }
+
+    fn maximum_offset(&mut self, log: &FilteredLog, width: usize) -> usize {
+        if self.maximum_width != Some(width) {
+            self.maximum_queue.clear();
+            self.maximum_last = None;
+            self.maximum_width = Some(width);
+        }
+
+        let first = log.records.front().map(|record| record.accepted_order);
+        while self
+            .maximum_queue
+            .front()
+            .is_some_and(|(order, _)| first.is_none_or(|first| *order < first))
+        {
+            self.maximum_queue.pop_front();
+        }
+        let start = log.records.partition_point(|record| {
+            self.maximum_last
+                .is_some_and(|last| record.accepted_order <= last)
+        });
+        for record in log.records.iter().skip(start) {
+            let offset = log_record_horizontal_offset(record, width);
+            while self
+                .maximum_queue
+                .back()
+                .is_some_and(|(_, previous)| *previous <= offset)
+            {
+                self.maximum_queue.pop_back();
+            }
+            self.maximum_queue
+                .push_back((record.accepted_order, offset));
+        }
+        self.maximum_last = log.records.back().map(|record| record.accepted_order);
+        self.maximum_queue.front().map_or(0, |(_, offset)| *offset)
     }
 
     fn resume_follow(&mut self) {
@@ -1179,7 +1277,7 @@ impl FullLogInteraction {
         self.anchor_clamped = false;
     }
 
-    fn top_index(&self, log: &FilteredLog<'_>) -> usize {
+    fn top_index(&self, log: &FilteredLog) -> usize {
         if self.follow {
             return log.records.len().saturating_sub(self.available_rows);
         }
@@ -1192,30 +1290,22 @@ impl FullLogInteraction {
             .unwrap_or(0)
     }
 
-    fn lines_behind(&self, log: &FilteredLog<'_>) -> usize {
+    fn lines_behind(&self, log: &FilteredLog) -> usize {
         self.lines_behind_from(log, self.top_index(log))
     }
 
-    fn lines_behind_from(&self, log: &FilteredLog<'_>, top: usize) -> usize {
+    fn lines_behind_from(&self, log: &FilteredLog, top: usize) -> usize {
         log.records
             .len()
             .saturating_sub(top.saturating_add(self.available_rows))
     }
 }
 
-fn maximum_horizontal_offset(records: &[&WorkflowRunLogRecord], available_width: usize) -> usize {
-    let gutter = LogGutter::for_width(available_width);
-    records
-        .iter()
-        .map(|record| {
-            let line_width = gutter
-                .width()
-                .saturating_add(display_width(&record.payload));
-            let nominal_offset = line_width.saturating_sub(available_width);
-            next_log_grapheme_boundary(&record.payload, gutter.width(), nominal_offset)
-        })
-        .max()
-        .unwrap_or(0)
+fn log_record_horizontal_offset(record: &WorkflowRunLogRecord, available_width: usize) -> usize {
+    let gutter_width = LogGutter::for_width(available_width).width();
+    let line_width = gutter_width.saturating_add(record.display_width);
+    let nominal_offset = line_width.saturating_sub(available_width);
+    next_log_grapheme_boundary(&record.payload, gutter_width, nominal_offset)
 }
 
 fn next_log_grapheme_boundary(payload: &str, payload_start: usize, target: usize) -> usize {
@@ -1291,8 +1381,8 @@ impl HostInteraction {
                 && self.surface == HostSurface::FullLog
             {
                 let (width, rows) = full_log_record_dimensions(self.terminal_area, step);
-                let log = FilteredLog::new(&step.log, self.log_filters);
-                self.full_log.synchronize(&log, width, rows);
+                self.prepare_filtered_log(&step.log, self.selected, snapshot.generation);
+                self.full_log.synchronize(&self.filtered_log, width, rows);
             }
             return HostControl::Continue;
         }
@@ -1301,18 +1391,15 @@ impl HostInteraction {
             && let Some(step) = snapshot.steps.get(self.selected)
         {
             let (width, rows) = full_log_record_dimensions(self.terminal_area, step);
-            let log = FilteredLog::new(&step.log, self.log_filters);
-            self.full_log.synchronize(&log, width, rows);
+            self.prepare_filtered_log(&step.log, self.selected, snapshot.generation);
+            self.full_log.synchronize(&self.filtered_log, width, rows);
         }
 
         if self.surface == HostSurface::FullLog
-            && let (Some(step), Some(navigation)) = (
-                snapshot.steps.get(self.selected),
-                vertical_navigation(event),
-            )
+            && snapshot.steps.get(self.selected).is_some()
+            && let Some(navigation) = vertical_navigation(event)
         {
-            let log = FilteredLog::new(&step.log, self.log_filters);
-            self.full_log.navigate(&log, navigation);
+            self.full_log.navigate(&self.filtered_log, navigation);
             return HostControl::Continue;
         }
 
@@ -1324,8 +1411,8 @@ impl HostInteraction {
                 self.full_log = FullLogInteraction::default();
                 if let Some(step) = snapshot.steps.get(self.selected) {
                     let (width, rows) = full_log_record_dimensions(self.terminal_area, step);
-                    let log = FilteredLog::new(&step.log, self.log_filters);
-                    self.full_log.synchronize(&log, width, rows);
+                    self.prepare_filtered_log(&step.log, self.selected, snapshot.generation);
+                    self.full_log.synchronize(&self.filtered_log, width, rows);
                 }
             }
             TerminalInputEvent::Escape => {
@@ -1342,11 +1429,8 @@ impl HostInteraction {
             TerminalInputEvent::PanLeft | TerminalInputEvent::PanRight
                 if self.surface == HostSurface::FullLog =>
             {
-                if let Some(step) = snapshot.steps.get(self.selected) {
-                    let log = FilteredLog::new(&step.log, self.log_filters);
-                    self.full_log
-                        .pan(&log, event == TerminalInputEvent::PanRight);
-                }
+                self.full_log
+                    .pan(&self.filtered_log, event == TerminalInputEvent::PanRight);
             }
             TerminalInputEvent::Follow if self.surface == HostSurface::FullLog => {
                 self.full_log.resume_follow();
@@ -1426,8 +1510,10 @@ fn render(
         let selected_step = snapshot.steps.get(interaction.selected);
         if let Some(step) = selected_step {
             let (width, rows) = full_log_record_dimensions(area, step);
-            let log = FilteredLog::new(&step.log, interaction.log_filters);
-            interaction.full_log.synchronize(&log, width, rows);
+            interaction.prepare_filtered_log(&step.log, interaction.selected, snapshot.generation);
+            interaction
+                .full_log
+                .synchronize(&interaction.filtered_log, width, rows);
         }
         let full_log_sections =
             inspector_and_log_areas(sections[0], inspector_desired_height(selected_step));
@@ -1443,6 +1529,7 @@ fn render(
             full_log_sections[1],
             selected_step,
             &interaction.full_log,
+            &interaction.filtered_log,
             interaction.log_filters,
             color,
         );
@@ -1564,7 +1651,7 @@ fn render_split_body(
     area: Rect,
     snapshot: &WorkflowRunViewSnapshot,
     graph: &DagLayout,
-    interaction: &HostInteraction,
+    interaction: &mut HostInteraction,
     color: bool,
 ) {
     let selected_step = snapshot.steps.get(interaction.selected);
@@ -3096,7 +3183,7 @@ fn render_log(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &WorkflowRunViewSnapshot,
-    interaction: &HostInteraction,
+    interaction: &mut HostInteraction,
     color: bool,
     borders: Borders,
 ) {
@@ -3104,7 +3191,8 @@ fn render_log(
         render_missing_step_log(frame, area, borders, color);
         return;
     };
-    let log = FilteredLog::new(&step.log, interaction.log_filters);
+    interaction.prepare_filtered_log(&step.log, interaction.selected, snapshot.generation);
+    let log = &interaction.filtered_log;
     let records_area = render_log_surface(
         frame,
         area,
@@ -3119,7 +3207,7 @@ fn render_log(
     );
     let lines = log_tail_lines(
         step,
-        &log,
+        log,
         usize::from(records_area.width),
         usize::from(records_area.height),
         color,
@@ -3137,6 +3225,7 @@ fn render_full_log(
     area: Rect,
     step: Option<&WorkflowRunStepView>,
     interaction: &FullLogInteraction,
+    log: &FilteredLog,
     filters: LogFilterState,
     color: bool,
 ) {
@@ -3144,12 +3233,11 @@ fn render_full_log(
         render_missing_step_log(frame, area, Borders::ALL, color);
         return;
     };
-    let log = FilteredLog::new(&step.log, filters);
     let status = if interaction.follow {
         LogTitleStatus::Following
     } else {
         LogTitleStatus::Paused {
-            lines_behind: interaction.lines_behind(&log),
+            lines_behind: interaction.lines_behind(log),
         }
     };
     let mut records_area = render_log_surface(
@@ -3194,7 +3282,7 @@ fn render_full_log(
     }
 
     let available_width = usize::from(records_area.width);
-    let top = interaction.top_index(&log);
+    let top = interaction.top_index(log);
     let lines = log
         .records
         .iter()
@@ -3407,7 +3495,7 @@ fn log_status_title(
 
 fn log_tail_lines(
     step: &WorkflowRunStepView,
-    log: &FilteredLog<'_>,
+    log: &FilteredLog,
     available_width: usize,
     available_rows: usize,
     color: bool,
@@ -5123,7 +5211,12 @@ mod tests {
         let (available_width, _) =
             full_log_record_dimensions(interaction.terminal_area, &snapshot.steps[0]);
         let log = FilteredLog::new(&snapshot.steps[0].log, interaction.log_filters);
-        let maximum = maximum_horizontal_offset(&log.records, available_width);
+        let maximum = log
+            .records
+            .iter()
+            .map(|record| log_record_horizontal_offset(record, available_width))
+            .max()
+            .unwrap_or(0);
         assert_eq!(interaction.full_log.horizontal_offset, maximum);
         let rendered = buffer_text(&render_full_log_snapshot(
             &snapshot,
@@ -5138,11 +5231,62 @@ mod tests {
         let _ = render_full_log_snapshot(&snapshot, &mut interaction, 64, 20);
         assert_eq!(interaction.full_log.horizontal_offset, maximum);
 
-        snapshot.steps[0].log.records.remove(0);
+        Arc::make_mut(&mut snapshot.steps[0].log.records).remove(0);
         snapshot.steps[0].log.retained_records = 1;
         snapshot.steps[0].log.discarded_records = 1;
         let _ = render_full_log_snapshot(&snapshot, &mut interaction, 64, 20);
         assert_eq!(interaction.full_log.horizontal_offset, 0);
+    }
+
+    #[test]
+    fn full_ring_eviction_exposes_the_next_horizontal_bound() {
+        let records = (1..=4096)
+            .map(|order| {
+                let payload = match order {
+                    1 => "x".repeat(180),
+                    2 => "界".repeat(60),
+                    _ => "short".to_owned(),
+                };
+                direct_log_record(
+                    order,
+                    CommandOutputSource::StandardOutput,
+                    "2026-08-04T12:34:56Z",
+                    &payload,
+                    false,
+                )
+            })
+            .collect();
+        let mut snapshot =
+            direct_snapshot(direct_log_step(StepStateKind::Running, records, 4096, 0));
+        let (mut interaction, _) = entered_full_log(&snapshot, 64, 20);
+        let (width, _) = full_log_record_dimensions(interaction.terminal_area, &snapshot.steps[0]);
+        let first = log_record_horizontal_offset(&snapshot.steps[0].log.records[0], width);
+        let second = log_record_horizontal_offset(&snapshot.steps[0].log.records[1], width);
+        assert!(first > second && second > 0);
+        interaction.full_log.horizontal_offset = first;
+
+        for (appended, expected, bound_order) in [(4097, second, 2), (4098, 0, 4098)] {
+            Arc::make_mut(&mut snapshot.steps[0].log.records).pop_front();
+            append_log_record(&mut snapshot.steps[0].log, appended, "short");
+            snapshot.steps[0].log.discarded_records += 1;
+            let _ = render_full_log_snapshot(&snapshot, &mut interaction, 64, 20);
+            assert_eq!(interaction.full_log.horizontal_offset, expected);
+            assert_eq!(
+                interaction
+                    .full_log
+                    .maximum_queue
+                    .front()
+                    .map(|(order, _)| order.get()),
+                Some(bound_order)
+            );
+            assert_eq!(
+                interaction
+                    .full_log
+                    .maximum_last
+                    .map(AcceptedRecordOrder::get),
+                Some(appended)
+            );
+        }
     }
 
     #[test]
@@ -5268,6 +5412,35 @@ mod tests {
         let all_hidden = buffer_text(&render_snapshot(&snapshot, &mut interaction, 120, 24, true));
         assert!(all_hidden.contains("● following · 2 hidden"));
         assert!(all_hidden.contains("All log channels hidden."));
+    }
+
+    #[test]
+    fn filtered_log_tracks_hidden_appends_and_eviction() {
+        let mut snapshot = direct_snapshot(numbered_log_step(4, 20));
+        let mut interaction = HostInteraction::default();
+        assert!(interaction.log_filters.toggle(&snapshot.steps[0], '2'));
+        interaction.prepare_filtered_log(&snapshot.steps[0].log, 0, snapshot.generation);
+        assert_eq!(interaction.filtered_log.records.len(), 2);
+
+        append_log_record(&mut snapshot.steps[0].log, 5, "hidden");
+        interaction.prepare_filtered_log(&snapshot.steps[0].log, 0, snapshot.generation + 1);
+        assert_eq!(interaction.filtered_log.records.len(), 2);
+        assert_eq!(interaction.filtered_log.hidden_records, 3);
+
+        Arc::make_mut(&mut snapshot.steps[0].log.records).drain(..3);
+        snapshot.steps[0].log.discarded_records = 3;
+        append_log_record(&mut snapshot.steps[0].log, 6, "visible");
+        interaction.prepare_filtered_log(&snapshot.steps[0].log, 0, snapshot.generation + 2);
+        assert_eq!(interaction.filtered_log.records.len(), 2);
+        assert_eq!(
+            interaction.filtered_log.records[0].accepted_order,
+            AcceptedRecordOrder::for_test(4)
+        );
+        assert_eq!(
+            interaction.filtered_log.records[1].payload.as_ref(),
+            "visible"
+        );
+        assert_eq!(interaction.filtered_log.hidden_records, 1);
     }
 
     #[test]
@@ -7462,6 +7635,7 @@ finalizers:
             source,
             source_sequence: SourceSequence::first().get(),
             payload: Arc::from(payload),
+            display_width: display_width(payload),
             continuation,
         }
     }
@@ -7474,9 +7648,7 @@ finalizers:
             height,
             &[(KeyCode::Char('g'), KeyModifiers::NONE)],
         );
-        let discarded_bytes = snapshot.steps[0]
-            .log
-            .records
+        let discarded_bytes = Arc::make_mut(&mut snapshot.steps[0].log.records)
             .drain(0..8)
             .map(|record| u64::try_from(record.payload.len()).unwrap())
             .sum();
@@ -7515,7 +7687,7 @@ finalizers:
     }
 
     fn append_log_record(log: &mut WorkflowRunStepLog, order: u64, payload: &str) {
-        log.records.push(direct_log_record(
+        Arc::make_mut(&mut log.records).push_back(direct_log_record(
             order,
             if order.is_multiple_of(2) {
                 CommandOutputSource::StandardOutput
@@ -7751,7 +7923,7 @@ finalizers:
         let mut step =
             direct_command_step(state, None, None, WorkflowRunOutputDisposition::Pending);
         step.log = WorkflowRunStepLog {
-            records,
+            records: Arc::new(records.into()),
             observed_records,
             retained_records,
             retained_bytes,
@@ -7786,7 +7958,7 @@ finalizers:
             timing,
             outputs: BTreeMap::from([("report".to_owned(), output_disposition)]),
             log: WorkflowRunStepLog {
-                records: Vec::new(),
+                records: Arc::new(VecDeque::new()),
                 observed_records: 0,
                 retained_records: 0,
                 retained_bytes: 0,
@@ -7857,7 +8029,7 @@ finalizers:
                     frame,
                     frame.area(),
                     &snapshot,
-                    &HostInteraction::default(),
+                    &mut HostInteraction::default(),
                     color,
                     Borders::ALL,
                 );
