@@ -312,6 +312,8 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
         "publication": null,
         "cancellation": null,
         "interruption": interruption,
+        "failure": null,
+        "rejection": null,
         "artifactDelivery": null,
         "portableResult": "absent",
         "continuation": null,
@@ -2059,10 +2061,13 @@ fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
 
 #[test]
 fn create_wait_preserves_authoritative_replay_through_failed_execution() {
-    let (server, _directory, credential_path) = prepared_run(vec![
-        acceptance_response(true),
-        run_response(run_body_with_state("failed")),
-    ]);
+    let mut body = run_body_with_state("failed");
+    body["failure"] = serde_json::json!({
+        "node": {"id": "build", "role": "step"}, "state": "failed",
+        "detail": {"phase": "execution", "code": "command_exit", "exitCode": 23}
+    });
+    let (server, _directory, credential_path) =
+        prepared_run(vec![acceptance_response(true), run_response(body.clone())]);
     let environment = deployment_environment(&server.api_url, &credential_path);
     let mut arguments = create_args(true);
     arguments.insert(arguments.len() - 1, "--wait");
@@ -2072,12 +2077,34 @@ fn create_wait_preserves_authoritative_replay_through_failed_execution() {
     assert_eq!(result["operation"], "create");
     assert_eq!(result["outcome"], "settled");
     assert_eq!(result["run"]["state"], "failed");
+    assert_eq!(result["run"]["failure"], body["failure"]);
     assert_eq!(result["replayed"], true);
     assert_eq!(result["error"], serde_json::Value::Null);
     let requests = server.finish();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].contains("/runs HTTP/1.1"));
     assert!(requests[1].contains(&format!("/runs/{RUN_ID} HTTP/1.1")));
+}
+
+#[test]
+fn create_wait_displays_failed_primary_issue() {
+    let mut body = run_body_with_state("failed");
+    body["failure"] = serde_json::json!({
+        "node": {"id": "build", "role": "step"}, "state": "failed",
+        "detail": {"code": "command_exit", "exitCode": 23}
+    });
+    let (server, _directory, credential_path) =
+        prepared_run(vec![acceptance_response(false), run_response(body)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(false);
+    arguments.insert(arguments.len() - 1, "--wait");
+    let output = run_with_env(&arguments, &environment);
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    for field in ["build", "command_exit", "exitCode"] {
+        assert!(text.contains(field), "missing {field} in {text}");
+    }
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]
@@ -4822,6 +4849,44 @@ fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
         assert!(request.starts_with(&format!(
             "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID} HTTP/1.1\r\n"
         )));
+    }
+}
+
+#[test]
+fn run_show_displays_terminal_failure_and_rejection() {
+    for (state, field, evidence, expected) in [
+        (
+            "failed",
+            "failure",
+            serde_json::json!({
+                "node": {"id": "build", "role": "step"}, "state": "failed",
+                "detail": {"code": "command_exit", "exitCode": 23, "input": {"name": "source"}, "output": {"name": "result"}}
+            }),
+            "command_exit",
+        ),
+        (
+            "rejected",
+            "rejection",
+            serde_json::json!({"reason": "source_commit_unavailable"}),
+            "source_commit_unavailable",
+        ),
+    ] {
+        let mut body = run_body_with_state(state);
+        body[field] = evidence;
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+            &environment,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(expected), "{text}");
+        assert_eq!(server.finish().len(), 1);
     }
 }
 

@@ -1607,6 +1607,22 @@ fn write_observation_human(
     Ok(())
 }
 
+fn write_run_terminal_issue(out: &mut impl Write, run: &Run) -> anyhow::Result<()> {
+    if let Some(failure) = run.failure.as_deref() {
+        writeln!(out, "\nfailure:")?;
+        writeln!(out, "  node: {}", visible_text(&failure.node.id))?;
+        writeln!(out, "  role: {}", enum_text(&failure.node.role)?)?;
+        writeln!(out, "  state: {}", enum_text(&failure.state)?)?;
+        let detail = serde_json::to_value(&failure.detail)?;
+        writeln!(out, "  detail: {}", visible_text(&detail.to_string()))?;
+    }
+    if let Some(rejection) = run.rejection.as_deref() {
+        writeln!(out, "\nrejection:")?;
+        writeln!(out, "  reason: {}", visible_text(&rejection.reason))?;
+    }
+    Ok(())
+}
+
 fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -1783,6 +1799,7 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     } else {
         writeln!(stdout, "  none")?;
     }
+    write_run_terminal_issue(&mut stdout, run)?;
     writeln!(stdout, "\nartifact delivery:")?;
     match run.artifact_delivery.as_deref() {
         None => writeln!(stdout, "  none")?,
@@ -2244,6 +2261,8 @@ mod tests {
             "publication": null,
             "cancellation": null,
             "interruption": null,
+            "failure": null,
+            "rejection": null,
             "artifactDelivery": null,
             "portableResult": "absent",
             "continuation": null,
@@ -2293,6 +2312,42 @@ mod tests {
                 .workspace
                 .start_snapshot
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_run_human_output_includes_primary_issue_or_rejection() {
+        let mut failed = serde_json::to_value(run(RunState::Failed)).unwrap();
+        failed["failure"] = serde_json::json!({
+            "node": {"id": "work", "role": "step"}, "state": "failed",
+            "detail": {"code": "command_exit", "exitCode": 23,
+                "input": {"name": "source"}, "output": {"name": "result"}}
+        });
+        let mut output = Vec::new();
+        super::write_run_terminal_issue(&mut output, &serde_json::from_value(failed).unwrap())
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        for field in [
+            "work",
+            "step",
+            "failed",
+            "command_exit",
+            "exitCode",
+            "input",
+            "output",
+        ] {
+            assert!(text.contains(field), "missing {field} in {text}");
+        }
+
+        let mut rejected = serde_json::to_value(run(RunState::Rejected)).unwrap();
+        rejected["rejection"] = serde_json::json!({"reason": "source_commit_unavailable"});
+        let mut output = Vec::new();
+        super::write_run_terminal_issue(&mut output, &serde_json::from_value(rejected).unwrap())
+            .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("source_commit_unavailable")
         );
     }
 

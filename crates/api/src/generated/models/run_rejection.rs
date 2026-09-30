@@ -16,32 +16,14 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AuditProjectionWarning : A redacted indication that one immutable record could not be projected.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AuditProjectionWarning {
-    /// The immutable audit record's opaque identifier.
-    #[serde(rename = "recordId")]
-    pub record_id: String,
+pub struct RunRejection {
     #[serde(rename = "reason")]
-    pub reason: Reason,
+    pub reason: String,
 }
 
-impl AuditProjectionWarning {
-    /// A redacted indication that one immutable record could not be projected.
-    pub fn new(record_id: String, reason: Reason) -> AuditProjectionWarning {
-        AuditProjectionWarning { record_id, reason }
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Reason {
-    #[serde(rename = "unknown_action")]
-    UnknownAction,
-    #[serde(rename = "malformed_record")]
-    MalformedRecord,
-}
-
-impl Default for Reason {
-    fn default() -> Reason {
-        Self::UnknownAction
+impl RunRejection {
+    pub fn new(reason: String) -> RunRejection {
+        RunRejection { reason }
     }
 }

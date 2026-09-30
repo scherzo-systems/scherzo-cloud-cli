@@ -16,32 +16,40 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AuditProjectionWarning : A redacted indication that one immutable record could not be projected.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AuditProjectionWarning {
-    /// The immutable audit record's opaque identifier.
-    #[serde(rename = "recordId")]
-    pub record_id: String,
-    #[serde(rename = "reason")]
-    pub reason: Reason,
+pub struct RunFailure {
+    #[serde(rename = "node")]
+    pub node: Box<models::RunFailureNode>,
+    #[serde(rename = "state")]
+    pub state: State,
+    /// Canonical primary issue detail retained from the Coordinator without omitting node-specific fields.
+    #[serde(rename = "detail")]
+    pub detail: std::collections::HashMap<String, serde_json::Value>,
 }
 
-impl AuditProjectionWarning {
-    /// A redacted indication that one immutable record could not be projected.
-    pub fn new(record_id: String, reason: Reason) -> AuditProjectionWarning {
-        AuditProjectionWarning { record_id, reason }
+impl RunFailure {
+    pub fn new(
+        node: models::RunFailureNode,
+        state: State,
+        detail: std::collections::HashMap<String, serde_json::Value>,
+    ) -> RunFailure {
+        RunFailure {
+            node: Box::new(node),
+            state,
+            detail,
+        }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Reason {
-    #[serde(rename = "unknown_action")]
-    UnknownAction,
-    #[serde(rename = "malformed_record")]
-    MalformedRecord,
+pub enum State {
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "blocked")]
+    Blocked,
 }
 
-impl Default for Reason {
-    fn default() -> Reason {
-        Self::UnknownAction
+impl Default for State {
+    fn default() -> State {
+        Self::Failed
     }
 }
