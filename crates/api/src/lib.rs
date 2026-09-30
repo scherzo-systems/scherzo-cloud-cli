@@ -347,6 +347,42 @@ mod tests {
     }
 
     #[test]
+    fn generated_linear_condition_preserves_null_assignee() {
+        use generated::models::LinearEventConditionValue;
+        let null: LinearEventConditionValue =
+            serde_json::from_value(serde_json::Value::Null).expect("null assignee value");
+        let set: LinearEventConditionValue =
+            serde_json::from_value(serde_json::json!([null, "user"]))
+                .expect("assignee set with null");
+        assert_eq!(
+            serde_json::to_value(null).expect("encode null"),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(set).expect("encode set"),
+            serde_json::json!([null, "user"])
+        );
+    }
+
+    #[test]
+    fn generated_linear_root_observation_distinguishes_missing_and_null() {
+        let observation: generated::models::LinearEvaluationObservations =
+            serde_json::from_value(serde_json::json!({
+                "observedAt": "2025-01-01T00:00:00Z",
+                "assigneeId": null,
+                "labelIds": []
+            }))
+            .expect("root observation should decode");
+        assert_eq!(observation.state_id, None);
+        assert_eq!(observation.assignee_id, Some(None));
+        assert_eq!(observation.label_ids, Some(Some(vec![])));
+        let encoded = serde_json::to_value(observation).expect("root observation should encode");
+        assert!(encoded.get("stateId").is_none());
+        assert!(encoded["assigneeId"].is_null());
+        assert_eq!(encoded["labelIds"], serde_json::json!([]));
+    }
+
+    #[test]
     fn generated_run_input_union_consumes_its_discriminator_once() {
         let entry = generated::models::RunInputManifestEntry::Text(Box::new(
             generated::models::RunInputTextEntry::new(

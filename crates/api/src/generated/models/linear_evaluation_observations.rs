@@ -17,18 +17,47 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LinearConnectionError {
+pub struct LinearEvaluationObservations {
     #[serde(rename = "observedAt")]
     pub observed_at: String,
-    #[serde(rename = "reasonCode")]
-    pub reason_code: String,
+    #[serde(
+        rename = "stateId",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state_id: Option<Option<String>>,
+    #[serde(
+        rename = "teamId",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub team_id: Option<Option<String>>,
+    #[serde(
+        rename = "labelIds",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub label_ids: Option<Option<Vec<String>>>,
+    #[serde(
+        rename = "assigneeId",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub assignee_id: Option<Option<String>>,
 }
 
-impl LinearConnectionError {
-    pub fn new(observed_at: String, reason_code: String) -> LinearConnectionError {
-        LinearConnectionError {
+impl LinearEvaluationObservations {
+    pub fn new(observed_at: String) -> LinearEvaluationObservations {
+        LinearEvaluationObservations {
             observed_at,
-            reason_code,
+            state_id: None,
+            team_id: None,
+            label_ids: None,
+            assignee_id: None,
         }
     }
 }
