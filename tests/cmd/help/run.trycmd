@@ -10,6 +10,7 @@ Commands:
   input      Manage retained run inputs
   input-set  Manage Run Input Sets
   list       List Scherzo Cloud runs
+  retry      Retry a run
   show       Show a run
   help       Print this message or the help of the given subcommand(s)
 

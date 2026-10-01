@@ -1337,6 +1337,10 @@ scherzo-cloud run show \
 scherzo-cloud run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 
+# Retry an eligible terminal run; observe the durable receipt until it resolves.
+scherzo-cloud run retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --expected-version 7 --timeout 30m
+
 # Request graceful cancellation; force is a separate explicit, separately keyed choice.
 scherzo-cloud run cancel acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
@@ -1444,8 +1448,22 @@ proof of a stopped Run. Force requires explicit `--force`; to escalate use a new
 idempotency key. Reuse `--idempotency-key` with the same mode and Run to reconcile an
 uncertain response. Signals and timeouts stop only local observation.
 
-With `--json`, each command emits one schema-version-1 object with `operation`,
-`deployment`, `organizationRef`, nullable `runId`, `outcome`, full nullable `run`,
+`run retry ORGANIZATION RUN` always observes its retry receipt; `--expected-version`
+requires a positive integer and `--timeout` limits observation after acceptance.
+A single generated key is reused for ambiguous transport replay. POST acceptance alone
+never reports application: only an applied GET receipt succeeds. JSON retry results
+contain `schemaVersion`, `operation: retry`, `deployment`, `organizationRef`, `runId`,
+`outcome`, nullable `requestId`, `idempotencyKey`, `receipt`, and `code`.
+Outcomes are `applied`, exact-code `rejected`, `trigger_slot_conflict`,
+`retry_pending`, `timed_out`, `observation_stopped`, `acceptance_unknown`, and
+`error`. Rejection, conflict, and timeout exit 1; usage exits 2; authentication
+exits 3; unresolved transport exits 4; SIGINT/SIGTERM exit 130/143. A known
+interruption retains the request ID; unknown submission retains the key. Neither
+cancels or creates another retry. Inspect the run and request before trying again.
+
+For `run create`, `run show`, and `run cancel`, `--json` emits one
+schema-version-1 object with `operation`, `deployment`, `organizationRef`,
+nullable `runId`, `outcome`, full nullable `run`,
 `publication`, `cancellationRequest`, nullable create `replayed`, and nullable `error`.
 The error includes `code`, `idempotencyKey`, `requestedMode`, and `requestId` (nullable).
 Progress goes to stderr. Human create/show results show the Run's automatic publication

@@ -49,8 +49,8 @@ pub use device_flow::{
 pub use session::{
     BoundRequiredOperation, LocalCredentialState, LogoutOutcome, RequiredOperation,
     RequiredOperationWithBinding, RevocationState, SessionBinding, execute_bound_required,
-    execute_optional, execute_required, execute_required_until, execute_required_with_binding,
-    logout, remove_bound_credential,
+    execute_optional, execute_pinned_required, execute_required, execute_required_until,
+    execute_required_with_binding, logout, remove_bound_credential,
 };
 pub use status::{
     AuthenticationState, AuthenticationStatus, StatusError, check as check_auth_status,

@@ -24,6 +24,7 @@ mod inputs;
 mod list;
 mod observation;
 mod output;
+mod retry;
 use output::{CloudOutput, CloudSnapshot};
 
 // Keep the closed envelope fields grouped at the rendering boundary, without
@@ -69,6 +70,8 @@ enum RunCommand {
     InputSet(input_set::Command),
     #[command(about = "List Scherzo Cloud runs")]
     List(ListCommand),
+    #[command(about = "Retry a run")]
+    Retry(retry::Command),
     #[command(about = "Show a run")]
     Show(ShowCommand),
 }
@@ -248,6 +251,12 @@ impl Command {
                 Some(command),
                 &[NAME],
                 "configure Scherzo Cloud run access",
+                |command, deployment| command.execute(deployment.clone()),
+            ),
+            Some(RunCommand::Retry(command)) => super::execute_deployment_command(
+                Some(command),
+                &[NAME],
+                "configure Scherzo Cloud run retry",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::Cancel(command)) => super::execute_deployment_command(
@@ -1192,7 +1201,12 @@ fn failure_code(
         RunFailure::InvalidInput => ("invalid_input", ExitCode::GeneralFailure),
         RunFailure::NotFound => ("not_found", ExitCode::GeneralFailure),
         RunFailure::IdempotencyConflict => ("idempotency_conflict", ExitCode::GeneralFailure),
-        RunFailure::Conflict => ("submission_failed", ExitCode::GeneralFailure),
+        RunFailure::Conflict | RunFailure::RetryConflict(_) => {
+            ("submission_failed", ExitCode::GeneralFailure)
+        }
+        RunFailure::RetryAfter(_)
+        | RunFailure::RetryAmbiguousRateLimited
+        | RunFailure::RetryAmbiguousAuthentication => ("unavailable", ExitCode::Unavailable),
         RunFailure::CreationRejected => ("creation_rejected", ExitCode::GeneralFailure),
         RunFailure::Unreachable(_) => ("unavailable", ExitCode::Unavailable),
         RunFailure::Protocol { .. } => ("protocol_error", ExitCode::GeneralFailure),
@@ -1904,7 +1918,7 @@ fn write_failure_with_input_set(
             "error: Cloud run resource not found or unavailable\n\nCheck the organization and resource identifier, then try again.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
-        RunFailure::Conflict | RunFailure::IdempotencyConflict => (
+        RunFailure::Conflict | RunFailure::IdempotencyConflict | RunFailure::RetryConflict(_) => (
             "conflict",
             None,
             "error: Cloud run request conflicts with current state\n\nCheck the resource state and try again.".to_owned(),
@@ -1921,6 +1935,13 @@ fn write_failure_with_input_set(
             None,
             "error: Cloud run input content is no longer available\n\nStart a new input set or run instead.".to_owned(),
             OutcomeClass::GeneralFailure,
+        ),
+        RunFailure::RetryAfter(_)
+        | RunFailure::RetryAmbiguousRateLimited
+        | RunFailure::RetryAmbiguousAuthentication => (
+            "unreachable", None,
+            "error: Cloud run API is temporarily unavailable\n\nTry again after the reported interval.".to_owned(),
+            OutcomeClass::RateLimited,
         ),
         RunFailure::Unreachable(category) => (
             "unreachable",

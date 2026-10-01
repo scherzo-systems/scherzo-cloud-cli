@@ -148,12 +148,12 @@ pub use runners::{
     RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub use runs::{
-    CreateRunInput, Run, RunApi, RunArtifactDelivery, RunCancellation,
+    CreateRunInput, RetryConflict, Run, RunApi, RunArtifactDelivery, RunCancellation,
     RunCancellationEffectiveMode, RunCancellationEnvelope, RunCancellationMode,
     RunCancellationReceipt, RunCancellationReceiptMode, RunCancellationReceiptState,
     RunCancellationResolutionKind, RunCreationAcceptance, RunCreationPending, RunFailure,
     RunInterruption, RunList, RunListFilter, RunObservation, RunPublicationHandoffState, RunRead,
-    RunState, valid_integration_context,
+    RunRetryReceipt, RunRetryRejection, RunRetryState, RunState, valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

@@ -229,6 +229,30 @@ pub fn remove_bound_credential(
     })
 }
 
+// A mutation must never retry under a newly selected login. Capture its acting
+// credential before dispatch; the bound refresh path checks the same session
+// under the credential-store authority before a rejected request is retried.
+pub fn execute_pinned_required<T, E>(
+    client: &HttpClient,
+    deployment: &Deployment,
+    operation: impl FnMut(&SecretToken) -> Result<T, E>,
+    credential_rejected: impl Fn(&Result<T, E>) -> bool,
+) -> Result<BoundRequiredOperation<T, E>, SessionError> {
+    let store = CredentialStore::from_environment().map_err(SessionError::CredentialStore)?;
+    let Some(credential) = credential_for_use(&store, client, deployment)? else {
+        return Ok(BoundRequiredOperation::Unauthenticated {
+            credential_state: LocalCredentialState::Retained,
+        });
+    };
+    execute_bound_required(
+        client,
+        deployment,
+        &SessionBinding { credential },
+        operation,
+        credential_rejected,
+    )
+}
+
 pub fn execute_bound_required<T, E>(
     client: &HttpClient,
     deployment: &Deployment,

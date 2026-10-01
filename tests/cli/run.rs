@@ -19,6 +19,619 @@ const REPOSITORY_CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const INPUT_SET_ID: &str = "ris_01k0z6r1w8f4jy2m7q9v3x5abc";
 const WORKFLOW_PATH: &str = "workflows/build.yaml";
 
+mod retry_command_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    const REQUEST_ID: &str = "cmd_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+    fn receipt(state: &str, rejection: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "id": REQUEST_ID, "organizationId": ORGANIZATION_ID, "runId": RUN_ID,
+            "observedVersion": 7, "acceptedAt": "2026-08-10T12:00:00Z",
+            "state": state, "fault": null,
+            "resolvedAt": if state == "pending" { None } else { Some("2026-08-10T12:01:00Z") },
+            "rejection": rejection,
+            "attemptId": if state == "applied" { Some(ATTEMPT_ID) } else { None },
+            "attemptNumber": if state == "applied" { Some(2) } else { None },
+            "runVersion": if state == "applied" { Some(8) } else { None }
+        })
+    }
+
+    fn read_request(stream: &TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut lines = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(!line.is_empty(), "request ended before headers");
+            if line == "\r\n" {
+                break;
+            }
+            if line.to_ascii_lowercase().starts_with("content-length:") {
+                length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+            }
+            lines.push_str(&line);
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        lines.push_str("\r\n");
+        lines.push_str(std::str::from_utf8(&body).unwrap());
+        lines
+    }
+
+    // A scripted TCP peer echoes the generated key, rather than predicting random input.
+    // Each accepted connection is a synchronization point; an IO timeout only bounds a
+    // broken fixture, never determines when an assertion is safe.
+    fn execute(steps: &[(&str, Option<&str>)], args: &[&str]) -> (Output, Vec<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+        let credential_directory = private_credential_directory();
+        let credential_path = credential_directory.path().join("credentials.json");
+        write_credential_fixture(&credential_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+        let script: Vec<_> = steps
+            .iter()
+            .map(|(state, code)| (state.to_string(), code.map(str::to_owned)))
+            .collect();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (state, code) in script {
+                let (mut stream, _) = listener.accept().unwrap();
+                let lines = read_request(&stream);
+                let key = lines.lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("idempotency-key: ")
+                        .map(str::to_owned)
+                });
+                let reply = match state.as_str() {
+                    "lost" => None,
+                    "pending" | "applied" | "rejected" | "applied-post" => {
+                        let post = lines.starts_with("POST ");
+                        let state = if state == "applied-post" {
+                            "applied"
+                        } else if post {
+                            "pending"
+                        } else {
+                            state.as_str()
+                        };
+                        let body = serde_json::to_vec(&receipt(state, code.as_deref())).unwrap();
+                        let location = format!(
+                            "/v1/organizations/{ORGANIZATION_ID}/runs/{RUN_ID}/retry-requests/{REQUEST_ID}"
+                        );
+                        let mut headers = vec![("Cache-Control", "private, no-store")];
+                        if post {
+                            headers.push(("Idempotency-Key", key.as_deref().unwrap()));
+                            headers.push(("Location", location.as_str()));
+                        }
+                        Some(http_response_with_headers(
+                            if post { "202 Accepted" } else { "200 OK" },
+                            Some("application/json"),
+                            &headers,
+                            &body,
+                        ))
+                    }
+                    other => {
+                        let (status, title) = match other {
+                            "unauthorized" => ("401 Unauthorized", "Unauthorized"),
+                            "forbidden" => ("403 Forbidden", "Forbidden"),
+                            "not-found" => ("404 Not Found", "Not Found"),
+                            "rate-limited" => ("429 Too Many Requests", "Too Many Requests"),
+                            "unavailable" => ("503 Service Unavailable", "Service Unavailable"),
+                            _ => ("409 Conflict", "Conflict"),
+                        };
+                        let status_number: u16 = status.split(' ').next().unwrap().parse().unwrap();
+                        let body = serde_json::json!({"type":format!("https://api.scherzo.dev/problems/{other}"),"title":title,"status":status_number});
+                        let bytes = serde_json::to_vec(&body).unwrap();
+                        Some(http_response_with_headers(
+                            status,
+                            Some("application/problem+json"),
+                            if matches!(other, "rate-limited" | "unavailable") {
+                                &[("Retry-After", "1")]
+                            } else {
+                                &[]
+                            },
+                            &bytes,
+                        ))
+                    }
+                };
+                if let Some(reply) = reply {
+                    stream.write_all(&reply).unwrap();
+                }
+                requests.push(lines);
+            }
+            requests
+        });
+        let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
+        let output = run_with_env(args, &environment);
+        (output, server.join().unwrap())
+    }
+
+    fn args() -> [&'static str; 8] {
+        [
+            "run",
+            "retry",
+            ORGANIZATION,
+            RUN_ID,
+            "--expected-version",
+            "7",
+            "--json",
+            "--allow-insecure-http",
+        ]
+    }
+
+    #[test]
+    fn lost_acceptance_replays_one_key_and_only_get_can_apply() {
+        let (output, requests) = execute(
+            &[("lost", None), ("pending", None), ("applied", None)],
+            &args(),
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "applied");
+        assert_eq!(json["requestId"], REQUEST_ID);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+        assert_eq!(
+            requests[0].split("\r\n\r\n").nth(1),
+            requests[1].split("\r\n\r\n").nth(1)
+        );
+        assert!(requests[2].starts_with("GET "));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("DELETE "))
+        );
+    }
+
+    #[test]
+    fn two_lost_post_responses_report_unresolved_transport_and_the_one_key() {
+        let (output, requests) = execute(&[("lost", None), ("lost", None)], &args());
+        assert_eq!(output.status.code(), Some(4));
+        assert!(output.stderr.is_empty());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "acceptance_unknown");
+        assert_eq!(json["requestId"], serde_json::Value::Null);
+        assert_eq!(
+            json["idempotencyKey"],
+            header_value(&requests[0], "idempotency-key")
+        );
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+        assert!(requests.iter().all(|request| request.starts_with("POST ")));
+    }
+
+    #[test]
+    fn definitive_post_rate_limit_does_not_claim_unknown_acceptance() {
+        let (output, requests) = execute(&[("rate-limited", None)], &args());
+        assert_eq!(output.status.code(), Some(4));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "error");
+        assert_eq!(json["code"], "rate_limited");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn rate_limited_replay_does_not_erase_ambiguous_first_post() {
+        let (output, requests) = execute(&[("lost", None), ("rate-limited", None)], &args());
+        assert_eq!(output.status.code(), Some(4));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "acceptance_unknown");
+        assert_eq!(
+            json["idempotencyKey"],
+            header_value(&requests[0], "idempotency-key")
+        );
+        assert_eq!(json["requestId"], serde_json::Value::Null);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+    }
+
+    #[test]
+    fn unauthorized_replay_cannot_erase_unresolved_acceptance() {
+        let (output, requests) = execute(&[("lost", None), ("unauthorized", None)], &args());
+        assert_eq!(output.status.code(), Some(4));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "acceptance_unknown");
+        assert_eq!(
+            json["idempotencyKey"],
+            header_value(&requests[0], "idempotency-key")
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+    }
+
+    #[test]
+    fn resolved_replay_still_requires_a_get_before_reporting_applied() {
+        let (output, requests) = execute(
+            &[("lost", None), ("applied-post", None), ("applied", None)],
+            &args(),
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+            "applied"
+        );
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("GET "));
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+    }
+
+    #[test]
+    fn pending_get_is_not_application_until_a_later_get_applies() {
+        let (output, requests) = execute(
+            &[("pending", None), ("pending", None), ("applied", None)],
+            &args(),
+        );
+        assert_eq!(output.status.code(), Some(0));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "applied");
+        assert_eq!(json["receipt"]["attemptNumber"], 2);
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+    }
+
+    #[test]
+    fn rejected_receipts_preserve_every_code() {
+        for code in [
+            "run_not_found",
+            "idempotency_conflict",
+            "expected_run_version_conflict",
+            "attempt_active",
+            "latest_attempt_succeeded",
+            "source_unavailable",
+            "latest_attempt_rejected",
+            "run_input_retry_unavailable",
+        ] {
+            let (output, requests) =
+                execute(&[("pending", None), ("rejected", Some(code))], &args());
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stderr.is_empty());
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["outcome"], "rejected");
+            assert_eq!(json["code"], code);
+            assert_eq!(requests.len(), 2);
+        }
+    }
+
+    #[test]
+    fn receipt_loss_and_authorization_loss_never_resubmit() {
+        for (problem, code, exit) in [("not-found", "not_found", 1), ("forbidden", "forbidden", 1)]
+        {
+            let (output, requests) = execute(&[("pending", None), (problem, None)], &args());
+            assert_eq!(output.status.code(), Some(exit));
+            assert!(output.stderr.is_empty());
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["outcome"], "error");
+            assert_eq!(json["code"], code);
+            assert_eq!(json["requestId"], REQUEST_ID);
+            assert!(requests[0].starts_with("POST "));
+            assert!(requests[1].starts_with("GET "));
+        }
+    }
+
+    #[test]
+    fn replacement_login_after_unauthorized_post_never_receives_the_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+        let directory = private_credential_directory();
+        let path = directory.path().join("credentials.json");
+        write_credential_fixture(&path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+        let environment = deployment_environment(&api_url, path.to_str().unwrap());
+        let server_api_url = api_url.clone();
+        let server_path = path.clone();
+        let (release, released) = mpsc::sync_channel(0);
+        let server = std::thread::spawn(move || {
+            let (mut post, _) = listener.accept().unwrap();
+            let request = read_request(&post);
+            let replacement = server_path.with_extension("replacement");
+            write_credential_fixture_with_refresh_token(
+                &replacement,
+                &server_api_url,
+                "http://auth.fixture.example/",
+                "replacement-access-token",
+                "2999-01-01T00:00:00Z",
+                "replacement-refresh-token",
+            );
+            fs::rename(replacement, &server_path).unwrap();
+            post.write_all(&http_response_with_headers(
+                "401 Unauthorized",
+                Some("application/problem+json"),
+                &[],
+                br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#,
+            ))
+            .unwrap();
+            drop(post);
+            released.recv().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            request
+        });
+        let output = run_with_env(&args(), &environment);
+        release.send(()).unwrap();
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST "));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {TOKEN}\r\n").to_ascii_lowercase())
+        );
+        assert_eq!(output.status.code(), Some(3));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "error");
+        assert_eq!(json["code"], "authentication_required");
+        assert_eq!(
+            json["idempotencyKey"],
+            header_value(&request, "idempotency-key")
+        );
+    }
+
+    #[test]
+    fn rejected_service_identity_does_not_resubmit_after_acceptance() {
+        let directory = private_credential_directory();
+        let key_file = directory.path().join("key");
+        fs::write(
+            &key_file,
+            "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .unwrap();
+        fs::set_permissions(&key_file, Permissions::from_mode(0o600)).unwrap();
+        let mut command = args().to_vec();
+        command.extend(["--service-api-key-file", key_file.to_str().unwrap()]);
+        let (output, requests) = execute(&[("pending", None), ("unauthorized", None)], &command);
+        assert_eq!(output.status.code(), Some(3));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "error");
+        assert_eq!(json["code"], "authentication_required");
+        assert_eq!(json["requestId"], REQUEST_ID);
+        assert!(requests[1].starts_with("GET "));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn retry_after_does_not_resubmit_accepted_mutation() {
+        for throttled in ["rate-limited", "unavailable"] {
+            let (output, requests) = execute(
+                &[("pending", None), (throttled, None), ("applied", None)],
+                &args(),
+            );
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+                "applied"
+            );
+            assert_eq!(requests.len(), 3);
+            assert!(
+                requests[1..]
+                    .iter()
+                    .all(|request| request.starts_with("GET "))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interruption_preserves_the_known_request_or_unknown_key_without_resubmission() {
+        for (after_acceptance, signal, exit, outcome) in [
+            (
+                false,
+                rustix::process::Signal::INT,
+                130,
+                "acceptance_unknown",
+            ),
+            (
+                true,
+                rustix::process::Signal::TERM,
+                143,
+                "observation_stopped",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+            let credentials = private_credential_directory();
+            let credentials_path = credentials.path().join("credentials.json");
+            write_credential_fixture(&credentials_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+            let (ready, reached) = mpsc::sync_channel(0);
+            let (release, released) = mpsc::sync_channel(0);
+            let server = std::thread::spawn(move || {
+                let (mut post, _) = listener.accept().unwrap();
+                let request = read_request(&post);
+                let key = header_value(&request, "idempotency-key").to_owned();
+                let mut requests = vec![request];
+                if after_acceptance {
+                    let location = format!(
+                        "/v1/organizations/{ORGANIZATION_ID}/runs/{RUN_ID}/retry-requests/{REQUEST_ID}"
+                    );
+                    let body = serde_json::to_vec(&receipt("pending", None)).unwrap();
+                    let response = http_response_with_headers(
+                        "202 Accepted",
+                        Some("application/json"),
+                        &[
+                            ("Idempotency-Key", &key),
+                            ("Cache-Control", "private, no-store"),
+                            ("Location", &location),
+                        ],
+                        &body,
+                    );
+                    post.write_all(&response).unwrap();
+                    drop(post);
+                    let (get, _) = listener.accept().unwrap();
+                    requests.push(read_request(&get));
+                    ready.send(key.clone()).unwrap();
+                    released.recv().unwrap();
+                    drop(get);
+                } else {
+                    ready.send(key.clone()).unwrap();
+                    released.recv().unwrap();
+                    drop(post);
+                }
+                listener.set_nonblocking(true).unwrap();
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                );
+                requests
+            });
+            let env = deployment_environment(&api_url, credentials_path.to_str().unwrap());
+            let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+            command
+                .args(args())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env_remove(CREDENTIALS_FILE_VARIABLE);
+            for variable in DEPLOYMENT_VARIABLES {
+                command.env_remove(variable);
+            }
+            for (name, value) in env {
+                command.env(name, value);
+            }
+            let child = command.spawn().unwrap();
+            let key = reached.recv().unwrap();
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+                signal,
+            )
+            .unwrap();
+            let output = child.wait_with_output().unwrap();
+            release.send(()).unwrap();
+            let requests = server.join().unwrap();
+            assert_eq!(output.status.code(), Some(exit));
+            assert!(output.stderr.is_empty());
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["outcome"], outcome);
+            if after_acceptance {
+                assert_eq!(json["requestId"], REQUEST_ID);
+                assert_eq!(requests.len(), 2);
+                assert!(requests[1].starts_with("GET "));
+            } else {
+                assert_eq!(json["idempotencyKey"], key);
+                assert_eq!(json["requestId"], serde_json::Value::Null);
+                assert_eq!(requests.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_acceptance_times_out_without_claiming_application() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+        let directory = private_credential_directory();
+        let path = directory.path().join("credentials.json");
+        write_credential_fixture(&path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+        let (release, released) = mpsc::sync_channel(0);
+        let server = std::thread::spawn(move || {
+            let (mut post, _) = listener.accept().unwrap();
+            let request = read_request(&post);
+            let key = header_value(&request, "idempotency-key");
+            let location = format!(
+                "/v1/organizations/{ORGANIZATION_ID}/runs/{RUN_ID}/retry-requests/{REQUEST_ID}"
+            );
+            let body = serde_json::to_vec(&receipt("pending", None)).unwrap();
+            post.write_all(&http_response_with_headers(
+                "202 Accepted",
+                Some("application/json"),
+                &[
+                    ("Idempotency-Key", key),
+                    ("Cache-Control", "private, no-store"),
+                    ("Location", &location),
+                ],
+                &body,
+            ))
+            .unwrap();
+            released.recv().unwrap();
+            request
+        });
+        let environment = deployment_environment(&api_url, path.to_str().unwrap());
+        let mut command = args().to_vec();
+        command.extend(["--timeout", "25ms"]);
+        let output = run_with_env(&command, &environment);
+        release.send(()).unwrap();
+        let post = server.join().unwrap();
+        assert!(post.starts_with("POST "));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "timed_out");
+        assert_eq!(json["requestId"], REQUEST_ID);
+        assert_eq!(json["receipt"]["state"], "pending");
+    }
+
+    #[test]
+    fn retry_human_result_and_invalid_version() {
+        let human = [
+            "run",
+            "retry",
+            ORGANIZATION,
+            RUN_ID,
+            "--allow-insecure-http",
+        ];
+        let (output, requests) = execute(&[("pending", None), ("applied", None)], &human);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert!(String::from_utf8_lossy(&output.stdout).contains(REQUEST_ID));
+        assert_eq!(requests.len(), 2);
+        let (rejected, requests) = execute(
+            &[("pending", None), ("rejected", Some("attempt_active"))],
+            &human,
+        );
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("code: attempt_active"));
+        assert_eq!(requests.len(), 2);
+        let invalid = run(&[
+            "run",
+            "retry",
+            ORGANIZATION,
+            RUN_ID,
+            "--expected-version",
+            "0",
+        ]);
+        assert_eq!(invalid.status.code(), Some(2));
+        assert!(invalid.stdout.is_empty());
+        assert!(!invalid.stderr.is_empty());
+    }
+
+    #[test]
+    fn conflicts_are_not_reported_as_applied() {
+        for (problem, outcome) in [
+            ("trigger-active-run", "trigger_slot_conflict"),
+            ("run-retry-pending", "retry_pending"),
+        ] {
+            let (output, requests) = execute(&[(problem, None)], &args());
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stderr.is_empty());
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["outcome"], outcome);
+            assert_eq!(requests.len(), 1);
+        }
+    }
+}
+
 fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
     let credential_directory = private_credential_directory();

@@ -31,6 +31,9 @@ pub type RunState = models::run::State;
 pub type RunCreationAcceptance = models::RunCreationAcceptance;
 pub type RunCreationPending = models::RunCreationPending;
 pub type RunArtifactDelivery = models::RunArtifactDelivery;
+pub type RunRetryReceipt = models::RunRetryReceipt;
+pub type RunRetryState = models::run_retry_receipt::State;
+pub type RunRetryRejection = models::run_retry_receipt::Rejection;
 pub type RunCancellation = models::RunCancellation;
 pub type RunInterruption = models::RunInterruption;
 pub type RunCancellationEnvelope = models::RunCancellationEnvelope;
@@ -153,6 +156,7 @@ impl<'a> RunApi<'a> {
             begin_dispatch,
             build,
         )
+        .map(|(response, _)| response)
     }
 
     fn send_api_request_with_statuses(
@@ -161,7 +165,8 @@ impl<'a> RunApi<'a> {
         idempotency_key: Option<&str>,
         begin_dispatch: impl Fn() -> bool,
         mut build: impl FnMut() -> reqwest::blocking::RequestBuilder,
-    ) -> Result<ReceivedResponse, RunFailure> {
+    ) -> Result<(ReceivedResponse, bool), RunFailure> {
+        let mut ambiguous_attempt = false;
         let attempts = if idempotency_key.is_some() {
             CREATE_ATTEMPTS
         } else {
@@ -184,6 +189,7 @@ impl<'a> RunApi<'a> {
                             category,
                         )
                     {
+                        ambiguous_attempt = true;
                         um_support::sleep(um_support::short_retry_delay());
                         continue;
                     }
@@ -200,7 +206,7 @@ impl<'a> RunApi<'a> {
                 )?;
             }
             match http_util::buffer_blocking_response(response) {
-                Ok(response) => return Ok(response),
+                Ok(response) => return Ok((response, ambiguous_attempt)),
                 Err(BoundedBodyError::TooLarge) => {
                     return Err(RunFailure::protocol(status == StatusCode::UNAUTHORIZED));
                 }
@@ -210,6 +216,7 @@ impl<'a> RunApi<'a> {
                     let category = classify_reqwest_error(&error);
                     last_transport_failure = category;
                     if http_util::can_retry_ambiguous_mutation(attempt, CREATE_ATTEMPTS, category) {
+                        ambiguous_attempt = true;
                         um_support::sleep(um_support::short_retry_delay());
                         continue;
                     }
@@ -230,6 +237,88 @@ impl<'a> RunApi<'a> {
         Err(RunFailure::Unreachable(last_transport_failure))
     }
 
+    pub fn request_retry(
+        &self,
+        organization: &str,
+        run_id: &str,
+        key: &str,
+        expected_version: Option<i64>,
+        begin_dispatch: impl Fn() -> bool,
+    ) -> Result<RunRetryReceipt, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/retry",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id)
+        );
+        let mut request = models::RunRetryRequest::new();
+        request.expected_version = expected_version;
+        let (response, ambiguous_attempt) = self.send_api_request_with_statuses(
+            &[StatusCode::ACCEPTED],
+            Some(key),
+            begin_dispatch,
+            || {
+                self.request(Method::POST, &endpoint)
+                    .header("Idempotency-Key", key)
+                    .json(&request)
+            },
+        )?;
+        if response.status == StatusCode::UNAUTHORIZED && ambiguous_attempt {
+            return Err(RunFailure::RetryAmbiguousAuthentication);
+        }
+        if response.status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(if ambiguous_attempt {
+                RunFailure::RetryAmbiguousRateLimited
+            } else {
+                RunFailure::Unreachable(UnreachableCategory::RateLimited)
+            });
+        }
+        if response.status != StatusCode::ACCEPTED {
+            return Err(classify_retry_failure(&response));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.idempotency_keys.iter(), key)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let receipt: RunRetryReceipt =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        validate_retry_receipt(&receipt, run_id)?;
+        let location = format!(
+            "/v1/organizations/{}/runs/{}/retry-requests/{}",
+            apis::urlencode(&receipt.organization_id),
+            apis::urlencode(run_id),
+            apis::urlencode(&receipt.id)
+        );
+        require_exact_header(response.locations.iter(), &location)?;
+        Ok(receipt)
+    }
+
+    pub fn get_retry(
+        &self,
+        organization: &str,
+        run_id: &str,
+        request_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RunRetryReceipt, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/retry-requests/{}",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id),
+            apis::urlencode(request_id)
+        );
+        let response = self.read_response(&endpoint, timeout)?;
+        if response.status != StatusCode::OK {
+            return Err(classify_retry_failure(&response));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let receipt: RunRetryReceipt =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        validate_retry_receipt(&receipt, run_id)?;
+        if receipt.id != request_id {
+            return Err(RunFailure::protocol(false));
+        }
+        Ok(receipt)
+    }
+
     pub fn cancel(
         &self,
         organization: &str,
@@ -243,7 +332,7 @@ impl<'a> RunApi<'a> {
             self.collection_endpoint(organization),
             apis::urlencode(run_id)
         );
-        let response = self.send_api_request_with_statuses(
+        let (response, _) = self.send_api_request_with_statuses(
             &[StatusCode::OK, StatusCode::ACCEPTED],
             Some(key),
             begin_dispatch,
@@ -442,6 +531,10 @@ pub enum RunFailure {
     Conflict,
     IdempotencyConflict,
     CreationRejected,
+    RetryConflict(RetryConflict),
+    RetryAfter(Duration),
+    RetryAmbiguousRateLimited,
+    RetryAmbiguousAuthentication,
     Gone,
     Unreachable(UnreachableCategory),
     InputUploadRejected,
@@ -472,7 +565,96 @@ impl RunFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryConflict {
+    TriggerSlot,
+    Pending,
+    Idempotency,
+}
+
 pub(super) type ReceivedResponse = BufferedBlockingResponse;
+
+fn classify_retry_failure(response: &ReceivedResponse) -> RunFailure {
+    if response.status == StatusCode::CONFLICT {
+        if require_media_type(response, PROBLEM_MEDIA_TYPE, false).is_err() {
+            return RunFailure::protocol(false);
+        }
+        return match problem::decode(&response.body, response.status) {
+            Ok(problem) => match problem.r#type.as_str() {
+                "https://api.scherzo.dev/problems/trigger-active-run" => {
+                    RunFailure::RetryConflict(RetryConflict::TriggerSlot)
+                }
+                "https://api.scherzo.dev/problems/run-retry-pending" => {
+                    RunFailure::RetryConflict(RetryConflict::Pending)
+                }
+                "https://api.scherzo.dev/problems/idempotency-conflict" => {
+                    RunFailure::RetryConflict(RetryConflict::Idempotency)
+                }
+                _ => RunFailure::Conflict,
+            },
+            Err(_) => RunFailure::protocol(false),
+        };
+    }
+    if matches!(
+        response.status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+    ) && let Some(delay) = response
+        .retry_afters
+        .first()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        return RunFailure::RetryAfter(Duration::from_secs(delay));
+    }
+    classify_failure(response, RunOperation::Get)
+}
+
+fn validate_retry_receipt(receipt: &RunRetryReceipt, run_id: &str) -> Result<(), RunFailure> {
+    let valid = um_support::valid_typed_id(&receipt.id, "cmd_")
+        && um_support::valid_typed_id(&receipt.organization_id, "org_")
+        && receipt.run_id == run_id
+        && um_support::valid_typed_id(run_id, "run_")
+        && receipt.observed_version >= 0
+        && valid_timestamp(&receipt.accepted_at)
+        && receipt.resolved_at.as_deref().is_none_or(valid_timestamp)
+        && receipt
+            .attempt_id
+            .as_deref()
+            .is_none_or(|id| um_support::valid_typed_id(id, "atm_"))
+        && receipt.attempt_number.is_none_or(|number| number > 0)
+        && receipt.run_version.is_none_or(|version| version > 0)
+        && match receipt.state {
+            RunRetryState::Pending => {
+                receipt.resolved_at.is_none()
+                    && receipt.rejection.is_none()
+                    && receipt.attempt_id.is_none()
+                    && receipt.attempt_number.is_none()
+                    && receipt.run_version.is_none()
+            }
+            RunRetryState::Applied => {
+                receipt.resolved_at.is_some()
+                    && receipt.rejection.is_none()
+                    && receipt.fault.is_none()
+                    && receipt.attempt_id.is_some()
+                    && receipt.attempt_number.is_some()
+                    && receipt.run_version.is_some()
+            }
+            RunRetryState::Rejected => {
+                receipt.resolved_at.is_some()
+                    && receipt.rejection.is_some()
+                    && receipt.fault.is_none()
+                    && receipt.attempt_id.is_none()
+                    && receipt.attempt_number.is_none()
+                    && receipt.run_version.is_none()
+            }
+        };
+    if valid {
+        Ok(())
+    } else {
+        Err(RunFailure::protocol(false))
+    }
+}
 
 fn decode_create_response(
     response: ReceivedResponse,
