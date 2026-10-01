@@ -200,6 +200,9 @@ fn load_error(requested: &Path, error: ArchivedAttemptLoadError) -> anyhow::Erro
 }
 
 fn terminal_failure(failure: &PresentationFailure) -> anyhow::Error {
+    if failure.panic_message.is_some() {
+        return anyhow!("{failure}");
+    }
     failure.error_kind.map_or_else(
         || anyhow!("workflow view terminal failure: {:?}", failure.operation),
         |kind| {

@@ -905,12 +905,60 @@ steps:
         )]),
     };
     run.steps[0].timing = None;
+    run.steps[1].state = StepState::Inherited {
+        detail: crate::workflow::evidence::InheritedDetail {
+            prior_attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            prior_attempt_number: 1,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Skipped,
+            definition_changed: false,
+        },
+        disposition: crate::workflow::runtime::InheritedDisposition::Skipped,
+        outputs: BTreeMap::new(),
+    };
+    run.steps[1].timing = None;
 
     let view = model(&workflow, clock.clone());
     view.reconcile_terminal_result(&run).unwrap();
     let snapshot = view.snapshot();
     assert!(snapshot.authoritative_result);
-    assert_eq!(snapshot.steps[0].state, StepStateKind::Succeeded);
+    for (step, prior_state) in snapshot.steps.iter().zip([
+        crate::workflow::evidence::InheritedPriorState::Succeeded,
+        crate::workflow::evidence::InheritedPriorState::Skipped,
+    ]) {
+        assert_eq!(step.state, StepStateKind::Inherited);
+        let inherited = step.inherited.as_ref().unwrap();
+        assert_eq!(inherited.prior_state, prior_state);
+        let archived = crate::workflow::archived_attempt::ArchivedStep {
+            id: step.id.clone(),
+            role: step.role,
+            failure_policy: step.definition.failure_policy(),
+            state: crate::workflow::archived_attempt::ArchivedStepState::Inherited,
+            inherited_data_available: prior_state
+                == crate::workflow::evidence::InheritedPriorState::Succeeded,
+            started_at: None,
+            duration: None,
+            detail: crate::workflow::archived_attempt::ArchivedStepDetail::Evidence(
+                crate::workflow::evidence::NodeDetail::Inherited(inherited.clone()),
+            ),
+            command_output: None,
+            recovery: None,
+            invocations: Vec::new(),
+        };
+        assert_eq!(
+            crate::workflow::terminal_host::live_step_detail(step).as_deref(),
+            Some(
+                crate::workflow::archived_presentation::archived_step_detail(
+                    &archived,
+                    &step.definition
+                )
+                .as_str()
+            )
+        );
+    }
+    assert_eq!(
+        snapshot.steps[1].outputs["receipt"],
+        WorkflowRunOutputDisposition::Unavailable(WorkflowRunOutputUnavailableReason::Skipped)
+    );
     assert_eq!(
         snapshot.steps[0].outputs["report"],
         WorkflowRunOutputDisposition::Committed

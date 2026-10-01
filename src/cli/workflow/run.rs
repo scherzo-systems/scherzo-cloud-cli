@@ -553,11 +553,26 @@ async fn execute_owned_attempt_with(
     let mut attempt = AttemptTeardown::new(owned_run, signal_task);
     let result =
         execute_attempt_phases(&workflow, &admitted, &cancellation, &mut attempt, settings).await;
-    let result = result.unwrap_or_else(|error| Err(error.into()));
+    // A terminal task can fail again while stopping after a readiness failure.
+    // Report its diagnostic after teardown restores the terminal, rather than
+    // losing it behind the earlier generic readiness error.
+    let readiness_failure = !attempt.execution_started
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.downcast_ref::<PresentationFailure>().is_some());
     if result.is_err() {
         attempt.teardown().await;
+        if readiness_failure
+            && let Some(failure) = attempt
+                .host
+                .as_ref()
+                .and_then(ActiveRunHost::terminal_failure)
+        {
+            return diagnose(failure);
+        }
     }
-    result
+    result.unwrap_or_else(|error| Err(error.into()))
 }
 
 async fn execute_attempt_phases(
@@ -1745,6 +1760,13 @@ impl ActiveRunHost {
         }
     }
 
+    fn terminal_failure(&self) -> Option<PresentationFailure> {
+        match self {
+            Self::Tui { failure, .. } => failure.clone(),
+            Self::Standard(_) => None,
+        }
+    }
+
     fn reconcile_and_mark_quiescent(&self, run: &WorkflowRunResult) -> anyhow::Result<()> {
         if let Self::Tui { view, .. } = self {
             view.reconcile_terminal_result(run)
@@ -1869,6 +1891,7 @@ impl ActiveRunHost {
                                     operation: PresentationFailureOperation::TerminalTask,
                                     error_kind: None,
                                     result_directory: None,
+                                    panic_message: None,
                                 });
                             }
                         }

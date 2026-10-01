@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use super::text_fit::{display_width, ellipsize, fit_text};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use futures_util::StreamExt as _;
+use futures_util::{FutureExt as _, StreamExt as _};
 use ratatui::backend::CrosstermBackend;
 pub use ratatui::layout::Rect as TerminalRect;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -21,10 +22,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
+use std::panic::AssertUnwindSafe;
 use time::UtcOffset;
 use tokio::sync::oneshot;
 use unicode_segmentation::UnicodeSegmentation as _;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use self::dag_layout::DagLayout;
 #[cfg(test)]
@@ -132,7 +133,7 @@ impl WorkflowTerminalHost {
                     Arc::clone(&task_execution_active),
                 );
                 let mut terminal = RestoringTerminal::new(boundary);
-                let result = run_terminal_host(
+                let result = AssertUnwindSafe(run_terminal_host(
                     &mut terminal,
                     view,
                     task_cancellation,
@@ -143,10 +144,19 @@ impl WorkflowTerminalHost {
                         ready: ready_sender,
                     },
                     &mut shutdown_receiver,
-                )
+                ))
+                .catch_unwind()
                 .await;
-                unwind_guard.disarm();
-                result
+                match result {
+                    Ok(result) => {
+                        unwind_guard.disarm();
+                        result
+                    }
+                    Err(payload) => {
+                        let _ = terminal.restore();
+                        Err(report_terminal_panic(payload))
+                    }
+                }
             })
         });
         Ok(Self {
@@ -215,15 +225,17 @@ impl WorkflowTerminalHost {
     ) -> Result<TerminalHostExit, PresentationFailure> {
         match result {
             Ok(result) => result,
-            Err(_) => {
+            Err(error) => {
                 if execution_active.load(Ordering::SeqCst) {
                     cancellation.request_cancellation(CancellationReason::CallerOutputFailure);
                 }
-                Err(PresentationFailure {
-                    operation: PresentationFailureOperation::TerminalTask,
-                    error_kind: None,
-                    result_directory: None,
-                })
+                if error.is_panic() {
+                    Err(report_terminal_panic(error.into_panic()))
+                } else {
+                    Err(PresentationFailure::operation(
+                        PresentationFailureOperation::TerminalTask,
+                    ))
+                }
             }
         }
     }
@@ -257,6 +269,24 @@ pub trait WorkflowTerminalBoundary: TerminalBoundary {
         interaction: &mut HostInteraction,
         color: bool,
     ) -> io::Result<()>;
+}
+
+fn report_terminal_panic(payload: Box<dyn std::any::Any + Send>) -> PresentationFailure {
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned());
+    let failure = PresentationFailure {
+        panic_message: Some(message),
+        ..PresentationFailure::operation(PresentationFailureOperation::TerminalTask)
+    };
+    // The caller renders this failure after the terminal has been restored.
+    failure
 }
 
 struct TerminalTaskUnwindGuard {
@@ -573,6 +603,7 @@ fn presentation_failure(
         operation,
         error_kind: Some(error.kind()),
         result_directory: None,
+        panic_message: None,
     }
 }
 
@@ -1305,22 +1336,7 @@ fn log_record_horizontal_offset(record: &WorkflowRunLogRecord, available_width: 
     let gutter_width = LogGutter::for_width(available_width).width();
     let line_width = gutter_width.saturating_add(record.display_width);
     let nominal_offset = line_width.saturating_sub(available_width);
-    next_log_grapheme_boundary(&record.payload, gutter_width, nominal_offset)
-}
-
-fn next_log_grapheme_boundary(payload: &str, payload_start: usize, target: usize) -> usize {
-    if target <= payload_start {
-        return target;
-    }
-
-    let mut boundary = payload_start;
-    for grapheme in payload.graphemes(true) {
-        if boundary >= target {
-            break;
-        }
-        boundary = boundary.saturating_add(display_width(grapheme));
-    }
-    boundary
+    super::text_fit::next_grapheme_boundary(&record.payload, gutter_width, nominal_offset)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2175,7 +2191,16 @@ impl StepProjection for WorkflowRunStepView {
     }
 
     fn inspector_fact(&self) -> Option<InspectorField> {
-        live_inspector_fact(self.fact.as_ref())
+        self.inherited.as_ref().map_or_else(
+            || live_inspector_fact(self.fact.as_ref()),
+            |detail| {
+                Some(InspectorField::new(
+                    "inheritance",
+                    super::render_style::inherited_detail(detail),
+                    Tone::Neutral,
+                ))
+            },
+        )
     }
 
     fn inspector_outputs(&self) -> Vec<InspectorOutput> {
@@ -2397,7 +2422,7 @@ fn selected_step_title<Step: StepProjection>(
 fn step_kind_badge_style(color: bool) -> Style {
     let style = tone_style(color, Tone::Muted);
     if color {
-        style.bg(Color::Rgb(49, 50, 68))
+        style.bg(theme_color(super::render_style::SELECTION))
     } else {
         style
     }
@@ -2896,36 +2921,6 @@ fn inspector_output_detail_line(
     ])
 }
 
-fn ellipsize(value: &str, maximum_width: usize) -> String {
-    if display_width(value) <= maximum_width {
-        return value.to_owned();
-    }
-    if maximum_width == 0 {
-        return String::new();
-    }
-    if maximum_width == 1 {
-        return "…".to_owned();
-    }
-
-    let content_width = maximum_width - 1;
-    let mut used_width = 0_usize;
-    let mut result = String::new();
-    for grapheme in value.graphemes(true) {
-        let grapheme_width = display_width(grapheme);
-        if used_width.saturating_add(grapheme_width) > content_width {
-            break;
-        }
-        result.push_str(grapheme);
-        used_width = used_width.saturating_add(grapheme_width);
-    }
-    result.push('…');
-    result
-}
-
-fn display_width(value: &str) -> usize {
-    UnicodeWidthStr::width(value)
-}
-
 fn step_state_is_active(state: StepStateKind) -> bool {
     matches!(
         state,
@@ -3006,7 +3001,10 @@ impl StepColumns {
     }
 }
 
-fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
+pub(super) fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
+    if let Some(detail) = &step.inherited {
+        return Some(super::render_style::inherited_detail(detail));
+    }
     match &step.fact {
         Some(ObservedStepTransition::Recovery {
             active,
@@ -3051,19 +3049,10 @@ fn live_step_detail(step: &WorkflowRunStepView) -> Option<String> {
                 .values()
                 .filter(|disposition| **disposition == WorkflowRunOutputDisposition::Committed)
                 .count();
-            match &step.definition {
-                WorkflowPresentationStep::Command { .. } if committed_outputs == 0 => {
-                    Some("exit 0".to_owned())
-                }
-                WorkflowPresentationStep::Command { .. } => Some(format!(
-                    "exit 0 · {}",
-                    output_count_detail(committed_outputs)
-                )),
-                WorkflowPresentationStep::Agent { .. } if committed_outputs != 0 => {
-                    Some(output_count_detail(committed_outputs))
-                }
-                WorkflowPresentationStep::Agent { .. } => None,
-            }
+            Some(super::render_style::success_detail(
+                matches!(step.definition, WorkflowPresentationStep::Command { .. }),
+                committed_outputs,
+            ))
         }
         None => None,
     }
@@ -3112,31 +3101,9 @@ fn padded_text(value: &str, width: usize) -> String {
     format!("{fitted}{}", " ".repeat(padding))
 }
 
-fn fit_text(value: &str, width: usize) -> String {
-    if display_width(value) <= width {
-        return value.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let content_width = width.saturating_sub(1);
-    let mut fitted = String::new();
-    let mut used = 0_usize;
-    for character in value.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used.saturating_add(character_width) > content_width {
-            break;
-        }
-        fitted.push(character);
-        used = used.saturating_add(character_width);
-    }
-    fitted.push('…');
-    fitted
-}
-
 fn graph_connector_style(color: bool) -> Style {
     let style = if color {
-        Style::default().fg(Color::Rgb(127, 132, 156))
+        Style::default().fg(theme_color(super::render_style::MUTED))
     } else {
         Style::default()
     };
@@ -3153,7 +3120,7 @@ fn selection_marker_style(color: bool) -> Style {
 
 fn step_selection_style(color: bool) -> Style {
     if color {
-        Style::default().bg(Color::Rgb(49, 50, 68))
+        Style::default().bg(theme_color(super::render_style::SELECTION))
     } else {
         Style::default().add_modifier(Modifier::REVERSED)
     }
@@ -3922,25 +3889,41 @@ fn lifecycle_control(snapshot: &WorkflowRunViewSnapshot) -> LifecycleControl {
     }
 }
 
-const SPLIT_FOOTER_OPTIONS: [&[&str]; 3] = [
-    &["↑/k up", "↓/j down", "↵ open"],
-    &["↑/k up", "↓/j down", "↵ open"],
-    &["↑/k", "↓/j", "↵"],
+const fn help(keys: &'static str, description: &'static str) -> HelpCommand {
+    HelpCommand { keys, description }
+}
+
+const SPLIT_FOOTER_OPTIONS: [&[HelpCommand]; 3] = [
+    &[help("↑/k", "up"), help("↓/j", "down"), help("↵", "open")],
+    &[help("↑/k", "up"), help("↓/j", "down"), help("↵", "open")],
+    &[help("↑/k", ""), help("↓/j", ""), help("↵", "")],
 ];
 
-const FULL_LOG_FOOTER_OPTIONS: [&[&str]; 3] = [
+const FULL_LOG_FOOTER_OPTIONS: [&[HelpCommand]; 3] = [
     &[
-        "Esc back",
-        "↑/k up",
-        "↓/j down",
-        "PgUp/b page-up",
-        "PgDn/f page-down",
-        "←/h left",
-        "→/l right",
-        "F follow",
+        help("Esc", "back"),
+        help("↑/k", "up"),
+        help("↓/j", "down"),
+        help("PgUp/b", "page-up"),
+        help("PgDn/f", "page-down"),
+        help("←/h", "left"),
+        help("→/l", "right"),
+        help("F", "follow"),
     ],
-    &["Esc back", "↑/k", "↓/j", "PgUp/b", "PgDn/f", "F follow"],
-    &["Esc", "↑/k", "↓/j", "F"],
+    &[
+        help("Esc", "back"),
+        help("↑/k", ""),
+        help("↓/j", ""),
+        help("PgUp/b", ""),
+        help("PgDn/f", ""),
+        help("F", "follow"),
+    ],
+    &[
+        help("Esc", ""),
+        help("↑/k", ""),
+        help("↓/j", ""),
+        help("F", ""),
+    ],
 ];
 
 fn render_contextual_footer(
@@ -3949,7 +3932,7 @@ fn render_contextual_footer(
     snapshot: &WorkflowRunViewSnapshot,
     color: bool,
     label: &'static str,
-    command_options: &[&[&str]],
+    command_options: &[&[HelpCommand]],
 ) {
     let lifecycle = lifecycle_control(snapshot);
     let options = command_options
@@ -3964,46 +3947,58 @@ fn render_contextual_footer(
         })
         .collect();
     let reserved_width = u16::try_from(display_width(label).saturating_add(4)).unwrap_or(u16::MAX);
-    let text = fitting_footer(options, area.width.saturating_sub(reserved_width));
-    render_footer_text(frame, area, label, text, color);
+    let commands = fitting_footer(options, area.width.saturating_sub(reserved_width));
+    render_footer_text(frame, area, label, commands, color);
 }
 
 fn footer_option(
-    commands: &[&str],
+    commands: &[HelpCommand],
     lifecycle: LifecycleControl,
     abbreviate_lifecycle: bool,
-) -> String {
-    let mut parts = commands
-        .iter()
-        .map(|command| (*command).to_owned())
-        .collect::<Vec<_>>();
+) -> Vec<HelpCommand> {
+    let mut parts = commands.to_vec();
     let lifecycle = match (lifecycle, abbreviate_lifecycle) {
-        (LifecycleControl::Cancel, false) => Some("^C cancel run"),
-        (LifecycleControl::Cancel, true) => Some("^C"),
-        (LifecycleControl::Quit, _) => Some("q quit"),
+        (LifecycleControl::Cancel, false) => Some(help("^C", "cancel run")),
+        (LifecycleControl::Cancel, true) => Some(help("^C", "")),
+        (LifecycleControl::Quit, _) => Some(help("q", "quit")),
         (LifecycleControl::None, _) => None,
     };
     if let Some(lifecycle) = lifecycle {
-        parts.push(lifecycle.to_owned());
+        parts.push(lifecycle);
     }
-    parts.push("? help".to_owned());
-    parts.join("  ")
+    parts.push(help("?", "help"));
+    parts
 }
 
-fn fitting_footer(options: Vec<String>, width: u16) -> String {
+fn footer_width(commands: &[HelpCommand]) -> usize {
+    commands
+        .iter()
+        .map(|command| {
+            display_width(command.keys)
+                + if command.description.is_empty() {
+                    0
+                } else {
+                    1 + display_width(command.description)
+                }
+        })
+        .sum::<usize>()
+        + commands.len().saturating_sub(1) * 2
+}
+
+fn fitting_footer(options: Vec<Vec<HelpCommand>>, width: u16) -> Vec<HelpCommand> {
     let available = usize::from(width);
     options
         .iter()
-        .find(|option| display_width(option) <= available)
+        .find(|option| footer_width(option) <= available)
         .cloned()
-        .unwrap_or_else(|| ellipsize(options.last().map_or("? help", String::as_str), available))
+        .unwrap_or_else(|| vec![help("?", "help")])
 }
 
 fn render_footer_text(
     frame: &mut Frame<'_>,
     area: Rect,
     label: &'static str,
-    text: String,
+    commands: Vec<HelpCommand>,
     color: bool,
 ) {
     let mut spans = vec![
@@ -4013,23 +4008,21 @@ fn render_footer_text(
         ),
         Span::raw("  "),
     ];
-    for (index, command) in text.split("  ").enumerate() {
+    for (index, command) in commands.iter().enumerate() {
         if index != 0 {
             spans.push(Span::raw("  "));
         }
-        if let Some((keys, description)) = command.split_once(' ') {
-            let key_style = if keys == "?" {
-                command_accent_style(color)
-            } else {
-                footer_key_style(color)
-            };
-            spans.push(Span::styled(keys.to_owned(), key_style));
+        let key_style = if command.keys == "?" {
+            command_accent_style(color)
+        } else {
+            footer_key_style(color)
+        };
+        spans.push(Span::styled(command.keys, key_style));
+        if !command.description.is_empty() {
             spans.push(Span::styled(
-                format!(" {description}"),
+                format!(" {}", command.description),
                 tone_style(color, Tone::Muted),
             ));
-        } else {
-            spans.push(Span::styled(command.to_owned(), footer_key_style(color)));
         }
     }
     frame.render_widget(
@@ -4588,35 +4581,39 @@ fn tone_style(color: bool, tone: Tone) -> Style {
         return Style::default();
     }
     let foreground = match tone {
-        Tone::Primary => Color::Rgb(205, 214, 244),
-        Tone::Neutral => Color::Rgb(186, 194, 222),
-        Tone::Muted => Color::Rgb(108, 112, 134),
-        Tone::Active => Color::Rgb(137, 180, 250),
-        Tone::Success => Color::Rgb(166, 227, 161),
-        Tone::Failure => Color::Rgb(243, 139, 168),
-        Tone::Blocked => Color::Rgb(250, 179, 135),
+        Tone::Primary => super::render_style::PRIMARY,
+        Tone::Neutral => super::render_style::NEUTRAL,
+        Tone::Muted => super::render_style::MUTED,
+        Tone::Active => super::render_style::ACTIVE,
+        Tone::Success => super::render_style::SUCCESS,
+        Tone::Failure => super::render_style::FAILURE,
+        Tone::Blocked => super::render_style::BLOCKED,
     };
-    Style::default().fg(foreground)
+    Style::default().fg(theme_color(foreground))
+}
+
+fn theme_color((red, green, blue): (u8, u8, u8)) -> Color {
+    Color::Rgb(red, green, blue)
 }
 
 fn command_accent_style(color: bool) -> Style {
-    fixed_color_style(color, Color::Rgb(203, 166, 247))
+    fixed_color_style(color, theme_color(super::render_style::ACCENT))
 }
 
 fn footer_key_style(color: bool) -> Style {
-    fixed_color_style(color, Color::Rgb(180, 190, 254))
+    fixed_color_style(color, theme_color(super::render_style::FOOTER_KEY))
 }
 
 fn help_key_style(color: bool) -> Style {
-    fixed_color_style(color, Color::Rgb(249, 226, 175))
+    fixed_color_style(color, theme_color(super::render_style::HELP_KEY))
 }
 
 fn footer_separator_style(color: bool) -> Style {
-    fixed_color_style(color, Color::Rgb(49, 50, 68))
+    fixed_color_style(color, theme_color(super::render_style::SELECTION))
 }
 
 fn separator_style(color: bool) -> Style {
-    fixed_color_style(color, Color::Rgb(69, 71, 90))
+    fixed_color_style(color, theme_color(super::render_style::SEPARATOR))
 }
 
 fn fixed_color_style(color: bool, foreground: Color) -> Style {
@@ -4669,6 +4666,7 @@ mod tests {
     struct BoundaryFailures {
         setup: bool,
         draw_at: Option<usize>,
+        panic_at: Option<usize>,
         restore: bool,
     }
 
@@ -4790,6 +4788,9 @@ mod tests {
         ) -> io::Result<()> {
             self.draw_count = self.draw_count.saturating_add(1);
             self.record(BoundaryAction::Draw(interaction.terminal_area));
+            if self.failures.panic_at == Some(self.draw_count) {
+                std::panic::panic_any("injected widget panic");
+            }
             if self.failures.draw_at == Some(self.draw_count) {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -6132,6 +6133,10 @@ mod tests {
 
         while actions.recv().await.is_some() {}
         let failure = host.wait().await.unwrap_err();
+        assert_eq!(
+            failure.panic_message.as_deref(),
+            Some("injected terminal input panic")
+        );
 
         assert_eq!(
             cancellation.cancellation_reason(),
@@ -6141,6 +6146,157 @@ mod tests {
         assert_eq!(
             failure.operation,
             PresentationFailureOperation::TerminalTask
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn widget_panic_restores_pty_and_reports_on_stderr() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::process::{Command, Stdio};
+
+        if std::env::var_os("SCHERZO_WIDGET_PANIC_CHILD").is_some() {
+            struct PanickingWidget(SystemTerminalBoundary);
+            impl TerminalBoundary for PanickingWidget {
+                fn setup(&mut self) -> io::Result<Rect> {
+                    self.0.setup()
+                }
+                fn next_event(
+                    &mut self,
+                ) -> impl Future<Output = io::Result<TerminalInputEvent>> + Send {
+                    self.0.next_event()
+                }
+                fn resize(&mut self) -> io::Result<Rect> {
+                    self.0.resize()
+                }
+                fn restore(&mut self) -> io::Result<()> {
+                    self.0.restore()
+                }
+            }
+            impl WorkflowTerminalBoundary for PanickingWidget {
+                fn draw_workflow(
+                    &mut self,
+                    _: &WorkflowRunViewSnapshot,
+                    _: &mut HostInteraction,
+                    _: bool,
+                ) -> io::Result<()> {
+                    std::panic::panic_any("pty widget diagnostic");
+                }
+            }
+            let (_temporary, _workflow, view, _) = scripted_host_view();
+            let original = tcgetattr(io::stdin()).unwrap();
+            let mut host = WorkflowTerminalHost::start_with_boundary(
+                view,
+                CancellationSource::new(),
+                false,
+                PanickingWidget(SystemTerminalBoundary::new()),
+            )
+            .unwrap();
+            assert_eq!(
+                host.await_ready().await.unwrap_err().operation,
+                PresentationFailureOperation::TerminalTask
+            );
+            let failure = host.stop().await.unwrap_err();
+            assert_eq!(
+                failure.panic_message.as_deref(),
+                Some("pty widget diagnostic")
+            );
+            let restored = tcgetattr(io::stdin()).unwrap();
+            assert_eq!(restored.local_modes, original.local_modes);
+            assert_eq!(restored.input_modes, original.input_modes);
+            writeln!(io::stderr().lock(), "{failure}").unwrap();
+            return;
+        }
+
+        let master = rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR).unwrap();
+        rustix::pty::grantpt(&master).unwrap();
+        rustix::pty::unlockpt(&master).unwrap();
+        let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(std::ffi::OsStr::from_bytes(name.as_bytes()))
+            .unwrap();
+        rustix::termios::tcsetwinsize(
+            &slave,
+            rustix::termios::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .unwrap();
+        let before = tcgetattr(&slave).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workflow::terminal_host::tests::widget_panic_restores_pty_and_reports_on_stderr",
+                "--nocapture",
+            ])
+            .env("SCHERZO_WIDGET_PANIC_CHILD", "1")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let after = tcgetattr(&slave).unwrap();
+        assert_eq!(after.input_modes, before.input_modes);
+        assert_eq!(after.output_modes, before.output_modes);
+        assert_eq!(after.control_modes, before.control_modes);
+        assert_eq!(after.local_modes, before.local_modes);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            stderr.contains("workflow run output failure: TerminalTask: pty widget diagnostic"),
+            "{stderr}"
+        );
+        // The child has exited, so every write is complete. Drain while the slave
+        // remains open: some PTYs discard unread output when the last slave closes.
+        let flags = rustix::fs::fcntl_getfl(&master).unwrap();
+        rustix::fs::fcntl_setfl(&master, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match rustix::io::read(&master, &mut chunk) {
+                Ok(0) | Err(rustix::io::Errno::AGAIN) | Err(rustix::io::Errno::IO) => break,
+                Ok(count) => output.extend_from_slice(&chunk[..count]),
+                Err(error) => panic!("read restored pty: {error}"),
+            }
+        }
+        assert!(output.windows(8).any(|window| window == b"\x1b[?1049l"));
+    }
+
+    #[tokio::test]
+    async fn widget_panic_restores_before_reporting_its_payload() {
+        let (_temporary, _workflow, view, _) = scripted_host_view();
+        let cancellation = CancellationSource::new();
+        let (boundary, input, mut actions) = ScriptedTerminalBoundary::new(
+            Rect::new(0, 0, 80, 24),
+            [],
+            BoundaryFailures {
+                panic_at: Some(2),
+                ..BoundaryFailures::default()
+            },
+        );
+        let host = start_active_scripted_host(view, cancellation.clone(), boundary);
+        input
+            .send(ScriptedInput::Event(TerminalInputEvent::Other))
+            .unwrap();
+        let failure = host.wait().await.unwrap_err();
+        let events = std::iter::from_fn(|| actions.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.last(), Some(&BoundaryAction::Restore));
+        assert_eq!(
+            failure.panic_message.as_deref(),
+            Some("injected widget panic")
+        );
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::CallerOutputFailure)
         );
     }
 
@@ -7046,7 +7202,7 @@ mod tests {
         let rows = buffer_rows(&buffer);
         for (needle, expected) in [
             ("? — all commands", Color::Rgb(203, 166, 247)),
-            ("MOVE", Color::Rgb(108, 112, 134)),
+            ("MOVE", Color::Rgb(127, 132, 156)),
             ("↑/k", Color::Rgb(249, 226, 175)),
             ("previous step", Color::Rgb(186, 194, 222)),
         ] {
@@ -7955,6 +8111,7 @@ finalizers:
             },
             state,
             fact,
+            inherited: None,
             timing,
             outputs: BTreeMap::from([("report".to_owned(), output_disposition)]),
             log: WorkflowRunStepLog {

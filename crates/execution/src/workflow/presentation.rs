@@ -8,11 +8,11 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::text_fit::{display_width, next_detail_segment};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::{oneshot, watch};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::ExecutionOutcome;
 use super::admission::{AdmissionFailure, CancellationReason};
@@ -51,15 +51,10 @@ const STACKED_DETAIL_INDENT: usize = 2;
 const STACKED_CONTINUATION_INDENT: usize = 4;
 const SAFETY_CONTINUATION_MARKER: &str = "↪";
 const VISUAL_CONTINUATION_MARKER: &str = "↳";
-const STYLE_PRIMARY: &str = "38;2;205;214;244";
-const STYLE_SECONDARY: &str = "38;2;166;173;200";
-const STYLE_MUTED: &str = "38;2;127;132;156";
-const STYLE_ACTIVE: &str = "38;2;137;180;250";
-const STYLE_OUTPUT: &str = "38;2;148;226;213";
-const STYLE_SUCCESS: &str = "38;2;166;227;161";
-const STYLE_FAILURE: &str = "38;2;243;139;168";
-const STYLE_BLOCKED: &str = "38;2;250;179;135";
-const STYLE_CONTINUATION: &str = "2;38;2;127;132;156";
+use super::render_style::{
+    STYLE_ACTIVE, STYLE_BLOCKED, STYLE_CONTINUATION, STYLE_FAILURE, STYLE_MUTED, STYLE_OUTPUT,
+    STYLE_PRIMARY, STYLE_SECONDARY, STYLE_SUCCESS,
+};
 
 pub fn styled_terminal_text(value: &str, style: &str, color: bool) -> String {
     if color {
@@ -241,6 +236,7 @@ pub struct PresentationFailure {
     pub operation: PresentationFailureOperation,
     pub error_kind: Option<io::ErrorKind>,
     pub result_directory: Option<String>,
+    pub panic_message: Option<String>,
 }
 
 impl PresentationFailure {
@@ -249,6 +245,7 @@ impl PresentationFailure {
             operation,
             error_kind: Some(error.kind()),
             result_directory: None,
+            panic_message: None,
         }
     }
 
@@ -257,6 +254,7 @@ impl PresentationFailure {
             operation,
             error_kind: None,
             result_directory: None,
+            panic_message: None,
         }
     }
 
@@ -275,6 +273,9 @@ impl fmt::Display for PresentationFailure {
         )?;
         if let Some(kind) = self.error_kind {
             write!(formatter, " ({kind:?})")?;
+        }
+        if let Some(message) = &self.panic_message {
+            write!(formatter, ": {}", visible_text(message))?;
         }
         if let Some(path) = &self.result_directory {
             write!(formatter, "; result published at {}", visible_text(path))?;
@@ -1068,6 +1069,7 @@ where
                 operation: PresentationFailureOperation::LineWriter,
                 error_kind: Some(kind),
                 result_directory: None,
+                panic_message: None,
             };
             *queue_failure = Some(failure.clone());
             self.failure_sender.send_replace(Some(failure));
@@ -1402,13 +1404,16 @@ where
                             TokenRole::Output,
                         )?;
                     }
-                    let detail = self
-                        .definition
-                        .steps
-                        .get(&step)
-                        .map_or_else(String::new, |definition| {
-                            success_detail(definition.success, outputs.len())
-                        });
+                    let detail =
+                        self.definition
+                            .steps
+                            .get(&step)
+                            .map_or_else(String::new, |definition| {
+                                super::render_style::success_detail(
+                                    matches!(definition.success, StepSuccessPresentation::Command),
+                                    outputs.len(),
+                                )
+                            });
                     let detail = completion_detail(
                         detail,
                         self.finish_step_duration(&step, observed_at.monotonic),
@@ -2104,10 +2109,6 @@ fn observation_timestamp(value: OffsetDateTime) -> String {
     )
 }
 
-fn display_width(value: &str) -> usize {
-    UnicodeWidthStr::width(value)
-}
-
 fn wrap_detail(
     detail: &str,
     first_width: usize,
@@ -2121,54 +2122,6 @@ fn wrap_detail(
         remainder = next;
     }
     (first.to_owned(), continuations)
-}
-
-fn next_detail_segment(value: &str, maximum_width: usize) -> (&str, &str) {
-    let maximum_width = maximum_width.max(1);
-    if display_width(value) <= maximum_width {
-        return (value, "");
-    }
-
-    let mut used_width = 0_usize;
-    let mut fitting_end = 0;
-    for (index, character) in value.char_indices() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used_width.saturating_add(character_width) > maximum_width {
-            if used_width == 0 {
-                fitting_end = index + character.len_utf8();
-            }
-            break;
-        }
-        used_width += character_width;
-        fitting_end = index + character.len_utf8();
-    }
-
-    let candidate = &value[..fitting_end];
-    if value[fitting_end..]
-        .chars()
-        .next()
-        .is_some_and(char::is_whitespace)
-    {
-        return (
-            candidate.trim_end_matches(char::is_whitespace),
-            value[fitting_end..].trim_start_matches(char::is_whitespace),
-        );
-    }
-    if let Some((boundary, whitespace)) =
-        candidate.char_indices().rev().find(|(index, character)| {
-            character.is_whitespace()
-                && *index != 0
-                && candidate[..*index]
-                    .chars()
-                    .any(|candidate| !candidate.is_whitespace())
-        })
-    {
-        return (
-            candidate[..boundary].trim_end_matches(char::is_whitespace),
-            value[boundary + whitespace.len_utf8()..].trim_start_matches(char::is_whitespace),
-        );
-    }
-    (candidate, &value[fitting_end..])
 }
 
 pub(crate) fn header_timestamp(value: OffsetDateTime) -> String {
@@ -2412,16 +2365,6 @@ fn completion_detail(detail: String, duration: Option<Duration>) -> String {
     }
 }
 
-fn success_detail(presentation: StepSuccessPresentation, output_count: usize) -> String {
-    match (presentation, output_count) {
-        (StepSuccessPresentation::Command, 0) => "exit 0".to_owned(),
-        (StepSuccessPresentation::Command, 1) => "exit 0 · 1 output".to_owned(),
-        (StepSuccessPresentation::Command, count) => format!("exit 0 · {count} outputs"),
-        (StepSuccessPresentation::Agent, 1) => "1 output committed".to_owned(),
-        (StepSuccessPresentation::Agent, count) => format!("{count} outputs committed"),
-    }
-}
-
 fn summary_step(
     step: &WorkflowRunStep,
     success: StepSuccessPresentation,
@@ -2429,15 +2372,15 @@ fn summary_step(
     let (state, mut detail, role) = match &step.state {
         StepState::Succeeded { outputs } => Some((
             "succeeded",
-            success_detail(success, outputs.len()),
+            super::render_style::success_detail(
+                matches!(success, StepSuccessPresentation::Command),
+                outputs.len(),
+            ),
             TokenRole::Success,
         )),
         StepState::Inherited { detail, .. } => Some((
             "inherited",
-            format!(
-                "prior attempt {} ({:?}); definition changed: {}",
-                detail.prior_attempt_number, detail.prior_state, detail.definition_changed
-            ),
+            super::render_style::inherited_detail(detail),
             TokenRole::Neutral,
         )),
         StepState::Failed { detail } => Some((

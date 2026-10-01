@@ -424,6 +424,42 @@ fn step_transition(
     }))
 }
 
+#[tokio::test]
+async fn plain_blocked_evidence_never_writes_terminal_controls() {
+    use crate::workflow::evidence::{BlockedDetail, Prerequisite};
+
+    let fixture = Fixture::new(workflow_source());
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &fixture.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    let detail =
+        BlockedDetail::new([Prerequisite::control("before\u{1b}]0;hostile\u{7}after").unwrap()])
+            .unwrap();
+    presentation
+        .observe(step_transition(
+            "b",
+            StepStateKind::Blocked,
+            Some(ObservedStepTransition::Blocked { detail }),
+        ))
+        .await;
+    presentation.flush_pending().await;
+    let output = stdout.text();
+    assert!(
+        output.contains("before\\x1b]0;hostile\\x07after"),
+        "{output:?}"
+    );
+    assert!(!output.contains('\u{1b}'), "{output:?}");
+}
+
 #[test]
 fn capability_matrix_selects_one_mode_without_consulting_runtime_state() {
     for stdin in [false, true] {

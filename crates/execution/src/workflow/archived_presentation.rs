@@ -19,12 +19,9 @@ use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
 use super::validated::WorkflowNodeRole;
 
 const COMMAND: &str = "scherzo-cloud workflow view";
-const STYLE_PRIMARY: &str = "38;2;205;214;244";
-const STYLE_SECONDARY: &str = "38;2;166;173;200";
-const STYLE_MUTED: &str = "38;2;127;132;156";
-const STYLE_SUCCESS: &str = "38;2;166;227;161";
-const STYLE_FAILURE: &str = "38;2;243;139;168";
-const STYLE_BLOCKED: &str = "38;2;250;179;135";
+use super::render_style::{
+    STYLE_BLOCKED, STYLE_FAILURE, STYLE_MUTED, STYLE_PRIMARY, STYLE_SECONDARY, STYLE_SUCCESS,
+};
 
 #[derive(Debug)]
 pub enum ArchivedViewOutput {
@@ -326,19 +323,18 @@ fn plain_step_row(
     )
 }
 
-fn archived_step_detail(step: &ArchivedStep, definition: &WorkflowPresentationStep) -> String {
+pub(super) fn archived_step_detail(
+    step: &ArchivedStep,
+    definition: &WorkflowPresentationStep,
+) -> String {
     match &step.detail {
-        ArchivedStepDetail::Succeeded => match definition {
-            WorkflowPresentationStep::Command { .. } => "exit 0".to_owned(),
-            WorkflowPresentationStep::Agent { outputs, .. } => match outputs.len() {
-                1 => "1 output committed".to_owned(),
-                count => format!("{count} outputs committed"),
-            },
-        },
-        ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => format!(
-            "prior attempt {} ({:?}) · definition changed {}",
-            detail.prior_attempt_number, detail.prior_state, detail.definition_changed,
+        ArchivedStepDetail::Succeeded => super::render_style::success_detail(
+            matches!(definition, WorkflowPresentationStep::Command { .. }),
+            definition.outputs().len(),
         ),
+        ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => {
+            super::render_style::inherited_detail(detail)
+        }
         ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
             archived_failure_detail(failure)
         }

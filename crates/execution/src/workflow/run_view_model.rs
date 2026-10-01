@@ -127,6 +127,7 @@ pub(crate) struct WorkflowRunStepView {
     pub(crate) definition: WorkflowPresentationStep,
     pub(crate) state: StepStateKind,
     pub(crate) fact: Option<ObservedStepTransition>,
+    pub(crate) inherited: Option<super::evidence::InheritedDetail>,
     pub(crate) timing: Option<WorkflowRunElapsed>,
     pub(crate) outputs: BTreeMap<String, WorkflowRunOutputDisposition>,
     pub(crate) log: WorkflowRunStepLog,
@@ -695,6 +696,7 @@ struct WorkflowRunStepViewState {
     definition: WorkflowPresentationStep,
     state: StepStateKind,
     fact: Option<ObservedStepTransition>,
+    inherited: Option<super::evidence::InheritedDetail>,
     outputs: BTreeMap<String, WorkflowRunOutputDisposition>,
     log: StepLogRing,
     terminal_timing: Option<WorkflowStepTiming>,
@@ -713,6 +715,7 @@ impl WorkflowRunStepViewState {
             definition,
             state: StepStateKind::Pending,
             fact: None,
+            inherited: None,
             outputs,
             log: StepLogRing::default(),
             terminal_timing: None,
@@ -763,6 +766,10 @@ impl WorkflowRunStepViewState {
     fn reconcile(&mut self, terminal: &super::publication::WorkflowRunStep) {
         self.state = terminal_state_kind(&terminal.state);
         self.fact = terminal_step_fact(&terminal.state);
+        self.inherited = match &terminal.state {
+            StepState::Inherited { detail, .. } => Some(detail.clone()),
+            _ => None,
+        };
         match &terminal.state {
             StepState::Succeeded { outputs } => {
                 for (name, disposition) in &mut self.outputs {
@@ -846,6 +853,7 @@ impl WorkflowRunStepViewState {
             definition: self.definition.clone(),
             state: self.state,
             fact: self.fact.clone(),
+            inherited: self.inherited.clone(),
             timing: step_timing,
             outputs: self.outputs.clone(),
             log: self.log.snapshot(include_log_records),
@@ -1038,7 +1046,8 @@ fn terminal_state_kind(state: &StepState<super::value::CapturedValue>) -> StepSt
         StepState::CapturingOutputs => StepStateKind::CapturingOutputs,
         StepState::Recovering { .. } => StepStateKind::Recovering,
         StepState::Cancelling { .. } => StepStateKind::Cancelling,
-        StepState::Succeeded { .. } | StepState::Inherited { .. } => StepStateKind::Succeeded,
+        StepState::Succeeded { .. } => StepStateKind::Succeeded,
+        StepState::Inherited { .. } => StepStateKind::Inherited,
         StepState::Failed { .. } => StepStateKind::Failed,
         StepState::Blocked { .. } => StepStateKind::Blocked,
         StepState::Skipped { .. } => StepStateKind::Skipped,

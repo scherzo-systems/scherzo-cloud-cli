@@ -54,33 +54,54 @@ impl ArchivedWorkflowTerminalHost {
     {
         let view = ArchivedTerminalView::new(attempt);
         let mut terminal = RestoringTerminal::new(boundary);
-        let area = terminal.boundary.setup().map_err(|error| {
-            presentation_failure(PresentationFailureOperation::TerminalSetup, &error)
-        })?;
-        let mut interaction = ArchivedHostInteraction {
-            terminal_area: area,
-            ..ArchivedHostInteraction::default()
+        let setup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let area = terminal.boundary.setup().map_err(|error| {
+                presentation_failure(PresentationFailureOperation::TerminalSetup, &error)
+            })?;
+            let mut interaction = ArchivedHostInteraction {
+                terminal_area: area,
+                ..ArchivedHostInteraction::default()
+            };
+            terminal
+                .boundary
+                .draw_archived(&view, &mut interaction, color)
+                .map_err(|error| {
+                    presentation_failure(PresentationFailureOperation::TerminalDraw, &error)
+                })?;
+            Ok::<_, PresentationFailure>(interaction)
+        }));
+        let interaction = match setup {
+            Ok(Ok(interaction)) => interaction,
+            Ok(Err(failure)) => {
+                let _ = terminal.restore();
+                return Err(failure);
+            }
+            Err(payload) => {
+                let _ = terminal.restore();
+                return Err(report_terminal_panic(payload));
+            }
         };
-        if let Err(error) = terminal
-            .boundary
-            .draw_archived(&view, &mut interaction, color)
-        {
-            let failure = presentation_failure(PresentationFailureOperation::TerminalDraw, &error);
-            let _ = terminal.restore();
-            return Err(failure);
-        }
         let _ = terminal
             .boundary
             .notify_lifecycle(TerminalLifecycleEvent::QuitEligible);
 
         let (exit, exit_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(run_archived_terminal(
-            terminal,
-            view,
-            color,
-            exit_receiver,
-            interaction,
-        ));
+        let task = tokio::spawn(async move {
+            match AssertUnwindSafe(run_archived_terminal(
+                terminal,
+                view,
+                color,
+                exit_receiver,
+                interaction,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(result) => result,
+                // Unwinding dropped the restoring terminal before reporting the panic.
+                Err(payload) => Err(report_terminal_panic(payload)),
+            }
+        });
         Ok(Self {
             exit,
             task: Some(task),
@@ -120,6 +141,7 @@ fn archived_join_result(
 ) -> Result<ArchivedTerminalHostExit, PresentationFailure> {
     match result {
         Ok(result) => result,
+        Err(error) if error.is_panic() => Err(report_terminal_panic(error.into_panic())),
         Err(_) => Err(PresentationFailure::operation(
             PresentationFailureOperation::TerminalTask,
         )),
@@ -418,26 +440,14 @@ impl StepProjection for ArchivedTerminalStepView {
     // jscpd:ignore-end
     fn dag_detail(&self) -> Option<String> {
         match &self.detail {
-            ArchivedStepDetail::Succeeded => {
-                let output_count = self.definition.outputs().len();
-                match &self.definition {
-                    WorkflowPresentationStep::Command { .. } if output_count == 0 => {
-                        Some(self.with_recovery_detail("exit 0".to_owned()))
-                    }
-                    WorkflowPresentationStep::Command { .. } => Some(self.with_recovery_detail(
-                        format!("exit 0 · {}", output_count_detail(output_count)),
-                    )),
-                    WorkflowPresentationStep::Agent { .. } if output_count != 0 => {
-                        Some(self.with_recovery_detail(output_count_detail(output_count)))
-                    }
-                    WorkflowPresentationStep::Agent { .. } => self
-                        .recovery
-                        .as_ref()
-                        .map(|_| self.with_recovery_detail(String::new())),
-                }
-            }
+            ArchivedStepDetail::Succeeded => Some(self.with_recovery_detail(
+                crate::workflow::render_style::success_detail(
+                    matches!(self.definition, WorkflowPresentationStep::Command { .. }),
+                    self.definition.outputs().len(),
+                ),
+            )),
             ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => {
-                Some(inherited_detail(detail))
+                Some(crate::workflow::render_style::inherited_detail(detail))
             }
             ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
                 Some(self.with_recovery_detail(issue_detail_for_step(
@@ -492,9 +502,13 @@ impl StepProjection for ArchivedTerminalStepView {
                 output_count_detail(self.definition.outputs().len()),
                 Tone::Success,
             )),
-            ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => Some(
-                InspectorField::new("inheritance", inherited_detail(detail), Tone::Neutral),
-            ),
+            ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => {
+                Some(InspectorField::new(
+                    "inheritance",
+                    crate::workflow::render_style::inherited_detail(detail),
+                    Tone::Neutral,
+                ))
+            }
             ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => Some(InspectorField::new(
                 "failure",
                 archived_failure_detail(failure),
@@ -569,13 +583,6 @@ impl ArchivedTerminalStepView {
             format!("{base} · {recovery_detail}")
         }
     }
-}
-
-fn inherited_detail(detail: &crate::workflow::evidence::InheritedDetail) -> String {
-    format!(
-        "prior attempt {} ({:?}) · definition changed {}",
-        detail.prior_attempt_number, detail.prior_state, detail.definition_changed,
-    )
 }
 
 fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> {
@@ -1035,17 +1042,11 @@ fn render_archived(
             sections[1],
             color,
             "OUTPUT",
-            &ARCHIVED_OUTPUT_FOOTER_OPTIONS,
+            &FULL_LOG_FOOTER_OPTIONS,
         );
     } else {
         render_archived_split(frame, sections[0], view, graph, interaction, color);
-        render_archived_footer(
-            frame,
-            sections[1],
-            color,
-            "DAG",
-            &ARCHIVED_SPLIT_FOOTER_OPTIONS,
-        );
+        render_archived_footer(frame, sections[1], color, "DAG", &SPLIT_FOOTER_OPTIONS);
         render_split_footer_junction(
             frame,
             sections[0],
@@ -1422,48 +1423,29 @@ fn archived_output_areas(area: Rect) -> [Rect; 2] {
     [rows[0], rows[1]]
 }
 
-const ARCHIVED_SPLIT_FOOTER_OPTIONS: [&[&str]; 3] = [
-    &["↑/k up", "↓/j down", "↵ open"],
-    &["↑/k up", "↓/j down", "↵ open"],
-    &["↑/k", "↓/j", "↵"],
-];
-
-const ARCHIVED_OUTPUT_FOOTER_OPTIONS: [&[&str]; 3] = [
-    &[
-        "Esc back",
-        "↑/k up",
-        "↓/j down",
-        "PgUp/b page-up",
-        "PgDn/f page-down",
-        "←/h left",
-        "→/l right",
-    ],
-    &["Esc back", "↑/k", "↓/j", "PgUp/b", "PgDn/f"],
-    &["Esc", "↑/k", "↓/j"],
-];
-
 fn render_archived_footer(
     frame: &mut Frame<'_>,
     area: Rect,
     color: bool,
     label: &'static str,
-    options: &[&[&str]],
+    options: &[&[HelpCommand]],
 ) {
     let options = options
         .iter()
         .map(|commands| {
             let mut commands = commands
                 .iter()
-                .map(|command| (*command).to_owned())
+                .copied()
+                .filter(|command| command.keys != "F")
                 .collect::<Vec<_>>();
-            commands.push("q quit".to_owned());
-            commands.push("? help".to_owned());
-            commands.join("  ")
+            commands.push(help("q", "quit"));
+            commands.push(help("?", "help"));
+            commands
         })
         .collect::<Vec<_>>();
     let reserved_width = u16::try_from(display_width(label).saturating_add(4)).unwrap_or(u16::MAX);
-    let text = fitting_footer(options, area.width.saturating_sub(reserved_width));
-    render_footer_text(frame, area, label, text, color);
+    let commands = fitting_footer(options, area.width.saturating_sub(reserved_width));
+    render_footer_text(frame, area, label, commands, color);
 }
 
 fn archived_help_groups(surface: HostSurface) -> Vec<HelpGroup> {
@@ -1552,6 +1534,37 @@ mod tests {
             selected.contains("failure       execution · command_exit · exit 17"),
             "missing selected failure: {selected:?}"
         );
+    }
+
+    #[test]
+    fn hostile_node_evidence_is_safe_in_live_and_archived_presentations() {
+        let detail = crate::workflow::evidence::BlockedDetail::new([
+            crate::workflow::evidence::Prerequisite::control("before\u{1b}]0;hostile\u{7}after")
+                .unwrap(),
+        ])
+        .unwrap();
+        // The live plain renderer uses this canonical detail in its blocked transition.
+        let live_plain_detail = crate::workflow::presentation::canonical_blocked_detail(&detail);
+        let mut attempt = archived_attempt(None);
+        attempt.steps[1].state = ArchivedStepState::Blocked;
+        attempt.steps[1].detail = ArchivedStepDetail::Evidence(NodeDetail::Blocked(detail));
+        let plain = crate::workflow::archived_presentation::render_plain(&attempt, false).unwrap();
+        let view = ArchivedTerminalView::new(attempt);
+        let graph = DagLayout::for_steps(&view.steps);
+        let mut interaction = ArchivedHostInteraction {
+            selected: 1,
+            terminal_area: Rect::new(0, 0, 140, 40),
+            ..ArchivedHostInteraction::default()
+        };
+        let tui = buffer_text(&render_view(&view, &graph, &mut interaction, 140, 40));
+        assert!(live_plain_detail.contains("before\\x1b]0;hostile\\x07after"));
+        for rendered in [&plain, &tui] {
+            assert!(rendered.contains("beforeafter"), "{rendered:?}");
+            assert!(!rendered.contains("hostile"), "{rendered:?}");
+        }
+        for rendered in [&live_plain_detail, &plain, &tui] {
+            assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        }
     }
 
     #[test]
@@ -1817,6 +1830,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(host.wait().await.unwrap(), ArchivedTerminalHostExit::Quit);
+        wait_for_action(&mut actions, BoundaryAction::Restore).await;
+    }
+
+    #[tokio::test]
+    async fn archived_widget_panics_restore_and_carry_diagnostics() {
+        let (boundary, _sender, mut actions) = ScriptedArchiveBoundary::new(
+            Rect::new(0, 0, 100, 30),
+            BoundaryFailures {
+                panic_at: Some(1),
+                ..BoundaryFailures::default()
+            },
+        );
+        let failure = ArchivedWorkflowTerminalHost::start_with_boundary(
+            archived_attempt(None),
+            false,
+            boundary,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            failure.panic_message.as_deref(),
+            Some("injected archived widget panic")
+        );
+        wait_for_action(&mut actions, BoundaryAction::Restore).await;
+
+        let (host, sender, mut actions) = start_scripted_archive_host(BoundaryFailures {
+            panic_at: Some(2),
+            ..BoundaryFailures::default()
+        });
+        sender
+            .send(ScriptedInput::Event(TerminalInputEvent::Other))
+            .unwrap();
+        let failure = host.wait().await.unwrap_err();
+        assert_eq!(
+            failure.panic_message.as_deref(),
+            Some("injected archived widget panic")
+        );
         wait_for_action(&mut actions, BoundaryAction::Restore).await;
     }
 
@@ -2100,6 +2150,7 @@ mod tests {
     struct BoundaryFailures {
         setup: bool,
         draw_at: Option<usize>,
+        panic_at: Option<usize>,
         restore: bool,
     }
 
@@ -2213,6 +2264,9 @@ mod tests {
         ) -> io::Result<()> {
             self.draw_count = self.draw_count.saturating_add(1);
             self.record(BoundaryAction::Draw(interaction.terminal_area));
+            if self.failures.panic_at == Some(self.draw_count) {
+                std::panic::panic_any("injected archived widget panic");
+            }
             if self.failures.draw_at == Some(self.draw_count) {
                 Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,

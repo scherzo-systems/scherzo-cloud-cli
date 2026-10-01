@@ -44,6 +44,7 @@ pub(crate) mod process_group;
 pub(crate) mod publication;
 pub(crate) mod recovery;
 pub(crate) mod rejection;
+mod render_style;
 pub(crate) mod resolution;
 mod result_metadata;
 pub(crate) mod result_validation;
@@ -57,6 +58,7 @@ mod strict_yaml;
 pub(crate) mod terminal_host;
 #[cfg(test)]
 mod test_support;
+mod text_fit;
 pub(crate) mod validated;
 pub(crate) mod validation;
 pub(crate) mod value;
