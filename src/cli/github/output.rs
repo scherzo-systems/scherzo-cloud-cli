@@ -95,9 +95,10 @@ pub(super) fn write_installation_list(
                 for installation in installations {
                     writeln!(
                         output,
-                        "  Installation: {}  State: {}  Account: {} {}  Provider installation: {}",
+                        "  Installation: {}  State: {}  Account: {} ({}, {})  Provider installation: {}",
                         installation.id,
                         installation_state(installation.state),
+                        installation.provider_account_login,
                         account_type(installation.provider_account_type),
                         installation.provider_account_id,
                         installation.provider_installation_id,
@@ -215,9 +216,10 @@ fn write_installation_fields(
     )?;
     writeln!(
         output,
-        "  Provider account:      {} ({})",
-        installation.provider_account_id,
-        account_type(installation.provider_account_type)
+        "  Provider account:      {} ({}, {})",
+        installation.provider_account_login,
+        account_type(installation.provider_account_type),
+        installation.provider_account_id
     )?;
     writeln!(
         output,

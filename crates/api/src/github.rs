@@ -21,6 +21,7 @@ pub struct GitHubInstallation {
     pub id: String,
     pub provider_installation_id: String,
     pub provider_account_id: String,
+    pub provider_account_login: String,
     pub provider_account_type: GitHubAccountType,
     pub state: GitHubInstallationState,
     pub created_at: String,
@@ -327,6 +328,9 @@ impl TryFrom<models::GitHubInstallation> for GitHubInstallation {
         if !valid_provider_id(&value.provider_account_id) {
             return Err("the provider account ID is invalid");
         }
+        if value.provider_account_login.is_empty() {
+            return Err("the provider account login is empty");
+        }
         if value.created_at.is_empty() {
             return Err("the installation creation time is empty");
         }
@@ -337,6 +341,7 @@ impl TryFrom<models::GitHubInstallation> for GitHubInstallation {
             id: value.id,
             provider_installation_id: value.provider_installation_id,
             provider_account_id: value.provider_account_id,
+            provider_account_login: value.provider_account_login,
             provider_account_type: match value.provider_account_type {
                 models::git_hub_installation::ProviderAccountType::Organization => {
                     GitHubAccountType::Organization

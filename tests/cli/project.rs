@@ -213,6 +213,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
         "id": INSTALLATION_ID,
         "providerInstallationId": "87654321",
         "providerAccountId": "11223344",
+        "providerAccountLogin": "acme",
         "providerAccountType": "Organization",
         "state": "active",
         "createdAt": "2026-09-05T11:00:00Z",

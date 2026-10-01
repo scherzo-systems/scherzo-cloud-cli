@@ -24,6 +24,7 @@ fn installation_body(state: &str) -> serde_json::Value {
         "id": INSTALLATION,
         "providerInstallationId": "713",
         "providerAccountId": "829",
+        "providerAccountLogin": "acme",
         "providerAccountType": "Organization",
         "state": state,
         "createdAt": "2026-09-05T12:00:00Z",
@@ -119,7 +120,8 @@ fn setup_begin_and_complete_preserve_the_browser_handoff() {
                 "id": INSTALLATION,
                 "providerInstallationId": "713",
                 "providerAccountId": "829",
-                "providerAccountType": "Organization",
+                "providerAccountLogin": "acme",
+        "providerAccountType": "Organization",
                 "state": "active",
                 "createdAt": "2026-09-05T12:00:00Z",
                 "updatedAt": "2026-09-05T12:01:00Z"
@@ -237,7 +239,8 @@ fn installation_and_repository_lists_expose_current_provider_state() {
                 "id": INSTALLATION,
                 "providerInstallationId": "713",
                 "providerAccountId": "829",
-                "providerAccountType": "Organization",
+                "providerAccountLogin": "acme",
+        "providerAccountType": "Organization",
                 "state": "active",
                 "createdAt": "2026-09-05T12:00:00Z",
                 "updatedAt": "2026-09-05T12:01:00Z"
