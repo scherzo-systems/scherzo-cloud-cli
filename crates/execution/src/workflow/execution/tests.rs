@@ -551,6 +551,7 @@ exports:
             1,
             1024,
         );
+        let (observer, observations, _observed) = RecordingObserver::new();
         let result = execute_workflow(
             fixture.admitted,
             &fixture.artifacts,
@@ -558,11 +559,39 @@ exports:
             &StepDiagnosticLog::default(),
             AgentExecution::disabled(),
             TestClock,
-            NoopExecutionObserver,
+            observer,
         )
         .await
         .unwrap();
         assert_eq!(result.outcome, RunOutcome::Succeeded);
+        let invocations =
+            observations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|observation| match observation {
+                    ExecutionObservation::Transition(transition) => match &transition.step {
+                        Some(ObservedStepTransition::Recovery {
+                            active:
+                                crate::workflow::runtime::ActiveStepInvocation::Target {
+                                    execution_number,
+                                },
+                            active_invocation_id,
+                            ..
+                        }) if execution_number.get() == 2 => Some(*active_invocation_id),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+        assert!(
+            invocations.len() >= 3,
+            "observe start, running, and output capture"
+        );
+        assert!(
+            invocations.iter().all(|id| *id == invocations[0]),
+            "output capture must retain the recovered target's invocation identity"
+        );
         assert_eq!(
             fs::read(fixture.execution_root.join("target-runs.txt")).unwrap(),
             b"xx"

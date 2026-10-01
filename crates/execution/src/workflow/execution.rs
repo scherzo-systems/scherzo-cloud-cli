@@ -101,7 +101,10 @@ fn observed_step_transition<Deadline>(
         .as_ref()
         .filter(|recovery| !recovery.rounds.is_empty())
         && let Some(active) = runtime.active_invocation
-        && let Some(active_invocation_id) = runtime.current_action
+        && let Some(active_invocation_id) = match active {
+            super::runtime::ActiveStepInvocation::Target { .. } => runtime.target_invocation,
+            super::runtime::ActiveStepInvocation::RecoveryHandler { .. } => runtime.current_action,
+        }
     {
         let settled_invocation = if matches!(
             from,
