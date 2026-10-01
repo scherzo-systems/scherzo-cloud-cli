@@ -3180,6 +3180,14 @@ impl AssignmentManager {
         let Some(observation) = self.outbox.acknowledge(id) else {
             return;
         };
+        if let AssignmentObservation::Artifact {
+            delivery_id,
+            request: ArtifactRequest::ConfirmResult { .. },
+        } = &observation
+        {
+            self.artifact_delivery
+                .acknowledged_result_confirmation(*delivery_id);
+        }
         if let AssignmentObservation::CancellationApplied(application) = &observation
             && let Some(retained) = self.cancellations.iter_mut().find(|retained| {
                 retained.command.request_id == application.request_id
@@ -3259,14 +3267,15 @@ impl AssignmentManager {
         response: ArtifactCloudResponse,
     ) -> Result<(), ArtifactDeliveryProtocolFailure> {
         self.drain_events();
-        if !self.outbox.contains(observation_id) {
+        let acknowledged = self.outbox.contains(observation_id);
+        if !acknowledged && response.request_kind() != ArtifactRequestKind::ConfirmResult {
             return Err(ArtifactDeliveryProtocolFailure);
         }
         self.artifact_delivery
             .handle_response(delivery_id, response)?;
-        self.outbox
-            .acknowledge(observation_id)
-            .ok_or(ArtifactDeliveryProtocolFailure)?;
+        if acknowledged {
+            self.outbox.acknowledge(observation_id);
+        }
         Ok(())
     }
 

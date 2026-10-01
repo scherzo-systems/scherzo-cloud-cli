@@ -37,6 +37,9 @@ const SUBPROTOCOL: &str = "scherzo.runner.v1";
 const MAX_INBOUND_MESSAGE_BYTES: usize = MAXIMUM_ORDINARY_FRAME_BYTES;
 const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAXIMUM_TERMINAL_FRAME_BYTES;
 const OBSERVATION_WINDOW: usize = 32;
+// A result can remain pending for the full 15-minute finalization window.
+// Two-second correlated polls must not evict their early IDs during that window.
+const MAX_RETAINED_RESULT_RESPONSES: usize = 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1355,6 +1358,7 @@ enum PendingObservationKind {
     },
 }
 
+#[derive(Clone)]
 struct PendingObservation {
     message_id: String,
     sequence: u64,
@@ -2000,6 +2004,10 @@ where
         };
     let mut inbound_silence_timer = inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
     let mut in_flight = VecDeque::<PendingObservation>::new();
+    // An ack retires the outbox frame, not the semantic response. Preserve
+    // bounded correlation independently until the response or a newer poll.
+    let mut awaiting_response = VecDeque::<PendingObservation>::new();
+    let mut answered_before_ack = BTreeSet::<String>::new();
     let mut buffered_effect: Option<BufferedEffect> = None;
     let assignment_notification = assignment_manager
         .lock()
@@ -2319,7 +2327,23 @@ where
                     .await);
                 }
                 let kind = pending.kind;
-                in_flight.pop_front();
+                let pending = in_flight.pop_front().ok_or_else(|| {
+                    ConnectionError::terminal(
+                        progress,
+                        ConnectionCause::UnexpectedObservationAcknowledgement,
+                    )
+                })?;
+                if let PendingObservationKind::ArtifactObservation {
+                    request_kind: ArtifactRequestKind::ConfirmResult,
+                    ..
+                } = kind
+                    && !answered_before_ack.remove(&pending.message_id)
+                {
+                    if awaiting_response.len() == MAX_RETAINED_RESULT_RESPONSES {
+                        awaiting_response.pop_front();
+                    }
+                    awaiting_response.push_back(pending);
+                }
                 match kind {
                     PendingObservationKind::EffectReceipt => {
                         progress.effect_acknowledgements_confirmed = match progress
@@ -2354,9 +2378,11 @@ where
             CloudFrame::ArtifactCarrierRegistration { response, .. }
                 if progress.handshake_completed =>
             {
-                handle_artifact_cloud_response(
+                handle_correlated_artifact_response(
                     assignment_manager,
                     &in_flight,
+                    &mut awaiting_response,
+                    &mut answered_before_ack,
                     ArtifactCloudResponse::CarrierRegistration(response),
                 )
                 .map_err(|cause| ConnectionError::terminal(progress, cause))?;
@@ -2364,9 +2390,11 @@ where
             CloudFrame::ArtifactCarrierConfirmation { response, .. }
                 if progress.handshake_completed =>
             {
-                handle_artifact_cloud_response(
+                handle_correlated_artifact_response(
                     assignment_manager,
                     &in_flight,
+                    &mut awaiting_response,
+                    &mut answered_before_ack,
                     ArtifactCloudResponse::CarrierConfirmation(response),
                 )
                 .map_err(|cause| ConnectionError::terminal(progress, cause))?;
@@ -2374,9 +2402,11 @@ where
             CloudFrame::ArtifactResultRegistration { response, .. }
                 if progress.handshake_completed =>
             {
-                handle_artifact_cloud_response(
+                handle_correlated_artifact_response(
                     assignment_manager,
                     &in_flight,
+                    &mut awaiting_response,
+                    &mut answered_before_ack,
                     ArtifactCloudResponse::ResultRegistration(response),
                 )
                 .map_err(|cause| ConnectionError::terminal(progress, cause))?;
@@ -2384,9 +2414,11 @@ where
             CloudFrame::ArtifactResultConfirmation { response, .. }
                 if progress.handshake_completed =>
             {
-                handle_artifact_cloud_response(
+                handle_correlated_artifact_response(
                     assignment_manager,
                     &in_flight,
+                    &mut awaiting_response,
+                    &mut answered_before_ack,
                     ArtifactCloudResponse::ResultConfirmation(response),
                 )
                 .map_err(|cause| ConnectionError::terminal(progress, cause))?;
@@ -2464,6 +2496,33 @@ where
         }
         inbound_silence_timer = inbound_silence_timeout.map(|timeout| sleeper.sleep(timeout));
     }
+}
+
+fn handle_correlated_artifact_response(
+    assignment_manager: &Mutex<AssignmentManager>,
+    in_flight: &VecDeque<PendingObservation>,
+    awaiting_response: &mut VecDeque<PendingObservation>,
+    answered_before_ack: &mut BTreeSet<String>,
+    response: ArtifactCloudResponse,
+) -> Result<(), ConnectionCause> {
+    let request_id = response.request_message_id().to_owned();
+    let mut correlated = in_flight.clone();
+    correlated.extend(awaiting_response.iter().cloned());
+    handle_artifact_cloud_response(assignment_manager, &correlated, response)?;
+    if in_flight.iter().any(|pending| {
+        pending.message_id == request_id
+            && matches!(
+                pending.kind,
+                PendingObservationKind::ArtifactObservation {
+                    request_kind: ArtifactRequestKind::ConfirmResult,
+                    ..
+                }
+            )
+    }) {
+        answered_before_ack.insert(request_id.clone());
+    }
+    awaiting_response.retain(|pending| pending.message_id != request_id);
+    Ok(())
 }
 
 fn handle_artifact_cloud_response(

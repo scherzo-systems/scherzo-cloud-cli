@@ -481,6 +481,9 @@ pub enum ArtifactResultConfirmationOutcome {
     Confirmed {
         artifact_set_id: String,
     },
+    Pending {
+        artifact_set_id: String,
+    },
     Absent {
         artifact_set_id: String,
         upload_capability: ArtifactUploadCapability,
@@ -1682,6 +1685,7 @@ fn artifact_result_confirmation_response(
     let artifact_set_id = field("artifactSetId")?;
     let outcome = match field("outcome")?.as_str() {
         "confirmed" => ArtifactResultConfirmationOutcome::Confirmed { artifact_set_id },
+        "pending" => ArtifactResultConfirmationOutcome::Pending { artifact_set_id },
         "absent" => {
             let capability = value
                 .get("uploadCapability")
@@ -2152,6 +2156,10 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/cloud-artifact-result-confirmation.json"
         )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-artifact-result-pending.json"
+        )),
     ];
 
     const INVALID_FIXTURES: &[&[u8]] = &[
@@ -2280,6 +2288,23 @@ mod tests {
                 u32::from(control)
             );
         }
+    }
+
+    #[test]
+    fn result_pending_decodes_as_nonterminal_set_identity() {
+        let frame = decode_cloud_frame(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-artifact-result-pending.json"
+        )))
+        .unwrap();
+        let CloudFrame::ArtifactResultConfirmation { response, .. } = frame else {
+            panic!("wrong cloud frame kind");
+        };
+        assert!(
+            matches!(response.outcome, ArtifactResultConfirmationOutcome::Pending {
+            artifact_set_id
+        } if artifact_set_id == "ats_01k0z6r1w8f4jy2m7q9v3x5ac0")
+        );
     }
 
     #[test]

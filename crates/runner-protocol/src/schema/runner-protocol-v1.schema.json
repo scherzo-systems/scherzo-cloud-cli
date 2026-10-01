@@ -5938,6 +5938,26 @@
                       "$ref": "#/$defs/runnerMessageId"
                     },
                     "outcome": {
+                      "const": "pending"
+                    },
+                    "artifactSetId": {
+                      "$ref": "#/$defs/artifactSetId"
+                    }
+                  },
+                  "required": [
+                    "requestMessageId",
+                    "outcome",
+                    "artifactSetId"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requestMessageId": {
+                      "$ref": "#/$defs/runnerMessageId"
+                    },
+                    "outcome": {
                       "const": "absent"
                     },
                     "artifactSetId": {

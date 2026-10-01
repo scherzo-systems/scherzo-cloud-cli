@@ -12,6 +12,7 @@ use reqwest::header::{
     CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, IF_NONE_MATCH,
 };
 use ring::digest::{SHA256, digest};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{mpsc, oneshot};
 use um_support::lowercase_hex;
 
@@ -30,6 +31,7 @@ use um_runner_protocol::{
 
 const CHECKSUM_HEADER: HeaderName = HeaderName::from_static("x-amz-checksum-sha256");
 const MAXIMUM_DELIVERY_RETRIES: u8 = 3;
+const PREPARATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 type UploadReader = Box<dyn Read + Send>;
 
@@ -195,6 +197,15 @@ impl ArtifactCloudResponse {
         }
     }
 
+    pub(super) fn request_message_id(&self) -> &str {
+        match self {
+            Self::CarrierRegistration(response) => &response.request_message_id,
+            Self::CarrierConfirmation(response) => &response.request_message_id,
+            Self::ResultRegistration(response) => &response.request_message_id,
+            Self::ResultConfirmation(response) => &response.request_message_id,
+        }
+    }
+
     pub(super) fn request_kind(&self) -> ArtifactRequestKind {
         match self {
             Self::CarrierRegistration(_) => ArtifactRequestKind::RegisterCarrier,
@@ -228,6 +239,8 @@ struct Delivery {
     retries: u8,
     retry_generation: u64,
     backoff: Backoff,
+    finalization_deadline: Option<OffsetDateTime>,
+    deadline_read_scheduled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +255,22 @@ enum DeliveryPhase {
         artifact_set_id: String,
         carrier_id: Option<String>,
     },
+    Pending {
+        artifact_set_id: String,
+    },
+}
+
+impl DeliveryPhase {
+    fn result_set_id(&self) -> Option<&str> {
+        match self {
+            Self::Confirming {
+                artifact_set_id,
+                carrier_id: None,
+            }
+            | Self::Pending { artifact_set_id } => Some(artifact_set_id),
+            _ => None,
+        }
+    }
 }
 
 struct UploadCompleted {
@@ -340,6 +369,8 @@ impl ArtifactDeliveryBroker {
                 retries: 0,
                 retry_generation: 0,
                 backoff: Backoff::new(),
+                finalization_deadline: None,
+                deadline_read_scheduled: false,
             },
         );
         Ok(receiver)
@@ -416,18 +447,24 @@ impl ArtifactDeliveryBroker {
                         ArtifactResultRegistrationOutcome::Succeeded {
                             artifact_set_id,
                             upload_capability,
-                            ..
+                            finalization_deadline,
                         },
                     ..
                 }),
             ) if delivery.spec.is_result() => {
-                upload = Some(begin_upload(
-                    delivery_id,
-                    delivery,
-                    artifact_set_id,
-                    None,
-                    upload_capability,
-                ));
+                match OffsetDateTime::parse(&finalization_deadline, &Rfc3339) {
+                    Ok(deadline) => {
+                        delivery.finalization_deadline = Some(deadline);
+                        upload = Some(begin_upload(
+                            delivery_id,
+                            delivery,
+                            artifact_set_id,
+                            None,
+                            upload_capability,
+                        ));
+                    }
+                    Err(_) => completion = Some(internal_failure("registration")),
+                }
             }
             (
                 DeliveryPhase::Registering,
@@ -551,15 +588,12 @@ impl ArtifactDeliveryBroker {
                 completion = Some(failed_for_code("upload", code));
             }
             (
-                DeliveryPhase::Confirming {
-                    artifact_set_id: expected_set,
-                    carrier_id: None,
-                },
+                phase,
                 ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
                     outcome: ArtifactResultConfirmationOutcome::Confirmed { artifact_set_id },
                     ..
                 }),
-            ) if expected_set == &artifact_set_id => {
+            ) if phase.result_set_id() == Some(artifact_set_id.as_str()) => {
                 completion = Some(ArtifactDeliveryOutcome::Prepared { artifact_set_id });
             }
             (
@@ -583,6 +617,7 @@ impl ArtifactDeliveryBroker {
                         Some((artifact_set_id, None))
                     }
                     ArtifactResultConfirmationOutcome::Confirmed { .. }
+                    | ArtifactResultConfirmationOutcome::Pending { .. }
                     | ArtifactResultConfirmationOutcome::Failed { .. } => None,
                 };
                 let Some((artifact_set_id, upload_capability)) = result_retry else {
@@ -598,10 +633,7 @@ impl ArtifactDeliveryBroker {
                 );
             }
             (
-                DeliveryPhase::Confirming {
-                    artifact_set_id: expected_set,
-                    carrier_id: None,
-                },
+                delivery_phase,
                 ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
                     outcome:
                         ArtifactResultConfirmationOutcome::Failed {
@@ -611,10 +643,39 @@ impl ArtifactDeliveryBroker {
                         },
                     ..
                 }),
-            ) if expected_set == &artifact_set_id => {
+            ) if delivery_phase.result_set_id() == Some(artifact_set_id.as_str()) => {
                 completion = Some(ArtifactDeliveryOutcome::Failed(
                     ClosedArtifactDeliveryFailure { phase, code },
                 ));
+            }
+            (
+                DeliveryPhase::Pending {
+                    artifact_set_id: expected_set,
+                },
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    outcome:
+                        ArtifactResultConfirmationOutcome::Absent {
+                            artifact_set_id, ..
+                        }
+                        | ArtifactResultConfirmationOutcome::Retryable { artifact_set_id },
+                    ..
+                }),
+            ) if expected_set == &artifact_set_id => {
+                // A superseded response cannot revoke an accepted HEAD.
+            }
+            (
+                phase,
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    outcome: ArtifactResultConfirmationOutcome::Pending { artifact_set_id },
+                    ..
+                }),
+            ) if phase.result_set_id() == Some(artifact_set_id.as_str()) => {
+                delivery.phase = DeliveryPhase::Pending { artifact_set_id };
+                select_retry(
+                    plan_preparation_poll(delivery_id, delivery, self.sleeper.utc_now()),
+                    &mut retry,
+                    &mut completion,
+                );
             }
             _ => return Err(ArtifactDeliveryProtocolFailure),
         }
@@ -629,6 +690,38 @@ impl ArtifactDeliveryBroker {
             self.spawn_retry(retry);
         }
         Ok(())
+    }
+
+    // An acknowledgement is only transport receipt; a semantic response may
+    // never arrive. Pace a new correlated poll independently of the outbox.
+    pub(super) fn acknowledged_result_confirmation(&self, delivery_id: u64) {
+        let mut state = self.lock();
+        let Some(delivery) = state.deliveries.get_mut(&delivery_id) else {
+            return;
+        };
+        let artifact_set_id = match &delivery.phase {
+            DeliveryPhase::Confirming {
+                artifact_set_id,
+                carrier_id: None,
+            }
+            | DeliveryPhase::Pending { artifact_set_id } => artifact_set_id.clone(),
+            _ => return,
+        };
+        // Transport receipt is not semantic HEAD acceptance. Keep Confirming
+        // until Cloud actually replies pending so absence still retries upload.
+        let planned = plan_result_poll(
+            delivery_id,
+            delivery,
+            &artifact_set_id,
+            self.sleeper.utc_now(),
+        );
+        match planned {
+            Ok(retry) => {
+                drop(state);
+                self.spawn_retry(retry);
+            }
+            Err(result) => complete(&mut state, delivery_id, result),
+        }
     }
 
     pub(super) fn drain_uploads(&self) {
@@ -755,9 +848,9 @@ impl ArtifactDeliveryBroker {
                 if let Err(failure) = self.outbox.enqueue(request) {
                     let phase = match delivery.phase {
                         DeliveryPhase::Registering => "registration",
-                        DeliveryPhase::Uploading { .. } | DeliveryPhase::Confirming { .. } => {
-                            "upload"
-                        }
+                        DeliveryPhase::Uploading { .. }
+                        | DeliveryPhase::Confirming { .. }
+                        | DeliveryPhase::Pending { .. } => "upload",
                     };
                     let operation = if phase == "registration" {
                         "registration"
@@ -1029,6 +1122,65 @@ fn select_retry(
         Ok(work) => *retry = Some(work),
         Err(result) => *completion = Some(result),
     }
+}
+
+fn plan_preparation_poll(
+    delivery_id: u64,
+    delivery: &mut Delivery,
+    now: OffsetDateTime,
+) -> Result<RetryWork, ArtifactDeliveryOutcome> {
+    let DeliveryPhase::Pending { artifact_set_id } = &delivery.phase else {
+        return Err(internal_failure("preparation"));
+    };
+    let artifact_set_id = artifact_set_id.clone();
+    plan_result_poll(delivery_id, delivery, &artifact_set_id, now)
+}
+
+fn plan_result_poll(
+    delivery_id: u64,
+    delivery: &mut Delivery,
+    artifact_set_id: &str,
+    now: OffsetDateTime,
+) -> Result<RetryWork, ArtifactDeliveryOutcome> {
+    let request = confirm_observation(
+        delivery_id,
+        &delivery.spec,
+        artifact_set_id.to_owned(),
+        None,
+    )
+    .map_err(|_| internal_failure("preparation"))?;
+    let generation = delivery
+        .retry_generation
+        .checked_add(1)
+        .ok_or_else(|| internal_failure("preparation"))?;
+    delivery.retry_generation = generation;
+    Ok(RetryWork {
+        delivery_id,
+        generation,
+        delay: preparation_poll_delay(
+            now,
+            delivery.finalization_deadline,
+            &mut delivery.deadline_read_scheduled,
+        ),
+        action: RetryAction::Request(request),
+    })
+}
+
+// Always read Cloud's stored decision rather than inferring a failure from
+// the runner clock. If it is still pending, subsequent reads remain paced.
+fn preparation_poll_delay(
+    now: OffsetDateTime,
+    deadline: Option<OffsetDateTime>,
+    deadline_read_scheduled: &mut bool,
+) -> Duration {
+    if !*deadline_read_scheduled && let Some(deadline) = deadline {
+        let remaining = std::time::Duration::try_from(deadline - now).unwrap_or(Duration::ZERO);
+        if remaining <= PREPARATION_POLL_INTERVAL {
+            *deadline_read_scheduled = true;
+            return remaining;
+        }
+    }
+    PREPARATION_POLL_INTERVAL
 }
 
 fn plan_retry(
@@ -1540,6 +1692,252 @@ mod tests {
         })
         .await
         .expect("registration was not re-enqueued after released backoff");
+    }
+
+    async fn wait_for_queued_poll(outbox: &ObservationOutbox, expected: usize) {
+        let notification = outbox.notification();
+        with_watchdog(async {
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if outbox.pending(&BTreeSet::new(), 10).len() == expected {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("poll was not queued");
+    }
+
+    #[test]
+    fn finalization_deadline_schedules_one_bounded_read_without_guessing_terminal_state() {
+        let deadline = OffsetDateTime::parse("2099-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let mut scheduled = false;
+        assert_eq!(
+            preparation_poll_delay(
+                deadline - time::Duration::seconds(10),
+                Some(deadline),
+                &mut scheduled
+            ),
+            PREPARATION_POLL_INTERVAL,
+        );
+        assert!(!scheduled);
+        assert_eq!(
+            preparation_poll_delay(
+                deadline - time::Duration::milliseconds(500),
+                Some(deadline),
+                &mut scheduled
+            ),
+            Duration::from_millis(500),
+        );
+        assert!(scheduled);
+        assert_eq!(
+            preparation_poll_delay(deadline, Some(deadline), &mut scheduled),
+            PREPARATION_POLL_INTERVAL,
+        );
+        scheduled = false;
+        assert_eq!(
+            preparation_poll_delay(
+                deadline + time::Duration::seconds(1),
+                Some(deadline),
+                &mut scheduled
+            ),
+            Duration::ZERO,
+        );
+    }
+
+    fn set_result_confirming(broker: &ArtifactDeliveryBroker, artifact_set_id: &str) {
+        broker.lock().deliveries.get_mut(&1).unwrap().phase = DeliveryPhase::Confirming {
+            artifact_set_id: artifact_set_id.to_owned(),
+            carrier_id: None,
+        };
+    }
+
+    #[tokio::test]
+    async fn pending_polls_keep_retry_budget_and_require_a_terminal_decision() {
+        let outbox = ObservationOutbox::new();
+        let (sleeper, mut timers) = controlled_sleeper();
+        let (broker, mut completion) = start_result_delivery(&outbox, sleeper);
+        let set_id = "ats_01k0z6r1w8f4jy2m7q9v3x5ac0".to_owned();
+        set_result_confirming(&broker, &set_id);
+        for poll in 0..4 {
+            broker
+                .handle_response(
+                    1,
+                    ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                        request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                        outcome: ArtifactResultConfirmationOutcome::Pending {
+                            artifact_set_id: set_id.clone(),
+                        },
+                    }),
+                )
+                .unwrap();
+            assert_eq!(broker.lock().deliveries.get(&1).unwrap().retries, 0);
+            assert!(matches!(
+                completion.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            let (duration, release) = with_watchdog(timers.recv()).await.unwrap().unwrap();
+            assert_eq!(duration, PREPARATION_POLL_INTERVAL);
+            release.release();
+            wait_for_queued_poll(&outbox, poll + 2).await;
+        }
+        broker
+            .handle_response(
+                1,
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+                    outcome: ArtifactResultConfirmationOutcome::Confirmed {
+                        artifact_set_id: set_id,
+                    },
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            completion.try_recv(),
+            Ok(ArtifactDeliveryOutcome::Prepared { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_head_reads_at_deadline_and_waits_for_the_stored_decision() {
+        let outbox = ObservationOutbox::new();
+        let (sleeper, mut timers) = controlled_sleeper();
+        let now = sleeper.utc_now();
+        let (broker, mut completion) = start_result_delivery(&outbox, sleeper);
+        let artifact_set_id = "ats_01k0z6r1w8f4jy2m7q9v3x5ac0".to_owned();
+        {
+            let mut state = broker.lock();
+            let delivery = state.deliveries.get_mut(&1).unwrap();
+            delivery.phase = DeliveryPhase::Confirming {
+                artifact_set_id: artifact_set_id.clone(),
+                carrier_id: None,
+            };
+            delivery.finalization_deadline = Some(now + time::Duration::milliseconds(500));
+        }
+        broker.acknowledged_result_confirmation(1);
+        let (duration, release) = with_watchdog(timers.recv()).await.unwrap().unwrap();
+        assert_eq!(duration, Duration::from_millis(500));
+        release.release();
+        wait_for_queued_poll(&outbox, 2).await;
+        assert!(matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        broker
+            .handle_response(
+                1,
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    request_message_id: String::new(),
+                    outcome: ArtifactResultConfirmationOutcome::Pending {
+                        artifact_set_id: artifact_set_id.clone(),
+                    },
+                }),
+            )
+            .unwrap();
+        let (duration, _release) = with_watchdog(timers.recv()).await.unwrap().unwrap();
+        assert_eq!(duration, PREPARATION_POLL_INTERVAL);
+        broker
+            .handle_response(
+                1,
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    request_message_id: String::new(),
+                    outcome: ArtifactResultConfirmationOutcome::Failed {
+                        artifact_set_id,
+                        phase: "preparation".to_owned(),
+                        code: "delivery_deadline_exceeded".to_owned(),
+                    },
+                }),
+            )
+            .unwrap();
+        assert!(
+            matches!(completion.await, Ok(ArtifactDeliveryOutcome::Failed(
+            ClosedArtifactDeliveryFailure { code, .. }
+        )) if code == "delivery_deadline_exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_without_a_semantic_response_schedules_a_new_poll() {
+        let outbox = ObservationOutbox::new();
+        let (sleeper, mut timers) = controlled_sleeper();
+        let (broker, mut completion) = start_result_delivery(&outbox, sleeper);
+        broker.lock().deliveries.get_mut(&1).unwrap().phase = DeliveryPhase::Confirming {
+            artifact_set_id: "ats_01k0z6r1w8f4jy2m7q9v3x5ac0".to_owned(),
+            carrier_id: None,
+        };
+        broker.acknowledged_result_confirmation(1);
+        let (duration, release) = with_watchdog(timers.recv()).await.unwrap().unwrap();
+        assert_eq!(duration, PREPARATION_POLL_INTERVAL);
+        assert!(matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        release.release();
+        wait_for_queued_poll(&outbox, 2).await;
+    }
+
+    #[tokio::test]
+    async fn ack_without_head_acceptance_does_not_consume_absence_retry() {
+        let outbox = ObservationOutbox::new();
+        let (sleeper, mut timers) = controlled_sleeper();
+        let (broker, mut completion) = start_result_delivery(&outbox, sleeper);
+        let set_id = "ats_01k0z6r1w8f4jy2m7q9v3x5ac0".to_owned();
+        set_result_confirming(&broker, &set_id);
+        broker.acknowledged_result_confirmation(1);
+        let (_, unaccepted_poll) = with_watchdog(timers.recv()).await.unwrap().unwrap();
+        unaccepted_poll.release();
+        wait_for_queued_poll(&outbox, 2).await;
+        broker
+            .handle_response(
+                1,
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+                    outcome: ArtifactResultConfirmationOutcome::Absent {
+                        artifact_set_id: set_id,
+                        upload_capability: ArtifactUploadCapability {
+                            url: "https://example.com/artifact".to_owned(),
+                            content_length: "0".to_owned(),
+                            content_type: "application/octet-stream".to_owned(),
+                            if_none_match: "*".to_owned(),
+                            checksum_sha256: String::new(),
+                            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+                        },
+                    },
+                }),
+            )
+            .unwrap();
+        {
+            let state = broker.lock();
+            let delivery = state.deliveries.get(&1).unwrap();
+            assert_eq!(delivery.retries, 1);
+            assert!(matches!(delivery.phase, DeliveryPhase::Confirming { .. }));
+            assert!(matches!(
+                completion.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        let (_, retry_upload) = with_watchdog(timers.recv()).await.unwrap().unwrap();
+        retry_upload.release();
+        let notification = outbox.notification();
+        with_watchdog(async {
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if matches!(
+                    broker.lock().deliveries.get(&1).unwrap().phase,
+                    DeliveryPhase::Uploading { .. }
+                ) {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
