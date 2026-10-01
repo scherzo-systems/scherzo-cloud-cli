@@ -5686,7 +5686,13 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     )]
     fn materialize_runner_stubborn_descendant() {
         let descendant = std::process::Command::new("/bin/sh")
-            .args(["-c", "trap '' INT TERM; while :; do sleep 60; done"])
+            // Use one stubborn process: a shell loop can orphan its sleep child
+            // during group teardown and keep the group observable after the
+            // recorded descendant PID is gone. Close the fixture's protocol fd.
+            .args(["-c", "exec 3>&-; trap '' INT TERM; exec sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         fs::write(
@@ -5991,6 +5997,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             loop {
                 let notified = notification.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 if let Some(preparation) = manager
                     .pending_observations(&BTreeSet::new(), 10)
                     .into_iter()
@@ -6834,6 +6841,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             loop {
                 let notified = notification.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 if let Some(requested) = manager
                     .pending_observations(&BTreeSet::new(), 10)
                     .into_iter()
@@ -6861,6 +6869,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         loop {
             let notified = notification.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             if reached(manager) {
                 return;
             }
@@ -6957,6 +6966,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         loop {
             let notified = notification.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             let pending = manager.pending_observations(&BTreeSet::new(), 100);
             if pending.iter().any(|entry| {
                 matches!(
@@ -6978,6 +6988,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         loop {
             let notified = notification.notified();
             tokio::pin!(notified);
+            // The outbox uses notify_waiters, so register before checking its state.
+            notified.as_mut().enable();
             let pending = manager.pending_observations(&BTreeSet::new(), 100);
             if fail_pending_artifact_registrations(manager, &pending) {
                 continue;
@@ -8627,6 +8639,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             while released < 80 {
                 let notified = notification.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 let pending = manager.pending_observations(&BTreeSet::new(), 100);
                 fail_pending_artifact_registrations(&mut manager, &pending);
                 tokio::select! {
@@ -8646,6 +8659,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             loop {
                 let notified = notification.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 manager.drain_events();
                 let pending = manager.pending_observations(&BTreeSet::new(), 100);
                 fail_pending_artifact_registrations(&mut manager, &pending);
@@ -9910,6 +9924,7 @@ steps:
             loop {
                 let notified = notification.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 manager.pending_observations(&BTreeSet::new(), 100);
                 if manager.slot.is_none() {
                     break;
@@ -9970,6 +9985,7 @@ steps:
             loop {
                 let notified = notification.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 let pending = manager.pending_observations(&BTreeSet::new(), 100);
                 if fail_pending_artifact_registrations(&mut manager, &pending) {
                     continue;
@@ -10127,6 +10143,7 @@ steps:
             loop {
                 let notified = notification.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 let pending = manager.pending_observations(&BTreeSet::new(), 100);
                 if let Some(artifact) = pending
                     .iter()
