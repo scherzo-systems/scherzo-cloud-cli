@@ -49,12 +49,15 @@ Every `list` leaf paginates unless the API-limited exception is recorded in
 the exact `Pagination:` after-help from the style guide. Use its bound parameter
 for a family whose maximum differs from the standard 200 items.
 
-Every new command path needs exactly one help snapshot under `tests/cmd/help/`;
-[`cli::tests::every_customer_command_has_one_help_snapshot`](src/cli.rs) is the topology
-conformance test, and [`tests/help_snapshots.rs`](tests/help_snapshots.rs) checks the
-rendered help. Adding a path is the only normal reason to add a `trycmd` case. Update an
-existing snapshot when help changes, and use focused integration tests rather than
-snapshots for command behavior.
+[`cli::grammar_tests::cli_grammar_conforms`](src/cli/grammar_tests.rs) checks command
+grammar across the command tree, and
+[`cli::tests::customer_command_surface_is_exact_and_has_no_operator_entrypoint`](src/cli.rs)
+checks the customer command paths. The small set of `trycmd` cases under
+`tests/cmd/help/` protects representative help rendering shapes, not every command's
+prose. Add a snapshot only when a new rendering shape is not covered (for example, a
+new kind of positional/flag layout or after-help section); update a retained case if
+its rendered help changes. Prefer structural conformance checks for cross-command rules
+and focused integration tests for command behavior.
 
 ## Development checks
 

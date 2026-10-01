@@ -2242,37 +2242,6 @@ mod tests {
         paths
     }
 
-    fn help_snapshot_paths() -> Vec<String> {
-        let snapshot_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cmd/help");
-        let mut paths = snapshot_directory
-            .read_dir()
-            .expect("help snapshot directory should exist")
-            .filter_map(|entry| {
-                let path = entry
-                    .expect("help snapshot entry should be readable")
-                    .path();
-                path.extension()
-                    .is_some_and(|extension| extension == "trycmd")
-                    .then_some(path)
-            })
-            .map(|path| {
-                let snapshot =
-                    fs::read_to_string(path).expect("help snapshot should be readable as UTF-8");
-                snapshot
-                    .lines()
-                    .find_map(|line| {
-                        line.strip_prefix("$ scherzo-cloud")
-                            .and_then(|invocation| invocation.strip_suffix(" --help"))
-                    })
-                    .expect("help snapshot should declare its command invocation")
-                    .trim()
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths
-    }
-
     #[test]
     fn every_unreachable_category_uses_the_shared_outcome_table() {
         for category in [
@@ -2291,14 +2260,6 @@ mod tests {
             unreachable_outcome_class(UnreachableCategory::RateLimited),
             OutcomeClass::RateLimited
         );
-    }
-
-    #[test]
-    fn every_customer_command_has_one_help_snapshot() {
-        let mut command_paths = vec![String::new()];
-        command_paths.extend(customer_command_paths());
-
-        assert_eq!(help_snapshot_paths(), command_paths);
     }
 
     #[test]
