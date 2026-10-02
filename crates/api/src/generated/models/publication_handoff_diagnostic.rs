@@ -16,28 +16,25 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// RunnerCurrentAssignment : The runner's reserved assignment, absent when idle. Assigned at is the offer creation time.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunnerCurrentAssignment {
-    #[serde(rename = "runId")]
-    pub run_id: String,
-    /// Present when the run has a display name.
-    #[serde(rename = "runDisplayName", skip_serializing_if = "Option::is_none")]
-    pub run_display_name: Option<String>,
-    #[serde(rename = "projectId")]
-    pub project_id: String,
-    #[serde(rename = "assignedAt")]
-    pub assigned_at: String,
+pub struct PublicationHandoffDiagnostic {
+    #[serde(rename = "stage", skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(rename = "deliveryPhase", skip_serializing_if = "Option::is_none")]
+    pub delivery_phase: Option<String>,
+    #[serde(rename = "deliveryCode", skip_serializing_if = "Option::is_none")]
+    pub delivery_code: Option<String>,
+    #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
 }
 
-impl RunnerCurrentAssignment {
-    /// The runner's reserved assignment, absent when idle. Assigned at is the offer creation time.
-    pub fn new(run_id: String, project_id: String, assigned_at: String) -> RunnerCurrentAssignment {
-        RunnerCurrentAssignment {
-            run_id,
-            run_display_name: None,
-            project_id,
-            assigned_at,
+impl PublicationHandoffDiagnostic {
+    pub fn new() -> PublicationHandoffDiagnostic {
+        PublicationHandoffDiagnostic {
+            stage: None,
+            delivery_phase: None,
+            delivery_code: None,
+            error_type: None,
         }
     }
 }
