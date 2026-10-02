@@ -2994,6 +2994,9 @@
         },
         {
           "$ref": "#/$defs/RecoverySettlingTransitionEvent"
+        },
+        {
+          "$ref": "#/$defs/FinalizerInvocationTransitionEvent"
         }
       ]
     },
@@ -3580,6 +3583,69 @@
         "from",
         "to",
         "recoveryProgress"
+      ]
+    },
+    "FinalizerInvocationTransitionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventVersion": { "const": 1 },
+        "eventType": { "const": "step_state_changed" },
+        "transitionSequence": { "$ref": "#/$defs/positiveSequence" },
+        "stepId": { "$ref": "#/$defs/stepId" },
+        "role": { "const": "finalizer" },
+        "failurePolicy": { "$ref": "#/$defs/FailurePolicy" },
+        "from": { "$ref": "#/$defs/StepStateKind" },
+        "to": { "enum": ["succeeded", "failed", "cancelled"] },
+        "detail": {},
+        "invocationEvidence": {
+          "allOf": [
+            { "$ref": "#/$defs/InvocationEvidence" },
+            {
+              "properties": {
+                "role": { "const": "target" },
+                "targetExecution": { "const": 1 }
+              },
+              "required": ["targetExecution"],
+              "not": { "required": ["recoveryRound"] }
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "to": { "const": "failed" },
+                "detail": { "$ref": "#/$defs/FailureDetail" }
+              },
+              "required": ["detail"]
+            },
+            {
+              "properties": {
+                "to": { "const": "cancelled" },
+                "detail": { "$ref": "#/$defs/RuntimeCancellationDetail" }
+              },
+              "required": ["detail"]
+            },
+            {
+              "properties": { "to": { "const": "succeeded" } },
+              "not": { "required": ["detail"] }
+            }
+          ]
+        }
+      ],
+      "required": [
+        "eventVersion",
+        "eventType",
+        "transitionSequence",
+        "stepId",
+        "role",
+        "failurePolicy",
+        "from",
+        "to",
+        "invocationEvidence"
       ]
     },
     "RecoverySettlingTransitionEvent": {

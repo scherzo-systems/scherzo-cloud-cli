@@ -1238,10 +1238,10 @@ impl ExecutionJob {
                 return ExecutionCompletion::lease_clock_failed(report.flatten());
             }
         };
-        if observer.faulted() {
+        if let Some(fault) = observer.fault() {
             self.collapse(
                 "runner_internal_failure",
-                "execution_observer_faulted",
+                fault.cause(),
                 "harness_execution",
             );
             return self
@@ -2775,7 +2775,38 @@ struct ObserverState {
     step_timings: BTreeMap<String, RunnerStepTiming>,
     active_invocations: BTreeMap<String, RunnerActiveInvocation>,
     settled_invocations: BTreeMap<u64, (String, RecoveryInvocationV1)>,
-    faulted: bool,
+    fault: Option<ObserverFault>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObserverFault {
+    TransitionCapacityExceeded,
+    SequenceExhausted,
+    DuplicateTerminal,
+    InvocationSettlementFailed,
+    AmbiguousAgentInvocation,
+    AgentInvocationTimingMissing,
+    InvocationEvidenceInvalid,
+    Outbox(OutboxFailure),
+    DuplicateCancellation,
+}
+
+impl ObserverFault {
+    fn cause(self) -> &'static str {
+        match self {
+            Self::TransitionCapacityExceeded => "observer_transition_capacity_exceeded",
+            Self::SequenceExhausted => "observer_sequence_exhausted",
+            Self::DuplicateTerminal => "observer_duplicate_terminal",
+            Self::InvocationSettlementFailed => "observer_invocation_settlement_failed",
+            Self::AmbiguousAgentInvocation => "observer_ambiguous_agent_invocation",
+            Self::AgentInvocationTimingMissing => "observer_agent_invocation_timing_missing",
+            Self::InvocationEvidenceInvalid => "observer_invocation_evidence_invalid",
+            Self::Outbox(OutboxFailure::Encoding) => "transition_observation_encoding_failed",
+            Self::Outbox(OutboxFailure::Capacity) => "transition_observation_capacity_exceeded",
+            Self::Outbox(OutboxFailure::Sequence) => "transition_observation_sequence_exhausted",
+            Self::DuplicateCancellation => "observer_duplicate_cancellation",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2819,7 +2850,7 @@ impl RunnerExecutionObserver {
                 step_timings: BTreeMap::new(),
                 active_invocations: BTreeMap::new(),
                 settled_invocations: BTreeMap::new(),
-                faulted: false,
+                fault: None,
             })),
         }
     }
@@ -2840,8 +2871,8 @@ impl RunnerExecutionObserver {
         self.lock().force_abort
     }
 
-    fn faulted(&self) -> bool {
-        self.lock().faulted
+    fn fault(&self) -> Option<ObserverFault> {
+        self.lock().fault
     }
 
     fn cancellation(&self) -> Option<(CancellationReason, RunnerExecutionInstant)> {
@@ -3060,12 +3091,15 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 return;
             }
             let mut state = observer.lock();
-            if state.transition_count == observer.transition_budget || state.faulted {
-                state.faulted = true;
+            if state.fault.is_some() {
+                return;
+            }
+            if state.transition_count == observer.transition_budget {
+                state.fault = Some(ObserverFault::TransitionCapacityExceeded);
                 return;
             }
             let Some(sequence) = state.last_sequence.checked_add(1) else {
-                state.faulted = true;
+                state.fault = Some(ObserverFault::SequenceExhausted);
                 return;
             };
             let cancellation = match &transition.event {
@@ -3088,7 +3122,7 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                 _ => None,
             };
             if terminal.is_some() && state.terminal_sequence.is_some() {
-                state.faulted = true;
+                state.fault = Some(ObserverFault::DuplicateTerminal);
                 return;
             }
             let mut invocation_evidence = None;
@@ -3114,7 +3148,7 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                             false,
                             &mut invocation_evidence,
                         ) {
-                            state.faulted = true;
+                            state.fault = Some(ObserverFault::InvocationSettlementFailed);
                             return;
                         }
                     }
@@ -3140,7 +3174,7 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                             false,
                             &mut invocation_evidence,
                         ) {
-                            state.faulted = true;
+                            state.fault = Some(ObserverFault::InvocationSettlementFailed);
                             return;
                         }
                     }
@@ -3166,7 +3200,7 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                         &mut invocation_evidence,
                     )
                 {
-                    state.faulted = true;
+                    state.fault = Some(ObserverFault::InvocationSettlementFailed);
                     return;
                 }
             }
@@ -3184,14 +3218,14 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                     .diagnostics
                     .invocation_ids(step);
                 if ids.len() > 1 {
-                    state.faulted = true;
+                    state.fault = Some(ObserverFault::AmbiguousAgentInvocation);
                     return;
                 }
                 if let Some(id) = ids.first() {
                     let Some(started_at) =
                         state.step_timings.get(step).map(|timing| timing.started_at)
                     else {
-                        state.faulted = true;
+                        state.fault = Some(ObserverFault::AgentInvocationTimingMissing);
                         return;
                     };
                     let active = RunnerActiveInvocation {
@@ -3207,7 +3241,7 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                         observed_at,
                         *to == StepStateKind::Cancelled,
                     ) else {
-                        state.faulted = true;
+                        state.fault = Some(ObserverFault::InvocationEvidenceInvalid);
                         return;
                     };
                     state
@@ -3232,8 +3266,8 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                     workflow_event,
                 },
             });
-            if enqueued.is_err() {
-                state.faulted = true;
+            if let Err(error) = enqueued {
+                state.fault = Some(ObserverFault::Outbox(error));
                 return;
             }
             match &transition.event {
@@ -3279,7 +3313,7 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
             if let Some(cancellation) = cancellation
                 && state.cancellation.replace(cancellation).is_some()
             {
-                state.faulted = true;
+                state.fault = Some(ObserverFault::DuplicateCancellation);
             }
             drop(state);
             if let Some(reason) = phase_cancellation {
@@ -4905,6 +4939,47 @@ mod tests {
         assert_eq!(workflow_event["invocationEvidence"]["invocationId"], 1);
         assert_eq!(workflow_event["invocationEvidence"]["role"], "target");
         assert!(serde_json::to_vec(workflow_event).unwrap().len() <= MAXIMUM_ORDINARY_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn observer_retains_encoding_fault_and_stops_emitting_transitions() {
+        let outbox = ObservationOutbox::new();
+        let observer = RunnerExecutionObserver::new(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            2,
+            outbox.clone(),
+            PostStopFence::with_workflow_git(None),
+            CancellationSource::new(),
+            RunnerInvocationEvidence::default(),
+        );
+        for sequence in [0, 1] {
+            observer
+                .observe(ExecutionObservation::Transition(Box::new(
+                    TransitionObservation {
+                        event: TransitionEvent::Step {
+                            sequence: TransitionSequence(sequence),
+                            step: "prepare".to_owned(),
+                            role: WorkflowNodeRole::Step,
+                            failure_policy: FailurePolicy::Required,
+                            from: StepStateKind::Pending,
+                            to: StepStateKind::Starting,
+                        },
+                        step: None,
+                    },
+                )))
+                .await;
+        }
+        assert_eq!(
+            observer.fault(),
+            Some(ObserverFault::Outbox(OutboxFailure::Encoding))
+        );
+        assert_eq!(
+            observer.fault().unwrap().cause(),
+            "transition_observation_encoding_failed"
+        );
+        assert_eq!(observer.last_sequence(), 0);
+        assert!(outbox.pending(&BTreeSet::new(), 2).is_empty());
     }
 
     #[tokio::test]

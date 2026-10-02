@@ -10854,6 +10854,37 @@ steps:
     }
 
     #[tokio::test]
+    async fn failed_command_with_agent_finalizer_retains_the_workflow_failure() {
+        let failing_argv = serde_json::to_string(&failing_command_fixture_arguments()).unwrap();
+        let workflow = format!(
+            "schemaVersion: 1\nagentProfiles:\n  reporter:\n    harness:\n      kind: pi\n      config:\n        model: fixture/pi\n        thinking: medium\nsteps:\n  prepare:\n    kind: cmd\n    command:\n      argv: {failing_argv}\nfinalizers:\n  report:\n    kind: agent\n    when: [failed]\n    failurePolicy: advisory\n    agent:\n      profile: reporter\n      systemPrompt: system.md\n      message:\n        text: [{{file: system.md}}]\n"
+        );
+        let reports = execute_fixture_workflow(&workflow, Some(SUCCESSFUL_PI), 1).await;
+
+        assert!(reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Transition { workflow_event, .. }
+                if workflow_event["stepId"] == "report"
+                    && workflow_event["role"] == "finalizer"
+                    && workflow_event["to"] == "succeeded"
+                    && workflow_event["invocationEvidence"]["role"] == "target"
+                    && workflow_event["invocationEvidence"]["targetExecution"] == 1
+                    && workflow_event["invocationEvidence"]["usage"]["inputTokens"] == 1
+                    && workflow_event["invocationEvidence"]["diagnosticReference"].is_string()
+        )));
+        assert!(
+            matches!(
+                reports.last(),
+                Some(ExecutionReport::Finished { outcome, .. })
+                    if outcome["outcome"] == "failed"
+                        && outcome["primaryIssue"]["node"]["id"] == "prepare"
+                        && outcome["finalization"]["finalizers"][0]["state"] == "succeeded"
+            ),
+            "unexpected reports: {reports:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn outputless_finalizers_emit_roles_phase_and_authoritative_summary() {
         let successful_argv = serde_json::to_string(&command_fixture_arguments()).unwrap();
         let failing_argv = serde_json::to_string(&failing_command_fixture_arguments()).unwrap();

@@ -2090,6 +2090,18 @@ mod tests {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/execution-transition-agent-finalizer-succeeded.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/execution-transition-agent-finalizer-failed.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/execution-transition-agent-finalizer-cancelled.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-execution-finished.json"
         )),
         include_bytes!(concat!(
@@ -2218,6 +2230,14 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/runner-execution-finished-recovery-version.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/execution-transition-agent-finalizer-recovery-handler.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/execution-transition-agent-finalizer-recovery-progress.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
