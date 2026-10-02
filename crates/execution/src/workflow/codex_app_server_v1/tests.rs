@@ -2182,6 +2182,79 @@ fn bounded_native_error_prose_does_not_replace_structured_identity() {
 }
 
 #[test]
+fn flex_unavailable_preserves_native_failure_and_retry_correlation() {
+    for notify in [false, true] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        if notify {
+            let (_, observations) = feed(
+                &mut parser,
+                json!({"method": "error", "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "error": {"message": "capacity diagnostic", "codexErrorInfo": "flexUnavailable"},
+                    "willRetry": false,
+                }}),
+            )
+            .unwrap();
+            assert!(matches!(observations.as_slice(),
+                [AgentObservation::Diagnostic { level: AgentDiagnosticLevel::Error, message }]
+                    if message.as_ref() == "capacity diagnostic"));
+        }
+        feed(
+            &mut parser,
+            json!({"method": "turn/completed", "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "status": "failed",
+                    "error": {"message": "terminal diagnostic", "codexErrorInfo": "flexUnavailable"},
+                },
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            parser.finish(true),
+            AgentOutcome::Failed(
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelError,
+                }
+                .into()
+            ),
+        );
+    }
+
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    let (_, observations) = feed(
+        &mut parser,
+        json!({"method": "error", "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "error": {"message": "capacity diagnostic", "codexErrorInfo": "flexUnavailable"},
+            "willRetry": true,
+        }}),
+    )
+    .unwrap();
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::RetryStarted
+        }
+    )));
+    let (_, observations) = feed(&mut parser, turn_completed(vec![], "completed")).unwrap();
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::RetryCompleted
+        }
+    )));
+    assert_eq!(
+        parser.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+}
+
+#[test]
 fn declined_server_requests_enforce_only_correlation_identity() {
     for (method, item_kind, params, expected) in [
         (

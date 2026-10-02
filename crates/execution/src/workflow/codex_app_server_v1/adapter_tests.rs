@@ -2711,6 +2711,14 @@ pub(super) mod exact_binary {
         }
 
         async fn start_turn(&mut self, approval_policy: &str) -> (String, String) {
+            self.start_turn_with_network(approval_policy, true).await
+        }
+
+        async fn start_turn_with_network(
+            &mut self,
+            approval_policy: &str,
+            network_access: bool,
+        ) -> (String, String) {
             let approval_is_interactive = approval_policy == "on-request";
             let thread_sandbox = if approval_is_interactive {
                 "workspace-write"
@@ -2721,7 +2729,7 @@ pub(super) mod exact_binary {
                 json!({
                     "type": "workspaceWrite",
                     "writableRoots": [self._fixture.expected_cwd],
-                    "networkAccess": true,
+                    "networkAccess": network_access,
                     "excludeTmpdirEnvVar": true,
                     "excludeSlashTmp": true,
                 })
@@ -3349,6 +3357,137 @@ for line in sys.stdin:
                 "exact Codex did not surface the additive rate-limit notification: {observations:?}",
             );
             provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_respects_explicit_network_denial() {
+        with_watchdog(async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            assert!(tokio::net::TcpStream::connect(address).await.is_ok());
+            let mut provider = LoopbackResponsesProvider::start_function_call_then_response(
+                "denied-network",
+                "exec_command",
+                json!({"cmd": format!(
+                    "command -v bash >/dev/null || exit 99; if bash -c 'echo >/dev/tcp/127.0.0.1/{}' 2>/dev/null; then printf 'connected'; else printf 'blocked'; fi",
+                    address.port()
+                )}),
+                RESPONSE,
+            )
+            .await;
+            let mut codex = DirectCodex::start(provider.address);
+            let (thread_id, turn_id) = codex.start_turn_with_network("on-request", false).await;
+            assert_eq!(provider.next_request().await.path, "/responses");
+            let continuation = provider.next_request().await;
+            assert!(continuation.body["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["type"] == "function_call_output"
+                        && item["call_id"] == "denied-network"
+                        && item["output"].as_str().is_some_and(|output| output.contains("blocked"))
+                })
+            }));
+            let terminal = codex.turn_completed(&thread_id, &turn_id).await;
+            assert_eq!(terminal["params"]["turn"]["status"], "completed");
+            codex.finish(provider).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_command_lifecycle_correlates_early_output() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_function_call_then_response(
+                "command-lifecycle",
+                "exec_command",
+                json!({"cmd": "printf 'early output\\n'"}),
+                RESPONSE,
+            )
+            .await;
+            let mut codex = DirectCodex::start(provider.address);
+            let (thread_id, turn_id) = codex.start_turn("never").await;
+            assert_eq!(provider.next_request().await.path, "/responses");
+            let continuation = provider.next_request().await;
+            assert!(continuation.body["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "command-lifecycle"
+                })
+            }));
+            let terminal = codex.turn_completed(&thread_id, &turn_id).await;
+            assert_eq!(terminal["params"]["turn"]["status"], "completed");
+            let started = codex
+                .transcript
+                .iter()
+                .find(|frame| {
+                    frame["method"] == "item/started"
+                        && frame["params"]["item"]["type"] == "commandExecution"
+                        && frame["params"]["threadId"] == thread_id
+                        && frame["params"]["turnId"] == turn_id
+                })
+                .expect("exact Codex must start the command item");
+            let item_id = &started["params"]["item"]["id"];
+            let completed = codex
+                .transcript
+                .iter()
+                .find(|frame| {
+                    frame["method"] == "item/completed"
+                        && frame["params"]["item"]["id"] == *item_id
+                        && frame["params"]["threadId"] == thread_id
+                        && frame["params"]["turnId"] == turn_id
+                })
+                .expect("exact Codex must complete the same command item");
+            assert_eq!(completed["params"]["item"]["exitCode"], 0);
+            assert!(
+                completed["params"]["item"]["aggregatedOutput"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("early output"))
+            );
+            codex.finish(provider).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_declines_elevated_terminal_input_before_launch() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_function_call_then_response(
+                "terminal-approval",
+                "exec_command",
+                json!({
+                    "cmd": "read -r input; printf ran > terminal-command-ran",
+                    "tty": true,
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "Confirm that unattended terminal input cannot be approved.",
+                }),
+                RESPONSE,
+            )
+            .await;
+            let mut codex = DirectCodex::start(provider.address);
+            let marker = codex._fixture.expected_cwd.join("terminal-command-ran");
+            let (thread_id, turn_id) = codex.start_turn("on-request").await;
+            assert_eq!(provider.next_request().await.path, "/responses");
+            codex
+                .decline_approval(
+                    "item/commandExecution/requestApproval",
+                    &thread_id,
+                    &turn_id,
+                )
+                .await;
+            let continuation = provider.next_request().await;
+            assert!(continuation.body["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "terminal-approval"
+                })
+            }));
+            let terminal = codex.turn_completed(&thread_id, &turn_id).await;
+            assert_eq!(terminal["params"]["turn"]["status"], "completed");
+            assert!(!marker.exists());
+            codex.finish(provider).await;
         })
         .await;
     }
