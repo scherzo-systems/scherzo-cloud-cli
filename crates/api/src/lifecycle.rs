@@ -19,11 +19,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MUTATION_ATTEMPTS: usize = 2;
 const DELETION_LIFETIME: time::Duration = time::Duration::days(30);
 const REAUTHENTICATION_REQUIRED: &str =
-    "https://api.scherzo.dev/problems/reauthentication-required";
-const HUMAN_OWNER_REQUIRED: &str = "https://api.scherzo.dev/problems/human-owner-required";
+    "https://api.usefulmachinery.com/problems/reauthentication-required";
+const HUMAN_OWNER_REQUIRED: &str = "https://api.usefulmachinery.com/problems/human-owner-required";
 const TRANSITION_UNAVAILABLE: &str =
-    "https://api.scherzo.dev/problems/lifecycle-transition-unavailable";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
+    "https://api.usefulmachinery.com/problems/lifecycle-transition-unavailable";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

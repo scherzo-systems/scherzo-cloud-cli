@@ -37,21 +37,26 @@ const MUTATION_ATTEMPTS: usize = 2;
 const READ_ATTEMPTS: usize = 1;
 const MERGE_PATCH_MEDIA_TYPE: &str = "application/merge-patch+json";
 const CREATION_NOT_PERMITTED: &str =
-    "https://api.scherzo.dev/problems/organization-creation-not-permitted";
-const SLUG_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/slug-unavailable";
-const QUANTITY_LIMIT_REACHED: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
-const RATE_LIMITED: &str = "https://api.scherzo.dev/problems/rate-limit-exceeded";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
+    "https://api.usefulmachinery.com/problems/organization-creation-not-permitted";
+const SLUG_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/slug-unavailable";
+const QUANTITY_LIMIT_REACHED: &str =
+    "https://api.usefulmachinery.com/problems/quantity-limit-reached";
+const RATE_LIMITED: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const MEMBERSHIP_TRANSITION_UNAVAILABLE: &str =
-    "https://api.scherzo.dev/problems/membership-transition-unavailable";
-const HUMAN_OWNER_REQUIRED: &str = "https://api.scherzo.dev/problems/human-owner-required";
-const RECIPIENT_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/recipient-unavailable";
-const INVITATION_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/invitation-unavailable";
+    "https://api.usefulmachinery.com/problems/membership-transition-unavailable";
+const HUMAN_OWNER_REQUIRED: &str = "https://api.usefulmachinery.com/problems/human-owner-required";
+const RECIPIENT_UNAVAILABLE: &str =
+    "https://api.usefulmachinery.com/problems/recipient-unavailable";
+const INVITATION_UNAVAILABLE: &str =
+    "https://api.usefulmachinery.com/problems/invitation-unavailable";
 const OUTSTANDING_INVITATION_LIMIT: &str =
-    "https://api.scherzo.dev/problems/outstanding-invitation-limit-reached";
-const MEMBERSHIP_LIMIT: &str = "https://api.scherzo.dev/problems/membership-limit-reached";
-const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
-const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupported-media-type";
+    "https://api.usefulmachinery.com/problems/outstanding-invitation-limit-reached";
+const MEMBERSHIP_LIMIT: &str = "https://api.usefulmachinery.com/problems/membership-limit-reached";
+const REQUEST_BODY_TOO_LARGE: &str =
+    "https://api.usefulmachinery.com/problems/request-body-too-large";
+const UNSUPPORTED_MEDIA_TYPE: &str =
+    "https://api.usefulmachinery.com/problems/unsupported-media-type";
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum CommonOrganizationFailure {

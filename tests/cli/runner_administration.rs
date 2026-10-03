@@ -134,7 +134,7 @@ fn rate_limit_response() -> Vec<u8> {
     problem_http_response(
         "429 Too Many Requests",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/rate-limit-exceeded",
+            "type": "https://api.usefulmachinery.com/problems/rate-limit-exceeded",
             "title": "Rate limit exceeded",
             "status": 429
         }),
@@ -417,7 +417,7 @@ fn deletion_refresh_reuses_the_resolved_id_and_invocation_key() {
     let rejected = problem_http_response(
         "401 Unauthorized",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "type": "https://api.usefulmachinery.com/problems/unauthorized",
             "title": "Unauthorized",
             "status": 401
         }),
@@ -496,7 +496,7 @@ fn deletion_blockers_remain_ordered_and_bound_to_the_resolved_id() {
     let blocked = problem_http_response(
         "409 Conflict",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/runner-registration-delete-unavailable",
+            "type": "https://api.usefulmachinery.com/problems/runner-registration-delete-unavailable",
             "title": "Runner registration deletion unavailable",
             "status": 409,
             "blockers": ["capacity_reserved", "nonterminal_assignment"]
@@ -543,7 +543,7 @@ fn post_dispatch_transport_server_and_protocol_failures_report_unknown_commitmen
         problem_http_response(
             "500 Internal Server Error",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/internal-server-error",
+                "type": "https://api.usefulmachinery.com/problems/internal-server-error",
                 "title": "Internal server error",
                 "status": 500
             }),
@@ -725,7 +725,7 @@ fn runner_create_refreshes_a_token_rejected_during_activation() {
     let rejected = problem_http_response(
         "401 Unauthorized",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "type": "https://api.usefulmachinery.com/problems/unauthorized",
             "title": "Unauthorized",
             "status": 401
         }),
@@ -818,7 +818,7 @@ fn runner_create_preserves_registration_when_refresh_replay_fails_early() {
     let rejected = problem_http_response(
         "401 Unauthorized",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "type": "https://api.usefulmachinery.com/problems/unauthorized",
             "title": "Unauthorized",
             "status": 401
         }),

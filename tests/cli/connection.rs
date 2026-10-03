@@ -216,7 +216,7 @@ fn reauthorization_conflict_and_role_loss_have_distinct_outcomes() {
         problem_http_response(
             status,
             serde_json::json!({
-                "type": format!("https://api.scherzo.dev/problems/{kind}"), "title": SECRET, "status":code,"detail":SECRET
+                "type": format!("https://api.usefulmachinery.com/problems/{kind}"), "title": SECRET, "status":code,"detail":SECRET
             }),
         )
     };
@@ -369,7 +369,7 @@ fn polling_stops_on_owner_role_loss_without_restarting_consent() {
         json_http_response("201 Created", session("pending")),
         problem_http_response(
             "403 Forbidden",
-            serde_json::json!({"type":"https://api.scherzo.dev/problems/forbidden","title":SECRET,"status":403}),
+            serde_json::json!({"type":"https://api.usefulmachinery.com/problems/forbidden","title":SECRET,"status":403}),
         ),
     ]);
     let output = env_run(
@@ -403,7 +403,7 @@ fn rejected_service_credential_does_not_expose_a_token() {
     let (server, directory, credential) = prepared(vec![problem_http_response(
         "401 Unauthorized",
         serde_json::json!({
-        "type":"https://api.scherzo.dev/problems/unauthorized","title":SECRET,"status":401}),
+        "type":"https://api.usefulmachinery.com/problems/unauthorized","title":SECRET,"status":401}),
     )]);
     let service_path = directory.path().join("service.key");
     fs::write(

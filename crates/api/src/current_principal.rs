@@ -13,7 +13,7 @@ use super::problem;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const PRINCIPAL_NOT_PROVISIONED: &str =
-    "https://api.scherzo.dev/problems/principal-not-provisioned";
+    "https://api.usefulmachinery.com/problems/principal-not-provisioned";
 const JSON_MEDIA_TYPE: &str = "application/json";
 const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";

@@ -13,7 +13,7 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, pr
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const SOURCE_CONNECTION_CONFLICT: &str =
-    "https://api.scherzo.dev/problems/source-connection-conflict";
+    "https://api.usefulmachinery.com/problems/source-connection-conflict";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

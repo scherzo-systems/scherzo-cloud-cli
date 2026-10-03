@@ -20,14 +20,16 @@ use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_ATTEMPTS: usize = 1;
 const MUTATION_ATTEMPTS: usize = 2;
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
-const QUANTITY_LIMIT_REACHED: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
-const RATE_LIMIT_EXCEEDED: &str = "https://api.scherzo.dev/problems/rate-limit-exceeded";
-const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
+const QUANTITY_LIMIT_REACHED: &str =
+    "https://api.usefulmachinery.com/problems/quantity-limit-reached";
+const RATE_LIMIT_EXCEEDED: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
+const REQUEST_BODY_TOO_LARGE: &str =
+    "https://api.usefulmachinery.com/problems/request-body-too-large";
 const CREDENTIAL_REMOVAL_UNAVAILABLE: &str =
-    "https://api.scherzo.dev/problems/credential-removal-unavailable";
+    "https://api.usefulmachinery.com/problems/credential-removal-unavailable";
 const PLATFORM_CREDENTIAL_REQUIRED: &str =
-    "https://api.scherzo.dev/problems/platform-credential-required";
+    "https://api.usefulmachinery.com/problems/platform-credential-required";
 
 struct SecretResponseString(Zeroizing<String>);
 

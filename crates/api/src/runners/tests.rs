@@ -188,7 +188,7 @@ fn runner_deletion_requires_exact_bodyless_success_and_echoed_key() {
 #[test]
 fn runner_deletion_accepts_only_ordered_resource_specific_blockers() {
     let blocked = serde_json::to_vec(&serde_json::json!({
-        "type": "https://api.scherzo.dev/problems/runner-pool-delete-unavailable",
+        "type": "https://api.usefulmachinery.com/problems/runner-pool-delete-unavailable",
         "title": "Runner pool deletion unavailable",
         "status": 409,
         "blockers": ["runner_registrations_present", "nonterminal_runs_present"]
@@ -205,7 +205,7 @@ fn runner_deletion_accepts_only_ordered_resource_specific_blockers() {
     server.finish_one();
 
     let malformed = serde_json::to_vec(&serde_json::json!({
-        "type": "https://api.scherzo.dev/problems/runner-registration-delete-unavailable",
+        "type": "https://api.usefulmachinery.com/problems/runner-registration-delete-unavailable",
         "title": "Runner registration deletion unavailable",
         "status": 409,
         "blockers": ["nonterminal_assignment", "capacity_reserved"]
@@ -261,7 +261,7 @@ fn name_lookup_stops_after_ten_pages() {
 #[test]
 fn runner_client_requires_contracted_problem_types() {
     let body = serde_json::to_vec(&serde_json::json!({
-        "type": "https://api.scherzo.dev/problems/not-found",
+        "type": "https://api.usefulmachinery.com/problems/not-found",
         "title": "Not found",
         "status": 404
     }))

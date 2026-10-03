@@ -10,20 +10,22 @@ use super::http_client::generated_configuration;
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const BAD_REQUEST: &str = "https://api.scherzo.dev/problems/bad-request";
-const UNAUTHORIZED: &str = "https://api.scherzo.dev/problems/unauthorized";
-const FORBIDDEN: &str = "https://api.scherzo.dev/problems/forbidden";
-const NOT_FOUND: &str = "https://api.scherzo.dev/problems/not-found";
-const NAME_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/runner-name-unavailable";
-const QUANTITY_LIMIT: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
-const RATE_LIMIT: &str = "https://api.scherzo.dev/problems/rate-limit-exceeded";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
-const CREDENTIAL_LIMIT: &str = "https://api.scherzo.dev/problems/runner-credential-limit-reached";
+const BAD_REQUEST: &str = "https://api.usefulmachinery.com/problems/bad-request";
+const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorized";
+const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
+const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
+const NAME_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/runner-name-unavailable";
+const QUANTITY_LIMIT: &str = "https://api.usefulmachinery.com/problems/quantity-limit-reached";
+const RATE_LIMIT: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
+const CREDENTIAL_LIMIT: &str =
+    "https://api.usefulmachinery.com/problems/runner-credential-limit-reached";
 const ACTIVATION_UNAVAILABLE: &str =
-    "https://api.scherzo.dev/problems/runner-activation-unavailable";
+    "https://api.usefulmachinery.com/problems/runner-activation-unavailable";
 const CREDENTIAL_TRANSITION_UNAVAILABLE: &str =
-    "https://api.scherzo.dev/problems/runner-credential-transition-unavailable";
-const POOL_MOVE_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/runner-pool-move-unavailable";
+    "https://api.usefulmachinery.com/problems/runner-credential-transition-unavailable";
+const POOL_MOVE_UNAVAILABLE: &str =
+    "https://api.usefulmachinery.com/problems/runner-pool-move-unavailable";
 
 pub type RunnerPool = models::RunnerPool;
 pub type RunnerPoolList = models::RunnerPoolList;
@@ -483,10 +485,10 @@ fn classify_deletion_response(
     {
         let expected_type = match kind {
             RunnerDeletionKind::Pool => {
-                "https://api.scherzo.dev/problems/runner-pool-delete-unavailable"
+                "https://api.usefulmachinery.com/problems/runner-pool-delete-unavailable"
             }
             RunnerDeletionKind::Registration => {
-                "https://api.scherzo.dev/problems/runner-registration-delete-unavailable"
+                "https://api.usefulmachinery.com/problems/runner-registration-delete-unavailable"
             }
         };
         if decoded.r#type == expected_type {

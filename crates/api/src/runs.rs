@@ -18,7 +18,8 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
 const PRIVATE_CACHE_CONTROL: &str = "private, no-store";
-const RUN_CREATION_REJECTED: &str = "https://api.scherzo.dev/problems/run-creation-rejected";
+const RUN_CREATION_REJECTED: &str =
+    "https://api.usefulmachinery.com/problems/run-creation-rejected";
 // 100 rows can each carry 16 KiB of context. Go's JSON encoder may expand
 // HTML-sensitive bytes sixfold; workflow paths and display/placement names add
 // less than 3 MiB at their admitted bounds. Keep the larger budget list-only.
@@ -581,13 +582,13 @@ fn classify_retry_failure(response: &ReceivedResponse) -> RunFailure {
         }
         return match problem::decode(&response.body, response.status) {
             Ok(problem) => match problem.r#type.as_str() {
-                "https://api.scherzo.dev/problems/trigger-active-run" => {
+                "https://api.usefulmachinery.com/problems/trigger-active-run" => {
                     RunFailure::RetryConflict(RetryConflict::TriggerSlot)
                 }
-                "https://api.scherzo.dev/problems/run-retry-pending" => {
+                "https://api.usefulmachinery.com/problems/run-retry-pending" => {
                     RunFailure::RetryConflict(RetryConflict::Pending)
                 }
-                "https://api.scherzo.dev/problems/idempotency-conflict" => {
+                "https://api.usefulmachinery.com/problems/idempotency-conflict" => {
                     RunFailure::RetryConflict(RetryConflict::Idempotency)
                 }
                 _ => RunFailure::Conflict,
@@ -745,7 +746,7 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
             match problem::decode(&response.body, response.status) {
                 Ok(problem)
                     if problem.r#type
-                        == "https://api.scherzo.dev/problems/idempotency-conflict" =>
+                        == "https://api.usefulmachinery.com/problems/idempotency-conflict" =>
                 {
                     RunFailure::IdempotencyConflict
                 }

@@ -269,7 +269,7 @@ fn rejected_service_key_uses_the_authentication_exit_and_structured_outcome() {
     let response = problem_http_response(
         "401 Unauthorized",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "type": "https://api.usefulmachinery.com/problems/unauthorized",
             "title": "Unauthorized",
             "status": 401
         }),

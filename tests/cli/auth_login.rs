@@ -289,7 +289,7 @@ fn human_login_prefers_the_direct_link_and_explains_required_signup() {
         problem_http_response(
             "403 Forbidden",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/principal-not-provisioned",
+                "type": "https://api.usefulmachinery.com/problems/principal-not-provisioned",
                 "title": "Principal not provisioned",
                 "status": 403
             }),
@@ -366,7 +366,7 @@ fn unauthenticated_existing_check_starts_device_authorization() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -1046,7 +1046,7 @@ fn unauthenticated_principal_confirmation_emits_status_and_removes_token() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -1058,7 +1058,7 @@ fn unauthenticated_principal_confirmation_emits_status_and_removes_token() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -1123,7 +1123,7 @@ fn signup_required_principal_confirmation_preserves_opaque_actions() {
         problem_http_response(
             "403 Forbidden",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/principal-not-provisioned",
+                "type": "https://api.usefulmachinery.com/problems/principal-not-provisioned",
                 "title": "Principal not provisioned",
                 "status": 403,
                 "actions": actions

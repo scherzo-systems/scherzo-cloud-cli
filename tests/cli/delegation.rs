@@ -295,17 +295,17 @@ fn ended_and_inaccessible_delegations_have_stable_failures() {
     let (server, _directory, human_credentials, service_key) = prepared(vec![
         problem_response(
             "409 Conflict",
-            "https://api.scherzo.dev/problems/delegation-transition-unavailable",
+            "https://api.usefulmachinery.com/problems/delegation-transition-unavailable",
             409,
         ),
         problem_response(
             "409 Conflict",
-            "https://api.scherzo.dev/problems/delegation-transition-unavailable",
+            "https://api.usefulmachinery.com/problems/delegation-transition-unavailable",
             409,
         ),
         problem_response(
             "404 Not Found",
-            "https://api.scherzo.dev/problems/not-found",
+            "https://api.usefulmachinery.com/problems/not-found",
             404,
         ),
         http_response_with_headers(
@@ -313,7 +313,7 @@ fn ended_and_inaccessible_delegations_have_stable_failures() {
             Some("application/problem+json"),
             &[("Retry-After", "3")],
             &serde_json::to_vec(&serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/retryable-conflict",
+                "type": "https://api.usefulmachinery.com/problems/retryable-conflict",
                 "title": "Retryable conflict",
                 "status": 503
             }))

@@ -52,7 +52,7 @@ fn problem_response(status: &str, code: u16) -> Vec<u8> {
     problem_http_response(
         status,
         serde_json::json!({
-            "type": format!("https://api.scherzo.dev/problems/fixture-{code}"),
+            "type": format!("https://api.usefulmachinery.com/problems/fixture-{code}"),
             "title": "Fixture problem",
             "status": code
         }),
@@ -540,7 +540,7 @@ fn artifact_list_json_preserves_meaningful_api_failure_classes() {
             problem_http_response(
                 "404 Not Found",
                 serde_json::json!({
-                    "type": "https://api.scherzo.dev/problems/not-found",
+                    "type": "https://api.usefulmachinery.com/problems/not-found",
                     "title": "Not found",
                     "status": 400
                 }),

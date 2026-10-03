@@ -17,10 +17,12 @@ use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ATTEMPTS: usize = 2;
 const MERGE_PATCH_MEDIA_TYPE: &str = "application/merge-patch+json";
-const INVALID_DISPLAY_NAME: &str = "https://api.scherzo.dev/problems/invalid-display-name";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
-const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
-const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupported-media-type";
+const INVALID_DISPLAY_NAME: &str = "https://api.usefulmachinery.com/problems/invalid-display-name";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
+const REQUEST_BODY_TOO_LARGE: &str =
+    "https://api.usefulmachinery.com/problems/request-body-too-large";
+const UNSUPPORTED_MEDIA_TYPE: &str =
+    "https://api.usefulmachinery.com/problems/unsupported-media-type";
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum UpdateProfileOutcome {

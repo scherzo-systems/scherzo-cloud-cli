@@ -22,15 +22,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
 const DEFAULT_LIST_LIMIT: usize = 50;
 const PRIVATE_CACHE_CONTROL: &str = "private, no-store";
-const GONE: &str = "https://api.scherzo.dev/problems/gone";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
-const RUN_NOT_PUBLISHABLE: &str = "https://api.scherzo.dev/problems/run-not-publishable";
-const EXPORT_NOT_PUBLISHABLE: &str = "https://api.scherzo.dev/problems/export-not-publishable";
-const TARGET_MISMATCH: &str = "https://api.scherzo.dev/problems/publication-target-mismatch";
-const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
-const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupported-media-type";
-const INTERNAL_SERVER_ERROR: &str = "https://api.scherzo.dev/problems/internal-server-error";
-const RETRYABLE_CONFLICT: &str = "https://api.scherzo.dev/problems/retryable-conflict";
+const GONE: &str = "https://api.usefulmachinery.com/problems/gone";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
+const RUN_NOT_PUBLISHABLE: &str = "https://api.usefulmachinery.com/problems/run-not-publishable";
+const EXPORT_NOT_PUBLISHABLE: &str =
+    "https://api.usefulmachinery.com/problems/export-not-publishable";
+const TARGET_MISMATCH: &str =
+    "https://api.usefulmachinery.com/problems/publication-target-mismatch";
+const REQUEST_BODY_TOO_LARGE: &str =
+    "https://api.usefulmachinery.com/problems/request-body-too-large";
+const UNSUPPORTED_MEDIA_TYPE: &str =
+    "https://api.usefulmachinery.com/problems/unsupported-media-type";
+const INTERNAL_SERVER_ERROR: &str =
+    "https://api.usefulmachinery.com/problems/internal-server-error";
+const RETRYABLE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/retryable-conflict";
 
 pub type Publication = models::Publication;
 pub type PublicationList = models::PublicationList;

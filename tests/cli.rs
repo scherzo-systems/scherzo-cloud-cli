@@ -786,7 +786,7 @@ fn insecure_http_flag_is_scoped_to_networked_leaf_commands() {
     assert_eq!(misplaced.status.code(), Some(2));
     assert!(misplaced.stdout.is_empty());
 
-    let body = br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#;
+    let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
     let server = OneShotServer::respond("401 Unauthorized", Some("application/problem+json"), body);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
@@ -813,7 +813,7 @@ fn partial_deployment_override_fails_before_auth_dispatch() {
 
 #[test]
 fn networked_auth_requires_http_opt_in_but_local_logout_does_not() {
-    let body = br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#;
+    let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
     let server = OneShotServer::respond("401 Unauthorized", Some("application/problem+json"), body);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
@@ -973,7 +973,7 @@ fn structured_status_preserves_signup_actions_without_synthesizing_fields() {
         "additional": { "preserved": true }
     }]);
     let body = serde_json::to_vec(&serde_json::json!({
-        "type": "https://api.scherzo.dev/problems/principal-not-provisioned",
+        "type": "https://api.usefulmachinery.com/problems/principal-not-provisioned",
         "title": "Principal not provisioned",
         "status": 403,
         "actions": actions
@@ -1025,7 +1025,7 @@ fn structured_status_omits_absent_optional_fields() {
         (
             "403 Forbidden",
             "application/problem+json",
-            br#"{"type":"https://api.scherzo.dev/problems/principal-not-provisioned","title":"Principal not provisioned","status":403}"#.as_slice(),
+            br#"{"type":"https://api.usefulmachinery.com/problems/principal-not-provisioned","title":"Principal not provisioned","status":403}"#.as_slice(),
             "",
             "actions",
         ),
@@ -1058,7 +1058,7 @@ fn structured_status_omits_absent_optional_fields() {
 
 #[test]
 fn status_without_a_credential_still_contacts_the_server_without_authorization() {
-    let body = br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#;
+    let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
     let server = OneShotServer::respond("401 Unauthorized", Some("application/problem+json"), body);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
@@ -1163,7 +1163,7 @@ fn rejected_status_access_token_refreshes_once_and_retries_once() {
     let unauthorized = problem_http_response(
         "401 Unauthorized",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "type": "https://api.usefulmachinery.com/problems/unauthorized",
             "title": "Unauthorized",
             "status": 401
         }),
@@ -1221,7 +1221,7 @@ fn a_second_status_rejection_stops_without_an_authentication_loop() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -1273,7 +1273,7 @@ fn terminal_refresh_rejection_removes_session_and_checks_anonymously() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -1738,7 +1738,7 @@ fn malformed_unauthorized_response_deletes_the_rejected_credential() {
 
 #[test]
 fn human_status_writes_the_recognized_result_to_stdout() {
-    let body = br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#;
+    let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
     let server = OneShotServer::respond("401 Unauthorized", Some("application/problem+json"), body);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");

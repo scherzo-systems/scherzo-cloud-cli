@@ -149,7 +149,11 @@ fn recognized_http_failures_map_to_closed_status_categories() {
         (
             "401 Unauthorized",
             Some(PROBLEM_MEDIA_TYPE),
-            problem(401, "https://api.scherzo.dev/problems/unauthorized", None),
+            problem(
+                401,
+                "https://api.usefulmachinery.com/problems/unauthorized",
+                None,
+            ),
             CurrentPrincipalOutcome::Unauthenticated,
         ),
         (

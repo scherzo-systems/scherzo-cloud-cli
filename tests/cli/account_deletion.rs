@@ -380,11 +380,11 @@ fn account_deletion_request_emits_json_for_an_invalid_api_response() {
 fn account_deletion_request_reports_owner_and_existing_schedule_conflicts() {
     for (problem_type, expected_outcome) in [
         (
-            "https://api.scherzo.dev/problems/human-owner-required",
+            "https://api.usefulmachinery.com/problems/human-owner-required",
             "human_owner_required",
         ),
         (
-            "https://api.scherzo.dev/problems/lifecycle-transition-unavailable",
+            "https://api.usefulmachinery.com/problems/lifecycle-transition-unavailable",
             "transition_unavailable",
         ),
     ] {
@@ -548,11 +548,11 @@ fn account_deletion_cancellation_emits_a_terminal_result_for_an_invalid_api_resp
 fn account_deletion_cancellation_reports_reauthentication_and_already_cancelled_states() {
     for (problem_type, expected_outcome) in [
         (
-            "https://api.scherzo.dev/problems/reauthentication-required",
+            "https://api.usefulmachinery.com/problems/reauthentication-required",
             "reauthentication_required",
         ),
         (
-            "https://api.scherzo.dev/problems/lifecycle-transition-unavailable",
+            "https://api.usefulmachinery.com/problems/lifecycle-transition-unavailable",
             "transition_unavailable",
         ),
     ] {

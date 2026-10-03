@@ -18,19 +18,23 @@ use um_support::valid_typed_id;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_ATTEMPTS: usize = 1;
 const MUTATION_ATTEMPTS: usize = 2;
-const INVALID_IDENTITY_PROOF: &str = "https://api.scherzo.dev/problems/invalid-identity-proof";
-const IDENTITY_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/identity-unavailable";
-const IDENTITY_NOT_FOUND: &str = "https://api.scherzo.dev/problems/identity-not-found";
+const INVALID_IDENTITY_PROOF: &str =
+    "https://api.usefulmachinery.com/problems/invalid-identity-proof";
+const IDENTITY_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/identity-unavailable";
+const IDENTITY_NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/identity-not-found";
 const IDENTITY_REMOVAL_UNAVAILABLE: &str =
-    "https://api.scherzo.dev/problems/identity-removal-unavailable";
+    "https://api.usefulmachinery.com/problems/identity-removal-unavailable";
 const REAUTHENTICATION_REQUIRED: &str =
-    "https://api.scherzo.dev/problems/reauthentication-required";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
-const QUANTITY_LIMIT_REACHED: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
+    "https://api.usefulmachinery.com/problems/reauthentication-required";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
+const QUANTITY_LIMIT_REACHED: &str =
+    "https://api.usefulmachinery.com/problems/quantity-limit-reached";
 const WORKLOAD_IDENTITY_LINKING_NOT_PERMITTED: &str =
-    "https://api.scherzo.dev/problems/workload-identity-linking-not-permitted";
-const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
-const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupported-media-type";
+    "https://api.usefulmachinery.com/problems/workload-identity-linking-not-permitted";
+const REQUEST_BODY_TOO_LARGE: &str =
+    "https://api.usefulmachinery.com/problems/request-body-too-large";
+const UNSUPPORTED_MEDIA_TYPE: &str =
+    "https://api.usefulmachinery.com/problems/unsupported-media-type";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

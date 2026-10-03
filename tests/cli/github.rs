@@ -422,7 +422,7 @@ fn meaningful_api_failures_have_closed_json_and_exit_statuses() {
         github_problem(
             "409 Conflict",
             409,
-            "https://api.scherzo.dev/problems/source-connection-conflict",
+            "https://api.usefulmachinery.com/problems/source-connection-conflict",
         ),
         vec!["github", "repository", "list", ORGANIZATION, INSTALLATION],
         "source_connection_conflict",
@@ -458,7 +458,7 @@ fn setup_conflict_is_actionable_on_standard_error_without_problem_prose() {
     let response = github_problem(
         "409 Conflict",
         409,
-        "https://api.scherzo.dev/problems/source-connection-conflict",
+        "https://api.usefulmachinery.com/problems/source-connection-conflict",
     );
     let (server, _directory, credential_path) = prepared_github(vec![response]);
     let environment = deployment_environment(&server.api_url, &credential_path);

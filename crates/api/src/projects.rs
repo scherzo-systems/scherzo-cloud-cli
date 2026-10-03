@@ -17,16 +17,16 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MUTATION_ATTEMPTS: usize = 2;
-const BAD_REQUEST: &str = "https://api.scherzo.dev/problems/bad-request";
-const UNAUTHORIZED: &str = "https://api.scherzo.dev/problems/unauthorized";
-const FORBIDDEN: &str = "https://api.scherzo.dev/problems/forbidden";
-const NOT_FOUND: &str = "https://api.scherzo.dev/problems/not-found";
-const REPOSITORY_NOT_BOUND: &str = "https://api.scherzo.dev/problems/repository-not-bound";
-const NAME_UNAVAILABLE: &str = "https://api.scherzo.dev/problems/project-name-unavailable";
-const QUANTITY_LIMIT: &str = "https://api.scherzo.dev/problems/quantity-limit-reached";
-const RATE_LIMIT: &str = "https://api.scherzo.dev/problems/rate-limit-exceeded";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
-const SOURCE_CONFLICT: &str = "https://api.scherzo.dev/problems/source-connection-conflict";
+const BAD_REQUEST: &str = "https://api.usefulmachinery.com/problems/bad-request";
+const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorized";
+const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
+const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
+const REPOSITORY_NOT_BOUND: &str = "https://api.usefulmachinery.com/problems/repository-not-bound";
+const NAME_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/project-name-unavailable";
+const QUANTITY_LIMIT: &str = "https://api.usefulmachinery.com/problems/quantity-limit-reached";
+const RATE_LIMIT: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
+const SOURCE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/source-connection-conflict";
 
 pub type Project = models::Project;
 pub type ProjectList = models::ProjectList;

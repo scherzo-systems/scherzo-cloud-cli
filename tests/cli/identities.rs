@@ -456,7 +456,7 @@ fn link_reports_identity_unavailable_without_exposing_or_replacing_credentials()
     let conflict = identity_problem(
         "409 Conflict",
         409,
-        "https://api.scherzo.dev/problems/identity-unavailable",
+        "https://api.usefulmachinery.com/problems/identity-unavailable",
     );
     let (server, _directory, credential_path) =
         prepared_identity_command(identity_link_flow_responses(vec![conflict]));
@@ -510,13 +510,13 @@ fn service_link_reports_workload_policy_and_quantity_failures() {
         (
             "403 Forbidden",
             403,
-            "https://api.scherzo.dev/problems/workload-identity-linking-not-permitted",
+            "https://api.usefulmachinery.com/problems/workload-identity-linking-not-permitted",
             "workload_identity_linking_not_permitted",
         ),
         (
             "409 Conflict",
             409,
-            "https://api.scherzo.dev/problems/quantity-limit-reached",
+            "https://api.usefulmachinery.com/problems/quantity-limit-reached",
             "quantity_limit_reached",
         ),
     ];
@@ -567,7 +567,7 @@ fn link_does_not_report_an_unchanged_session_after_rejected_credential_cleanup()
     let rejected = identity_problem(
         "401 Unauthorized",
         401,
-        "https://api.scherzo.dev/problems/unauthorized",
+        "https://api.usefulmachinery.com/problems/unauthorized",
     );
     let (server, _directory, credential_path) =
         prepared_identity_command(identity_link_flow_responses(vec![
@@ -718,7 +718,7 @@ fn remove_reports_freshness_and_retention_outcomes() {
             identity_problem(
                 "403 Forbidden",
                 403,
-                "https://api.scherzo.dev/problems/reauthentication-required",
+                "https://api.usefulmachinery.com/problems/reauthentication-required",
             ),
             "reauthentication_required",
         ),
@@ -726,7 +726,7 @@ fn remove_reports_freshness_and_retention_outcomes() {
             identity_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/identity-removal-unavailable",
+                "https://api.usefulmachinery.com/problems/identity-removal-unavailable",
             ),
             "removal_unavailable",
         ),
@@ -766,7 +766,7 @@ fn service_remove_reports_disabled_workload_identity_linking() {
     let server = ScriptedServer::respond(vec![identity_problem(
         "403 Forbidden",
         403,
-        "https://api.scherzo.dev/problems/workload-identity-linking-not-permitted",
+        "https://api.usefulmachinery.com/problems/workload-identity-linking-not-permitted",
     )]);
     let directory = private_credential_directory();
     let service_key_path = directory.path().join("service.key");

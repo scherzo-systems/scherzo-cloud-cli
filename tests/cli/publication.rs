@@ -624,7 +624,7 @@ fn publication_show_wait_renews_authentication_for_each_observation() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -998,7 +998,7 @@ fn generated_key_is_reused_across_authentication_and_transport_retries() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -1150,7 +1150,7 @@ fn publication_failures_use_registered_exits_and_redact_response_details() {
     let (server, _directory, credential_path) = prepared_publication(vec![problem_http_response(
         "403 Forbidden",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/forbidden",
+            "type": "https://api.usefulmachinery.com/problems/forbidden",
             "title": "Forbidden",
             "status": 403,
             "detail": signed_url
@@ -1174,7 +1174,7 @@ fn publication_failures_use_registered_exits_and_redact_response_details() {
             Some("application/problem+json"),
             &[("Retry-After", "1")],
             &serde_json::to_vec(&serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/retryable-conflict",
+                "type": "https://api.usefulmachinery.com/problems/retryable-conflict",
                 "title": "Retryable conflict",
                 "status": 503
             }))
@@ -1200,7 +1200,7 @@ fn ambiguous_creation_preserves_the_generated_key_when_refresh_loses_authenticat
             problem_http_response(
                 "401 Unauthorized",
                 serde_json::json!({
-                    "type": "https://api.scherzo.dev/problems/unauthorized",
+                    "type": "https://api.usefulmachinery.com/problems/unauthorized",
                     "title": "Unauthorized",
                     "status": 401
                 }),
@@ -1261,7 +1261,7 @@ fn post_dispatch_session_protocol_failure_emits_one_recovery_document() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),

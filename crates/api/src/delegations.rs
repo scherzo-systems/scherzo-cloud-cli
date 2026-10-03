@@ -25,11 +25,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_ATTEMPTS: usize = 1;
 const MUTATION_ATTEMPTS: usize = 2;
 const DELEGATION_TRANSITION_UNAVAILABLE: &str =
-    "https://api.scherzo.dev/problems/delegation-transition-unavailable";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
-const REQUEST_BODY_TOO_LARGE: &str = "https://api.scherzo.dev/problems/request-body-too-large";
-const UNSUPPORTED_MEDIA_TYPE: &str = "https://api.scherzo.dev/problems/unsupported-media-type";
-const RETRYABLE_CONFLICT: &str = "https://api.scherzo.dev/problems/retryable-conflict";
+    "https://api.usefulmachinery.com/problems/delegation-transition-unavailable";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
+const REQUEST_BODY_TOO_LARGE: &str =
+    "https://api.usefulmachinery.com/problems/request-body-too-large";
+const UNSUPPORTED_MEDIA_TYPE: &str =
+    "https://api.usefulmachinery.com/problems/unsupported-media-type";
+const RETRYABLE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/retryable-conflict";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

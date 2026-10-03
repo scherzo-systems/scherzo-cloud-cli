@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn generated_problem_preserves_opaque_actions() {
         let input = serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/principal-not-provisioned",
+            "type": "https://api.usefulmachinery.com/problems/principal-not-provisioned",
             "title": "Principal not provisioned",
             "status": 403,
             "actions": [{

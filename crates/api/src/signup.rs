@@ -19,11 +19,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ATTEMPTS: usize = 2;
 const JSON_MEDIA_TYPE: &str = "application/json";
 const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";
-const UNAUTHORIZED: &str = "https://api.scherzo.dev/problems/unauthorized";
-const SIGNUP_NOT_PERMITTED: &str = "https://api.scherzo.dev/problems/signup-not-permitted";
+const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorized";
+const SIGNUP_NOT_PERMITTED: &str = "https://api.usefulmachinery.com/problems/signup-not-permitted";
 const PRINCIPAL_ALREADY_PROVISIONED: &str =
-    "https://api.scherzo.dev/problems/principal-already-provisioned";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.scherzo.dev/problems/idempotency-conflict";
+    "https://api.usefulmachinery.com/problems/principal-already-provisioned";
+const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum SignupOutcome {

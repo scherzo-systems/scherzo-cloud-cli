@@ -153,7 +153,7 @@ fn project_list_uses_only_the_explicit_service_api_key() {
     let server = ScriptedServer::respond(vec![problem_http_response(
         "401 Unauthorized",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/unauthorized",
+            "type": "https://api.usefulmachinery.com/problems/unauthorized",
             "title": "Unauthorized",
             "status": 401
         }),
@@ -866,7 +866,7 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
         (
             vec!["project", "repository", "show", ORGANIZATION, PROJECT_ID],
             "404 Not Found",
-            "https://api.scherzo.dev/problems/repository-not-bound",
+            "https://api.usefulmachinery.com/problems/repository-not-bound",
             "repository_not_bound",
             1,
         ),
@@ -883,7 +883,7 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
                 REPOSITORY_ID,
             ],
             "409 Conflict",
-            "https://api.scherzo.dev/problems/project-name-unavailable",
+            "https://api.usefulmachinery.com/problems/project-name-unavailable",
             "name_unavailable",
             1,
         ),
@@ -900,7 +900,7 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
                 REPOSITORY_ID,
             ],
             "409 Conflict",
-            "https://api.scherzo.dev/problems/source-connection-conflict",
+            "https://api.usefulmachinery.com/problems/source-connection-conflict",
             "source_conflict",
             1,
         ),
@@ -917,7 +917,7 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
                 REPOSITORY_ID,
             ],
             "429 Too Many Requests",
-            "https://api.scherzo.dev/problems/rate-limit-exceeded",
+            "https://api.usefulmachinery.com/problems/rate-limit-exceeded",
             "rate_limited",
             4,
         ),
@@ -1004,7 +1004,7 @@ fn project_mutation_rejects_a_different_project_identity() {
 fn project_rate_limit_requires_a_positive_retry_after() {
     for retry_after in [None, Some("0"), Some("invalid")] {
         let body = serde_json::to_vec(&serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/rate-limit-exceeded",
+            "type": "https://api.usefulmachinery.com/problems/rate-limit-exceeded",
             "title": "Rate limited",
             "status": 429
         }))

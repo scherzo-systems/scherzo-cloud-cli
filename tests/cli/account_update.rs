@@ -160,7 +160,7 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             update_problem(
                 "400 Bad Request",
                 400,
-                "https://api.scherzo.dev/problems/invalid-display-name",
+                "https://api.usefulmachinery.com/problems/invalid-display-name",
             ),
             "invalid_display_name",
             1,
@@ -169,7 +169,7 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             update_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/idempotency-conflict",
+                "https://api.usefulmachinery.com/problems/idempotency-conflict",
             ),
             "idempotency_conflict",
             1,
@@ -178,7 +178,7 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             update_problem(
                 "413 Payload Too Large",
                 413,
-                "https://api.scherzo.dev/problems/request-body-too-large",
+                "https://api.usefulmachinery.com/problems/request-body-too-large",
             ),
             "request_too_large",
             1,
@@ -187,7 +187,7 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
             update_problem(
                 "415 Unsupported Media Type",
                 415,
-                "https://api.scherzo.dev/problems/unsupported-media-type",
+                "https://api.usefulmachinery.com/problems/unsupported-media-type",
             ),
             "unsupported_media_type",
             1,
@@ -228,7 +228,7 @@ fn rejected_display_name_has_a_stable_human_remedy() {
     let response = update_problem(
         "400 Bad Request",
         400,
-        "https://api.scherzo.dev/problems/invalid-display-name",
+        "https://api.usefulmachinery.com/problems/invalid-display-name",
     );
     let (server, _directory, credential_path) = prepared_update(vec![response]);
     let environment =

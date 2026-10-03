@@ -5,10 +5,10 @@ use super::generated::models;
 pub(super) const JSON_MEDIA_TYPE: &str = "application/json";
 pub(super) const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 pub(super) const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";
-pub(super) const BAD_REQUEST: &str = "https://api.scherzo.dev/problems/bad-request";
-pub(super) const UNAUTHORIZED: &str = "https://api.scherzo.dev/problems/unauthorized";
-pub(super) const FORBIDDEN: &str = "https://api.scherzo.dev/problems/forbidden";
-pub(super) const NOT_FOUND: &str = "https://api.scherzo.dev/problems/not-found";
+pub(super) const BAD_REQUEST: &str = "https://api.usefulmachinery.com/problems/bad-request";
+pub(super) const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorized";
+pub(super) const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
+pub(super) const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
 
 pub(super) fn decode_type(
     response: &super::http_util::BufferedResponse,

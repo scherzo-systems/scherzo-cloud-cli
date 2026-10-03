@@ -126,7 +126,7 @@ mod retry_command_tests {
                             _ => ("409 Conflict", "Conflict"),
                         };
                         let status_number: u16 = status.split(' ').next().unwrap().parse().unwrap();
-                        let body = serde_json::json!({"type":format!("https://api.scherzo.dev/problems/{other}"),"title":title,"status":status_number});
+                        let body = serde_json::json!({"type":format!("https://api.usefulmachinery.com/problems/{other}"),"title":title,"status":status_number});
                         let bytes = serde_json::to_vec(&body).unwrap();
                         Some(http_response_with_headers(
                             status,
@@ -361,7 +361,7 @@ mod retry_command_tests {
                 "401 Unauthorized",
                 Some("application/problem+json"),
                 &[],
-                br#"{"type":"https://api.scherzo.dev/problems/unauthorized","title":"Unauthorized","status":401}"#,
+                br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#,
             ))
             .unwrap();
             drop(post);
@@ -1198,7 +1198,7 @@ fn cancellation_observation_failure_retains_reconciliation_identity_without_post
             problem_http_response(
                 "403 Forbidden",
                 serde_json::json!({
-                    "type":"https://api.scherzo.dev/problems/forbidden", "title":"Forbidden", "status":403
+                    "type":"https://api.usefulmachinery.com/problems/forbidden", "title":"Forbidden", "status":403
                 }),
             ),
         ]);
@@ -1570,7 +1570,7 @@ fn cancellation_definite_rate_limit_is_not_reported_as_unknown_acceptance() {
     let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
         "429 Too Many Requests",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/too-many-requests", "title": "Slow down", "status": 429
+            "type": "https://api.usefulmachinery.com/problems/too-many-requests", "title": "Slow down", "status": 429
         }),
     )]);
     let environment = deployment_environment(&server.api_url, &credential_path);
@@ -1601,7 +1601,7 @@ fn cancellation_key_conflict_does_not_send_escalation_or_claim_acceptance() {
     let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
         "409 Conflict",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/idempotency-conflict",
+            "type": "https://api.usefulmachinery.com/problems/idempotency-conflict",
             "title": "Conflict", "status": 409
         }),
     )]);
@@ -4916,7 +4916,7 @@ fn exactly_one_mib_text_input_reaches_input_set_creation() {
         prepared_run(vec![problem_http_response(
             "403 Forbidden",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/forbidden",
+                "type": "https://api.usefulmachinery.com/problems/forbidden",
                 "title": "Forbidden",
                 "status": 403
             }),
@@ -4951,7 +4951,7 @@ fn credential_rejection_reuses_the_create_key_and_reports_the_server_replay() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -5117,7 +5117,7 @@ fn text_input_sequence_refreshes_authority_but_does_not_treat_network_failure_as
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -5320,7 +5320,7 @@ fn failed_staging_reports_allocated_input_set_in_human_mode() {
         problem_http_response(
             "403 Forbidden",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/forbidden",
+                "type": "https://api.usefulmachinery.com/problems/forbidden",
                 "title": "Forbidden",
                 "status": 403
             }),
@@ -5527,7 +5527,7 @@ fn run_show_distinguishes_pending_creation_and_creation_rejection() {
         Some("application/problem+json"),
         &[("Cache-Control", "private, no-store")],
         &serde_json::to_vec(&serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/run-creation-rejected",
+            "type": "https://api.usefulmachinery.com/problems/run-creation-rejected",
             "title": "Run creation rejected",
             "status": 409
         }))
@@ -5679,7 +5679,7 @@ fn show_wait_bounds_expiring_and_rejected_credential_refresh() {
                 problem_http_response(
                     "401 Unauthorized",
                     serde_json::json!({
-                        "type": "https://api.scherzo.dev/problems/unauthorized",
+                        "type": "https://api.usefulmachinery.com/problems/unauthorized",
                         "title": "Unauthorized",
                         "status": 401
                     }),
@@ -5756,7 +5756,7 @@ fn show_wait_refreshes_authentication_and_recovers_from_one_server_failure() {
         problem_http_response(
             "401 Unauthorized",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/unauthorized",
+                "type": "https://api.usefulmachinery.com/problems/unauthorized",
                 "title": "Unauthorized",
                 "status": 401
             }),
@@ -5773,7 +5773,7 @@ fn show_wait_refreshes_authentication_and_recovers_from_one_server_failure() {
         problem_http_response(
             "500 Internal Server Error",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/internal-server-error",
+                "type": "https://api.usefulmachinery.com/problems/internal-server-error",
                 "title": "Internal Server Error",
                 "status": 500
             }),
@@ -5842,7 +5842,7 @@ fn show_wait_preserves_fatal_response_classifications() {
             problem_http_response(
                 "403 Forbidden",
                 serde_json::json!({
-                    "type": "https://api.scherzo.dev/problems/forbidden",
+                    "type": "https://api.usefulmachinery.com/problems/forbidden",
                     "title": "Forbidden",
                     "status": 403
                 }),
@@ -5853,7 +5853,7 @@ fn show_wait_preserves_fatal_response_classifications() {
             problem_http_response(
                 "404 Not Found",
                 serde_json::json!({
-                    "type": "https://api.scherzo.dev/problems/not-found",
+                    "type": "https://api.usefulmachinery.com/problems/not-found",
                     "title": "Not Found",
                     "status": 404
                 }),
@@ -6172,7 +6172,7 @@ fn run_failures_use_registered_outcomes_without_exposing_secrets() {
         (
             "403 Forbidden",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/forbidden",
+                "type": "https://api.usefulmachinery.com/problems/forbidden",
                 "title": "Forbidden",
                 "status": 403,
                 "detail": "unique-response-capability-material"
@@ -6182,7 +6182,7 @@ fn run_failures_use_registered_outcomes_without_exposing_secrets() {
         (
             "404 Not Found",
             serde_json::json!({
-                "type": "https://api.scherzo.dev/problems/not-found",
+                "type": "https://api.usefulmachinery.com/problems/not-found",
                 "title": "Not found",
                 "status": 404
             }),
@@ -6215,7 +6215,7 @@ fn run_failures_use_registered_outcomes_without_exposing_secrets() {
     let (conflict, _directory, credential_path) = prepared_run(vec![problem_http_response(
         "409 Conflict",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/project-not-ready",
+            "type": "https://api.usefulmachinery.com/problems/project-not-ready",
             "title": "Project not ready",
             "status": 409,
             "blockers": ["runner_pool_unassigned"]

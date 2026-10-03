@@ -150,19 +150,19 @@ fn organization_deletion_request_preserves_owner_and_private_target_failures() {
         (
             "403 Forbidden",
             403,
-            "https://api.scherzo.dev/problems/forbidden",
+            "https://api.usefulmachinery.com/problems/forbidden",
             "forbidden",
         ),
         (
             "404 Not Found",
             404,
-            "https://api.scherzo.dev/problems/not-found",
+            "https://api.usefulmachinery.com/problems/not-found",
             "not_found",
         ),
         (
             "409 Conflict",
             409,
-            "https://api.scherzo.dev/problems/lifecycle-transition-unavailable",
+            "https://api.usefulmachinery.com/problems/lifecycle-transition-unavailable",
             "transition_unavailable",
         ),
     ] {
@@ -267,7 +267,7 @@ fn organization_deletion_cancellation_does_not_weaken_owner_or_actor_proof() {
     let terminal = organization_lifecycle_problem(
         "403 Forbidden",
         403,
-        "https://api.scherzo.dev/problems/reauthentication-required",
+        "https://api.usefulmachinery.com/problems/reauthentication-required",
     );
     let (server, _directory, credential_path) =
         prepared_organization_deletion(organization_cancellation_flow(terminal));

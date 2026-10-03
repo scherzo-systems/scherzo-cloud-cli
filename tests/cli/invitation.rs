@@ -470,7 +470,7 @@ fn unavailable_invitation_returns_stable_json_and_exit_code() {
     let (server, _directory, _path, credential_path) = prepared(vec![problem_http_response(
         "409 Conflict",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/invitation-unavailable",
+            "type": "https://api.usefulmachinery.com/problems/invitation-unavailable",
             "title": "Invitation unavailable",
             "status": 409
         }),
@@ -503,19 +503,19 @@ fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
     let (server, _directory, _path, credential_path) = prepared(vec![
         problem_response_with_headers(
             "429 Too Many Requests",
-            "https://api.scherzo.dev/problems/rate-limit-exceeded",
+            "https://api.usefulmachinery.com/problems/rate-limit-exceeded",
             429,
             &[("Retry-After", "17")],
         ),
         problem_response_with_headers(
             "409 Conflict",
-            "https://api.scherzo.dev/problems/membership-limit-reached",
+            "https://api.usefulmachinery.com/problems/membership-limit-reached",
             409,
             &[],
         ),
         problem_response_with_headers(
             "409 Conflict",
-            "https://api.scherzo.dev/problems/idempotency-conflict",
+            "https://api.usefulmachinery.com/problems/idempotency-conflict",
             409,
             &[],
         ),

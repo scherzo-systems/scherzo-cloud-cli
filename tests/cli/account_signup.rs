@@ -133,7 +133,7 @@ fn signup_reports_policy_denial_without_claiming_a_principal() {
     let response = problem_http_response(
         "403 Forbidden",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/signup-not-permitted",
+            "type": "https://api.usefulmachinery.com/problems/signup-not-permitted",
             "title": "Signup not permitted",
             "status": 403,
             "detail": "The platform signup policy does not permit signup."
@@ -168,7 +168,7 @@ fn already_provisioned_signup_directs_the_human_to_status() {
     let response = problem_http_response(
         "409 Conflict",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/principal-already-provisioned",
+            "type": "https://api.usefulmachinery.com/problems/principal-already-provisioned",
             "title": "Principal already provisioned",
             "status": 409
         }),

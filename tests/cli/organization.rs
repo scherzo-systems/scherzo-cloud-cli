@@ -215,7 +215,7 @@ fn response_with_detail(detail: &str) -> Vec<u8> {
     problem_http_response(
         "404 Not Found",
         serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/not-found",
+            "type": "https://api.usefulmachinery.com/problems/not-found",
             "title": "Private target",
             "status": 404,
             "detail": detail
@@ -464,7 +464,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "400 Bad Request",
                 400,
-                "https://api.scherzo.dev/problems/bad-request",
+                "https://api.usefulmachinery.com/problems/bad-request",
             ),
             "invalid_input",
             1,
@@ -474,7 +474,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "401 Unauthorized",
                 401,
-                "https://api.scherzo.dev/problems/unauthorized",
+                "https://api.usefulmachinery.com/problems/unauthorized",
             ),
             "unauthenticated",
             3,
@@ -484,7 +484,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "403 Forbidden",
                 403,
-                "https://api.scherzo.dev/problems/forbidden",
+                "https://api.usefulmachinery.com/problems/forbidden",
             ),
             "forbidden",
             1,
@@ -494,7 +494,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "403 Forbidden",
                 403,
-                "https://api.scherzo.dev/problems/organization-creation-not-permitted",
+                "https://api.usefulmachinery.com/problems/organization-creation-not-permitted",
             ),
             "creation_not_permitted",
             1,
@@ -504,7 +504,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/slug-unavailable",
+                "https://api.usefulmachinery.com/problems/slug-unavailable",
             ),
             "slug_unavailable",
             1,
@@ -514,7 +514,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/quantity-limit-reached",
+                "https://api.usefulmachinery.com/problems/quantity-limit-reached",
             ),
             "quantity_limit_reached",
             1,
@@ -524,7 +524,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/idempotency-conflict",
+                "https://api.usefulmachinery.com/problems/idempotency-conflict",
             ),
             "idempotency_conflict",
             1,
@@ -536,7 +536,7 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
                 Some("application/problem+json"),
                 &[("Retry-After", "42")],
                 &serde_json::to_vec(&serde_json::json!({
-                    "type": "https://api.scherzo.dev/problems/rate-limit-exceeded",
+                    "type": "https://api.usefulmachinery.com/problems/rate-limit-exceeded",
                     "title": "organization-problem-title-sentinel",
                     "status": 429,
                     "detail": "organization-problem-detail-sentinel"
@@ -641,7 +641,7 @@ fn malformed_rate_limit_metadata_is_a_protocol_failure() {
             .map(|value| vec![("Retry-After", value)])
             .unwrap_or_default();
         let body = serde_json::to_vec(&serde_json::json!({
-            "type": "https://api.scherzo.dev/problems/rate-limit-exceeded",
+            "type": "https://api.usefulmachinery.com/problems/rate-limit-exceeded",
             "title": "rate-title-sentinel",
             "status": 429,
             "detail": "rate-detail-sentinel"
@@ -685,7 +685,7 @@ fn unauthorized_removes_only_the_rejected_credential_and_forbidden_retains_it() 
             organization_problem(
                 "401 Unauthorized",
                 401,
-                "https://api.scherzo.dev/problems/unauthorized",
+                "https://api.usefulmachinery.com/problems/unauthorized",
             ),
             3,
             false,
@@ -703,7 +703,7 @@ fn unauthorized_removes_only_the_rejected_credential_and_forbidden_retains_it() 
             organization_problem(
                 "403 Forbidden",
                 403,
-                "https://api.scherzo.dev/problems/forbidden",
+                "https://api.usefulmachinery.com/problems/forbidden",
             ),
             1,
             true,
@@ -795,7 +795,7 @@ fn a_rejected_request_does_not_remove_a_concurrently_replaced_credential() {
     let response = organization_problem(
         "401 Unauthorized",
         401,
-        "https://api.scherzo.dev/problems/unauthorized",
+        "https://api.usefulmachinery.com/problems/unauthorized",
     );
     let mut server = ScriptedServer::respond_with_paused_first_response(vec![
         response,
@@ -1150,7 +1150,7 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/slug-unavailable",
+                "https://api.usefulmachinery.com/problems/slug-unavailable",
             ),
             "slug_unavailable",
             1,
@@ -1159,7 +1159,7 @@ fn update_expected_outcomes_have_exact_json_and_exit_statuses() {
             organization_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/idempotency-conflict",
+                "https://api.usefulmachinery.com/problems/idempotency-conflict",
             ),
             "idempotency_conflict",
             1,
@@ -1287,7 +1287,7 @@ fn human_organization_list_api_failure_uses_the_diagnostic_stream() {
     let response = organization_problem(
         "400 Bad Request",
         400,
-        "https://api.scherzo.dev/problems/bad-request",
+        "https://api.usefulmachinery.com/problems/bad-request",
     );
     let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
     let environment = deployment_environment(&server.api_url, &credential_path);
@@ -1792,7 +1792,7 @@ fn membership_management_preserves_closed_authorization_and_conflict_outcomes() 
             organization_problem(
                 "403 Forbidden",
                 403,
-                "https://api.scherzo.dev/problems/forbidden",
+                "https://api.usefulmachinery.com/problems/forbidden",
             ),
             "forbidden",
         ),
@@ -1811,7 +1811,7 @@ fn membership_management_preserves_closed_authorization_and_conflict_outcomes() 
             organization_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/human-owner-required",
+                "https://api.usefulmachinery.com/problems/human-owner-required",
             ),
             "human_owner_required",
         ),
@@ -1829,7 +1829,7 @@ fn membership_management_preserves_closed_authorization_and_conflict_outcomes() 
             organization_problem(
                 "409 Conflict",
                 409,
-                "https://api.scherzo.dev/problems/membership-transition-unavailable",
+                "https://api.usefulmachinery.com/problems/membership-transition-unavailable",
             ),
             "transition_unavailable",
         ),
@@ -1898,7 +1898,7 @@ fn membership_management_human_reports_use_the_expected_streams() {
     let response = organization_problem(
         "409 Conflict",
         409,
-        "https://api.scherzo.dev/problems/human-owner-required",
+        "https://api.usefulmachinery.com/problems/human-owner-required",
     );
     let (server, _directory, _path, credential_path) = prepared_organization(vec![response], TOKEN);
     let environment = deployment_environment(&server.api_url, &credential_path);

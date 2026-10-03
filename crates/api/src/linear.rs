@@ -308,9 +308,10 @@ fn classify_response(status: StatusCode, body: &[u8], retry_after: Option<u64>) 
         (StatusCode::UNAUTHORIZED, problem::UNAUTHORIZED) => LinearFailure::Unauthenticated,
         (StatusCode::FORBIDDEN, problem::FORBIDDEN) => LinearFailure::Forbidden,
         (StatusCode::NOT_FOUND, problem::NOT_FOUND) => LinearFailure::NotFound,
-        (StatusCode::CONFLICT, "https://api.scherzo.dev/problems/source-connection-conflict") => {
-            LinearFailure::Conflict
-        }
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/source-connection-conflict",
+        ) => LinearFailure::Conflict,
         _ => invalid(),
     }
 }
