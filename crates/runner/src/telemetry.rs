@@ -17,93 +17,87 @@ use serde_json::{Map, Number, Value};
 
 mod otlp;
 pub(crate) mod attribute {
-    pub(crate) const BACKOFF_MS: &str = "scherzo.connection.backoff_ms";
-    pub(crate) const CONNECTION_ATTEMPT: &str = "scherzo.connection.attempt";
+    pub(crate) const BACKOFF_MS: &str = "um.connection.backoff_ms";
+    pub(crate) const CONNECTION_ATTEMPT: &str = "um.connection.attempt";
     pub(crate) const EFFECT_ACKNOWLEDGEMENTS_CONFIRMED: &str =
-        "scherzo.runner.effect_acknowledgements_confirmed";
-    pub(crate) const EFFECT_ID: &str = "scherzo.effect.id";
-    pub(crate) const LEASE_DISPOSITION: &str = "scherzo.lease.disposition";
-    pub(crate) const LEASE_DECISION_DELAY_MS: &str = "scherzo.lease.decision_delay_ms";
-    pub(crate) const LEASE_CANCELLATION_HEADROOM_MS: &str =
-        "scherzo.lease.cancellation_headroom_ms";
-    pub(crate) const LEASE_REQUEST_AGE_MS: &str = "scherzo.lease.request_age_ms";
-    pub(crate) const EFFECTS_RECEIVED: &str = "scherzo.runner.effects_received";
+        "um.runner.effect_acknowledgements_confirmed";
+    pub(crate) const EFFECT_ID: &str = "um.effect.id";
+    pub(crate) const LEASE_DISPOSITION: &str = "um.lease.disposition";
+    pub(crate) const LEASE_DECISION_DELAY_MS: &str = "um.lease.decision_delay_ms";
+    pub(crate) const LEASE_CANCELLATION_HEADROOM_MS: &str = "um.lease.cancellation_headroom_ms";
+    pub(crate) const LEASE_REQUEST_AGE_MS: &str = "um.lease.request_age_ms";
+    pub(crate) const EFFECTS_RECEIVED: &str = "um.runner.effects_received";
     pub(crate) const ERROR_TYPE: &str = "error.type";
-    pub(crate) const FAILURE_KIND: &str = "scherzo.connection.failure_kind";
-    pub(crate) const HANDSHAKE_COMPLETED: &str = "scherzo.runner.handshake_completed";
-    pub(crate) const OPENING_ACKNOWLEDGED: &str = "scherzo.runner.opening_acknowledged";
-    pub(crate) const RUN_ID: &str = "scherzo.run.id";
-    pub(crate) const RUN_RESULT: &str = "scherzo.run.result";
-    pub(crate) const FAILURE_PHASE: &str = "scherzo.failure.phase";
-    pub(crate) const FAILURE_CODE: &str = "scherzo.failure.code";
-    pub(crate) const FAILURE_CAUSE_TYPE: &str = "scherzo.failure.cause_type";
-    pub(crate) const INTERRUPTION_CAUSE: &str = "scherzo.interruption.cause";
-    pub(crate) const EXECUTOR_FAULT_REASON: &str = "scherzo.executor_fault.reason";
-    pub(crate) const DIAGNOSTIC_STAGE: &str = "scherzo.diagnostic.stage";
-    pub(crate) const RUNNER_BOOT_ID: &str = "scherzo.runner.boot_id";
-    pub(crate) const RUNNER_ID: &str = "scherzo.runner.id";
-    pub(crate) const RUNNER_SEQUENCE: &str = "scherzo.runner.sequence";
-    pub(crate) const RUNNER_TEXT_FRAMES_SENT: &str = "scherzo.runner.text_frames_sent";
-    pub(crate) const RUNNER_VERSION: &str = "scherzo.runner.version";
-    pub(crate) const CLOUD_TEXT_FRAMES_RECEIVED: &str = "scherzo.cloud.text_frames_received";
+    pub(crate) const FAILURE_KIND: &str = "um.connection.failure_kind";
+    pub(crate) const HANDSHAKE_COMPLETED: &str = "um.runner.handshake_completed";
+    pub(crate) const OPENING_ACKNOWLEDGED: &str = "um.runner.opening_acknowledged";
+    pub(crate) const RUN_ID: &str = "um.run.id";
+    pub(crate) const RUN_RESULT: &str = "um.run.result";
+    pub(crate) const FAILURE_PHASE: &str = "um.failure.phase";
+    pub(crate) const FAILURE_CODE: &str = "um.failure.code";
+    pub(crate) const FAILURE_CAUSE_TYPE: &str = "um.failure.cause_type";
+    pub(crate) const INTERRUPTION_CAUSE: &str = "um.interruption.cause";
+    pub(crate) const EXECUTOR_FAULT_REASON: &str = "um.executor_fault.reason";
+    pub(crate) const DIAGNOSTIC_STAGE: &str = "um.diagnostic.stage";
+    pub(crate) const RUNNER_BOOT_ID: &str = "um.runner.boot_id";
+    pub(crate) const RUNNER_ID: &str = "um.runner.id";
+    pub(crate) const RUNNER_SEQUENCE: &str = "um.runner.sequence";
+    pub(crate) const RUNNER_TEXT_FRAMES_SENT: &str = "um.runner.text_frames_sent";
+    pub(crate) const RUNNER_VERSION: &str = "um.runner.version";
+    pub(crate) const CLOUD_TEXT_FRAMES_RECEIVED: &str = "um.cloud.text_frames_received";
     pub(crate) const SERVER_ADDRESS: &str = "server.address";
     pub(crate) const SERVER_PORT: &str = "server.port";
-    pub(crate) const ASSIGNMENT_ID: &str = "scherzo.assignment.id";
-    pub(crate) const ATTEMPT_ID: &str = "scherzo.attempt.id";
-    pub(crate) const ARTIFACT_DELIVERY_ID: &str = "scherzo.artifact.delivery_id";
-    pub(crate) const ARTIFACT_OPERATION: &str = "scherzo.artifact.operation";
-    pub(crate) const ARTIFACT_MEMBER: &str = "scherzo.artifact.member";
-    pub(crate) const ARTIFACT_FAILURE_ORIGIN: &str = "scherzo.artifact.failure_origin";
-    pub(crate) const ARTIFACT_FAILURE_CODE: &str = "scherzo.artifact.failure_code";
-    pub(crate) const ARTIFACT_PREPARATION_STAGE: &str = "scherzo.artifact.preparation_stage";
-    pub(crate) const ARTIFACT_PUBLICATION_PHASE: &str = "scherzo.artifact.publication_phase";
-    pub(crate) const ARTIFACT_PUBLICATION_KIND: &str = "scherzo.artifact.publication_kind";
-    pub(crate) const ARTIFACT_RESULT_INVARIANT: &str = "scherzo.artifact.result_invariant";
-    pub(crate) const ARTIFACT_MEMBER_INDEX: &str = "scherzo.artifact.member_index";
-    pub(crate) const ARTIFACT_NODE_ID: &str = "scherzo.artifact.node_id";
-    pub(crate) const PROTOCOL_REQUEST_MESSAGE_ID: &str = "scherzo.protocol.request_message_id";
-    pub(crate) const ASSIGNMENT_PREPARATION_PHASE: &str = "scherzo.assignment.preparation_phase";
-    pub(crate) const OWNED_PROCESSES_STOPPED: &str = "scherzo.teardown.owned_processes_stopped";
-    pub(crate) const RETENTION_REASON: &str = "scherzo.workspace.retention_reason";
-    pub(crate) const RETENTION_RECORDED: &str = "scherzo.workspace.retention_recorded";
-    pub(crate) const RUNNER_CREDENTIALS_REMOVED: &str =
-        "scherzo.teardown.runner_credentials_removed";
-    pub(crate) const RUNNER_CREDENTIALS_REVOKED: &str =
-        "scherzo.teardown.runner_credentials_revoked";
-    pub(crate) const WORKSPACE_PATH: &str = "scherzo.workspace.path";
-    pub(crate) const PROTOCOL_ACKNOWLEDGED_MESSAGE_ID: &str =
-        "scherzo.protocol.acknowledged_message_id";
-    pub(crate) const PROTOCOL_ACKNOWLEDGED_SEQUENCE: &str =
-        "scherzo.protocol.acknowledged_sequence";
-    pub(crate) const PROTOCOL_CLOSE_CODE: &str = "scherzo.protocol.close_code";
-    pub(crate) const PROTOCOL_CLOSE_INITIATOR: &str = "scherzo.protocol.close_initiator";
-    pub(crate) const PROTOCOL_DECLINE_REASON: &str = "scherzo.protocol.decline_reason";
-    pub(crate) const PROTOCOL_DECLINE_TYPE: &str = "scherzo.protocol.decline_type";
-    pub(crate) const PROTOCOL_DIRECTION: &str = "scherzo.protocol.direction";
-    pub(crate) const PROTOCOL_EVENT: &str = "scherzo.protocol.event";
-    pub(crate) const PROTOCOL_FRAME_KIND: &str = "scherzo.protocol.frame_kind";
-    pub(crate) const PROTOCOL_FRAME_TYPE: &str = "scherzo.protocol.frame_type";
-    pub(crate) const PROTOCOL_LEASE_SEQUENCE: &str = "scherzo.protocol.lease_sequence";
-    pub(crate) const PROTOCOL_MESSAGE_ID: &str = "scherzo.protocol.message_id";
-    pub(crate) const PROTOCOL_ORDER: &str = "scherzo.protocol.order";
-    pub(crate) const PROTOCOL_PAYLOAD_VERSION: &str = "scherzo.protocol.payload_version";
-    pub(crate) const PROTOCOL_PING_INTERVAL_SECONDS: &str =
-        "scherzo.protocol.ping_interval_seconds";
-    pub(crate) const PROTOCOL_PONG_TIMEOUT_SECONDS: &str = "scherzo.protocol.pong_timeout_seconds";
-    pub(crate) const PROTOCOL_SENT_AT: &str = "scherzo.protocol.sent_at";
-    pub(crate) const PROTOCOL_TIMER: &str = "scherzo.protocol.timer";
-    pub(crate) const PROTOCOL_VERSION: &str = "scherzo.protocol.version";
-    pub(crate) const RUNNER_SESSION_ID: &str = "scherzo.runner.session_id";
+    pub(crate) const ASSIGNMENT_ID: &str = "um.assignment.id";
+    pub(crate) const ATTEMPT_ID: &str = "um.attempt.id";
+    pub(crate) const ARTIFACT_DELIVERY_ID: &str = "um.artifact.delivery_id";
+    pub(crate) const ARTIFACT_OPERATION: &str = "um.artifact.operation";
+    pub(crate) const ARTIFACT_MEMBER: &str = "um.artifact.member";
+    pub(crate) const ARTIFACT_FAILURE_ORIGIN: &str = "um.artifact.failure_origin";
+    pub(crate) const ARTIFACT_FAILURE_CODE: &str = "um.artifact.failure_code";
+    pub(crate) const ARTIFACT_PREPARATION_STAGE: &str = "um.artifact.preparation_stage";
+    pub(crate) const ARTIFACT_PUBLICATION_PHASE: &str = "um.artifact.publication_phase";
+    pub(crate) const ARTIFACT_PUBLICATION_KIND: &str = "um.artifact.publication_kind";
+    pub(crate) const ARTIFACT_RESULT_INVARIANT: &str = "um.artifact.result_invariant";
+    pub(crate) const ARTIFACT_MEMBER_INDEX: &str = "um.artifact.member_index";
+    pub(crate) const ARTIFACT_NODE_ID: &str = "um.artifact.node_id";
+    pub(crate) const PROTOCOL_REQUEST_MESSAGE_ID: &str = "um.protocol.request_message_id";
+    pub(crate) const ASSIGNMENT_PREPARATION_PHASE: &str = "um.assignment.preparation_phase";
+    pub(crate) const OWNED_PROCESSES_STOPPED: &str = "um.teardown.owned_processes_stopped";
+    pub(crate) const RETENTION_REASON: &str = "um.workspace.retention_reason";
+    pub(crate) const RETENTION_RECORDED: &str = "um.workspace.retention_recorded";
+    pub(crate) const RUNNER_CREDENTIALS_REMOVED: &str = "um.teardown.runner_credentials_removed";
+    pub(crate) const RUNNER_CREDENTIALS_REVOKED: &str = "um.teardown.runner_credentials_revoked";
+    pub(crate) const WORKSPACE_PATH: &str = "um.workspace.path";
+    pub(crate) const PROTOCOL_ACKNOWLEDGED_MESSAGE_ID: &str = "um.protocol.acknowledged_message_id";
+    pub(crate) const PROTOCOL_ACKNOWLEDGED_SEQUENCE: &str = "um.protocol.acknowledged_sequence";
+    pub(crate) const PROTOCOL_CLOSE_CODE: &str = "um.protocol.close_code";
+    pub(crate) const PROTOCOL_CLOSE_INITIATOR: &str = "um.protocol.close_initiator";
+    pub(crate) const PROTOCOL_DECLINE_REASON: &str = "um.protocol.decline_reason";
+    pub(crate) const PROTOCOL_DECLINE_TYPE: &str = "um.protocol.decline_type";
+    pub(crate) const PROTOCOL_DIRECTION: &str = "um.protocol.direction";
+    pub(crate) const PROTOCOL_EVENT: &str = "um.protocol.event";
+    pub(crate) const PROTOCOL_FRAME_KIND: &str = "um.protocol.frame_kind";
+    pub(crate) const PROTOCOL_FRAME_TYPE: &str = "um.protocol.frame_type";
+    pub(crate) const PROTOCOL_LEASE_SEQUENCE: &str = "um.protocol.lease_sequence";
+    pub(crate) const PROTOCOL_MESSAGE_ID: &str = "um.protocol.message_id";
+    pub(crate) const PROTOCOL_ORDER: &str = "um.protocol.order";
+    pub(crate) const PROTOCOL_PAYLOAD_VERSION: &str = "um.protocol.payload_version";
+    pub(crate) const PROTOCOL_PING_INTERVAL_SECONDS: &str = "um.protocol.ping_interval_seconds";
+    pub(crate) const PROTOCOL_PONG_TIMEOUT_SECONDS: &str = "um.protocol.pong_timeout_seconds";
+    pub(crate) const PROTOCOL_SENT_AT: &str = "um.protocol.sent_at";
+    pub(crate) const PROTOCOL_TIMER: &str = "um.protocol.timer";
+    pub(crate) const PROTOCOL_VERSION: &str = "um.protocol.version";
+    pub(crate) const RUNNER_SESSION_ID: &str = "um.runner.session_id";
 }
 
 const EVENT_NAME: &str = "event.name";
-const MAIN: &str = "scherzo.main";
-const SCHEMA_VERSION: &str = "scherzo.event.schema_version";
-const OUTCOME: &str = "scherzo.outcome";
+const MAIN: &str = "um.main";
+const SCHEMA_VERSION: &str = "um.event.schema_version";
+const OUTCOME: &str = "um.outcome";
 const SERVICE_NAME: &str = "service.name";
 const SERVICE_VERSION: &str = "service.version";
 const SERVICE_INSTANCE_ID: &str = "service.instance.id";
-const DROPPED_COUNT: &str = "scherzo.telemetry.dropped_count";
+const DROPPED_COUNT: &str = "um.telemetry.dropped_count";
 const DURATION_MS: &str = "duration_ms";
 const TRACE_ID: &str = "trace_id";
 const SPAN_ID: &str = "span_id";
@@ -732,7 +726,7 @@ mod tests {
         assert_eq!(event["fixture.integer"], 42);
         assert_eq!(event["fixture.float"], 1.5);
         assert_eq!(event["fixture.string"], "line one\nline two");
-        assert_eq!(event["scherzo.outcome"], "success");
+        assert_eq!(event["um.outcome"], "success");
         assert!(event["duration_ms"].is_i64());
         assert!(event["trace_id"].is_string());
         assert!(event["span_id"].is_string());
@@ -751,7 +745,7 @@ mod tests {
                 .map(|attribute| &attribute.value)
         };
         assert_eq!(
-            span_attribute("scherzo.main"),
+            span_attribute("um.main"),
             Some(&opentelemetry::Value::Bool(true))
         );
         assert_eq!(
@@ -763,7 +757,7 @@ mod tests {
             Some(&opentelemetry::Value::I64(42))
         );
         assert_eq!(
-            span_attribute("scherzo.outcome"),
+            span_attribute("um.outcome"),
             Some(&opentelemetry::Value::String("success".into()))
         );
     }
@@ -793,7 +787,7 @@ mod tests {
         for index in 0..20 {
             assert_eq!(events[0][&format!("fixture.field_{index}")], index as i64);
         }
-        assert_eq!(events[0]["scherzo.outcome"], "failure");
+        assert_eq!(events[0]["um.outcome"], "failure");
         let spans = capture.spans();
         assert_eq!(spans.len(), 1);
         assert!(matches!(

@@ -1700,13 +1700,10 @@ mod tests {
             .find(|event| event["event.name"] == "runner.workspace_retained")
             .expect("startup retention diagnostic");
         assert_eq!(
-            event["scherzo.workspace.path"],
+            event["um.workspace.path"],
             stale_path.to_string_lossy().as_ref()
         );
-        assert_eq!(
-            event["scherzo.workspace.retention_reason"],
-            "outcome_unknown"
-        );
+        assert_eq!(event["um.workspace.retention_reason"], "outcome_unknown");
     }
 
     #[tokio::test]
@@ -2979,7 +2976,7 @@ mod tests {
             .iter()
             .find(|event| {
                 event["event.name"] == "runner.effect_acknowledgement"
-                    && event["scherzo.outcome"] == effect_outcome
+                    && event["um.outcome"] == effect_outcome
             })
             .expect("captured effect acknowledgement outcome should exist");
         assert_eq!(
@@ -3050,16 +3047,13 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event["event.name"], "runner.gateway_connection");
-        assert_eq!(event["scherzo.connection.attempt"], 1);
-        assert_eq!(
-            event["scherzo.connection.failure_kind"],
-            "terminal_protocol"
-        );
+        assert_eq!(event["um.connection.attempt"], 1);
+        assert_eq!(event["um.connection.failure_kind"], "terminal_protocol");
         assert_eq!(event["error.type"], "gateway_policy_violation");
-        assert_eq!(event["scherzo.outcome"], "failure");
-        assert_eq!(event["scherzo.cloud.text_frames_received"], 0);
-        assert_eq!(event["scherzo.runner.text_frames_sent"], 1);
-        assert!(event.get("scherzo.connection.backoff_ms").is_none());
+        assert_eq!(event["um.outcome"], "failure");
+        assert_eq!(event["um.cloud.text_frames_received"], 0);
+        assert_eq!(event["um.runner.text_frames_sent"], 1);
+        assert!(event.get("um.connection.backoff_ms").is_none());
         let encoded = serde_json::to_string(event).expect("encode terminal connection event");
         for sentinel in [
             "URL-QUERY-MUST-NOT-LEAK",
@@ -3165,7 +3159,7 @@ mod tests {
         assert!(records.iter().all(|record| {
             record["service.version"] == crate::telemetry::TEST_SERVICE_VERSION
                 && record
-                    .get("scherzo.runner.version")
+                    .get("um.runner.version")
                     .is_none_or(|version| version == crate::telemetry::TEST_SERVICE_VERSION)
         }));
         let events = capture.events();
@@ -3175,23 +3169,23 @@ mod tests {
             .collect();
         assert_eq!(connection_events.len(), 1);
         let event = connection_events[0];
-        assert_eq!(event["scherzo.connection.failure_kind"], "retryable");
+        assert_eq!(event["um.connection.failure_kind"], "retryable");
         assert_eq!(
-            event["scherzo.runner.version"],
+            event["um.runner.version"],
             crate::telemetry::TEST_SERVICE_VERSION
         );
         assert_eq!(event["error.type"], "read_gateway_frame");
-        assert_eq!(event["scherzo.outcome"], "disconnected");
+        assert_eq!(event["um.outcome"], "disconnected");
         assert_eq!(
-            event["scherzo.connection.backoff_ms"],
+            event["um.connection.backoff_ms"],
             i64::try_from(backoff_delay.as_millis()).expect("fixture backoff fits i64")
         );
-        assert_eq!(event["scherzo.runner.opening_acknowledged"], true);
-        assert_eq!(event["scherzo.runner.handshake_completed"], true);
-        assert_eq!(event["scherzo.cloud.text_frames_received"], 3);
-        assert_eq!(event["scherzo.runner.text_frames_sent"], 3);
-        assert_eq!(event["scherzo.runner.effects_received"], 1);
-        assert_eq!(event["scherzo.runner.effect_acknowledgements_confirmed"], 0);
+        assert_eq!(event["um.runner.opening_acknowledged"], true);
+        assert_eq!(event["um.runner.handshake_completed"], true);
+        assert_eq!(event["um.cloud.text_frames_received"], 3);
+        assert_eq!(event["um.runner.text_frames_sent"], 3);
+        assert_eq!(event["um.runner.effects_received"], 1);
+        assert_eq!(event["um.runner.effect_acknowledgements_confirmed"], 0);
         assert_eq!(
             events
                 .iter()
@@ -3248,9 +3242,9 @@ mod tests {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["event.name"], "runner.gateway_connection");
             assert_eq!(events[0]["error.type"], error_type);
-            assert_eq!(events[0]["scherzo.connection.failure_kind"], "retryable");
-            assert_eq!(events[0]["scherzo.outcome"], outcome);
-            assert!(events[0].get("scherzo.connection.backoff_ms").is_some());
+            assert_eq!(events[0]["um.connection.failure_kind"], "retryable");
+            assert_eq!(events[0]["um.outcome"], outcome);
+            assert!(events[0].get("um.connection.backoff_ms").is_some());
             assert_eq!(capture.span_count("runner.gateway_connection"), 1);
 
             abort_service(service).await;
@@ -3325,7 +3319,7 @@ mod tests {
 
         let connection =
             assert_attempt_event_pair(&capture, "timeout", Some("gateway_liveness_timeout"), 1, 2);
-        assert_eq!(connection["scherzo.outcome"], "timeout");
+        assert_eq!(connection["um.outcome"], "timeout");
         assert_eq!(connection["error.type"], "gateway_liveness_timeout");
 
         drop(sleep_requests);
@@ -3461,12 +3455,12 @@ mod tests {
 
         let connection = assert_attempt_event_pair(&capture, "cancelled", None, 2, 4);
         assert_eq!(capture.span_count("runner.assignment_preparation"), 1);
-        assert_eq!(connection["scherzo.outcome"], "cancelled");
-        assert_eq!(connection["scherzo.runner.opening_acknowledged"], true);
-        assert_eq!(connection["scherzo.runner.handshake_completed"], true);
+        assert_eq!(connection["um.outcome"], "cancelled");
+        assert_eq!(connection["um.runner.opening_acknowledged"], true);
+        assert_eq!(connection["um.runner.handshake_completed"], true);
         assert!(connection.get("error.type").is_none());
-        assert!(connection.get("scherzo.connection.failure_kind").is_none());
-        assert!(connection.get("scherzo.connection.backoff_ms").is_none());
+        assert!(connection.get("um.connection.failure_kind").is_none());
+        assert!(connection.get("um.connection.backoff_ms").is_none());
         assert_eq!(capture.span_count("runner.gateway_connection"), 1);
     }
 }

@@ -2806,11 +2806,11 @@ mod tests {
             .find(|event| event["event.name"] == "runner.workspace_retained")
             .expect("retention diagnostic");
         assert_eq!(
-            event["scherzo.workspace.retention_reason"],
+            event["um.workspace.retention_reason"],
             "release_worker_unavailable"
         );
-        assert_eq!(event["scherzo.teardown.runner_credentials_removed"], true);
-        assert_eq!(event["scherzo.teardown.runner_credentials_revoked"], true);
+        assert_eq!(event["um.teardown.runner_credentials_removed"], true);
+        assert_eq!(event["um.teardown.runner_credentials_revoked"], true);
     }
 
     #[test]
@@ -2873,19 +2873,16 @@ mod tests {
             .into_iter()
             .find(|event| event["event.name"] == "runner.workspace_retained")
             .expect("retention diagnostic");
-        assert_eq!(event["scherzo.assignment.id"], ASSIGNMENT);
-        assert_eq!(event["scherzo.run.id"], "run_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert_eq!(event["um.assignment.id"], ASSIGNMENT);
+        assert_eq!(event["um.run.id"], "run_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert_eq!(event["um.attempt.id"], "atm_01k0z6r1w8f4jy2m7q9v3x5abc");
         assert_eq!(
-            event["scherzo.attempt.id"],
-            "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
-        );
-        assert_eq!(
-            event["scherzo.workspace.path"],
+            event["um.workspace.path"],
             workspace.to_string_lossy().as_ref()
         );
-        assert_eq!(event["scherzo.teardown.owned_processes_stopped"], false);
-        assert_eq!(event["scherzo.teardown.runner_credentials_removed"], true);
-        assert_eq!(event["scherzo.teardown.runner_credentials_revoked"], true);
+        assert_eq!(event["um.teardown.owned_processes_stopped"], false);
+        assert_eq!(event["um.teardown.runner_credentials_removed"], true);
+        assert_eq!(event["um.teardown.runner_credentials_revoked"], true);
     }
 
     #[test]

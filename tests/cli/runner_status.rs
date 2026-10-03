@@ -331,9 +331,9 @@ fn terminal_authentication_remains_locally_inspectable() {
             let is_terminal_authentication = serde_json::from_str::<serde_json::Value>(&line)
                 .is_ok_and(|record| {
                     record["event.name"].as_str() == Some("runner.gateway_connection")
-                        && record["scherzo.connection.failure_kind"].as_str()
+                        && record["um.connection.failure_kind"].as_str()
                             == Some("terminal_authentication")
-                        && record["scherzo.outcome"].as_str() == Some("failure")
+                        && record["um.outcome"].as_str() == Some("failure")
                 });
             if is_terminal_authentication {
                 let (observation, changed) = &*reader_observation;

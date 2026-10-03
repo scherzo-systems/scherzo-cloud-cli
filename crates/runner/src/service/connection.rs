@@ -3663,9 +3663,9 @@ mod tests {
             .active_effect_event
             .finish(Outcome::Disconnected, None);
         let event = context.capture.event("runner.effect_acknowledgement");
-        assert_eq!(event["scherzo.lease.disposition"], "applied");
-        assert_eq!(event["scherzo.lease.request_age_ms"], 29_000);
-        assert_eq!(event["scherzo.lease.cancellation_headroom_ms"], 1_000);
+        assert_eq!(event["um.lease.disposition"], "applied");
+        assert_eq!(event["um.lease.request_age_ms"], 29_000);
+        assert_eq!(event["um.lease.cancellation_headroom_ms"], 1_000);
     }
 
     #[tokio::test]
@@ -3740,10 +3740,10 @@ mod tests {
         assert_eq!(pending.kind, PendingObservationKind::EffectReceipt);
         effect_event.finish(Outcome::Disconnected);
         let event = context.capture.event("runner.effect_acknowledgement");
-        assert_eq!(event["scherzo.lease.disposition"], "applied");
-        assert_eq!(event["scherzo.lease.request_age_ms"], 29_000);
-        assert_eq!(event["scherzo.lease.cancellation_headroom_ms"], 1_000);
-        assert!(event["scherzo.lease.decision_delay_ms"].as_u64().is_some());
+        assert_eq!(event["um.lease.disposition"], "applied");
+        assert_eq!(event["um.lease.request_age_ms"], 29_000);
+        assert_eq!(event["um.lease.cancellation_headroom_ms"], 1_000);
+        assert!(event["um.lease.decision_delay_ms"].as_u64().is_some());
     }
 
     #[tokio::test]
@@ -3828,14 +3828,10 @@ mod tests {
             .unwrap();
         result.unwrap();
         let event = context.capture.event("runner.effect_acknowledgement");
-        assert_eq!(event["scherzo.outcome"], "success");
-        assert_eq!(event["scherzo.lease.disposition"], "unknown_assignment");
-        assert!(event["scherzo.lease.decision_delay_ms"].as_u64().is_some());
-        assert!(
-            event
-                .get("scherzo.lease.cancellation_headroom_ms")
-                .is_none()
-        );
+        assert_eq!(event["um.outcome"], "success");
+        assert_eq!(event["um.lease.disposition"], "unknown_assignment");
+        assert!(event["um.lease.decision_delay_ms"].as_u64().is_some());
+        assert!(event.get("um.lease.cancellation_headroom_ms").is_none());
     }
 
     #[tokio::test]
@@ -3871,7 +3867,7 @@ mod tests {
         assert!(error.is_terminal());
         assert_eq!(error.progress.effects_received, 1);
         let effect = context.capture.event("runner.effect_acknowledgement");
-        assert_eq!(effect["scherzo.outcome"], "failure");
+        assert_eq!(effect["um.outcome"], "failure");
         assert_eq!(effect["error.type"], "runner_lease_clock_failure");
     }
 
@@ -3897,7 +3893,7 @@ mod tests {
         drop(connection);
 
         let effect = context.capture.event("runner.effect_acknowledgement");
-        assert_eq!(effect["scherzo.outcome"], "cancelled");
+        assert_eq!(effect["um.outcome"], "cancelled");
         assert!(effect.get("error.type").is_none());
     }
 
@@ -3997,7 +3993,7 @@ mod tests {
         assert!(
             discarded
                 .iter()
-                .all(|event| event["scherzo.outcome"] == "disconnected")
+                .all(|event| event["um.outcome"] == "disconnected")
         );
     }
 
@@ -4612,22 +4608,16 @@ mod tests {
             let records = capture.records();
             assert_eq!(records.len(), 1);
             let record = &records[0];
-            assert_eq!(record["scherzo.protocol.frame_type"], "assignment_rejected");
-            assert_eq!(record["scherzo.protocol.decline_type"], expected_type);
+            assert_eq!(record["um.protocol.frame_type"], "assignment_rejected");
+            assert_eq!(record["um.protocol.decline_type"], expected_type);
             assert_eq!(
                 record
-                    .get("scherzo.protocol.decline_reason")
+                    .get("um.protocol.decline_reason")
                     .and_then(serde_json::Value::as_str),
                 expected_reason,
             );
-            assert_eq!(
-                record["scherzo.effect.id"],
-                "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
-            );
-            assert_eq!(
-                record["scherzo.assignment.id"],
-                "asn_01k0z6r1w8f4jy2m7q9v3x5abh"
-            );
+            assert_eq!(record["um.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abg");
+            assert_eq!(record["um.assignment.id"], "asn_01k0z6r1w8f4jy2m7q9v3x5abh");
 
             let decline_keys: Vec<_> = record
                 .keys()
@@ -4639,7 +4629,7 @@ mod tests {
             );
             assert!(decline_keys.iter().all(|key| matches!(
                 key.as_str(),
-                "scherzo.protocol.decline_type" | "scherzo.protocol.decline_reason"
+                "um.protocol.decline_type" | "um.protocol.decline_reason"
             )));
         }
     }
@@ -4666,7 +4656,7 @@ mod tests {
         let frames: Vec<_> = capture
             .records()
             .into_iter()
-            .filter(|record| record["scherzo.protocol.event"] == "frame")
+            .filter(|record| record["um.protocol.event"] == "frame")
             .collect();
         assert!(
             frames.is_empty(),
@@ -4704,12 +4694,12 @@ mod tests {
             .filter(|record| record["event.name"] == RUNNER_PROTOCOL_EVENT_NAME)
             .collect();
         assert_eq!(protocol.len(), 2);
-        assert_eq!(protocol[1]["scherzo.protocol.order"], 2);
-        assert_eq!(protocol[1]["scherzo.protocol.event"], "read_failed");
+        assert_eq!(protocol[1]["um.protocol.order"], 2);
+        assert_eq!(protocol[1]["um.protocol.event"], "read_failed");
         for frame_field in [
-            "scherzo.protocol.direction",
-            "scherzo.protocol.frame_kind",
-            "scherzo.protocol.close_initiator",
+            "um.protocol.direction",
+            "um.protocol.frame_kind",
+            "um.protocol.close_initiator",
         ] {
             assert!(
                 protocol[1].get(frame_field).is_none(),
@@ -5050,9 +5040,9 @@ mod tests {
             .iter()
             .find(|event| event["event.name"] == "runner.assignment_preparation")
             .expect("assignment preparation event");
-        assert_eq!(preparation["scherzo.outcome"], "failure");
+        assert_eq!(preparation["um.outcome"], "failure");
         assert_eq!(
-            preparation["scherzo.assignment.preparation_phase"],
+            preparation["um.assignment.preparation_phase"],
             "source_materialization"
         );
         let encoded_preparation =
@@ -5065,15 +5055,12 @@ mod tests {
         assert_eq!(events.len(), 3);
         let event = events[0];
         assert_eq!(event["event.name"], "runner.effect_acknowledgement");
-        assert_eq!(event["scherzo.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abg");
-        assert_eq!(
-            event["scherzo.assignment.id"],
-            "asn_01k0z6r1w8f4jy2m7q9v3x5abh"
-        );
-        assert_eq!(event["scherzo.run.id"], "run_01k0z6r1w8f4jy2m7q9v3x5abj");
-        assert_eq!(event["scherzo.runner.boot_id"], BOOT_ID);
-        assert_eq!(event["scherzo.runner.sequence"], 2);
-        assert_eq!(event["scherzo.outcome"], "success");
+        assert_eq!(event["um.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abg");
+        assert_eq!(event["um.assignment.id"], "asn_01k0z6r1w8f4jy2m7q9v3x5abh");
+        assert_eq!(event["um.run.id"], "run_01k0z6r1w8f4jy2m7q9v3x5abj");
+        assert_eq!(event["um.runner.boot_id"], BOOT_ID);
+        assert_eq!(event["um.runner.sequence"], 2);
+        assert_eq!(event["um.outcome"], "success");
         let encoded = serde_json::to_string(event).expect("encode effect event");
         // An effect acknowledgement does not itself claim an execution result.
         assert!(
@@ -5084,18 +5071,12 @@ mod tests {
         assert!(!encoded.contains("accepted"));
         assert!(!encoded.contains("executed"));
         assert!(!encoded.contains("abcdefghijklmnopqrstuvwxyzABCDEFG-012345678"));
-        assert_eq!(
-            events[1]["scherzo.effect.id"],
-            "eff_01k0z6r1w8f4jy2m7q9v3x5abh"
-        );
-        assert_eq!(events[1]["scherzo.runner.sequence"], 4);
-        assert_eq!(events[1]["scherzo.outcome"], "success");
-        assert_eq!(
-            events[2]["scherzo.effect.id"],
-            "eff_01k0z6r1w8f4jy2m7q9v3x5abj"
-        );
-        assert_eq!(events[2]["scherzo.runner.sequence"], 7);
-        assert_eq!(events[2]["scherzo.outcome"], "success");
+        assert_eq!(events[1]["um.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abh");
+        assert_eq!(events[1]["um.runner.sequence"], 4);
+        assert_eq!(events[1]["um.outcome"], "success");
+        assert_eq!(events[2]["um.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abj");
+        assert_eq!(events[2]["um.runner.sequence"], 7);
+        assert_eq!(events[2]["um.outcome"], "success");
         assert_eq!(capture.span_count("runner.effect_acknowledgement"), 3);
         assert_eq!(capture.span_count("runner.assignment_preparation"), 1);
 
@@ -5131,31 +5112,31 @@ mod tests {
         ];
         assert_eq!(protocol.len(), expected.len());
         for (index, (record, (kind, frame_type))) in protocol.iter().zip(expected).enumerate() {
-            assert_eq!(record["scherzo.main"], false);
-            assert_eq!(record["scherzo.protocol.order"], index + 1);
-            assert_eq!(record["scherzo.protocol.frame_kind"], kind);
+            assert_eq!(record["um.main"], false);
+            assert_eq!(record["um.protocol.order"], index + 1);
+            assert_eq!(record["um.protocol.frame_kind"], kind);
             assert_eq!(
                 record
-                    .get("scherzo.protocol.frame_type")
+                    .get("um.protocol.frame_type")
                     .and_then(serde_json::Value::as_str),
                 frame_type,
                 "protocol frame {index}: {record:?}",
             );
-            assert_eq!(record["scherzo.connection.attempt"], 1);
-            assert_eq!(record["scherzo.runner.id"], config.credential().runner_id());
-            assert_eq!(record["scherzo.runner.boot_id"], BOOT_ID);
+            assert_eq!(record["um.connection.attempt"], 1);
+            assert_eq!(record["um.runner.id"], config.credential().runner_id());
+            assert_eq!(record["um.runner.boot_id"], BOOT_ID);
         }
         assert_eq!(
-            protocol[1]["scherzo.runner.session_id"],
+            protocol[1]["um.runner.session_id"],
             "rsn_01k0z6r1w8f4jy2m7q9v3x5abc"
         );
         assert_eq!(
-            protocol[5]["scherzo.effect.id"],
+            protocol[5]["um.effect.id"],
             "eff_01k0z6r1w8f4jy2m7q9v3x5abg"
         );
-        assert_eq!(protocol[6]["scherzo.runner.sequence"], 2);
+        assert_eq!(protocol[6]["um.runner.sequence"], 2);
         assert_eq!(
-            protocol[0]["scherzo.runner.version"],
+            protocol[0]["um.runner.version"],
             crate::telemetry::TEST_SERVICE_VERSION
         );
         let protocol_json = serde_json::to_string(&protocol).expect("encode protocol records");
@@ -5197,7 +5178,7 @@ mod tests {
         let events = capture.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event.name"], "runner.effect_acknowledgement");
-        assert_eq!(events[0]["scherzo.outcome"], "disconnected");
+        assert_eq!(events[0]["um.outcome"], "disconnected");
         assert_eq!(
             events[0]["error.type"],
             "effect_acknowledgement_unconfirmed"
@@ -5250,9 +5231,9 @@ mod tests {
             .capture
             .records()
             .into_iter()
-            .find(|record| record.get("scherzo.protocol.timer") == Some(&json!("outbound_flush")))
+            .find(|record| record.get("um.protocol.timer") == Some(&json!("outbound_flush")))
             .expect("candidate Pong flush timer telemetry");
-        assert_eq!(timer["scherzo.protocol.event"], "timer_expired");
+        assert_eq!(timer["um.protocol.event"], "timer_expired");
     }
 
     #[tokio::test]
@@ -5296,11 +5277,11 @@ mod tests {
             .capture
             .records()
             .into_iter()
-            .find(|record| record.get("scherzo.protocol.timer") == Some(&json!("outbound_send")))
+            .find(|record| record.get("um.protocol.timer") == Some(&json!("outbound_send")))
             .expect("outbound send timer telemetry");
-        assert_eq!(timer["scherzo.protocol.event"], "timer_expired");
+        assert_eq!(timer["um.protocol.event"], "timer_expired");
         let effect = context.capture.event("runner.effect_acknowledgement");
-        assert_eq!(effect["scherzo.outcome"], "timeout");
+        assert_eq!(effect["um.outcome"], "timeout");
         assert_eq!(effect["error.type"], "gateway_liveness_timeout");
     }
 
@@ -5333,7 +5314,7 @@ mod tests {
         let events = context.capture.events();
         assert_eq!(events.len(), 2);
         let effect = context.capture.event("runner.effect_acknowledgement");
-        assert_eq!(effect["scherzo.outcome"], "cancelled");
+        assert_eq!(effect["um.outcome"], "cancelled");
         assert!(effect.get("error.type").is_none());
         assert_eq!(
             context.capture.span_count("runner.effect_acknowledgement"),
@@ -5368,9 +5349,9 @@ mod tests {
             .filter(|record| record["event.name"] == RUNNER_PROTOCOL_EVENT_NAME)
             .collect();
         assert_eq!(protocol.len(), 2);
-        assert_eq!(protocol[0]["scherzo.protocol.frame_type"], "hello");
-        assert_eq!(protocol[1]["scherzo.protocol.event"], "timer_expired");
-        assert_eq!(protocol[1]["scherzo.protocol.timer"], "welcome");
+        assert_eq!(protocol[0]["um.protocol.frame_type"], "hello");
+        assert_eq!(protocol[1]["um.protocol.event"], "timer_expired");
+        assert_eq!(protocol[1]["um.protocol.timer"], "welcome");
 
         abort_fixture_server(server).await;
     }
@@ -5410,9 +5391,9 @@ mod tests {
         let timer = capture
             .records()
             .into_iter()
-            .find(|record| record.get("scherzo.protocol.event") == Some(&json!("timer_expired")))
+            .find(|record| record.get("um.protocol.event") == Some(&json!("timer_expired")))
             .expect("runner liveness timer record");
-        assert_eq!(timer["scherzo.protocol.timer"], "inbound_silence");
+        assert_eq!(timer["um.protocol.timer"], "inbound_silence");
 
         abort_fixture_server(server).await;
     }

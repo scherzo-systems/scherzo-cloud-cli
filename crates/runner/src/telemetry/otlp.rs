@@ -898,12 +898,12 @@ mod tests {
 
         let connection = recorder.start(
             "runner.gateway_connection",
-            [KeyValue::new("scherzo.runner.id", "rnr_fixture")],
+            [KeyValue::new("um.runner.id", "rnr_fixture")],
         );
         connection.finish(Outcome::Disconnected);
         let effect = recorder.start(
             "runner.effect_acknowledgement",
-            [KeyValue::new("scherzo.effect.id", "eff_fixture")],
+            [KeyValue::new("um.effect.id", "eff_fixture")],
         );
         effect.finish(Outcome::Success);
         let local_events = capture.events();

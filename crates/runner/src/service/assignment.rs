@@ -7048,7 +7048,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             .filter(|event| event["event.name"] == "runner.run")
             .collect();
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["scherzo.run.result"], result);
+        assert_eq!(runs[0]["um.run.result"], result);
     }
 
     fn command_fixture_arguments() -> Vec<String> {
@@ -8304,22 +8304,22 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         let runs = run_events(&capture);
         assert_eq!(runs.len(), 1);
         let run = &runs[0];
-        assert_eq!(run["scherzo.run.id"], offered.run_id);
-        assert_eq!(run["scherzo.assignment.id"], offered.assignment_id);
-        assert_eq!(run["scherzo.attempt.id"], offered.attempt_id);
-        assert_eq!(run["scherzo.runner.boot_id"], "rbt_fixture");
-        assert_eq!(run["scherzo.run.result"], "failed");
-        assert_eq!(run["scherzo.failure.cause_type"], "occurrence_conflict");
-        assert_eq!(run["scherzo.diagnostic.stage"], "harness_execution");
+        assert_eq!(run["um.run.id"], offered.run_id);
+        assert_eq!(run["um.assignment.id"], offered.assignment_id);
+        assert_eq!(run["um.attempt.id"], offered.attempt_id);
+        assert_eq!(run["um.runner.boot_id"], "rbt_fixture");
+        assert_eq!(run["um.run.result"], "failed");
+        assert_eq!(run["um.failure.cause_type"], "occurrence_conflict");
+        assert_eq!(run["um.diagnostic.stage"], "harness_execution");
         let spans = capture.spans();
         let span = spans.iter().find(|span| span.name == "runner.run").unwrap();
         for key in [
-            "scherzo.run.id",
-            "scherzo.assignment.id",
-            "scherzo.attempt.id",
-            "scherzo.run.result",
-            "scherzo.failure.cause_type",
-            "scherzo.diagnostic.stage",
+            "um.run.id",
+            "um.assignment.id",
+            "um.attempt.id",
+            "um.run.result",
+            "um.failure.cause_type",
+            "um.diagnostic.stage",
         ] {
             assert_eq!(
                 span.attributes
@@ -8338,7 +8338,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         manager.retire_assignment_observations(&offered.assignment_id);
         let runs = run_events(&capture);
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["scherzo.run.result"], "fenced");
+        assert_eq!(runs[0]["um.run.result"], "fenced");
     }
 
     #[tokio::test]
@@ -8360,7 +8360,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             })
             .unwrap();
         manager.drain_events();
-        assert_eq!(capture.event("runner.run")["scherzo.run.result"], "fenced");
+        assert_eq!(capture.event("runner.run")["um.run.result"], "fenced");
         assert_eq!(
             capture
                 .events()
@@ -8386,10 +8386,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert_acknowledged_run(&mut manager, &capture, "aborted");
         let event = capture.event("runner.run");
         assert_eq!(
-            event["scherzo.failure.cause_type"],
+            event["um.failure.cause_type"],
             "workflow_git_activation_failed"
         );
-        assert_eq!(event["scherzo.diagnostic.stage"], "workflow_git_activation");
+        assert_eq!(event["um.diagnostic.stage"], "workflow_git_activation");
         assert!(
             !serde_json::to_string(&event)
                 .unwrap()
@@ -8417,15 +8417,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         );
         drop(manager);
         let event = capture.event("runner.run");
-        assert_eq!(event["scherzo.run.result"], "aborted");
-        assert_eq!(
-            event["scherzo.failure.cause_type"],
-            "lease_timer_unavailable"
-        );
-        assert_eq!(
-            event["scherzo.diagnostic.stage"],
-            "terminal_acknowledgement"
-        );
+        assert_eq!(event["um.run.result"], "aborted");
+        assert_eq!(event["um.failure.cause_type"], "lease_timer_unavailable");
+        assert_eq!(event["um.diagnostic.stage"], "terminal_acknowledgement");
     }
 
     #[tokio::test]
@@ -8450,14 +8444,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         assert!(manager.lease_clock_failed);
         drop(manager);
         let event = capture.event("runner.run");
-        assert_eq!(
-            event["scherzo.failure.cause_type"],
-            "lease_timer_wait_failed"
-        );
-        assert_eq!(
-            event["scherzo.diagnostic.stage"],
-            "terminal_acknowledgement"
-        );
+        assert_eq!(event["um.failure.cause_type"], "lease_timer_wait_failed");
+        assert_eq!(event["um.diagnostic.stage"], "terminal_acknowledgement");
     }
 
     #[tokio::test]
@@ -8482,8 +8470,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             assert_acknowledged_run(&mut manager, &capture, expected);
             if expected == "failed" {
                 let run = capture.event("runner.run");
-                assert!(run["scherzo.failure.phase"].is_string());
-                assert!(run["scherzo.failure.code"].is_string());
+                assert!(run["um.failure.phase"].is_string());
+                assert!(run["um.failure.code"].is_string());
             }
         }
     }
@@ -9556,9 +9544,9 @@ steps:
         decision.record(&event);
         event.finish(TelemetryOutcome::Success);
         let event = capture.event("runner.effect_acknowledgement");
-        assert_eq!(event["scherzo.lease.disposition"], "applied");
-        assert_eq!(event["scherzo.lease.cancellation_headroom_ms"], 10_000);
-        assert_eq!(event["scherzo.lease.request_age_ms"], 20_000);
+        assert_eq!(event["um.lease.disposition"], "applied");
+        assert_eq!(event["um.lease.cancellation_headroom_ms"], 10_000);
+        assert_eq!(event["um.lease.request_age_ms"], 20_000);
     }
 
     #[tokio::test]
