@@ -692,6 +692,33 @@ fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
 }
 
 #[test]
+fn frame_limit_is_enforced_while_reading_bytes() {
+    let limits =
+        ClaudeCodeStreamJsonV1ProtocolLimits::with_maximum_frame_bytes(NonZeroU64::new(8).unwrap());
+    let make_parser = || {
+        ClaudeCodeStreamJsonV1Parser::new(
+            Arc::from(CWD),
+            Arc::from(MODEL),
+            Arc::from(SESSION_ID),
+            Arc::from(QUALIFICATION_VERSION),
+            AgentValueKind::None,
+            NonZeroU64::new(1024).unwrap(),
+            limits,
+        )
+    };
+    let mut at_limit = make_parser();
+    at_limit.push_stdout(b"{}      ", drop).unwrap();
+    assert!(at_limit.push_stdout(b"\n", drop).is_err());
+    let at_limit = protocol_rejection_value(&at_limit.finish(true));
+    assert_ne!(at_limit["detail"]["reason"], "frame_too_large");
+
+    let mut over_limit = make_parser();
+    assert!(over_limit.push_stdout(b"{}      X", drop).is_err());
+    let over_limit = protocol_rejection_value(&over_limit.finish(true));
+    assert_eq!(over_limit["detail"]["reason"], "frame_too_large");
+}
+
+#[test]
 fn truncation_and_frame_overflow_fail_in_the_current_protocol_phase() {
     let mut transcript = framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]);
     transcript.pop();

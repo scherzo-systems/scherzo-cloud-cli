@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::future::{Future, ready};
+use std::future::Future;
 use std::io::{BufRead, Read as _, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -13,7 +13,7 @@ use rustix::process::Pid;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use super::adapter::{CodexAppServerV1Adapter, CodexAppServerV1LaunchPlan, prepare_launch};
 use super::*;
@@ -21,23 +21,21 @@ use crate::codex::CODEX_APP_SERVER_V1_QUALIFICATION_VERSION;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
-    AgentInvocationLimits, AgentInvocationStaging, AgentObservationEnvelope, AgentObservationSink,
-    AgentProcessContext, AgentProcessControl, AgentPrompt, AgentStartReceiver,
-    AgentTerminalReceiver, AgentValueMode, PositiveDuration, RetainedJsonSchema,
-    StagedAgentAttachment, WorkflowRunId, agent_start_channel, agent_terminal_channel,
-    invoke_agent_adapter,
+    AgentInvocationLimits, AgentInvocationStaging, AgentObservationEnvelope, AgentProcessContext,
+    AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver, AgentValueMode,
+    PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, WorkflowRunId,
+    agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
 };
 use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
+use crate::workflow::agent_process_driver::test_support::{
+    ControlledClock, InlineValidationWorker, PendingClock, RecordingObservationSink,
+};
 use crate::workflow::codex::CodexConfig;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::execution_root::AdmittedExecutionRoot;
 use crate::workflow::observation::NoopExecutionObserver;
 use crate::workflow::process_group::{ProcessGuardRegistry, process_group_is_quiescent};
-use crate::workflow::result_validation::{
-    ResultValidationWorker, RunningResultValidation, ValidationWorkerDecision,
-    ValidationWorkerRequest,
-};
 use crate::workflow::runtime::{ActionId, TransitionSequence};
 
 // Keep this slug in the pinned Codex catalog: unknown slugs lose apply_patch and tool_search.
@@ -76,21 +74,6 @@ exec "$CODEX_FIXTURE_HELPER" \
   3>&1 >/dev/null
 "#;
 
-#[derive(Clone, Copy)]
-struct PendingClock;
-
-impl CoordinatorClock for PendingClock {
-    type Instant = Duration;
-
-    fn now(&mut self) -> Self::Instant {
-        Duration::ZERO
-    }
-
-    async fn wait_until(&self, _deadline: Self::Instant) {
-        std::future::pending().await
-    }
-}
-
 #[derive(Clone)]
 struct ReleasedClock {
     deadlines: mpsc::UnboundedSender<(Duration, oneshot::Sender<()>)>,
@@ -98,7 +81,6 @@ struct ReleasedClock {
 
 // This clock carries Codex-specific stdin-deadline synchronization; sharing it with
 // another profile's fixture would couple independent protocol timing contracts.
-// jscpd:ignore-start
 impl CoordinatorClock for ReleasedClock {
     type Instant = Duration;
 
@@ -114,65 +96,6 @@ impl CoordinatorClock for ReleasedClock {
         if released.await.is_err() {
             std::future::pending::<()>().await;
         }
-    }
-}
-// jscpd:ignore-end
-
-#[derive(Clone)]
-struct ControlledClock {
-    deadlines: mpsc::UnboundedSender<Duration>,
-    expired: watch::Receiver<bool>,
-}
-
-struct ClockControl {
-    deadlines: mpsc::UnboundedReceiver<Duration>,
-    expired: watch::Sender<bool>,
-}
-
-impl ControlledClock {
-    fn new() -> (Self, ClockControl) {
-        let (deadlines, registrations) = mpsc::unbounded_channel();
-        let (expired, expiration) = watch::channel(false);
-        (
-            Self {
-                deadlines,
-                expired: expiration,
-            },
-            ClockControl {
-                deadlines: registrations,
-                expired,
-            },
-        )
-    }
-}
-
-// This clock records Codex result validation and settlement deadlines independently
-// from other harness fixtures so their synchronization cannot become coupled.
-// jscpd:ignore-start
-impl CoordinatorClock for ControlledClock {
-    type Instant = Duration;
-
-    fn now(&mut self) -> Self::Instant {
-        Duration::ZERO
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        let _ = self.deadlines.send(deadline);
-        let mut expired = self.expired.clone();
-        while !*expired.borrow_and_update() {
-            if expired.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-// jscpd:ignore-end
-#[derive(Clone, Default)]
-struct RecordingObservationSink(Arc<Mutex<Vec<AgentObservationEnvelope>>>);
-
-impl RecordingObservationSink {
-    fn snapshot(&self) -> Vec<AgentObservationEnvelope> {
-        self.0.lock().unwrap().clone()
     }
 }
 
@@ -212,52 +135,8 @@ fn assert_failure_cause(outcome: AgentOutcome, expected: AgentFailureCause, scen
     assert_eq!(failure.cause(), &expected, "{scenario}");
 }
 
-// This sink belongs to the Codex process fixture so its observations and synchronization
-// cannot be accidentally shared with another native conformance harness.
-// jscpd:ignore-start
-impl AgentObservationSink for RecordingObservationSink {
-    fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
-        self.0.lock().unwrap().push(observation);
-        ready(())
-    }
-}
-// jscpd:ignore-end
-
 type TestInvocation =
     AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, RecordingObservationSink>;
-
-// Keep the authoritative validator's inline worker local to the Codex process fixture;
-// sharing another native adapter's worker would couple otherwise independent transcripts.
-// jscpd:ignore-start
-#[derive(Clone, Copy)]
-struct InlineValidationWorker;
-
-impl ResultValidationWorker for InlineValidationWorker {
-    type Running = ReadyValidation;
-
-    fn start(&self, request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        Ok(ReadyValidation {
-            decision: Some(request.evaluate()),
-        })
-    }
-}
-
-struct ReadyValidation {
-    decision: Option<Result<ValidationWorkerDecision, ()>>,
-}
-
-impl RunningResultValidation for ReadyValidation {
-    fn wait(&mut self) -> impl Future<Output = Result<ValidationWorkerDecision, ()>> + Send {
-        ready(self.decision.take().unwrap())
-    }
-
-    fn request_stop(&mut self) {}
-
-    fn quiesce(self) -> impl Future<Output = ()> + Send {
-        ready(())
-    }
-}
-// jscpd:ignore-end
 
 struct ProcessFixture {
     _temporary: tempfile::TempDir,
@@ -353,7 +232,6 @@ impl ProcessFixture {
     ) -> Self {
         // Codex owns fresh native process, control, and state roots; sharing another
         // harness fixture would invalidate profile-specific persistence evidence.
-        // jscpd:ignore-start
         // The workflow-provided TMPDIR can be nested beneath a repository checkout.
         // Keep exact native project discovery outside that ancestor so Codex cannot load
         // repository state that is not part of this synthetic conformance fixture.
@@ -385,7 +263,6 @@ impl ProcessFixture {
         ] {
             std::fs::create_dir_all(directory).unwrap();
         }
-        // jscpd:ignore-end
         std::fs::write(cwd.join("AGENTS.md"), b"root resource marker\n").unwrap();
         std::fs::create_dir_all(cwd.join("nested")).unwrap();
         std::fs::write(cwd.join("nested/AGENTS.md"), b"nested resource marker\n").unwrap();
@@ -404,7 +281,6 @@ impl ProcessFixture {
         let descendant = controls.join("descendant.pid");
         // Codex's exact process fixture owns its synthetic environment and controls;
         // sharing another profile's fixture would blur native launch evidence.
-        // jscpd:ignore-start
         let mut environment = BTreeMap::from([
             (
                 OsString::from("PATH"),
@@ -484,10 +360,8 @@ impl ProcessFixture {
                 OsString::from(PLACEHOLDER_KEY),
             );
         }
-        // jscpd:ignore-end
         // The Codex fixture stages exact ordered identities for localImage and sealed-path
         // assertions rather than sharing another native transport's attachment setup.
-        // jscpd:ignore-start
         let staged_attachments = attachments
             .iter()
             .enumerate()
@@ -509,7 +383,6 @@ impl ProcessFixture {
             std::fs::Permissions::from_mode(0o700),
         )
         .unwrap();
-        // jscpd:ignore-end
         let admitted_root = AdmittedExecutionRoot::admit(&execution_root).unwrap();
         let working_directory = admitted_root
             .select_working_directory(Some("worktree"))
@@ -519,7 +392,6 @@ impl ProcessFixture {
         let diagnostics = StepDiagnosticLog::default();
         // The fixture deliberately materializes the full Codex invocation contract; sharing
         // this wiring would couple its profile, staging, and limits to another harness test.
-        // jscpd:ignore-start
         let invocation = AgentInvocation::new(
             AgentInvocationIdentity::new(
                 WorkflowRunId::from(Arc::from("run-codex-fixture")),
@@ -558,7 +430,6 @@ impl ProcessFixture {
             ProcessGuardRegistry::default(),
             observations.clone(),
         );
-        // jscpd:ignore-end
         Self {
             _temporary: temporary,
             invocation: Some(invocation),
@@ -676,7 +547,6 @@ fn result_mode(schema: Value) -> AgentValueMode {
 
 // These limits deliberately materialize the complete Codex fixture envelope rather than
 // inheriting another profile's protocol-limit type or test defaults.
-// jscpd:ignore-start
 fn invocation_limits(
     maximum_response_bytes: u64,
     maximum_result_bytes: u64,
@@ -694,10 +564,8 @@ fn invocation_limits(
         CodexAppServerV1ProtocolLimits::profile(),
     )
 }
-// jscpd:ignore-end
 
 // Codex fixture startup selects its test-only provider and exact terminal channel locally.
-// jscpd:ignore-start
 fn start_fixture(
     invocation: TestInvocation,
     diagnostics: StepDiagnosticLog,
@@ -753,7 +621,6 @@ fn start_fixture_with_clock_and_synthetic_model_provider<Clock: CoordinatorClock
     });
     (task, start, outcome)
 }
-// jscpd:ignore-end
 
 struct RunningCancellationFixture {
     fixture: ProcessFixture,
@@ -801,7 +668,6 @@ impl RunningCancellationFixture {
 
 // Process-record inspection is specific to this guarded App Server fixture's quiescence
 // proof, so it remains separate from other harness fixture runners.
-// jscpd:ignore-start
 async fn run_fixture(fixture: ProcessFixture) -> (ProcessFixture, AgentOutcome, bool) {
     run_fixture_with_synthetic_model_provider(fixture, Some(Arc::from(PROVIDER))).await
 }
@@ -827,7 +693,6 @@ async fn run_fixture_with_synthetic_model_provider(
     assert_transient_sqlite_cleaned(&fixture);
     (fixture, outcome, started)
 }
-// jscpd:ignore-end
 
 async fn run_response_process(
     scenario: &str,

@@ -1,20 +1,19 @@
 use std::ffi::OsString;
 use std::fs;
-use std::future::{Future, pending};
+use std::future::pending;
 use std::io;
 use std::num::NonZeroU64;
-use std::ops::Add as _;
+#[cfg(test)]
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
-use std::pin::Pin;
-use std::process::{ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::Stdio;
 use std::sync::Arc;
-use tracing::Instrument as _;
 
-use rustix::process::Pid;
-use tokio::io::AsyncReadExt as _;
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::process::ChildStderr;
+#[cfg(test)]
+use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use super::input_transport::PreparedInputTransport;
 use super::result_bridge::{
@@ -26,131 +25,53 @@ use super::{
 use crate::pi::{PiCompatibilityProfile, compatibility_profile_for_version};
 use crate::workflow::admission::{CancellationReason, CancellationSource};
 use crate::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentInputKind,
-    AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
-    AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueKind,
-    AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, check_agent_input_bound,
+    AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentInputKind, AgentInvocation,
+    AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
+    AgentProcessDirective, AgentStartCallback, AgentValueKind, AgentValueMode,
+    MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, check_agent_input_bound,
     failed_agent_outcome, finish_agent_diagnostic_capture, run_cancellable_blocking_launch,
 };
-use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
-use crate::workflow::child_guard::{
-    ChildGuardCancellation, StoppedChildGuard, force_stop_direct_child,
-};
+use crate::workflow::agent_process_driver::{self, GuardedProcess, Launch, Settlement};
+use crate::workflow::child_guard::ChildGuardCancellation;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::observation::{ExecutionObserver, NoopExecutionObserver};
 use crate::workflow::pi::PiConfig;
-use crate::workflow::process_group::{
-    ProcessGuardRegistration, interrupt_process_group, mark_process_guard_quiesced,
-    process_group_is_quiescent, reap_process_group_children, terminate_authenticated_process_group,
-    terminate_process_group,
-};
 use crate::workflow::result_validation::{
     AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
     ResultValidationOutcome, ResultValidationWorker,
 };
 
-pub(crate) struct PiJsonV1Adapter<
+#[derive(Clone, Default)]
+pub(crate) struct PiProfile;
+pub(crate) type PiJsonV1Adapter<
     Clock,
     Observer = NoopExecutionObserver,
     Worker = ProcessResultValidationWorker,
-> {
-    diagnostics: StepDiagnosticLog,
-    maximum_diagnostic_stream_bytes: NonZeroU64,
-    clock: Clock,
-    observer: Observer,
-    validation_worker: Worker,
-}
+> = agent_process_driver::AdapterCore<Clock, Observer, Worker, PiProfile>;
 
-impl<Clock, Observer> PiJsonV1Adapter<Clock, Observer, ProcessResultValidationWorker> {
-    pub(crate) fn new(
-        diagnostics: StepDiagnosticLog,
-        maximum_diagnostic_stream_bytes: NonZeroU64,
-        clock: Clock,
-        observer: Observer,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            diagnostics,
-            maximum_diagnostic_stream_bytes,
-            clock,
-            observer,
-            validation_worker: ProcessResultValidationWorker::for_current_executable()?,
-        })
-    }
-}
-
-impl<Clock, Observer, Worker> PiJsonV1Adapter<Clock, Observer, Worker> {
-    #[cfg(test)]
-    pub(super) fn with_validation_worker(
-        diagnostics: StepDiagnosticLog,
-        maximum_diagnostic_stream_bytes: NonZeroU64,
-        clock: Clock,
-        observer: Observer,
-        validation_worker: Worker,
-    ) -> Self {
-        Self {
-            diagnostics,
-            maximum_diagnostic_stream_bytes,
-            clock,
-            observer,
-            validation_worker,
-        }
-    }
-}
-
-impl<Clock, Observer, Worker> Clone for PiJsonV1Adapter<Clock, Observer, Worker>
-where
-    Clock: Clone,
-    Observer: Clone,
-    Worker: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            diagnostics: self.diagnostics.clone(),
-            maximum_diagnostic_stream_bytes: self.maximum_diagnostic_stream_bytes,
-            clock: self.clock.clone(),
-            observer: self.observer.clone(),
-            validation_worker: self.validation_worker.clone(),
-        }
-    }
-}
-
-// The trait boilerplate matches the scripted adapter, but each adapter owns a
-// distinct lifecycle and keeping their invocation logic separate avoids coupling them.
-// jscpd:ignore-start
-impl<Clock, Observer, Worker, Sink> AgentAdapter<Sink> for PiJsonV1Adapter<Clock, Observer, Worker>
+impl<Clock, Observer, Worker, Sink>
+    agent_process_driver::NativeProcessProfile<Clock, Observer, Worker, Sink> for PiProfile
 where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
     Worker: ResultValidationWorker,
     Sink: AgentObservationSink,
 {
-    type NativeConfiguration = PiConfig;
-    type ProtocolLimits = PiJsonV1ProtocolLimits;
+    type Configuration = PiConfig;
+    type Limits = PiJsonV1ProtocolLimits;
+    const NAME: &'static str = "pi_json_v1";
 
     async fn invoke(
-        &self,
-        invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
-        started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        let cancellation = invocation.cancellation().clone();
-        let span = tracing::info_span!("agent_invocation", profile = "pi_json_v1",
-            step = %invocation.identity().step(),
-            sequence = invocation.identity().invocation().transition_sequence.get());
-        let outcome = self
-            .invoke_inner(invocation, &started)
-            .instrument(span)
-            .await;
-        let outcome = cancellation
-            .cancellation_reason()
-            .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
-        let _ = terminal.report(outcome);
+        adapter: &agent_process_driver::AdapterCore<Clock, Observer, Worker, Self>,
+        invocation: AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+        started: &AgentStartCallback,
+    ) -> AgentOutcome {
+        adapter.invoke_inner(invocation, started).await
     }
 }
-// jscpd:ignore-end
 
-impl<Clock, Observer, Worker> PiJsonV1Adapter<Clock, Observer, Worker>
+impl<Clock, Observer, Worker> agent_process_driver::AdapterCore<Clock, Observer, Worker, PiProfile>
 where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
@@ -169,75 +90,56 @@ where
         }
 
         let adapter = self.clone();
-        let (invocation, preparation) = match tokio::task::spawn_blocking(move || {
-            let preparation = prepare_launch(&invocation).and_then(|mut plan| {
-                let result_bridge = adapter.prepare_result_bridge(&invocation)?;
-                if let Some(result_bridge) = result_bridge.as_ref() {
-                    plan.add_result_extension(result_bridge.bridge.extension_path());
-                }
-                Ok((plan, result_bridge))
-            });
-            (invocation, preparation)
-        })
+        let (invocation, (plan, mut result_bridge)) = match self
+            .prepare_invocation(
+                invocation,
+                move |invocation| {
+                    prepare_launch(invocation).and_then(|mut plan| {
+                        let result_bridge = adapter.prepare_result_bridge(invocation)?;
+                        if let Some(result_bridge) = result_bridge.as_ref() {
+                            plan.add_result_extension(result_bridge.bridge.extension_path());
+                        }
+                        Ok((plan, result_bridge))
+                    })
+                },
+                AgentFailureCause::start_failure("launch preparation", "unavailable"),
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        // Even without a durable guard store, the stopped-child handshake ensures the
+        // process is contained before it can run. Registration is a no-op in that case.
+        let cancellation_source = invocation.cancellation().clone();
+        let diagnostics = self.diagnostics.clone();
+        let maximum_stream_bytes = self.maximum_diagnostic_stream_bytes;
+        let launch = match run_cancellable_blocking_launch(
+            &cancellation_source,
+            move |launch_cancellation| {
+                let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
+                    log: &diagnostics,
+                    maximum_stream_bytes,
+                };
+                let launched = launch_guarded_process(
+                    &invocation,
+                    &plan,
+                    spawn_diagnostics,
+                    &launch_cancellation,
+                );
+                (invocation, plan, launched)
+            },
+        )
         .await
         {
-            Ok(preparation) => preparation,
+            Ok((launch, cancellation_reason)) => (launch, cancellation_reason),
             Err(_) => {
+                let _ = shutdown_result_bridge(result_bridge).await;
                 return failed(AgentFailureCause::start_failure(
                     "launch preparation",
                     "unavailable",
                 ));
             }
-        };
-        let (plan, mut result_bridge) = match preparation {
-            Ok(preparation) => preparation,
-            Err(cause) => {
-                self.diagnostics.record_agent_start_failure(
-                    invocation.identity(),
-                    self.maximum_diagnostic_stream_bytes,
-                    &cause,
-                );
-                return failed(cause);
-            }
-        };
-        let launch = if invocation.process_guards().is_durable() {
-            let cancellation_source = invocation.cancellation().clone();
-            let diagnostics = self.diagnostics.clone();
-            let maximum_stream_bytes = self.maximum_diagnostic_stream_bytes;
-            match run_cancellable_blocking_launch(
-                &cancellation_source,
-                move |launch_cancellation| {
-                    let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
-                        log: &diagnostics,
-                        maximum_stream_bytes,
-                    };
-                    let launched = launch_guarded_process(
-                        &invocation,
-                        &plan,
-                        spawn_diagnostics,
-                        &launch_cancellation,
-                    );
-                    (invocation, plan, launched)
-                },
-            )
-            .await
-            {
-                Ok((launch, cancellation_reason)) => (launch, cancellation_reason),
-                Err(_) => {
-                    let _ = shutdown_result_bridge(result_bridge).await;
-                    return failed(AgentFailureCause::start_failure(
-                        "launch preparation",
-                        "unavailable",
-                    ));
-                }
-            }
-        } else {
-            let spawn_diagnostics = ProcessSpawnDiagnosticCapture {
-                log: &self.diagnostics,
-                maximum_stream_bytes: self.maximum_diagnostic_stream_bytes,
-            };
-            let launched = launch_direct_process(&invocation, &plan, spawn_diagnostics).await;
-            ((invocation, plan, launched), None)
         };
         let ((mut invocation, plan, launched), cancellation_reason) = launch;
         if let Some(reason) = cancellation_reason {
@@ -259,22 +161,21 @@ where
                 return failed(cause);
             }
         };
-        let Some(process_directives) = invocation.take_process_directives() else {
-            let mut process = process;
-            let _ = process.child.force_stop(process.process_group).await;
+        let mut process = process;
+        let Some(process_directives) = agent_process_driver::take_process_directives(
+            &mut invocation,
+            &mut process.child,
+            process.process_group,
+        )
+        .await
+        else {
             let _ = shutdown_result_bridge(result_bridge).await;
             return failed(AgentFailureCause::start_failure(
                 "launch preparation",
                 "unavailable",
             ));
         };
-        let diagnostic = self.diagnostics.start_standard_error_capture(
-            invocation.identity().step().to_owned(),
-            invocation.identity().invocation(),
-            self.maximum_diagnostic_stream_bytes,
-            standard_error,
-            self.observer.clone(),
-        );
+        let diagnostic = self.start_diagnostic(&invocation, standard_error);
         let expected_result_tool_name = result_bridge
             .as_ref()
             .map(|result_bridge| Arc::clone(result_bridge.bridge.tool_name()));
@@ -332,16 +233,12 @@ where
             self.clock.clone(),
         )
         .map_err(|error| AgentFailureCause::start_failure("result bridge", error))?;
-        let validator = AuthoritativeResultValidator::new(
-            schema.clone(),
-            invocation.limits().maximum_result_bytes(),
-            invocation
-                .limits()
-                .maximum_result_rejection_feedback_bytes(),
-            invocation.limits().result_validation_deadline(),
-            self.clock.clone(),
-            self.validation_worker.clone(),
-        );
+        let Some(validator) = self.result_validator(invocation) else {
+            return Err(AgentFailureCause::start_failure(
+                "result bridge",
+                "result validator unavailable",
+            ));
+        };
         Ok(Some(ActiveResultBridge { bridge, validator }))
     }
 }
@@ -387,26 +284,19 @@ where
         AgentInputKind::Message,
     )?;
 
-    // The Claude and Pi adapters keep these admission guards local because their
-    // profile-specific launch contracts must remain independently typed.
-    // jscpd:ignore-start
-    if invocation.adapter().profile() != AgentCompatibilityProfile::PiJsonV1
-        || compatibility_profile_for_version(invocation.adapter().version())
-            != Some(PiCompatibilityProfile::PiJsonV1)
-        || !invocation.adapter().executable().is_absolute()
-    {
-        return Err(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ));
-    }
-    // jscpd:ignore-end
-    invocation
-        .diagnostic_session()
-        .verify_pi_native_session_path_binding()
-        .map_err(|error| {
-            AgentFailureCause::start_failure("pi diagnostic session binding", error)
-        })?;
+    agent_process_driver::require_native_profile(
+        invocation,
+        AgentCompatibilityProfile::PiJsonV1,
+        compatibility_profile_for_version(invocation.adapter().version())
+            == Some(PiCompatibilityProfile::PiJsonV1),
+        || AgentFailureCause::start_failure("launch preparation", "unavailable"),
+    )?;
+    agent_process_driver::verify_session_binding(
+        invocation
+            .diagnostic_session()
+            .verify_pi_native_session_path_binding(),
+        "pi diagnostic session binding",
+    )?;
     let expected_cwd = invocation.process().protocol_cwd().map_err(|error| {
         AgentFailureCause::start_failure("working directory", format!("{error:?}"))
     })?;
@@ -496,6 +386,7 @@ where
     })
 }
 
+#[cfg(test)]
 pub(super) fn build_command<Sink>(
     invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
     plan: &PiJsonV1LaunchPlan,
@@ -503,12 +394,12 @@ pub(super) fn build_command<Sink>(
 where
     Sink: AgentObservationSink,
 {
-    invocation
-        .diagnostic_session()
-        .verify_pi_native_session_path_binding()
-        .map_err(|error| {
-            AgentFailureCause::start_failure("pi diagnostic session binding", error)
-        })?;
+    agent_process_driver::verify_session_binding(
+        invocation
+            .diagnostic_session()
+            .verify_pi_native_session_path_binding(),
+        "pi diagnostic session binding",
+    )?;
     let mut command = Command::new(invocation.adapter().executable());
     command
         .args(&plan.arguments)
@@ -527,21 +418,6 @@ where
     Ok(command)
 }
 
-async fn launch_direct_process<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
-    plan: &PiJsonV1LaunchPlan,
-    spawn_diagnostics: ProcessSpawnDiagnosticCapture<'_>,
-) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
-    let mut command = build_command(invocation, plan)?;
-    let child = command
-        .spawn()
-        .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
-    finish_direct_process_launch(child).await
-}
-
 fn launch_guarded_process<Sink>(
     invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
     plan: &PiJsonV1LaunchPlan,
@@ -558,117 +434,34 @@ where
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<Vec<_>>();
-    let mut child = StoppedChildGuard::spawn_cancellable(
-        invocation.adapter().executable(),
+    let GuardedProcess {
+        child,
+        process_group,
+        standard_output,
+        standard_error,
+        ..
+    } = Launch::for_invocation(
+        invocation,
         &plan.arguments,
         &environment,
         cancellation,
-        |command| {
-            invocation
-                .process()
-                .bind_command(command)
-                .map_err(|_| io::Error::other("agent working directory is unavailable"))
-        },
+        false,
     )
-    .map_err(|error| spawn_diagnostics.capture(invocation, &error))?;
-    let process_group = child.identity().process_group();
-    let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
-    else {
-        let _ = child.force_stop_blocking();
-        return Err(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ));
-    };
-    let mut registration = match invocation.process_guards().register(
-        invocation.identity().step(),
-        invocation.identity().invocation().transition_sequence.get(),
-        child.identity(),
-    ) {
-        Ok(registration) => registration,
-        Err(_) => {
-            let _ = child.force_stop_blocking();
-            return Err(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ));
-        }
-    };
-    if let Err(failure) = release_guarded_pi(invocation.diagnostic_session(), || {
-        child
-            .continue_execution_cancellable(cancellation)
-            .map_err(GuardedPiReleaseFailure::ProcessExec)?;
-        registration
-            .mark_released()
-            .map_err(|_| GuardedPiReleaseFailure::GuardState)
-    }) {
-        let cause = match failure {
-            GuardedPiReleaseFailure::ProcessExec(error) => {
-                spawn_diagnostics.capture(invocation, &error)
-            }
-            GuardedPiReleaseFailure::SessionBinding | GuardedPiReleaseFailure::GuardState => {
-                AgentFailureCause::start_failure("launch preparation", "unavailable")
-            }
-        };
-        let _ = child.force_stop_blocking();
-        let _ = registration.mark_quiesced();
-        return Err(cause);
-    }
-
-    Ok((
-        LaunchedPiProcess {
-            child: PiChild::Guarded {
-                child,
-                registration: Some(registration),
-            },
-            process_group,
-            standard_output,
+    .spawn(
+        |command| agent_process_driver::bind_agent_command(invocation, command),
+        || {
+            invocation
+                .diagnostic_session()
+                .verify_pi_native_session_path_binding()
+                .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))
         },
-        standard_error,
-    ))
-}
-
-enum GuardedPiReleaseFailure {
-    SessionBinding,
-    ProcessExec(io::Error),
-    GuardState,
-}
-
-fn release_guarded_pi(
-    diagnostic_session: &AgentDiagnosticSession,
-    release: impl FnOnce() -> Result<(), GuardedPiReleaseFailure>,
-) -> Result<(), GuardedPiReleaseFailure> {
-    diagnostic_session
-        .verify_pi_native_session_path_binding()
-        .map_err(|_| GuardedPiReleaseFailure::SessionBinding)?;
-    release()
-}
-
-async fn finish_direct_process_launch(
-    mut child: Child,
-) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause> {
-    let Some(process_group) = child
-        .id()
-        .and_then(|process_id| i32::try_from(process_id).ok())
-        .and_then(Pid::from_raw)
-    else {
-        stop_child(&mut child, None).await;
-        return Err(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ));
-    };
-    let (Some(standard_output), Some(standard_error)) = (child.stdout.take(), child.stderr.take())
-    else {
-        stop_child(&mut child, Some(process_group)).await;
-        return Err(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ));
-    };
+        |error| spawn_diagnostics.capture(invocation, &error),
+        |error| spawn_diagnostics.capture(invocation, &error),
+        || AgentFailureCause::start_failure("launch preparation", "unavailable"),
+    )?;
     Ok((
         LaunchedPiProcess {
-            child: PiChild::Direct(child),
+            child,
             process_group,
             standard_output,
         },
@@ -726,69 +519,232 @@ fn combined_system_prompt(
     Ok(combined)
 }
 
-struct LaunchedPiProcess {
-    child: PiChild,
-    process_group: Pid,
-    standard_output: ChildStdout,
-}
+type LaunchedPiProcess = agent_process_driver::ProcessOutput;
 
-enum PiChild {
-    Guarded {
-        child: StoppedChildGuard,
-        registration: Option<ProcessGuardRegistration>,
-    },
-    Direct(Child),
-}
-
-impl PiChild {
-    fn force_process_group(&self, process_group: Pid) {
-        match self {
-            Self::Guarded { child, .. } => {
-                let _ = terminate_authenticated_process_group(child.identity());
-            }
-            Self::Direct(_) => terminate_process_group(process_group),
-        }
-    }
-
-    async fn wait(&mut self) -> Result<ExitStatus, ()> {
-        let status = match self {
-            Self::Guarded { child, .. } => child.wait().await.map_err(|_| ()),
-            Self::Direct(child) => child.wait().await.map_err(|_| ()),
-        }?;
-        self.mark_quiesced().await?;
-        Ok(status)
-    }
-
-    async fn force_stop(&mut self, process_group: Pid) -> Result<(), ()> {
-        self.force_process_group(process_group);
-        match self {
-            Self::Guarded { child, .. } => child.force_stop().await.map_err(|_| ())?,
-            Self::Direct(child) => force_stop_direct_child(child).await?,
-        }
-        self.mark_quiesced().await
-    }
-
-    async fn mark_quiesced(&mut self) -> Result<(), ()> {
-        match self {
-            Self::Guarded { registration, .. } => mark_process_guard_quiesced(registration).await,
-            Self::Direct(_) => Ok(()),
-        }
-    }
-}
-
-pub(super) const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(10);
+#[cfg(test)]
+pub(super) use agent_process_driver::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL;
 
 struct ResultSettlementConfiguration<Clock> {
     clock: Clock,
     grace: PositiveDuration,
 }
 
+enum PiExtra {
+    Result(ResultSocketEvent),
+    SettlementExpired,
+}
+
+struct PiProtocol<'a, Clock, Worker, Sink> {
+    invocation: &'a AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+    started: &'a AgentStartCallback,
+    parser: PiJsonV1Parser,
+    result_bridge: &'a mut Option<ActiveResultBridge<Clock, Worker>>,
+    begin_settlement: mpsc::UnboundedSender<()>,
+    settlement_outcome: mpsc::UnboundedReceiver<()>,
+    settlement_admitted: bool,
+    settlement_active: bool,
+    pending_result_event: Option<ResultSocketEvent>,
+    start_reported: bool,
+    failure: Option<AgentFailure>,
+}
+
+impl<Clock, Worker, Sink> agent_process_driver::Protocol<Clock>
+    for PiProtocol<'_, Clock, Worker, Sink>
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+    Sink: AgentObservationSink,
+{
+    type Extra = PiExtra;
+
+    fn extra_enabled(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        state.parser_enabled
+            && (self.settlement_active
+                || (self.pending_result_event.is_none() && self.result_bridge.is_some()))
+    }
+
+    async fn extra(&mut self) -> PiExtra {
+        tokio::select! {
+            biased;
+            event = receive_result_event(self.result_bridge), if self.pending_result_event.is_none() => PiExtra::Result(event),
+            _ = self.settlement_outcome.recv(), if self.settlement_active => PiExtra::SettlementExpired,
+        }
+    }
+
+    async fn on_extra(&mut self, event: PiExtra, state: &mut agent_process_driver::State<Clock>) {
+        if !state.parser_enabled {
+            return;
+        }
+        match event {
+            PiExtra::Result(event) => self.pending_result_event = Some(event),
+            PiExtra::SettlementExpired => {
+                self.settlement_active = false;
+                state.output_closed = true;
+                self.failure = Some(AgentFailureCause::ResultSettlementFailed.into());
+                state.parser_enabled = false;
+                state.force_group();
+            }
+        }
+    }
+
+    async fn on_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
+        let (parsed, observations) = agent_process_driver::collect_stdout_observations(|emit| {
+            self.parser.push_stdout(bytes, emit)
+        });
+        if parsed.is_ok()
+            && self.parser.accepted_result_ready_for_settlement()
+            && !self.settlement_admitted
+        {
+            if self.begin_settlement.send(()).is_err() {
+                self.failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                state.parser_enabled = false;
+                state.force_group();
+            } else {
+                self.settlement_admitted = true;
+                self.settlement_active = true;
+            }
+        }
+        if state.parser_enabled {
+            for observation in observations {
+                let reports_start = matches!(
+                    &observation,
+                    AgentObservation::Lifecycle {
+                        milestone: AgentLifecycleMilestone::HarnessStarted,
+                    }
+                );
+                // Native retries can report start repeatedly; the workflow callback is one-shot.
+                if reports_start && !self.start_reported {
+                    if self.started.report().is_err() {
+                        self.failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                        state.parser_enabled = false;
+                        state.force_group();
+                        break;
+                    }
+                    self.start_reported = true;
+                }
+                let emitted = self.invocation.observations().emit(observation).await;
+                if let Some(reason) = state.cancellation.cancellation_reason() {
+                    state.cancelled = Some(reason);
+                    state.parser_enabled = false;
+                    break;
+                }
+                if emitted.is_err() {
+                    self.failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                    state.parser_enabled = false;
+                    state.force_group();
+                    break;
+                }
+            }
+        }
+        if state.parser_enabled && parsed.is_err() {
+            self.failure = Some(self.parser.agent_failure_for_current_phase());
+            state.parser_enabled = false;
+            state.force_group();
+        }
+    }
+
+    fn classify_read_failure(&mut self) {
+        self.failure = Some(self.parser.agent_failure_for_current_phase());
+    }
+    fn cancellation_precedes_read_failure(&self) -> bool {
+        true
+    }
+    fn read_failure_enabled(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        state.cancelled.is_none()
+    }
+
+    async fn on_wait_error(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if state.cancelled.is_none() {
+            self.failure = Some(self.parser.agent_failure_for_current_phase());
+        }
+        state.force_group();
+    }
+
+    async fn after_event(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if state.parser_enabled
+            && let Some(event) = self.pending_result_event.take()
+        {
+            match handle_result_event(
+                event,
+                self.result_bridge,
+                &mut self.parser,
+                &state.cancellation,
+            )
+            .await
+            {
+                ResultEventProgress::Continue { observation } => {
+                    if let Some(observation) = observation {
+                        let emitted = self.invocation.observations().emit(observation).await;
+                        if let Some(reason) = state.cancellation.cancellation_reason() {
+                            state.cancelled = Some(reason);
+                            state.parser_enabled = false;
+                        } else if emitted.is_err() {
+                            self.failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
+                            state.parser_enabled = false;
+                            state.force_group();
+                        }
+                    }
+                }
+                ResultEventProgress::Pending(incoming) => {
+                    self.pending_result_event = Some(ResultSocketEvent::Request(incoming));
+                }
+                ResultEventProgress::Failed(failure) => {
+                    self.failure = Some(failure);
+                    state.parser_enabled = false;
+                    state.force_group();
+                }
+                ResultEventProgress::Cancelled(reason) => {
+                    state.cancelled = Some(reason);
+                    state.parser_enabled = false;
+                }
+            }
+        }
+    }
+
+    fn needs_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        !state.group_quiescent
+    }
+
+    fn probe_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        state.termination_requested
+    }
+
+    fn on_group_live(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if (!self.settlement_active || !state.parser_enabled) && !state.termination_requested {
+            state.force_group();
+        }
+    }
+
+    async fn finish(
+        self,
+        state: agent_process_driver::State<Clock>,
+        _supervisor_quiesced: bool,
+    ) -> AgentOutcome {
+        if let Some(reason) = state.cancelled {
+            return self.parser.finish(PiJsonV1ProcessCompletion::cancelled(
+                state.completion.is_some_and(|status| status.success()),
+                reason,
+            ));
+        }
+        if let Some(failure) = self.failure {
+            return AgentOutcome::Failed(failure);
+        }
+        if state.wait_failed {
+            return AgentOutcome::Failed(self.parser.agent_failure_for_current_phase());
+        }
+        let Some(status) = state.completion else {
+            return AgentOutcome::Failed(self.parser.agent_failure_for_current_phase());
+        };
+        self.parser
+            .finish(PiJsonV1ProcessCompletion::exited(status.success()))
+    }
+}
+
 async fn drive_process<Clock, Worker, Sink>(
     invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
     started: &AgentStartCallback,
     process: LaunchedPiProcess,
-    mut parser: PiJsonV1Parser,
+    parser: PiJsonV1Parser,
     process_directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
     result_bridge: &mut Option<ActiveResultBridge<Clock, Worker>>,
     settlement: ResultSettlementConfiguration<Clock>,
@@ -798,242 +754,35 @@ where
     Worker: ResultValidationWorker,
     Sink: AgentObservationSink,
 {
-    let LaunchedPiProcess {
-        mut child,
-        process_group,
-        mut standard_output,
-    } = process;
-    let cancellation_source = invocation.cancellation().clone();
-    let cancellation = cancellation_source.wait_for_cancellation();
-    tokio::pin!(cancellation);
-    let (stop_supervisor, supervisor_shutdown) = oneshot::channel();
     let (begin_settlement, settlement_starts) = mpsc::unbounded_channel();
-    let (settlement_outcomes, mut settlement_outcome) = mpsc::unbounded_channel();
-    let mut process_group_probe_clock = settlement.clock.clone();
-    let process_supervisor = tokio::spawn(supervise_process_group(
-        process_group,
-        cancellation_source.clone(),
-        process_directives,
-        supervisor_shutdown,
-        settlement,
-        settlement_starts,
-        settlement_outcomes,
-    ));
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut standard_output_closed = false;
-    let mut process_completion = None;
-    let mut process_group_quiescent = false;
-    let mut process_group_termination_requested = false;
-    let mut settlement_admitted = false;
-    let mut settlement_active = false;
-    let mut pending_result_event = None;
-    let mut parser_enabled = true;
-    let mut start_reported = false;
-    let mut failure: Option<AgentFailure> = None;
-    let mut cancelled = None;
-    let mut wait_failed = false;
-
-    while !standard_output_closed
-        || (process_completion.is_none() && !wait_failed)
-        || !process_group_quiescent
-    {
-        tokio::select! {
-            biased;
-            reason = &mut cancellation, if cancelled.is_none() => {
-                cancelled = Some(reason);
-                parser_enabled = false;
-            }
-            read = standard_output.read(&mut buffer), if !standard_output_closed => {
-                match read {
-                    Ok(0) => standard_output_closed = true,
-                    Ok(read) if parser_enabled => {
-                        let mut observations = Vec::new();
-                        let parsed = parser.push_stdout(&buffer[..read], |observation| {
-                            observations.push(observation);
-                        });
-                        if parsed.is_ok()
-                            && parser.accepted_result_ready_for_settlement()
-                            && !settlement_admitted
-                        {
-                            if begin_settlement.send(()).is_err() {
-                                failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
-                                parser_enabled = false;
-                                child.force_process_group(process_group);
-                            } else {
-                                settlement_admitted = true;
-                                settlement_active = true;
-                            }
-                        }
-                        if parser_enabled {
-                            for observation in observations {
-                                let reports_start = matches!(
-                                    &observation,
-                                    AgentObservation::Lifecycle {
-                                        milestone: AgentLifecycleMilestone::HarnessStarted,
-                                    }
-                                );
-                                // Pi emits agent_start for each native retry, while the
-                                // workflow invocation start callback is intentionally one-shot.
-                                if reports_start && !start_reported {
-                                    if started.report().is_err() {
-                                        failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
-                                        parser_enabled = false;
-                                        child.force_process_group(process_group);
-                                        break;
-                                    }
-                                    start_reported = true;
-                                }
-                                let emitted = invocation.observations().emit(observation).await;
-                                if let Some(reason) = cancellation_source.cancellation_reason() {
-                                    cancelled = Some(reason);
-                                    parser_enabled = false;
-                                    break;
-                                }
-                                if emitted.is_err() {
-                                    failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
-                                    parser_enabled = false;
-                                    child.force_process_group(process_group);
-                                    break;
-                                }
-                            }
-                        }
-                        if parser_enabled && parsed.is_err() {
-                            failure = Some(parser.agent_failure_for_current_phase());
-                            parser_enabled = false;
-                            child.force_process_group(process_group);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        standard_output_closed = true;
-                        if cancelled.is_none() {
-                            if let Some(reason) = cancellation_source.cancellation_reason() {
-                                cancelled = Some(reason);
-                            } else {
-                                failure = Some(parser.agent_failure_for_current_phase());
-                                child.force_process_group(process_group);
-                            }
-                            parser_enabled = false;
-                        }
-                    }
-                }
-            }
-            event = receive_result_event(result_bridge),
-                if parser_enabled && pending_result_event.is_none() =>
-            {
-                pending_result_event = Some(event);
-            }
-            outcome = settlement_outcome.recv(), if parser_enabled && settlement_active => {
-                settlement_active = false;
-                match outcome {
-                    Some(SettlementDeadlineOutcome::Expired) | None => {
-                        standard_output_closed = true;
-                        failure = Some(AgentFailureCause::ResultSettlementFailed.into());
-                        parser_enabled = false;
-                        child.force_process_group(process_group);
-                    }
-                }
-            }
-            waited = child.wait(), if process_completion.is_none() && !wait_failed => {
-                match waited {
-                    Ok(status) => process_completion = Some(status),
-                    Err(_) => {
-                        wait_failed = true;
-                        parser_enabled = false;
-                        if cancelled.is_none() {
-                            failure = Some(parser.agent_failure_for_current_phase());
-                        }
-                        child.force_process_group(process_group);
-                    }
-                }
-            }
-            () = wait_for_process_group_probe(&mut process_group_probe_clock),
-                if process_group_termination_requested => {}
-        }
-
-        if parser_enabled && let Some(event) = pending_result_event.take() {
-            match handle_result_event(event, result_bridge, &mut parser, &cancellation_source).await
-            {
-                ResultEventProgress::Continue { observation } => {
-                    if let Some(observation) = observation {
-                        let emitted = invocation.observations().emit(observation).await;
-                        if let Some(reason) = cancellation_source.cancellation_reason() {
-                            cancelled = Some(reason);
-                            parser_enabled = false;
-                        } else if emitted.is_err() {
-                            failure = Some(AgentFailureCause::HarnessProtocolFailed.into());
-                            parser_enabled = false;
-                            child.force_process_group(process_group);
-                        }
-                    }
-                }
-                ResultEventProgress::Pending(incoming) => {
-                    pending_result_event = Some(ResultSocketEvent::Request(incoming));
-                }
-                ResultEventProgress::Failed(result_failure) => {
-                    failure = Some(result_failure);
-                    parser_enabled = false;
-                    child.force_process_group(process_group);
-                }
-                ResultEventProgress::Cancelled(reason) => {
-                    cancelled = Some(reason);
-                    parser_enabled = false;
-                }
-            }
-        }
-
-        if standard_output_closed
-            && (process_completion.is_some() || wait_failed)
-            && !process_group_quiescent
-        {
-            reap_process_group_children(process_group);
-            if process_group_is_quiescent(process_group) {
-                process_group_quiescent = true;
-            } else if (!settlement_active || !parser_enabled)
-                && !process_group_termination_requested
-            {
-                child.force_process_group(process_group);
-                process_group_termination_requested = true;
-            }
-        }
-    }
-
-    if cancelled.is_none() {
-        cancelled = cancellation_source.cancellation_reason();
-    }
-    if !process_group_quiescent {
-        child.force_process_group(process_group);
-    }
-    if process_completion.is_none() {
-        process_completion = child.wait().await.ok();
-        if process_completion.is_none() {
-            let _ = child.force_stop(process_group).await;
-        }
-    }
-    let _ = stop_supervisor.send(());
-    let _ = process_supervisor.await;
-
-    if let Some(reason) = cancelled {
-        return parser.finish(PiJsonV1ProcessCompletion::cancelled(
-            process_completion.is_some_and(|status| status.success()),
-            reason,
-        ));
-    }
-    if let Some(failure) = failure {
-        return AgentOutcome::Failed(failure);
-    }
-    if wait_failed {
-        return AgentOutcome::Failed(parser.agent_failure_for_current_phase());
-    }
-    let Some(status) = process_completion else {
-        return AgentOutcome::Failed(parser.agent_failure_for_current_phase());
+    let (expired, settlement_outcome) = mpsc::unbounded_channel();
+    let protocol = PiProtocol {
+        invocation,
+        started,
+        parser,
+        result_bridge,
+        begin_settlement,
+        settlement_outcome,
+        settlement_admitted: false,
+        settlement_active: false,
+        pending_result_event: None,
+        start_reported: false,
+        failure: None,
     };
-    parser.finish(PiJsonV1ProcessCompletion::exited(status.success()))
-}
-
-async fn wait_for_process_group_probe<Clock: CoordinatorClock>(clock: &mut Clock) {
-    let deadline = clock.now().add(PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL);
-    clock.clone().wait_until(deadline).await;
+    agent_process_driver::drive_signalled(
+        process,
+        invocation.cancellation().clone(),
+        settlement.clock.clone(),
+        protocol,
+        process_directives,
+        Some(Settlement {
+            clock: settlement.clock,
+            grace: settlement.grace,
+            starts: settlement_starts,
+            expired,
+        }),
+    )
+    .await
 }
 
 enum ResultEventProgress {
@@ -1232,89 +981,6 @@ async fn shutdown_result_bridge<Clock, Worker>(
     }
 }
 
-enum SettlementDeadlineOutcome {
-    Expired,
-}
-
-type SettlementDeadlineWait = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-async fn wait_for_settlement_deadline(wait: &mut Option<SettlementDeadlineWait>) {
-    match wait {
-        Some(wait) => wait.await,
-        None => pending().await,
-    }
-}
-
-async fn supervise_process_group<Clock: CoordinatorClock>(
-    process_group: Pid,
-    cancellation: CancellationSource,
-    mut directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
-    mut shutdown: oneshot::Receiver<()>,
-    mut settlement: ResultSettlementConfiguration<Clock>,
-    mut settlement_starts: mpsc::UnboundedReceiver<()>,
-    settlement_outcomes: mpsc::UnboundedSender<SettlementDeadlineOutcome>,
-) {
-    let accepted_cancellation = cancellation.wait_for_cancellation();
-    tokio::pin!(accepted_cancellation);
-    let mut interrupted = false;
-    let mut cancellation_observed = false;
-    let mut directives_open = true;
-    let mut settlement_starts_open = true;
-    let mut settlement_deadline: Option<SettlementDeadlineWait> = None;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => return,
-            _ = &mut accepted_cancellation, if !cancellation_observed => {
-                cancellation_observed = true;
-                settlement_deadline = None;
-                if !interrupted {
-                    interrupt_process_group(process_group);
-                    interrupted = true;
-                }
-            }
-            directive = directives.recv(), if directives_open => {
-                match directive {
-                    Some(AgentProcessDirective::Interrupt) if !interrupted => {
-                        interrupt_process_group(process_group);
-                        interrupted = true;
-                    }
-                    Some(AgentProcessDirective::Interrupt) => {}
-                    Some(AgentProcessDirective::Force) => {
-                        terminate_process_group(process_group);
-                        return;
-                    }
-                    None => directives_open = false,
-                }
-            }
-            start = settlement_starts.recv(), if settlement_starts_open => {
-                match start {
-                    Some(()) if settlement_deadline.is_none() && !cancellation_observed => {
-                        let deadline = settlement.clock.now().add(settlement.grace.get());
-                        let clock = settlement.clock.clone();
-                        settlement_deadline = Some(Box::pin(async move {
-                            clock.wait_until(deadline).await;
-                        }));
-                    }
-                    Some(()) => {
-                        terminate_process_group(process_group);
-                        let _ = settlement_outcomes.send(SettlementDeadlineOutcome::Expired);
-                        return;
-                    }
-                    None => settlement_starts_open = false,
-                }
-            }
-            () = wait_for_settlement_deadline(&mut settlement_deadline),
-                if settlement_deadline.is_some() =>
-            {
-                terminate_process_group(process_group);
-                let _ = settlement_outcomes.send(SettlementDeadlineOutcome::Expired);
-                return;
-            }
-        }
-    }
-}
-
 impl PiJsonV1Parser {
     fn agent_failure_for_current_phase(&self) -> AgentFailure {
         self.failure
@@ -1323,40 +989,6 @@ impl PiJsonV1Parser {
     }
 }
 
-async fn stop_child(child: &mut Child, process_group: Option<Pid>) {
-    if let Some(process_group) = process_group {
-        terminate_process_group(process_group);
-    }
-    let _ = force_stop_direct_child(child).await;
-}
-
 fn failed(cause: AgentFailureCause) -> AgentOutcome {
     failed_agent_outcome(cause)
-}
-
-#[cfg(test)]
-mod guarded_release_tests {
-    use super::*;
-
-    #[test]
-    fn session_binding_is_rechecked_before_releasing_pi() {
-        let temporary = tempfile::tempdir().unwrap();
-        let session_directory = temporary.path().join("session");
-        let diagnostic_session = AgentDiagnosticSession::fixture(session_directory.clone());
-        diagnostic_session
-            .verify_pi_native_session_path_binding()
-            .unwrap();
-        fs::rename(&session_directory, temporary.path().join("moved-session")).unwrap();
-        fs::create_dir(&session_directory).unwrap();
-        let mut release_attempted = false;
-
-        assert!(matches!(
-            release_guarded_pi(&diagnostic_session, || {
-                release_attempted = true;
-                Ok(())
-            }),
-            Err(GuardedPiReleaseFailure::SessionBinding)
-        ));
-        assert!(!release_attempted);
-    }
 }

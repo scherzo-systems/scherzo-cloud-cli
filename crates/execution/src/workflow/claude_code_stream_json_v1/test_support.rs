@@ -1,11 +1,9 @@
 use std::ffi::OsString;
 use std::fs;
-use std::future::{Future, pending};
 use std::io::Read as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
@@ -18,15 +16,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::FIXED_INVOCATION_ENVIRONMENT;
-use super::adapter::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL;
 use crate::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION as QUALIFICATION_VERSION;
 use crate::workflow::admission::EnvironmentSnapshot;
 use crate::workflow::agent::{
-    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocationIdentity, AgentObservation,
-    AgentObservationEnvelope, AgentObservationSink, WorkflowRunId,
+    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocationIdentity, WorkflowRunId,
 };
 use crate::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
-use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::runtime::{ActionId, TransitionSequence};
 
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -81,58 +76,9 @@ impl FixtureSignal {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct PendingClock;
-
-// Exact-binary profiles keep independent clocks because their process probes coexist with
-// different native validation and settlement channels.
-// jscpd:ignore-start
-impl CoordinatorClock for PendingClock {
-    type Instant = Duration;
-
-    fn now(&mut self) -> Self::Instant {
-        Duration::ZERO
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        if deadline == PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL {
-            let probe = tokio::spawn(async {});
-            let _ = probe.await;
-        } else {
-            pending().await
-        }
-    }
-}
-// jscpd:ignore-end
-
-#[derive(Clone, Default)]
-pub(super) struct RecordingObservationSink(Arc<Mutex<Vec<AgentObservationEnvelope>>>);
-
-impl RecordingObservationSink {
-    /// Concatenates, in observation order and without a separator, the text of every
-    /// observation the selector accepts. Native text and reasoning both arrive as
-    /// arbitrarily split deltas, so only the reassembled stream is comparable.
-    pub(super) fn concatenated_text(
-        &self,
-        select: impl Fn(&AgentObservation) -> Option<&str>,
-    ) -> String {
-        self.snapshot()
-            .iter()
-            .filter_map(|envelope| select(envelope.observation()))
-            .collect()
-    }
-
-    pub(super) fn snapshot(&self) -> Vec<AgentObservationEnvelope> {
-        self.0.lock().unwrap().clone()
-    }
-}
-
-impl AgentObservationSink for RecordingObservationSink {
-    fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
-        self.0.lock().unwrap().push(observation);
-        async {}
-    }
-}
+pub(super) use crate::workflow::agent_process_driver::test_support::{
+    PendingClock, RecordingObservationSink,
+};
 
 pub(super) fn invocation_identity(run: &str, step: &str) -> AgentInvocationIdentity {
     AgentInvocationIdentity::new(
@@ -581,7 +527,6 @@ impl LoopbackProvider {
     pub(super) async fn start() -> Self {
         // The Claude fixture is bounded HTTP/SSE while Pi uses a Unix-socket extension;
         // keep their small controller loops separate so neither implies shared protocol.
-        // jscpd:ignore-start
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (request_sender, requests) = mpsc::unbounded_channel();
@@ -605,7 +550,6 @@ impl LoopbackProvider {
             }
             connections.shutdown().await;
         });
-        // jscpd:ignore-end
         Self {
             address,
             requests,
@@ -641,7 +585,6 @@ async fn serve_connection(
     };
     // This controller exchange releases one Anthropic-compatible HTTP response; Pi's
     // similarly shaped channel releases native extension events with different authority.
-    // jscpd:ignore-start
     let (respond, response) = oneshot::channel();
     if requests
         .send(ControlledProviderRequest {
@@ -657,7 +600,6 @@ async fn serve_connection(
     let Ok(response) = response.await else {
         return;
     };
-    // jscpd:ignore-end
     let (status, content_type, payload) = match response {
         LoopbackProviderResponse::InvalidRequest => (
             "400 Bad Request",

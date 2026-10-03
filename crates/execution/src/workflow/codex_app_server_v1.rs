@@ -756,10 +756,6 @@ impl CodexAppServerV1Parser {
         if frame.is_empty() {
             return Err(self.failure_for(CodexAppServerV1RejectionReason::FrameEmpty));
         }
-        if u64::try_from(frame.len()).unwrap_or(u64::MAX) > self.limits.maximum_frame_bytes().get()
-        {
-            return Err(self.failure_for(CodexAppServerV1RejectionReason::FrameTooLarge));
-        }
         let value = um_support::strict_json_from_slice(frame)
             .map_err(|_| self.failure_for(CodexAppServerV1RejectionReason::FrameDecodeFailed))?;
         let object = value

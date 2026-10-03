@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::future::{Future, pending, ready};
+use std::future::{Future, pending};
 use std::io::{BufRead as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::ffi::OsStrExt as _;
@@ -324,7 +324,6 @@ impl ProcessFixture {
         let diagnostic_directory = diagnostic_session.directory().to_owned();
         // The normal-driver and result-driver fixtures intentionally construct distinct
         // production invocations so their stdin closure and correction scripts cannot mix.
-        // jscpd:ignore-start
         let invocation = AgentInvocation::new(
             identity,
             admitted_adapter(executable, MODEL),
@@ -345,7 +344,6 @@ impl ProcessFixture {
             ProcessGuardRegistry::default(),
             observations.clone(),
         );
-        // jscpd:ignore-end
         Self {
             _temporary: temporary,
             attachment_directory,
@@ -380,7 +378,6 @@ impl Drop for ProcessFixture {
 
 // These small fixture limits intentionally differ from exact-binary conformance limits;
 // keeping the complete admitted envelope visible makes boundary tests auditable.
-// jscpd:ignore-start
 fn invocation_limits(
     maximum_response_bytes: u64,
 ) -> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits> {
@@ -397,7 +394,6 @@ fn invocation_limits(
         ClaudeCodeStreamJsonV1ProtocolLimits::profile(),
     )
 }
-// jscpd:ignore-end
 
 async fn run_fixture(fixture: ProcessFixture) -> (ProcessFixture, AgentOutcome) {
     let (fixture, outcome, started) = run_fixture_allowing_start_failure(fixture).await;
@@ -427,7 +423,7 @@ fn start_process_fixture(
     AgentTerminalReceiver,
 ) {
     let value_mode = invocation.value_mode().clone();
-    let adapter = ClaudeCodeStreamJsonV1Adapter::with_validation_worker(
+    let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
         diagnostics,
         NonZeroU64::new(1024).unwrap(),
         PendingClock,
@@ -897,67 +893,10 @@ fn type_schema(root_type: &str) -> RetainedJsonSchema {
     }))
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct InlineValidationWorker;
-
-pub(super) struct InlineValidation(Option<Result<ValidationWorkerDecision, ()>>);
-
-// Keep this inline worker local to the Claude transcript fixture; sharing Pi's test
-// worker would couple otherwise independent native-adapter conformance modules.
-// jscpd:ignore-start
-impl ResultValidationWorker for InlineValidationWorker {
-    type Running = InlineValidation;
-
-    fn start(&self, request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        Ok(InlineValidation(Some(request.evaluate())))
-    }
-}
-
-impl RunningResultValidation for InlineValidation {
-    fn wait(&mut self) -> impl Future<Output = Result<ValidationWorkerDecision, ()>> + Send {
-        ready(self.0.take().unwrap())
-    }
-
-    fn request_stop(&mut self) {}
-
-    fn quiesce(self) -> impl Future<Output = ()> + Send {
-        ready(())
-    }
-}
-// jscpd:ignore-end
-
-#[derive(Clone)]
-struct ControlledClock {
-    registrations: mpsc::UnboundedSender<Duration>,
-    release: watch::Receiver<bool>,
-}
-
-// This deterministic clock records Claude validation and settlement phases; Pi's clock
-// has additional process-guard scheduling modes and should remain profile-local.
-// jscpd:ignore-start
-impl CoordinatorClock for ControlledClock {
-    type Instant = Duration;
-
-    fn now(&mut self) -> Self::Instant {
-        Duration::ZERO
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        if deadline == super::adapter::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL {
-            let probe = tokio::spawn(async {});
-            let _ = probe.await;
-            return;
-        }
-        let _ = self.registrations.send(deadline);
-        let mut release = self.release.clone();
-        while !*release.borrow_and_update() {
-            if release.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-// jscpd:ignore-end
+use crate::workflow::agent_process_driver::test_support::ControlledClock;
+pub(super) use crate::workflow::agent_process_driver::test_support::{
+    InlineValidation, InlineValidationWorker,
+};
 
 fn controlled_clock() -> (
     ControlledClock,
@@ -1033,7 +972,7 @@ where
     Worker: ResultValidationWorker,
 {
     let invocation = fixture.invocation.take().unwrap();
-    let adapter = ClaudeCodeStreamJsonV1Adapter::with_validation_worker(
+    let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
         StepDiagnosticLog::default(),
         NonZeroU64::new(1024).unwrap(),
         clock,
@@ -1471,7 +1410,7 @@ async fn stalled_initial_input_write_reaches_a_typed_deadline() {
         let invocation = fixture.invocation.take().unwrap();
         let value_mode = invocation.value_mode().clone();
         let (clock, mut registered, release) = controlled_clock();
-        let adapter = ClaudeCodeStreamJsonV1Adapter::with_validation_worker(
+        let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
             fixture.diagnostics.clone(),
             NonZeroU64::new(1024).unwrap(),
             clock,

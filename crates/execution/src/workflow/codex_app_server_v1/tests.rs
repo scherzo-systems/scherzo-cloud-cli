@@ -2008,6 +2008,26 @@ fn malformed_diagnostic_payloads_are_observed_without_failing() {
 }
 
 #[test]
+fn frame_limit_is_enforced_while_reading_bytes() {
+    let mut at_limit = parser_with_system_prompt(AgentValueKind::None, 1024, None, "system");
+    at_limit.limits.maximum_frame_bytes = NonZeroU64::new(8).unwrap();
+    at_limit.push_stdout(b"{}      ", drop).unwrap();
+    assert!(at_limit.push_stdout(b"\n", drop).is_err());
+    assert_ne!(
+        at_limit.rejection_reason.get(),
+        Some(CodexAppServerV1RejectionReason::FrameTooLarge)
+    );
+
+    let mut over_limit = parser_with_system_prompt(AgentValueKind::None, 1024, None, "system");
+    over_limit.limits.maximum_frame_bytes = NonZeroU64::new(8).unwrap();
+    assert!(over_limit.push_stdout(b"{}      X", drop).is_err());
+    assert_eq!(
+        over_limit.rejection_reason.get(),
+        Some(CodexAppServerV1RejectionReason::FrameTooLarge)
+    );
+}
+
+#[test]
 fn protocol_rejections_identify_distinct_failure_conditions() {
     let mut malformed = parser(AgentValueKind::None, 1024, None);
     assert!(malformed.push_stdout(b"not-json\n", |_| {}).is_err());

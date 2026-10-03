@@ -1,7 +1,3 @@
-use std::fs::{self, File};
-use std::io::Read as _;
-use std::os::unix::fs::PermissionsExt as _;
-
 use serde_json::{Value, json};
 
 use crate::workflow::agent::{
@@ -17,18 +13,17 @@ pub(super) fn initial_turn_input<Sink>(
 where
     Sink: AgentObservationSink,
 {
-    if invocation.attachments().len() > invocation.limits().maximum_attachments().get() {
-        return Err(AgentFailureCause::HarnessSetupFailed {
-            stage: crate::workflow::agent::AgentHarnessSetupStage::ExecutableLaunch,
-        });
-    }
-
-    let attachment_root = invocation
-        .staging()
-        .result_endpoint_directory()
-        .parent()
-        .map(|parent| parent.join("attachments"))
-        .ok_or_else(launch_failure)?;
+    let validated = crate::workflow::agent_process_driver::validate_staged_attachments(
+        invocation.attachments(),
+        invocation.staging().result_endpoint_directory(),
+        invocation.limits().maximum_attachments().get(),
+        invocation.limits().maximum_attachment_bytes().get(),
+        |error| {
+            error.map_or_else(launch_failure, |error| {
+                AgentFailureCause::start_failure("codex attachment stat", error)
+            })
+        },
+    )?;
     let mut input = Vec::new();
     input
         .try_reserve_exact(invocation.attachments().len().saturating_add(1))
@@ -38,56 +33,31 @@ where
         "text": invocation.prompt().message(),
     }));
 
-    let mut total_bytes = 0_u64;
-    for (index, attachment) in invocation.attachments().iter().enumerate() {
-        let identity = format!("{index:06}");
-        if !attachment.path().is_absolute()
-            || attachment.path().parent() != Some(attachment_root.as_path())
-            || attachment.path().file_name().and_then(|name| name.to_str())
-                != Some(identity.as_str())
-        {
-            return Err(launch_failure());
-        }
-        let metadata = fs::symlink_metadata(attachment.path())
-            .map_err(|error| AgentFailureCause::start_failure("codex attachment stat", error))?;
-        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o377 != 0 {
-            return Err(launch_failure());
-        }
-        total_bytes = total_bytes
-            .checked_add(metadata.len())
-            .filter(|total| *total <= invocation.limits().maximum_attachment_bytes().get())
-            .ok_or_else(launch_failure)?;
-        input.push(attachment_input(attachment, &identity, metadata.len())?);
+    for (attachment, identity, expected_bytes) in validated {
+        input.push(attachment_input(attachment, &identity, expected_bytes)?);
     }
     Ok(input)
 }
 
 // Codex keeps its exact native input union and PDF/JPEG policy profile-private;
 // sharing Claude's similarly worded wrappers would couple distinct transports.
-// jscpd:ignore-start
 fn attachment_input(
     attachment: &StagedAgentAttachment,
     identity: &str,
     expected_bytes: u64,
 ) -> Result<Value, AgentFailureCause> {
     let media_type = attachment.media_type();
-    let base_media_type = media_type
-        .split_once(';')
-        .map_or(media_type, |(base, _)| base)
-        .trim();
-    let text_media = (base_media_type.len() > "text/".len()
-        && base_media_type[.."text/".len()].eq_ignore_ascii_case("text/"))
-        || base_media_type.eq_ignore_ascii_case("application/json");
+    let (base_media_type, text_media) =
+        crate::workflow::agent_process_driver::attachment_media_type(media_type);
 
     if text_media {
         let bytes = read_staged_attachment(attachment, expected_bytes)?;
         if let Ok(text) = std::str::from_utf8(&bytes) {
-            return Ok(json!({
-                "type": "text",
-                "text": format!(
-                    "Scherzo attachment {identity} ({media_type}) follows:\n{text}"
+            return Ok(
+                crate::workflow::agent_process_driver::attachment_text_content(
+                    identity, media_type, text,
                 ),
-            }));
+            );
         }
     }
 
@@ -101,33 +71,25 @@ fn attachment_input(
         }));
     }
 
-    let sealed_path = attachment.path().to_str().ok_or_else(launch_failure)?;
-    Ok(json!({
-        "type": "text",
-        "text": format!(
-            "Scherzo attachment {identity} has media type {media_type} and is available to runner tools at {sealed_path}."
-        ),
-    }))
+    crate::workflow::agent_process_driver::staged_attachment_reference(
+        attachment,
+        identity,
+        launch_failure,
+    )
 }
-// jscpd:ignore-end
 
 fn read_staged_attachment(
     attachment: &StagedAgentAttachment,
     expected_bytes: u64,
 ) -> Result<Vec<u8>, AgentFailureCause> {
-    let capacity = usize::try_from(expected_bytes).map_err(|_| launch_failure())?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|_| launch_failure())?;
-    let mut file = File::open(attachment.path())
-        .map_err(|error| AgentFailureCause::start_failure("codex attachment open", error))?;
-    file.read_to_end(&mut bytes)
-        .map_err(|error| AgentFailureCause::start_failure("codex attachment read", error))?;
-    if u64::try_from(bytes.len()) != Ok(expected_bytes) {
-        return Err(launch_failure());
-    }
-    Ok(bytes)
+    crate::workflow::agent_process_driver::read_staged_attachment(
+        attachment,
+        expected_bytes,
+        |_| launch_failure(),
+        |error| AgentFailureCause::start_failure("codex attachment open", error),
+        |error| AgentFailureCause::start_failure("codex attachment read", error),
+        |_| launch_failure(),
+    )
 }
 
 fn launch_failure() -> AgentFailureCause {

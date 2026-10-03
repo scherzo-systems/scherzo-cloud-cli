@@ -479,13 +479,6 @@ impl PiJsonV1Parser {
     }
 
     fn parse_frame_inner(&mut self, frame: &[u8]) -> Result<(), AgentFailureCause> {
-        let frame_bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
-        if frame_bytes > self.limits.maximum_frame_bytes().get() {
-            return self.reject(
-                PiJsonV1RejectionReason::FrameTooLarge,
-                PiJsonV1ProtocolStage::FrameRead,
-            );
-        }
         self.rejection_context.stage = PiJsonV1ProtocolStage::FrameDecode;
         let value =
             um_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;

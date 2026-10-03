@@ -95,7 +95,6 @@ impl RunningProductionClaudeCode {
     ) -> Self {
         // Lifecycle cases deliberately build their own invocation instead of borrowing the
         // attachment case's resources, so native cancellation cannot contaminate another root.
-        // jscpd:ignore-start
         let admitted_root = AdmittedExecutionRoot::admit(root.project()).unwrap();
         let working_directory = admitted_root.select_working_directory(None).unwrap();
         let cancellation = CancellationSource::new();
@@ -117,7 +116,7 @@ impl RunningProductionClaudeCode {
             observations,
         );
         let process_control = invocation.process_control().clone();
-        let adapter = ClaudeCodeStreamJsonV1Adapter::new(
+        let adapter = ClaudeCodeStreamJsonV1Adapter::new_default(
             StepDiagnosticLog::default(),
             NonZeroU64::new(1024).unwrap(),
             PendingClock,
@@ -136,7 +135,6 @@ impl RunningProductionClaudeCode {
             cancellation,
             process_control,
         }
-        // jscpd:ignore-end
     }
 
     async fn await_started(self) -> RunningStartedClaudeCode {
@@ -311,12 +309,10 @@ fn pinned_real_claude_code_00_qualification_anchor_is_exact() {
 async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_root() {
     // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
     // synthetic root; sharing those resources would let one native case contaminate another.
-    // jscpd:ignore-start
     let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
-        // jscpd:ignore-end
         let resources = root.install_native_resource_fixture(
             NATIVE_INSTRUCTION_MARKER,
             NATIVE_SKILL_MARKER,
@@ -420,14 +416,12 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
 async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_response() {
     // Production-adapter cases each need independent native process and provider state;
     // sharing their synthetic roots would invalidate same-process correction evidence.
-    // jscpd:ignore-start
     let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
         let admitted_root = AdmittedExecutionRoot::admit(root.project()).unwrap();
         let working_directory = admitted_root.select_working_directory(None).unwrap();
-        // jscpd:ignore-end
         let observations = RecordingObservationSink::default();
         let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2xZcAAAAASUVORK5CYII=";
         let png = BASE64.decode(png_base64).unwrap();
@@ -437,11 +431,17 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
             ("application/pdf", b"%PDF-native"),
             ("application/octet-stream", &[0xde, 0xad]),
         ];
+        // Use the same sealed sibling directories as production staging: the
+        // adapter rejects attachments outside the admitted attachment root.
+        let attachment_root = root.private().join("attachments");
+        let result_endpoint = root.private().join("result-endpoint");
+        fs::create_dir(&attachment_root).unwrap();
+        fs::create_dir(&result_endpoint).unwrap();
         let attachments = attachment_specs
             .iter()
             .enumerate()
             .map(|(index, (media_type, bytes))| {
-                let path = root.private().join(format!("{index:06}"));
+                let path = attachment_root.join(format!("{index:06}"));
                 fs::write(&path, bytes).unwrap();
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
                 StagedAgentAttachment::new(
@@ -460,7 +460,7 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
             invocation_identity("claude-code-conformance", "agent"),
             admitted_adapter(executable, MODEL),
             AgentProcessContext::new(working_directory, root.environment_snapshot(&provider)),
-            AgentInvocationStaging::new(root.private().to_owned()),
+            AgentInvocationStaging::new(result_endpoint),
             AgentDiagnosticSession::claude_code_fixture(
                 root.private().join("diagnostics/session"),
             ),
@@ -476,7 +476,7 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
             observations.clone(),
         );
         let diagnostics = StepDiagnosticLog::default();
-        let adapter = ClaudeCodeStreamJsonV1Adapter::new(
+        let adapter = ClaudeCodeStreamJsonV1Adapter::new_default(
             diagnostics.clone(),
             NonZeroU64::new(1024).unwrap(),
             PendingClock,
@@ -598,7 +598,7 @@ async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversa
             ProcessGuardRegistry::default(),
             observations.clone(),
         );
-        let adapter = ClaudeCodeStreamJsonV1Adapter::with_validation_worker(
+        let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
             StepDiagnosticLog::default(),
             NonZeroU64::new(1024).unwrap(),
             PendingClock,
@@ -896,12 +896,10 @@ fn reasoning_text(observation: &AgentObservation) -> Option<&str> {
 async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_before_text() {
     // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
     // synthetic root; sharing those resources would let one native case contaminate another.
-    // jscpd:ignore-start
     let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
-        // jscpd:ignore-end
         let observations = RecordingObservationSink::default();
         let running =
             launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
@@ -957,12 +955,10 @@ const REDACTED_THINKING_DATA: &str = "EmwKAhgBEgy3va3scherzoredacted";
 #[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_09_every_block_kind_correlates_its_own_nominal_envelope() {
     // Fresh per-case native resources, as in every other exact-binary case.
-    // jscpd:ignore-start
     let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
-        // jscpd:ignore-end
         let observations = RecordingObservationSink::default();
         let running =
             launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;

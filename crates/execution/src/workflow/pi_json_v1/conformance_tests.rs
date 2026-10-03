@@ -32,7 +32,6 @@ use crate::workflow::agent::{
 };
 // The black-box fixture intentionally owns its imports instead of depending on the
 // executable-stub fixture module solely to share test wiring.
-// jscpd:ignore-start
 use crate::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
@@ -41,7 +40,6 @@ use crate::workflow::observation::NoopExecutionObserver;
 use crate::workflow::pi::{PiConfig, Thinking};
 use crate::workflow::result_validation::{ResultValidationWorker, ValidationWorkerRequest};
 use crate::workflow::runtime::{ActionId, TransitionSequence};
-// jscpd:ignore-end
 
 const FAKE_PROVIDER_EXTENSION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -744,7 +742,7 @@ impl RunningRealPi {
         let value_mode = invocation.value_mode().clone();
         let (started_callback, started) = agent_start_channel();
         let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
-        let adapter = PiJsonV1Adapter::with_validation_worker(
+        let adapter = PiJsonV1Adapter::with_worker(
             fixture.diagnostics.clone(),
             NonZeroU64::new(16 * 1024).unwrap(),
             ConformanceClock,
@@ -1873,7 +1871,7 @@ fn launch_with_blocking_validation(
     let value_mode = invocation.value_mode().clone();
     let (started_callback, started) = agent_start_channel();
     let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
-    let adapter = PiJsonV1Adapter::with_validation_worker(
+    let adapter = PiJsonV1Adapter::with_worker(
         fixture.diagnostics.clone(),
         NonZeroU64::new(16 * 1024).unwrap(),
         ConformanceClock,

@@ -86,13 +86,13 @@ where
     Clock: Clone,
     Observer: Clone,
 {
-    let pi = PiJsonV1Adapter::new(
+    let pi = PiJsonV1Adapter::new_default(
         diagnostics.clone(),
         maximum_diagnostic_stream_bytes,
         clock.clone(),
         observer.clone(),
     )?;
-    let claude_code = ClaudeCodeStreamJsonV1Adapter::new(
+    let claude_code = ClaudeCodeStreamJsonV1Adapter::new_default(
         diagnostics.clone(),
         maximum_diagnostic_stream_bytes,
         clock.clone(),

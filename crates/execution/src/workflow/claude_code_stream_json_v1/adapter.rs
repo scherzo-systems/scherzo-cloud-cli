@@ -1,27 +1,21 @@
-use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::{Future, pending};
-use std::io::{self, Read as _, Write as _};
-use std::num::NonZeroU64;
+use std::io::{self, Write as _};
 use std::ops::Add as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::ExitStatus;
 use std::sync::Arc;
-use tracing::Instrument as _;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rustix::fs::{AtFlags, FileType, statat, symlinkat, unlinkat};
-use rustix::process::Pid;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
-use tokio::process::ChildStdout;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::{
     ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1ProtocolLimits,
@@ -31,158 +25,67 @@ use super::{
 use crate::claude_code::compatibility_profile_for_version;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
 use crate::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentDiagnosticLevel, AgentFailureCause,
-    AgentInputKind, AgentInvocation, AgentLifecycleMilestone, AgentObservation,
-    AgentObservationSink, AgentOutcome, AgentProcessDirective, AgentStartCallback,
-    AgentTerminalCallback, AgentValueKind, AgentValueMode, OrderedAgentObservationSink,
-    PositiveDuration, StagedAgentAttachment, check_agent_input_bound, failed_agent_outcome,
-    finish_agent_diagnostic_capture, run_cancellable_blocking_launch,
+    AgentCompatibilityProfile, AgentDiagnosticLevel, AgentFailureCause, AgentInvocation,
+    AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
+    AgentProcessDirective, AgentStartCallback, AgentValueKind, OrderedAgentObservationSink,
+    PositiveDuration, StagedAgentAttachment, failed_agent_outcome, finish_agent_diagnostic_capture,
 };
-use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
-use crate::workflow::child_guard::{ChildGuardCancellation, StoppedChildGuard};
+use crate::workflow::agent_process_driver::{
+    self, StdioProcess, WriteDeadline, close_standard_input,
+};
 use crate::workflow::claude_code::ClaudeCodeConfig;
 use crate::workflow::coordinator::CoordinatorClock;
-use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::observation::ExecutionObserver;
 use crate::workflow::private_staging::open_directory_path;
 // Both native adapters use the same containment and validator primitives, but their
 // protocol state machines decide independently when those primitives gain authority.
-// jscpd:ignore-start
-use crate::workflow::process_group::{
-    ProcessGuardRegistration, interrupt_process_group, mark_process_guard_quiesced,
-    process_group_is_quiescent, reap_process_group_children, terminate_authenticated_process_group,
-    terminate_process_group,
-};
 use crate::workflow::result_validation::{
     AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
     ResultValidationOutcome, ResultValidationWorker,
 };
-// jscpd:ignore-end
 
 const SYSTEM_PROMPT_FILE_PREFIX: &str = "claude-code-system-prompt-";
-const READ_BUFFER_BYTES: usize = 8 * 1024;
 pub(super) const MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const STANDARD_INPUT_WRITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
-pub(super) const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(10);
 const AMBIGUOUS_CANDIDATE_FEEDBACK: &str =
     "Result rejected: submit exactly one standalone structured result candidate.\n";
 pub(super) const NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC: &str =
     "Claude Code native transcript capture missing";
 
-pub(crate) struct ClaudeCodeStreamJsonV1Adapter<
+#[derive(Clone, Default)]
+pub(crate) struct ClaudeProfile;
+pub(crate) type ClaudeCodeStreamJsonV1Adapter<
     Clock,
     Observer,
     Worker = ProcessResultValidationWorker,
-> {
-    diagnostics: StepDiagnosticLog,
-    maximum_diagnostic_stream_bytes: NonZeroU64,
-    clock: Clock,
-    observer: Observer,
-    validation_worker: Worker,
-}
+> = agent_process_driver::AdapterCore<Clock, Observer, Worker, ClaudeProfile>;
 
-// Both concrete adapters own the same generic worker plumbing, but sharing their
-// constructors or clone implementation would erase the closed native adapter types.
-// jscpd:ignore-start
-impl<Clock, Observer>
-    ClaudeCodeStreamJsonV1Adapter<Clock, Observer, ProcessResultValidationWorker>
-{
-    pub(crate) fn new(
-        diagnostics: StepDiagnosticLog,
-        maximum_diagnostic_stream_bytes: NonZeroU64,
-        clock: Clock,
-        observer: Observer,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            diagnostics,
-            maximum_diagnostic_stream_bytes,
-            clock,
-            observer,
-            validation_worker: ProcessResultValidationWorker::for_current_executable()?,
-        })
-    }
-}
-
-impl<Clock, Observer, Worker> ClaudeCodeStreamJsonV1Adapter<Clock, Observer, Worker> {
-    #[cfg(test)]
-    pub(super) fn with_validation_worker(
-        diagnostics: StepDiagnosticLog,
-        maximum_diagnostic_stream_bytes: NonZeroU64,
-        clock: Clock,
-        observer: Observer,
-        validation_worker: Worker,
-    ) -> Self {
-        Self {
-            diagnostics,
-            maximum_diagnostic_stream_bytes,
-            clock,
-            observer,
-            validation_worker,
-        }
-    }
-}
-
-impl<Clock, Observer, Worker> Clone for ClaudeCodeStreamJsonV1Adapter<Clock, Observer, Worker>
-where
-    Clock: Clone,
-    Observer: Clone,
-    Worker: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            diagnostics: self.diagnostics.clone(),
-            maximum_diagnostic_stream_bytes: self.maximum_diagnostic_stream_bytes,
-            clock: self.clock.clone(),
-            observer: self.observer.clone(),
-            validation_worker: self.validation_worker.clone(),
-        }
-    }
-}
-
-// jscpd:ignore-end
-
-// The trait boilerplate matches the Pi adapter, while each implementation keeps its
-// profile-specific lifecycle and result transport statically typed.
-// jscpd:ignore-start
-impl<Clock, Observer, Worker, Sink> AgentAdapter<Sink>
-    for ClaudeCodeStreamJsonV1Adapter<Clock, Observer, Worker>
+impl<Clock, Observer, Worker, Sink>
+    agent_process_driver::NativeProcessProfile<Clock, Observer, Worker, Sink> for ClaudeProfile
 where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
     Worker: ResultValidationWorker,
     Sink: AgentObservationSink,
 {
-    type NativeConfiguration = ClaudeCodeConfig;
-    type ProtocolLimits = ClaudeCodeStreamJsonV1ProtocolLimits;
+    type Configuration = ClaudeCodeConfig;
+    type Limits = ClaudeCodeStreamJsonV1ProtocolLimits;
+    const NAME: &'static str = "claude_code_stream_json_v1";
 
     async fn invoke(
-        &self,
-        invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
-        started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        let cancellation = invocation.cancellation().clone();
-        let span = tracing::info_span!("agent_invocation", profile = "claude_code_stream_json_v1",
-            step = %invocation.identity().step(),
-            sequence = invocation.identity().invocation().transition_sequence.get());
-        let outcome = self
-            .invoke_inner(invocation, &started)
-            .instrument(span)
-            .await;
-        let outcome = cancellation
-            .cancellation_reason()
-            .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
-        let _ = terminal.report(outcome);
+        adapter: &agent_process_driver::AdapterCore<Clock, Observer, Worker, Self>,
+        invocation: AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+        started: &AgentStartCallback,
+    ) -> AgentOutcome {
+        adapter.invoke_inner(invocation, started).await
     }
 }
-// jscpd:ignore-end
 
 // The concrete generic bounds are intentionally repeated per closed adapter; a shared
 // erased implementation would weaken exhaustive dispatch.
-// jscpd:ignore-start
-impl<Clock, Observer, Worker> ClaudeCodeStreamJsonV1Adapter<Clock, Observer, Worker>
+impl<Clock, Observer, Worker>
+    agent_process_driver::AdapterCore<Clock, Observer, Worker, ClaudeProfile>
 where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
@@ -196,109 +99,40 @@ where
     where
         Sink: AgentObservationSink,
     {
-        // jscpd:ignore-end
         // Claude's init acknowledgement and stream input make this a distinct startup
         // transition from Pi's session header and extension preparation.
-        // jscpd:ignore-start
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
-        let (invocation, plan) = match tokio::task::spawn_blocking(move || {
-            let plan = prepare_launch(&invocation);
-            (invocation, plan)
-        })
-        .await
-        {
-            Ok((invocation, Ok(plan))) => (invocation, plan),
-            Ok((invocation, Err(cause))) => {
-                self.diagnostics.record_agent_start_failure(
-                    invocation.identity(),
-                    self.maximum_diagnostic_stream_bytes,
-                    &cause,
-                );
-                return failed_agent_outcome(cause);
-            }
-            Err(_) => {
-                return failed_agent_outcome(AgentFailureCause::start_failure(
-                    "launch preparation",
-                    "unavailable",
-                ));
-            }
-        };
-        // jscpd:ignore-end
-        // The shared validator is wired into a native exchange here, while Pi wires it
-        // into an injected socket bridge; combining those lifecycles would hide authority.
-        // jscpd:ignore-start
-        let validator = match invocation.value_mode() {
-            AgentValueMode::Result { schema, .. } => Some(AuthoritativeResultValidator::new(
-                schema.clone(),
-                invocation.limits().maximum_result_bytes(),
-                invocation
-                    .limits()
-                    .maximum_result_rejection_feedback_bytes(),
-                invocation.limits().result_validation_deadline(),
-                self.clock.clone(),
-                self.validation_worker.clone(),
-            )),
-            AgentValueMode::None | AgentValueMode::Response { .. } => None,
-        };
-        // jscpd:ignore-end
-
-        let cancellation_source = invocation.cancellation().clone();
-        let ((mut invocation, plan, launched), cancellation_reason) =
-            match run_cancellable_blocking_launch(
-                &cancellation_source,
-                move |launch_cancellation| {
-                    let launched = launch_process(&invocation, &plan, &launch_cancellation);
-                    (invocation, plan, launched)
-                },
+        let (invocation, plan) = match self
+            .prepare_invocation(
+                invocation,
+                prepare_launch,
+                AgentFailureCause::start_failure("launch preparation", "unavailable"),
             )
             .await
-            {
-                Ok(launch) => launch,
-                Err(_) => {
-                    return failed_agent_outcome(AgentFailureCause::start_failure(
-                        "launch preparation",
-                        "unavailable",
-                    ));
-                }
-            };
-        if let Some(reason) = cancellation_reason {
-            if let Ok((mut process, _)) = launched {
-                let _ = process.child.force_stop(process.process_group).await;
-            }
-            return AgentOutcome::Cancelled { reason };
-        }
-        let (process, standard_error) = match launched {
-            Ok(process) => process,
-            Err(cause) => {
-                self.diagnostics.record_agent_start_failure(
-                    invocation.identity(),
-                    self.maximum_diagnostic_stream_bytes,
-                    &cause,
-                );
-                return failed_agent_outcome(cause);
-            }
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
         };
-        let Some(process_directives) = invocation.take_process_directives() else {
-            let mut process = process;
-            let _ = process.child.force_stop(process.process_group).await;
-            return failed_agent_outcome(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ));
+        // The shared validator is wired into a native exchange here, while Pi wires it
+        // into an injected socket bridge; combining those lifecycles would hide authority.
+        let validator = self.result_validator(&invocation);
+
+        let (invocation, plan, process, standard_error, process_directives) = match self
+            .launch_stdio(
+                invocation,
+                plan,
+                AgentFailureCause::start_failure("launch preparation", "unavailable"),
+            )
+            .await
+        {
+            Ok(launched) => launched,
+            Err(outcome) => return outcome,
         };
         // Diagnostic drain is tied to Claude's stream driver lifetime rather than Pi's
         // result bridge and native-session settlement.
-        // jscpd:ignore-start
-        let diagnostic = self.diagnostics.start_standard_error_capture(
-            invocation.identity().step().to_owned(),
-            invocation.identity().invocation(),
-            self.maximum_diagnostic_stream_bytes,
-            standard_error,
-            self.observer.clone(),
-        );
-        // jscpd:ignore-end
+        let diagnostic = self.start_diagnostic(&invocation, standard_error);
         let parser = ClaudeCodeStreamJsonV1Parser::profile(
             Arc::clone(&plan.expected_cwd),
             Arc::from(invocation.adapter().native_configuration().model.as_str()),
@@ -313,10 +147,12 @@ where
             process,
             parser,
             process_directives,
-            &plan.input,
-            validator.as_ref(),
-            self.clock.clone(),
-            invocation.limits().result_settlement_grace(),
+            ClaudeDriverInput {
+                bytes: &plan.input,
+                validator: validator.as_ref(),
+                clock: self.clock.clone(),
+                settlement_grace: invocation.limits().result_settlement_grace(),
+            },
         )
         .await;
         if !plan.native_session_bridge.transcript_capture_verified() {
@@ -373,39 +209,22 @@ pub(super) fn prepare_launch<Sink>(
 where
     Sink: AgentObservationSink,
 {
-    check_agent_input_bound(
-        invocation.prompt().system_prompt(),
-        invocation.limits().maximum_system_prompt_bytes(),
-        AgentInputKind::SystemPrompt,
+    agent_process_driver::check_prompt_bounds(invocation)?;
+    agent_process_driver::require_native_profile(
+        invocation,
+        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
+        compatibility_profile_for_version(invocation.adapter().version()).is_some(),
+        || AgentFailureCause::start_failure("launch preparation", "unavailable"),
     )?;
-    check_agent_input_bound(
-        invocation.prompt().message(),
-        invocation.limits().maximum_message_bytes(),
-        AgentInputKind::Message,
+    agent_process_driver::verify_session_binding(
+        invocation
+            .diagnostic_session()
+            .verify_claude_code_native_session_path_binding(),
+        "claude diagnostic session binding",
     )?;
-    // The Claude and Pi adapters keep these admission guards local because their
-    // profile-specific launch contracts must remain independently typed.
-    // jscpd:ignore-start
-    if invocation.adapter().profile() != AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
-        || compatibility_profile_for_version(invocation.adapter().version()).is_none()
-        || !invocation.adapter().executable().is_absolute()
-    {
-        return Err(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ));
-    }
-    // jscpd:ignore-end
-    invocation
-        .diagnostic_session()
-        .verify_claude_code_native_session_path_binding()
-        .map_err(|error| {
-            AgentFailureCause::start_failure("claude diagnostic session binding", error)
-        })?;
 
     // Claude correlates this path in system/init and stages a native prompt file; Pi's
     // corresponding preparation uses a persisted session and injected input extension.
-    // jscpd:ignore-start
     let expected_cwd_path = invocation
         .process()
         .protocol_cwd()
@@ -442,7 +261,6 @@ where
                 .set_permissions(std::fs::Permissions::from_mode(0o400))
         })
         .map_err(|error| AgentFailureCause::start_failure("claude prompt write", error))?;
-    // jscpd:ignore-end
 
     let configuration = invocation.adapter().native_configuration();
     let arguments = if invocation.value_mode().kind() == AgentValueKind::Result {
@@ -704,51 +522,13 @@ where
             .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"));
     }
 
-    if invocation.attachments().len() > invocation.limits().maximum_attachments().get() {
-        return Err(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ));
-    }
-    let mut validated = Vec::new();
-    validated
-        .try_reserve_exact(invocation.attachments().len())
-        .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
-    let mut total_bytes = 0_u64;
-    for (index, attachment) in invocation.attachments().iter().enumerate() {
-        let expected_identity = format!("{index:06}");
-        let identity = attachment
-            .path()
-            .file_name()
-            .and_then(|identity| identity.to_str())
-            .filter(|identity| *identity == expected_identity)
-            .ok_or(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ))?;
-        if !attachment.path().is_absolute() {
-            return Err(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ));
-        }
-        let metadata = fs::symlink_metadata(attachment.path())
-            .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
-        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o377 != 0 {
-            return Err(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ));
-        }
-        total_bytes = total_bytes
-            .checked_add(metadata.len())
-            .filter(|total| *total <= invocation.limits().maximum_attachment_bytes().get())
-            .ok_or(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ))?;
-        validated.push((attachment, identity.to_owned(), metadata.len()));
-    }
+    let validated = agent_process_driver::validate_staged_attachments(
+        invocation.attachments(),
+        invocation.staging().result_endpoint_directory(),
+        invocation.limits().maximum_attachments().get(),
+        invocation.limits().maximum_attachment_bytes().get(),
+        |_| AgentFailureCause::start_failure("launch preparation", "unavailable"),
+    )?;
 
     let mut content = Vec::new();
     content
@@ -862,13 +642,7 @@ fn attachment_inline_content_block(
     expected_bytes: u64,
 ) -> Result<Option<Value>, AgentFailureCause> {
     let media_type = attachment.media_type();
-    let base_media_type = media_type
-        .split_once(';')
-        .map_or(media_type, |(base, _)| base)
-        .trim();
-    let text_media = (base_media_type.len() > "text/".len()
-        && base_media_type[.."text/".len()].eq_ignore_ascii_case("text/"))
-        || base_media_type.eq_ignore_ascii_case("application/json");
+    let (_, text_media) = agent_process_driver::attachment_media_type(media_type);
     let native_media = if media_type.eq_ignore_ascii_case("image/png") {
         Some(("image", "image/png"))
     } else if media_type.eq_ignore_ascii_case("application/pdf") {
@@ -882,12 +656,9 @@ fn attachment_inline_content_block(
 
     let bytes = read_staged_attachment(attachment, expected_bytes)?;
     if text_media && let Ok(text) = std::str::from_utf8(&bytes) {
-        return Ok(Some(json!({
-            "type": "text",
-            "text": format!(
-                "Scherzo attachment {identity} ({media_type}) follows:\n{text}"
-            ),
-        })));
+        return Ok(Some(agent_process_driver::attachment_text_content(
+            identity, media_type, text,
+        )));
     }
     Ok(native_media.map(|(block_type, native_media_type)| {
         json!({
@@ -905,513 +676,402 @@ fn attachment_reference_content_block(
     attachment: &StagedAgentAttachment,
     identity: &str,
 ) -> Result<Value, AgentFailureCause> {
-    let media_type = attachment.media_type();
-    let sealed_path = attachment
-        .path()
-        .to_str()
-        .ok_or(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ))?;
-    Ok(json!({
-        "type": "text",
-        "text": format!(
-            "Scherzo attachment {identity} has media type {media_type} and is available to runner tools at {sealed_path}."
-        ),
-    }))
+    agent_process_driver::staged_attachment_reference(attachment, identity, || {
+        AgentFailureCause::start_failure("launch preparation", "unavailable")
+    })
 }
 
 fn read_staged_attachment(
     attachment: &StagedAgentAttachment,
     expected_bytes: u64,
 ) -> Result<Vec<u8>, AgentFailureCause> {
-    let capacity = usize::try_from(expected_bytes)
-        .map_err(|error| AgentFailureCause::start_failure("attachment capacity", error))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|error| AgentFailureCause::start_failure("attachment capacity", error))?;
-    let mut file = fs::File::open(attachment.path())
-        .map_err(|error| AgentFailureCause::start_failure("attachment read", error))?;
-    file.read_to_end(&mut bytes)
-        .map_err(|error| AgentFailureCause::start_failure("attachment read", error))?;
-    if u64::try_from(bytes.len()) != Ok(expected_bytes) {
-        return Err(AgentFailureCause::start_failure(
-            "attachment length",
-            format!("expected {expected_bytes} bytes, read {}", bytes.len()),
-        ));
-    }
-    Ok(bytes)
-}
-
-struct LaunchedClaudeCodeProcess {
-    child: ClaudeCodeChild,
-    process_group: Pid,
-    standard_input: UnixStream,
-    standard_output: ChildStdout,
-}
-
-struct ClaudeCodeChild {
-    child: StoppedChildGuard,
-    registration: Option<ProcessGuardRegistration>,
-}
-
-impl ClaudeCodeChild {
-    fn force_process_group(&self, _process_group: Pid) {
-        let _ = terminate_authenticated_process_group(self.child.identity());
-    }
-
-    async fn wait(&mut self) -> Result<ExitStatus, ()> {
-        let status = self.child.wait().await.map_err(|_| ())?;
-        self.mark_quiesced().await?;
-        Ok(status)
-    }
-
-    async fn force_stop(&mut self, process_group: Pid) -> Result<(), ()> {
-        self.force_process_group(process_group);
-        self.child.force_stop().await.map_err(|_| ())?;
-        self.mark_quiesced().await
-    }
-
-    async fn mark_quiesced(&mut self) -> Result<(), ()> {
-        mark_process_guard_quiesced(&mut self.registration).await
-    }
-}
-
-fn launch_process<Sink>(
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
-    plan: &ClaudeCodeStreamJsonV1LaunchPlan,
-    cancellation: &ChildGuardCancellation,
-) -> Result<(LaunchedClaudeCodeProcess, tokio::process::ChildStderr), AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
-    // Claude always uses an invocation guard because native tools may create new sessions that
-    // an ordinary process-group boundary cannot contain. Registration remains optional.
-    // jscpd:ignore-start
-    let environment = invocation_environment(invocation);
-    let (mut child, standard_input) = StoppedChildGuard::spawn_with_stdin_cancellable(
-        invocation.adapter().executable(),
-        &plan.arguments,
-        &environment,
-        cancellation,
-        |command| {
-            invocation
-                .process()
-                .bind_command(command)
-                .map_err(|_| io::Error::other("agent working directory is unavailable"))
+    agent_process_driver::read_staged_attachment(
+        attachment,
+        expected_bytes,
+        |error| AgentFailureCause::start_failure("attachment capacity", error),
+        |error| AgentFailureCause::start_failure("attachment read", error),
+        |error| AgentFailureCause::start_failure("attachment read", error),
+        |len| {
+            AgentFailureCause::start_failure(
+                "attachment length",
+                format!("expected {expected_bytes} bytes, read {len}"),
+            )
         },
     )
-    .map_err(|error| AgentFailureCause::start_failure("claude process spawn", error))?;
-    let process_group = child.identity().process_group();
-    let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
-    else {
-        let _ = child.force_stop_blocking();
-        return Err(AgentFailureCause::start_failure(
-            "launch preparation",
-            "unavailable",
-        ));
-    };
-    let mut registration = match invocation.process_guards().register(
-        invocation.identity().step(),
-        invocation.identity().invocation().transition_sequence.get(),
-        child.identity(),
-    ) {
-        Ok(registration) => registration,
-        Err(_) => {
-            let _ = child.force_stop_blocking();
-            return Err(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ));
-        }
-    };
-    if let Err(cause) = release_guarded_claude_code(invocation.diagnostic_session(), || {
-        child
-            .continue_execution_cancellable(cancellation)
-            .map_err(|error| AgentFailureCause::start_failure("claude process release", error))?;
-        registration
-            .mark_released()
-            .map_err(|_| AgentFailureCause::start_failure("claude guard release", "unavailable"))
-    }) {
-        let _ = child.force_stop_blocking();
-        let _ = registration.mark_quiesced();
-        return Err(cause);
-    }
-
-    Ok((
-        LaunchedClaudeCodeProcess {
-            child: ClaudeCodeChild {
-                child,
-                registration: Some(registration),
-            },
-            process_group,
-            standard_input,
-            standard_output,
-        },
-        standard_error,
-    ))
-    // jscpd:ignore-end
 }
 
-fn release_guarded_claude_code(
-    diagnostic_session: &AgentDiagnosticSession,
-    release: impl FnOnce() -> Result<(), AgentFailureCause>,
-) -> Result<(), AgentFailureCause> {
-    diagnostic_session
-        .verify_claude_code_native_session_path_binding()
-        .map_err(|error| {
-            AgentFailureCause::start_failure("claude diagnostic session binding", error)
-        })?;
-    release()
-}
+type LaunchedClaudeCodeProcess = StdioProcess;
 
-fn invocation_environment<Sink>(
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
-) -> Vec<(OsString, OsString)>
-where
-    Sink: AgentObservationSink,
+impl<Sink: AgentObservationSink>
+    agent_process_driver::StdioLaunchPlan<
+        ClaudeCodeConfig,
+        ClaudeCodeStreamJsonV1ProtocolLimits,
+        Sink,
+    > for ClaudeCodeStreamJsonV1LaunchPlan
 {
-    let mut environment = invocation
-        .process()
-        .environment()
-        .variables()
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    environment.remove(OsStr::new("CLAUDE_CODE_PROJECT_DIR_NAME"));
-    for (name, value) in FIXED_INVOCATION_ENVIRONMENT {
-        environment.insert(OsString::from(name), OsString::from(value));
+    fn arguments(&self) -> &[OsString] {
+        &self.arguments
     }
-    environment.into_iter().collect()
+    fn environment(
+        &self,
+        invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+    ) -> Vec<(OsString, OsString)> {
+        let mut environment = agent_process_driver::invocation_environment(invocation);
+        environment.remove(OsStr::new("CLAUDE_CODE_PROJECT_DIR_NAME"));
+        for (name, value) in FIXED_INVOCATION_ENVIRONMENT {
+            environment.insert(OsString::from(name), OsString::from(value));
+        }
+        environment.into_iter().collect()
+    }
+    fn verify_binding(
+        &self,
+        invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+    ) -> Result<(), AgentFailureCause> {
+        agent_process_driver::verify_session_binding(
+            invocation
+                .diagnostic_session()
+                .verify_claude_code_native_session_path_binding(),
+            "claude diagnostic session binding",
+        )
+    }
+    fn spawn_stage(&self) -> &'static str {
+        "claude process spawn"
+    }
+    fn release_stage(&self) -> &'static str {
+        "claude process release"
+    }
+    fn guard_failure(&self) -> AgentFailureCause {
+        AgentFailureCause::start_failure("launch preparation", "unavailable")
+    }
 }
 
 type SettlementDeadlineWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the driver receives each admitted result boundary explicitly"
-)]
+enum ClaudeExtra {
+    Initial(InitialInputProgress),
+    SettlementExpired,
+}
+
+struct ClaudeProtocol<'a, Clock, Worker, Sink> {
+    invocation: &'a AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+    started: &'a AgentStartCallback,
+    parser: ClaudeCodeStreamJsonV1Parser,
+    validator: Option<&'a AuthoritativeResultValidator<Clock, Worker>>,
+    standard_input: Option<UnixStream>,
+    initial_input: Pin<Box<dyn Future<Output = InitialInputProgress> + Send + 'a>>,
+    initial_input_pending: bool,
+    settlement_deadline: Option<SettlementDeadlineWait>,
+    settlement_grace: PositiveDuration,
+    failure: Option<AgentFailureCause>,
+}
+
+impl<Clock, Worker, Sink> agent_process_driver::Protocol<Clock>
+    for ClaudeProtocol<'_, Clock, Worker, Sink>
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+    Sink: AgentObservationSink,
+{
+    type Extra = ClaudeExtra;
+
+    fn extra_enabled(&self, _state: &agent_process_driver::State<Clock>) -> bool {
+        self.initial_input_pending || self.settlement_deadline.is_some()
+    }
+
+    async fn extra(&mut self) -> ClaudeExtra {
+        tokio::select! {
+            biased;
+            progress = &mut self.initial_input, if self.initial_input_pending => ClaudeExtra::Initial(progress),
+            () = wait_for_optional_deadline(&mut self.settlement_deadline), if self.settlement_deadline.is_some() => ClaudeExtra::SettlementExpired,
+        }
+    }
+
+    async fn on_extra(
+        &mut self,
+        event: ClaudeExtra,
+        state: &mut agent_process_driver::State<Clock>,
+    ) {
+        match event {
+            ClaudeExtra::Initial(progress) => {
+                self.initial_input_pending = false;
+                match progress {
+                    InitialInputProgress::Ready(input) => self.standard_input = input,
+                    InitialInputProgress::Cancelled(reason) => {
+                        state.cancelled.get_or_insert(reason);
+                        state.parser_enabled = false;
+                    }
+                    InitialInputProgress::Failed(reason) => {
+                        if state.cancelled.is_none() && self.failure.is_none() {
+                            self.failure = Some(self.parser.fail_initial_input(reason));
+                        }
+                        state.parser_enabled = false;
+                        state.force_group();
+                    }
+                }
+            }
+            ClaudeExtra::SettlementExpired => {
+                self.settlement_deadline = None;
+                if let Some(reason) = state.cancellation.cancellation_reason() {
+                    state.cancelled = Some(reason);
+                } else {
+                    self.failure = Some(AgentFailureCause::ResultSettlementFailed);
+                }
+                state.parser_enabled = false;
+                state.force_group();
+            }
+        }
+    }
+
+    async fn on_cancel(
+        &mut self,
+        _reason: CancellationReason,
+        state: &mut agent_process_driver::State<Clock>,
+    ) {
+        state.parser_enabled = false;
+        self.settlement_deadline = None;
+        self.standard_input.take();
+    }
+
+    async fn on_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
+        let (parsed, observations) = agent_process_driver::collect_stdout_observations(|emit| {
+            self.parser.push_stdout(bytes, emit)
+        });
+        if let Some(reason) = state.cancellation.cancellation_reason() {
+            state.cancelled = Some(reason);
+            state.parser_enabled = false;
+            self.settlement_deadline = None;
+            self.standard_input.take();
+        }
+        if state.parser_enabled {
+            match emit_observations(
+                self.invocation.observations(),
+                self.started,
+                observations,
+                &state.cancellation,
+            )
+            .await
+            {
+                ObservationProgress::Completed => {}
+                ObservationProgress::Cancelled(reason) => {
+                    state.cancelled = Some(reason);
+                    state.parser_enabled = false;
+                    self.settlement_deadline = None;
+                    self.standard_input.take();
+                }
+                ObservationProgress::Failed => {
+                    self.failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                    state.parser_enabled = false;
+                    state.force_group();
+                }
+            }
+        }
+        if state.parser_enabled
+            && let Err(cause) = parsed
+        {
+            self.failure = Some(cause);
+            state.parser_enabled = false;
+            state.force_group();
+        }
+        if state.parser_enabled
+            && let Some(exchange) = self.parser.take_completed_result_exchange()
+        {
+            match handle_result_exchange(
+                exchange,
+                self.invocation,
+                self.validator,
+                &mut self.parser,
+                &mut self.standard_input,
+                &mut state.clock,
+            )
+            .await
+            {
+                ResultExchangeProgress::Continue => {}
+                ResultExchangeProgress::Accepted => {
+                    let deadline = state.clock.now().add(self.settlement_grace.get());
+                    let deadline_clock = state.clock.clone();
+                    self.settlement_deadline = Some(Box::pin(async move {
+                        deadline_clock.wait_until(deadline).await;
+                    }));
+                    match emit_observations(
+                        self.invocation.observations(),
+                        self.started,
+                        vec![AgentObservation::Lifecycle {
+                            milestone: AgentLifecycleMilestone::HarnessCompleted,
+                        }],
+                        &state.cancellation,
+                    )
+                    .await
+                    {
+                        ObservationProgress::Completed => {}
+                        ObservationProgress::Cancelled(reason) => {
+                            state.cancelled = Some(reason);
+                            state.parser_enabled = false;
+                            self.settlement_deadline = None;
+                            self.standard_input.take();
+                        }
+                        ObservationProgress::Failed => {
+                            self.failure = Some(AgentFailureCause::HarnessProtocolFailed);
+                            state.parser_enabled = false;
+                            state.force_group();
+                        }
+                    }
+                }
+                ResultExchangeProgress::Failed(cause) => {
+                    self.failure = Some(cause);
+                    state.parser_enabled = false;
+                    state.force_group();
+                }
+                ResultExchangeProgress::Cancelled(reason) => {
+                    state.cancelled = Some(reason);
+                    state.parser_enabled = false;
+                    self.settlement_deadline = None;
+                    self.standard_input.take();
+                }
+            }
+        }
+    }
+
+    fn classify_read_failure(&mut self) {
+        self.failure = Some(self.parser.protocol_failure());
+    }
+    fn cancellation_precedes_read_failure(&self) -> bool {
+        true
+    }
+
+    async fn on_wait_error(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if state.cancelled.is_none() {
+            self.failure.get_or_insert(self.parser.protocol_failure());
+        }
+        state.force_group();
+    }
+
+    fn needs_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        self.initial_input_pending || !state.group_quiescent
+    }
+
+    fn probe_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        state.output_closed
+            && (state.completion.is_some() || state.wait_failed)
+            && !state.group_quiescent
+    }
+
+    fn on_group_quiescent(&mut self, _state: &mut agent_process_driver::State<Clock>) {
+        self.settlement_deadline = None;
+    }
+
+    fn on_group_live(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if self.settlement_deadline.is_none() && !state.termination_requested {
+            if state.cancelled.is_none() {
+                self.failure
+                    .get_or_insert(AgentFailureCause::HarnessProtocolFailed);
+            }
+            state.parser_enabled = false;
+            state.force_group();
+        }
+    }
+
+    async fn finish(
+        self,
+        mut state: agent_process_driver::State<Clock>,
+        supervisor_quiesced: bool,
+    ) -> AgentOutcome {
+        if state.cancelled.is_none() {
+            state.cancelled = state.cancellation.cancellation_reason();
+        }
+        if let Some(reason) = state.cancelled {
+            return AgentOutcome::Cancelled { reason };
+        }
+        if let Some(cause) = self.failure {
+            return AgentOutcome::Failed(self.parser.agent_failure(cause));
+        }
+        if state.wait_failed || !supervisor_quiesced {
+            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
+        }
+        match emit_observations(
+            self.invocation.observations(),
+            self.started,
+            vec![AgentObservation::Lifecycle {
+                milestone: AgentLifecycleMilestone::HarnessQuiescent,
+            }],
+            &state.cancellation,
+        )
+        .await
+        {
+            ObservationProgress::Completed => {}
+            ObservationProgress::Cancelled(reason) => return AgentOutcome::Cancelled { reason },
+            ObservationProgress::Failed => {
+                return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
+            }
+        }
+        let Some(status) = state.completion else {
+            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
+        };
+        self.parser.finish(status.success())
+    }
+}
+
+struct ClaudeDriverInput<'a, Clock, Worker> {
+    bytes: &'a [u8],
+    validator: Option<&'a AuthoritativeResultValidator<Clock, Worker>>,
+    clock: Clock,
+    settlement_grace: PositiveDuration,
+}
+
 async fn drive_process<Clock, Worker, Sink>(
     invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
     started: &AgentStartCallback,
     process: LaunchedClaudeCodeProcess,
-    mut parser: ClaudeCodeStreamJsonV1Parser,
+    parser: ClaudeCodeStreamJsonV1Parser,
     process_directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
-    input: &[u8],
-    validator: Option<&AuthoritativeResultValidator<Clock, Worker>>,
-    mut clock: Clock,
-    settlement_grace: PositiveDuration,
+    driver_input: ClaudeDriverInput<'_, Clock, Worker>,
 ) -> AgentOutcome
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
     Sink: AgentObservationSink,
 {
-    let LaunchedClaudeCodeProcess {
-        mut child,
-        process_group,
-        standard_input,
-        mut standard_output,
-    } = process;
-    let cancellation_source = invocation.cancellation().clone();
-    let (stop_supervisor, supervisor_shutdown) = oneshot::channel();
-    let process_supervisor = tokio::spawn(supervise_process_group(
-        process_group,
-        cancellation_source.clone(),
-        process_directives,
-        supervisor_shutdown,
-    ));
-    let initial_input = initialize_standard_input(
-        standard_input,
-        input,
-        invocation.value_mode().kind() != AgentValueKind::Result,
-        &cancellation_source,
-        clock.clone(),
-    );
-    tokio::pin!(initial_input);
-    let mut initial_input_pending = true;
-    let mut standard_input = None;
-    let mut parser_enabled = true;
-    let mut failure = None;
-    let mut cancelled = None;
-
-    let cancellation = cancellation_source.wait_for_cancellation();
-    tokio::pin!(cancellation);
-    let mut buffer = [0_u8; READ_BUFFER_BYTES];
-    let mut standard_output_closed = false;
-    let mut process_completion: Option<ExitStatus> = None;
-    let mut process_group_quiescent = false;
-    let mut process_group_termination_requested = false;
-    let mut wait_failed = false;
-    let mut settlement_deadline: Option<SettlementDeadlineWait> = None;
-    let mut process_group_probe_clock = clock.clone();
-
-    // Claude's result closes an exchange without closing the process; retain a separate
-    // driver loop even where stream-drain mechanics resemble Pi's terminal loop.
-    // jscpd:ignore-start
-    while initial_input_pending
-        || !standard_output_closed
-        || (process_completion.is_none() && !wait_failed)
-        || !process_group_quiescent
-    {
-        let probe_process_group = standard_output_closed
-            && (process_completion.is_some() || wait_failed)
-            && !process_group_quiescent;
-        tokio::select! {
-            biased;
-            reason = &mut cancellation, if cancelled.is_none() => {
-                cancelled = Some(reason);
-                parser_enabled = false;
-                settlement_deadline = None;
-                standard_input.take();
-            }
-            progress = &mut initial_input, if initial_input_pending => {
-                initial_input_pending = false;
-                match progress {
-                    InitialInputProgress::Ready(input) => standard_input = input,
-                    InitialInputProgress::Cancelled(reason) => {
-                        cancelled.get_or_insert(reason);
-                        parser_enabled = false;
-                    }
-                    InitialInputProgress::Failed(reason) => {
-                        if cancelled.is_none() && failure.is_none() {
-                            failure = Some(parser.fail_initial_input(reason));
-                        }
-                        parser_enabled = false;
-                        child.force_process_group(process_group);
-                        process_group_termination_requested = true;
-                    }
-                }
-            }
-            read = standard_output.read(&mut buffer), if !standard_output_closed => {
-                match read {
-                    Ok(0) => standard_output_closed = true,
-                    // jscpd:ignore-end
-                    Ok(read) if parser_enabled => {
-                        let mut observations = Vec::new();
-                        let parsed = parser.push_stdout(&buffer[..read], |observation| {
-                            observations.push(observation);
-                        });
-                        if let Some(reason) = cancellation_source.cancellation_reason() {
-                            cancelled = Some(reason);
-                            parser_enabled = false;
-                            settlement_deadline = None;
-                            standard_input.take();
-                        }
-                        if parser_enabled {
-                            match emit_observations(
-                                invocation.observations(),
-                                started,
-                                observations,
-                                &cancellation_source,
-                            ).await {
-                                ObservationProgress::Completed => {}
-                                ObservationProgress::Cancelled(reason) => {
-                                    cancelled = Some(reason);
-                                    parser_enabled = false;
-                                    settlement_deadline = None;
-                                    standard_input.take();
-                                }
-                                ObservationProgress::Failed => {
-                                    failure = Some(AgentFailureCause::HarnessProtocolFailed);
-                                    parser_enabled = false;
-                                    child.force_process_group(process_group);
-                                    process_group_termination_requested = true;
-                                }
-                            }
-                        }
-                        // Parser failure selects Claude's exchange phase even though process
-                        // termination uses the same three assignments as Pi.
-                        // jscpd:ignore-start
-                        if parser_enabled
-                            && let Err(cause) = parsed
-                        {
-                            failure = Some(cause);
-                            parser_enabled = false;
-                            child.force_process_group(process_group);
-                            process_group_termination_requested = true;
-                        }
-                        // jscpd:ignore-end
-                        if parser_enabled
-                            && let Some(exchange) = parser.take_completed_result_exchange()
-                        {
-                            match handle_result_exchange(
-                                exchange,
-                                invocation,
-                                validator,
-                                &mut parser,
-                                &mut standard_input,
-                                &mut clock,
-                            ).await {
-                                ResultExchangeProgress::Continue => {}
-                                ResultExchangeProgress::Accepted => {
-                                    let deadline = clock.now().add(settlement_grace.get());
-                                    let deadline_clock = clock.clone();
-                                    settlement_deadline = Some(Box::pin(async move {
-                                        deadline_clock.wait_until(deadline).await;
-                                    }));
-                                    match emit_observations(
-                                        invocation.observations(),
-                                        started,
-                                        vec![AgentObservation::Lifecycle {
-                                            milestone: AgentLifecycleMilestone::HarnessCompleted,
-                                        }],
-                                        &cancellation_source,
-                                    ).await {
-                                        ObservationProgress::Completed => {}
-                                        ObservationProgress::Cancelled(reason) => {
-                                            cancelled = Some(reason);
-                                            parser_enabled = false;
-                                            settlement_deadline = None;
-                                            standard_input.take();
-                                        }
-                                        ObservationProgress::Failed => {
-                                            failure = Some(AgentFailureCause::HarnessProtocolFailed);
-                                            parser_enabled = false;
-                                            child.force_process_group(process_group);
-                                            process_group_termination_requested = true;
-                                        }
-                                    }
-                                }
-                                ResultExchangeProgress::Failed(cause) => {
-                                    failure = Some(cause);
-                                    parser_enabled = false;
-                                    child.force_process_group(process_group);
-                                    process_group_termination_requested = true;
-                                }
-                                ResultExchangeProgress::Cancelled(reason) => {
-                                    cancelled = Some(reason);
-                                    parser_enabled = false;
-                                    settlement_deadline = None;
-                                    standard_input.take();
-                                }
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    // Stream, wait, and deadline failures share OS mechanics with Pi but use
-                    // Claude's initialization and exchange phase for typed failure authority.
-                    // jscpd:ignore-start
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => {
-                        standard_output_closed = true;
-                        if parser_enabled {
-                            if let Some(reason) = cancellation_source.cancellation_reason() {
-                                cancelled = Some(reason);
-                            } else {
-                                failure = Some(parser.protocol_failure());
-                                child.force_process_group(process_group);
-                                process_group_termination_requested = true;
-                            }
-                            parser_enabled = false;
-                        }
-                    }
-                }
-            }
-            waited = child.wait(), if process_completion.is_none() && !wait_failed => {
-                match waited {
-                    Ok(status) => process_completion = Some(status),
-                    Err(_) => {
-                        wait_failed = true;
-                        parser_enabled = false;
-                        if cancelled.is_none() {
-                            failure.get_or_insert(parser.protocol_failure());
-                        }
-                        child.force_process_group(process_group);
-                        process_group_termination_requested = true;
-                    }
-                }
-            }
-            () = wait_for_optional_deadline(&mut settlement_deadline),
-                if settlement_deadline.is_some() =>
-            {
-                settlement_deadline = None;
-                if let Some(reason) = cancellation_source.cancellation_reason() {
-                    cancelled = Some(reason);
-                } else {
-                    failure = Some(AgentFailureCause::ResultSettlementFailed);
-                }
-                parser_enabled = false;
-                child.force_process_group(process_group);
-                process_group_termination_requested = true;
-            }
-            // jscpd:ignore-end
-            () = wait_for_process_group_probe(&mut process_group_probe_clock),
-                if probe_process_group => {}
-        }
-
-        // Claude settlement permits terminal drain events that Pi's native settled event does
-        // not, so this otherwise shared group probe remains in the Claude driver.
-        // jscpd:ignore-start
-        if standard_output_closed
-            && (process_completion.is_some() || wait_failed)
-            && !process_group_quiescent
-        {
-            reap_process_group_children(process_group);
-            if process_group_is_quiescent(process_group) {
-                process_group_quiescent = true;
-                settlement_deadline = None;
-            } else if settlement_deadline.is_none() && !process_group_termination_requested {
-                if cancelled.is_none() {
-                    failure.get_or_insert(AgentFailureCause::HarnessProtocolFailed);
-                }
-                parser_enabled = false;
-                child.force_process_group(process_group);
-                process_group_termination_requested = true;
-            }
-        }
-        // jscpd:ignore-end
-    }
-
-    // Final cleanup precedes Claude's parser finish and provisional-value decision; sharing
-    // this block with Pi would erase its distinct native completion value.
-    // jscpd:ignore-start
-    if !process_group_quiescent {
-        child.force_process_group(process_group);
-    }
-    if process_completion.is_none() {
-        process_completion = child.wait().await.ok();
-        if process_completion.is_none() {
-            let _ = child.force_stop(process_group).await;
-        }
-    }
-    let _ = stop_supervisor.send(());
-    let supervisor_quiesced = process_supervisor.await.is_ok();
-
-    if cancelled.is_none() {
-        cancelled = cancellation_source.cancellation_reason();
-    }
-    if let Some(reason) = cancelled {
-        return AgentOutcome::Cancelled { reason };
-    }
-    if let Some(cause) = failure {
-        return AgentOutcome::Failed(parser.agent_failure(cause));
-    }
-    if wait_failed || !supervisor_quiesced {
-        return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-    }
-    // jscpd:ignore-end
-    match emit_observations(
-        invocation.observations(),
+    let ClaudeDriverInput {
+        bytes,
+        validator,
+        clock,
+        settlement_grace,
+    } = driver_input;
+    let (standard_input, output) = process.split();
+    let cancellation = invocation.cancellation().clone();
+    let initial_cancellation = cancellation.clone();
+    let close_after_write = invocation.value_mode().kind() != AgentValueKind::Result;
+    let initial_clock = clock.clone();
+    let initial_input = Box::pin(async move {
+        initialize_standard_input(
+            standard_input,
+            bytes,
+            close_after_write,
+            &initial_cancellation,
+            initial_clock,
+        )
+        .await
+    });
+    let protocol = ClaudeProtocol {
+        invocation,
         started,
-        vec![AgentObservation::Lifecycle {
-            milestone: AgentLifecycleMilestone::HarnessQuiescent,
-        }],
-        &cancellation_source,
+        parser,
+        validator,
+        initial_input,
+        initial_input_pending: true,
+        standard_input: None,
+        settlement_deadline: None,
+        settlement_grace,
+        failure: None,
+    };
+    agent_process_driver::drive_signalled(
+        output,
+        cancellation,
+        clock,
+        protocol,
+        process_directives,
+        None,
     )
     .await
-    {
-        ObservationProgress::Completed => {}
-        ObservationProgress::Cancelled(reason) => return AgentOutcome::Cancelled { reason },
-        ObservationProgress::Failed => {
-            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-        }
-    }
-    let Some(status) = process_completion else {
-        return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-    };
-    parser.finish(status.success())
 }
 
 enum InitialInputProgress {
@@ -1433,25 +1093,21 @@ async fn write_with_cancellation<Clock: CoordinatorClock>(
     cancellation: &CancellationSource,
     mut clock: Clock,
 ) -> WriteProgress {
-    let write = input.write_all(bytes);
-    tokio::pin!(write);
     let cancelled = cancellation.wait_for_cancellation();
     tokio::pin!(cancelled);
-    let deadline = clock.now().add(STANDARD_INPUT_WRITE_TIMEOUT);
-    let deadline_clock = clock.clone();
     tokio::select! {
         biased;
         reason = &mut cancelled => WriteProgress::Cancelled(reason),
-        result = &mut write => {
-            if result.is_ok() {
-                WriteProgress::Completed
-            } else if let Some(reason) = cancellation.cancellation_reason() {
-                WriteProgress::Cancelled(reason)
-            } else {
-                WriteProgress::Failed
+        result = agent_process_driver::write_until(&mut clock, STANDARD_INPUT_WRITE_TIMEOUT, input.write_all(bytes)) => {
+            if let Some(reason) = cancellation.cancellation_reason() {
+                return WriteProgress::Cancelled(reason);
+            }
+            match result {
+                Ok(()) => WriteProgress::Completed,
+                Err(WriteDeadline::Failed(_)) => WriteProgress::Failed,
+                Err(WriteDeadline::TimedOut) => WriteProgress::TimedOut,
             }
         }
-        () = deadline_clock.wait_until(deadline) => WriteProgress::TimedOut,
     }
 }
 
@@ -1563,50 +1219,6 @@ async fn emit_observation<Sink: AgentObservationSink>(
         }
     }
 }
-
-// Claude's supervisor has no Pi result-bridge settlement channel; keeping this smaller
-// closed loop profile-local makes cancellation and input closure authority explicit.
-// jscpd:ignore-start
-async fn supervise_process_group(
-    process_group: Pid,
-    cancellation: CancellationSource,
-    mut directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
-    mut shutdown: oneshot::Receiver<()>,
-) {
-    let accepted_cancellation = cancellation.wait_for_cancellation();
-    tokio::pin!(accepted_cancellation);
-    let mut cancellation_observed = false;
-    let mut interrupted = false;
-    let mut directives_open = true;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => return,
-            _ = &mut accepted_cancellation, if !cancellation_observed => {
-                cancellation_observed = true;
-                if !interrupted {
-                    interrupt_process_group(process_group);
-                    interrupted = true;
-                }
-            }
-            directive = directives.recv(), if directives_open => {
-                match directive {
-                    Some(AgentProcessDirective::Interrupt) if !interrupted => {
-                        interrupt_process_group(process_group);
-                        interrupted = true;
-                    }
-                    Some(AgentProcessDirective::Interrupt) => {}
-                    Some(AgentProcessDirective::Force) => {
-                        terminate_process_group(process_group);
-                        return;
-                    }
-                    None => directives_open = false,
-                }
-            }
-        }
-    }
-}
-// jscpd:ignore-end
 
 enum ResultExchangeProgress {
     Continue,
@@ -1729,21 +1341,6 @@ async fn reject_and_continue<Clock: CoordinatorClock, Sink: AgentObservationSink
     }
 }
 
-async fn close_standard_input(standard_input: &mut Option<UnixStream>) -> Result<(), ()> {
-    let Some(mut input) = standard_input.take() else {
-        return Ok(());
-    };
-    match input.shutdown().await {
-        Ok(()) => Ok(()),
-        // A write-side close only guarantees the harness observes end of
-        // input. When the harness already closed its side of the socket pair,
-        // macOS reports NotConnected where Linux reports success; the peer has
-        // necessarily observed end of input either way.
-        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
-        Err(_) => Err(()),
-    }
-}
-
 fn bounded_feedback(feedback: &str, maximum_bytes: u64) -> Arc<str> {
     let maximum_bytes = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
     let mut end = feedback.len().min(maximum_bytes);
@@ -1758,9 +1355,4 @@ async fn wait_for_optional_deadline(wait: &mut Option<SettlementDeadlineWait>) {
         Some(wait) => wait.await,
         None => pending().await,
     }
-}
-
-async fn wait_for_process_group_probe<Clock: CoordinatorClock>(clock: &mut Clock) {
-    let deadline = clock.now().add(PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL);
-    clock.clone().wait_until(deadline).await;
 }

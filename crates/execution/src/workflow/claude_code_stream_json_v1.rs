@@ -608,13 +608,6 @@ impl ClaudeCodeStreamJsonV1Parser {
         // This profile owns decoding failure classification because Claude's init boundary
         // differs from Pi's session-header and agent-start boundaries.
         // jscpd:ignore-start
-        let frame_bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
-        if frame_bytes > self.limits.maximum_frame_bytes().get() {
-            return self.reject(
-                ClaudeCodeStreamJsonV1RejectionReason::FrameTooLarge,
-                ClaudeCodeStreamJsonV1ProtocolStage::FrameRead,
-            );
-        }
         self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::FrameDecode;
         let value =
             um_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;

@@ -7,16 +7,12 @@ use std::ops::Add as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::Instrument as _;
 
-use rustix::process::Pid;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
-use tokio::process::ChildStdout;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::input::initial_turn_input;
 use super::{
@@ -24,48 +20,44 @@ use super::{
     ParserProgress,
 };
 use crate::codex::{CodexCompatibilityProfile, compatibility_profile_for_version};
-use crate::workflow::admission::CancellationSource;
 use crate::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentFailure, AgentFailureCause,
-    AgentHarnessSetupStage, AgentInputKind, AgentInvocation, AgentLifecycleMilestone,
-    AgentObservation, AgentObservationSink, AgentOutcome, AgentProcessDirective,
-    AgentStartCallback, AgentTerminalCallback, AgentValueMode, PositiveDuration,
-    check_agent_input_bound, failed_agent_outcome, finish_agent_diagnostic_capture,
-    run_cancellable_blocking_launch,
+    AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentHarnessSetupStage,
+    AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
+    AgentProcessDirective, AgentStartCallback, PositiveDuration, failed_agent_outcome,
+    finish_agent_diagnostic_capture,
 };
-use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
-use crate::workflow::child_guard::{ChildGuardCancellation, StoppedChildGuard};
+use crate::workflow::agent_process_driver::{
+    self, StdioProcess, WriteDeadline, close_standard_input,
+};
 use crate::workflow::codex::CodexConfig;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::observation::ExecutionObserver;
-use crate::workflow::process_group::{
-    ProcessGuardRegistration, mark_process_guard_quiesced, process_group_is_quiescent,
-    terminate_authenticated_process_group, terminate_process_group,
-};
 use crate::workflow::result_validation::{
     AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
     ResultValidationOutcome, ResultValidationWorker,
 };
 
-const READ_BUFFER_BYTES: usize = 8 * 1024;
-const PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(10);
-
-pub(crate) struct CodexAppServerV1Adapter<Clock, Observer, Worker = ProcessResultValidationWorker> {
-    diagnostics: StepDiagnosticLog,
-    maximum_diagnostic_stream_bytes: NonZeroU64,
-    clock: Clock,
-    observer: Observer,
-    validation_worker: Worker,
+#[derive(Clone)]
+pub(crate) struct CodexProfile {
     client_version: Arc<str>,
     model_provider_override: Option<Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>>,
 }
 
-impl<Clock, Observer> CodexAppServerV1Adapter<Clock, Observer, ProcessResultValidationWorker> {
-    // Codex retains its profile-only fixture provider alongside the shared adapter fields;
-    // a shared constructor would expose synthetic provider selection to other harnesses.
-    // jscpd:ignore-start
+impl CodexProfile {
+    fn selected_model_provider(&self) -> Option<Arc<str>> {
+        self.model_provider_override
+            .as_ref()
+            .and_then(|provide| provide())
+    }
+}
+
+pub(crate) type CodexAppServerV1Adapter<Clock, Observer, Worker = ProcessResultValidationWorker> =
+    agent_process_driver::AdapterCore<Clock, Observer, Worker, CodexProfile>;
+
+impl<Clock, Observer>
+    agent_process_driver::AdapterCore<Clock, Observer, ProcessResultValidationWorker, CodexProfile>
+{
     pub(crate) fn new(
         diagnostics: StepDiagnosticLog,
         maximum_diagnostic_stream_bytes: NonZeroU64,
@@ -73,23 +65,23 @@ impl<Clock, Observer> CodexAppServerV1Adapter<Clock, Observer, ProcessResultVali
         observer: Observer,
         client_version: Arc<str>,
     ) -> io::Result<Self> {
-        Ok(Self {
+        Ok(Self::with_profile(
             diagnostics,
             maximum_diagnostic_stream_bytes,
             clock,
             observer,
-            validation_worker: ProcessResultValidationWorker::for_current_executable()?,
-            client_version,
-            model_provider_override: None,
-        })
+            ProcessResultValidationWorker::for_current_executable()?,
+            CodexProfile {
+                client_version,
+                model_provider_override: None,
+            },
+        ))
     }
-    // jscpd:ignore-end
 }
 
-// The injected worker/provider constructor remains local to Codex transcript fixtures;
-// sharing another profile's test constructor would couple native fixture controls.
-// jscpd:ignore-start
-impl<Clock, Observer, Worker> CodexAppServerV1Adapter<Clock, Observer, Worker> {
+impl<Clock, Observer, Worker>
+    agent_process_driver::AdapterCore<Clock, Observer, Worker, CodexProfile>
+{
     #[cfg(test)]
     pub(super) fn with_validation_worker(
         diagnostics: StepDiagnosticLog,
@@ -100,87 +92,48 @@ impl<Clock, Observer, Worker> CodexAppServerV1Adapter<Clock, Observer, Worker> {
         client_version: Arc<str>,
         synthetic_model_provider: Option<Arc<str>>,
     ) -> Self {
-        Self {
+        Self::with_profile(
             diagnostics,
             maximum_diagnostic_stream_bytes,
             clock,
             observer,
             validation_worker,
-            client_version,
-            model_provider_override: synthetic_model_provider.map(|provider| {
-                Arc::new(move || Some(Arc::clone(&provider)))
-                    as Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>
-            }),
-        }
-    }
-
-    fn selected_model_provider(&self) -> Option<Arc<str>> {
-        self.model_provider_override
-            .as_ref()
-            .and_then(|provide| provide())
+            CodexProfile {
+                client_version,
+                model_provider_override: synthetic_model_provider.map(|provider| {
+                    Arc::new(move || Some(Arc::clone(&provider)))
+                        as Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>
+                }),
+            },
+        )
     }
 }
-// jscpd:ignore-end
 
-// Clone keeps Codex's optional provider override private instead of adding that concern to
-// the shared adapter contract.
-// jscpd:ignore-start
-impl<Clock, Observer, Worker> Clone for CodexAppServerV1Adapter<Clock, Observer, Worker>
-where
-    Clock: Clone,
-    Observer: Clone,
-    Worker: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            diagnostics: self.diagnostics.clone(),
-            maximum_diagnostic_stream_bytes: self.maximum_diagnostic_stream_bytes,
-            clock: self.clock.clone(),
-            observer: self.observer.clone(),
-            validation_worker: self.validation_worker.clone(),
-            client_version: Arc::clone(&self.client_version),
-            model_provider_override: self.model_provider_override.clone(),
-        }
-    }
-}
-// jscpd:ignore-end
-
-impl<Clock, Observer, Worker, Sink> AgentAdapter<Sink>
-    for CodexAppServerV1Adapter<Clock, Observer, Worker>
+impl<Clock, Observer, Worker, Sink>
+    agent_process_driver::NativeProcessProfile<Clock, Observer, Worker, Sink> for CodexProfile
 where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
     Worker: ResultValidationWorker,
     Sink: AgentObservationSink,
 {
-    type NativeConfiguration = CodexConfig;
-    type ProtocolLimits = CodexAppServerV1ProtocolLimits;
+    type Configuration = CodexConfig;
+    type Limits = CodexAppServerV1ProtocolLimits;
+    const NAME: &'static str = "codex_app_server_v1";
 
     async fn invoke(
-        &self,
-        invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
-        started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        let cancellation = invocation.cancellation().clone();
-        let span = tracing::info_span!("agent_invocation", profile = "codex_app_server_v1",
-            step = %invocation.identity().step(),
-            sequence = invocation.identity().invocation().transition_sequence.get());
-        let outcome = self
-            .invoke_inner(invocation, &started)
-            .instrument(span)
-            .await;
-        let outcome = cancellation
-            .cancellation_reason()
-            .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
-        let _ = terminal.report(outcome);
+        adapter: &agent_process_driver::AdapterCore<Clock, Observer, Worker, Self>,
+        invocation: AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+        started: &AgentStartCallback,
+    ) -> AgentOutcome {
+        adapter.invoke_inner(invocation, started).await
     }
 }
 
-// Codex setup and result-validator preparation stay with its stdio lifecycle; a shared
-// harness driver would erase profile-specific setup and correction transitions.
-// jscpd:ignore-start
-impl<Clock, Observer, Worker> CodexAppServerV1Adapter<Clock, Observer, Worker>
+// Codex setup and result-validator preparation precede the shared process loop;
+// Codex's protocol hooks own native setup and correction transitions.
+impl<Clock, Observer, Worker>
+    agent_process_driver::AdapterCore<Clock, Observer, Worker, CodexProfile>
 where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
@@ -199,82 +152,30 @@ where
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
-        let (invocation, plan) = match tokio::task::spawn_blocking(move || {
-            let plan = prepare_launch(&invocation);
-            (invocation, plan)
-        })
-        .await
-        {
-            Ok((invocation, Ok(plan))) => (invocation, plan),
-            Ok((invocation, Err(cause))) => {
-                self.diagnostics.record_agent_start_failure(
-                    invocation.identity(),
-                    self.maximum_diagnostic_stream_bytes,
-                    &cause,
-                );
-                return failed_agent_outcome(cause);
-            }
-            Err(_) => {
-                return setup_failed(AgentHarnessSetupStage::ExecutableLaunch);
-            }
-        };
-        let result_validator = match invocation.value_mode() {
-            AgentValueMode::Result { schema, .. } => Some(AuthoritativeResultValidator::new(
-                schema.clone(),
-                invocation.limits().maximum_result_bytes(),
-                invocation
-                    .limits()
-                    .maximum_result_rejection_feedback_bytes(),
-                invocation.limits().result_validation_deadline(),
-                self.clock.clone(),
-                self.validation_worker.clone(),
-            )),
-            AgentValueMode::None | AgentValueMode::Response { .. } => None,
-        };
-        let cancellation_source = invocation.cancellation().clone();
-        let ((mut invocation, mut plan, launched), cancellation_reason) =
-            match run_cancellable_blocking_launch(
-                &cancellation_source,
-                move |launch_cancellation| {
-                    let launched = launch_process(&invocation, &plan, &launch_cancellation);
-                    (invocation, plan, launched)
-                },
+        let (invocation, plan) = match self
+            .prepare_invocation(
+                invocation,
+                prepare_launch,
+                setup_failure(AgentHarnessSetupStage::ExecutableLaunch),
             )
             .await
-            {
-                Ok(launch) => launch,
-                Err(_) => return setup_failed(AgentHarnessSetupStage::ExecutableLaunch),
-            };
-        if let Some(reason) = cancellation_reason {
-            if let Ok((mut process, _)) = launched {
-                let _ = process.child.force_stop(process.process_group).await;
-            }
-            return AgentOutcome::Cancelled { reason };
-        }
-        let (process, standard_error) = match launched {
-            Ok(process) => process,
-            Err(cause) => {
-                self.diagnostics.record_agent_start_failure(
-                    invocation.identity(),
-                    self.maximum_diagnostic_stream_bytes,
-                    &cause,
-                );
-                return failed_agent_outcome(cause);
-            }
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
         };
-        let Some(process_directives) = invocation.take_process_directives() else {
-            let mut process = process;
-            let _ = process.child.force_stop(process.process_group).await;
-            return setup_failed(AgentHarnessSetupStage::ExecutableLaunch);
+        let result_validator = self.result_validator(&invocation);
+        let (invocation, mut plan, process, standard_error, process_directives) = match self
+            .launch_stdio(
+                invocation,
+                plan,
+                setup_failure(AgentHarnessSetupStage::ExecutableLaunch),
+            )
+            .await
+        {
+            Ok(launched) => launched,
+            Err(outcome) => return outcome,
         };
-        // jscpd:ignore-end
-        let diagnostic = self.diagnostics.start_standard_error_capture(
-            invocation.identity().step().to_owned(),
-            invocation.identity().invocation(),
-            self.maximum_diagnostic_stream_bytes,
-            standard_error,
-            self.observer.clone(),
-        );
+        let diagnostic = self.start_diagnostic(&invocation, standard_error);
         let configuration = invocation.adapter().native_configuration();
         let expected_cwd = Arc::clone(&plan.expected_cwd);
         let codex_home = Arc::clone(&plan.codex_home);
@@ -284,13 +185,13 @@ where
             expected_cwd,
             codex_home,
             sqlite_home,
-            Arc::clone(&self.client_version),
+            Arc::clone(&self.profile.client_version),
             Arc::from(invocation.adapter().version()),
             Arc::from(configuration.model.as_str()),
             Arc::from(configuration.effort.as_str()),
             Arc::from(invocation.prompt().system_prompt()),
             initial_input,
-            self.selected_model_provider(),
+            self.profile.selected_model_provider(),
             invocation.value_mode().kind(),
             invocation.limits().maximum_response_bytes(),
             *invocation.limits().adapter_protocol(),
@@ -375,35 +276,18 @@ pub(super) fn prepare_launch<Sink>(
 where
     Sink: AgentObservationSink,
 {
-    // Each native profile owns which inputs are admitted before launch and how a failure
-    // is attributed; only the byte-bound primitive is shared.
-    // jscpd:ignore-start
-    check_agent_input_bound(
-        invocation.prompt().system_prompt(),
-        invocation.limits().maximum_system_prompt_bytes(),
-        AgentInputKind::SystemPrompt,
+    agent_process_driver::check_prompt_bounds(invocation)?;
+    agent_process_driver::require_native_profile(
+        invocation,
+        AgentCompatibilityProfile::CodexAppServerV1,
+        compatibility_profile_for_version(invocation.adapter().version())
+            == Some(CodexCompatibilityProfile::CodexAppServerV1),
+        || setup_failure(AgentHarnessSetupStage::ExecutableLaunch),
     )?;
-    check_agent_input_bound(
-        invocation.prompt().message(),
-        invocation.limits().maximum_message_bytes(),
-        AgentInputKind::Message,
+    agent_process_driver::verify_session_binding(
+        invocation.diagnostic_session().verify_path_binding(),
+        "codex diagnostic session binding",
     )?;
-    // jscpd:ignore-end
-    if invocation.adapter().profile() != AgentCompatibilityProfile::CodexAppServerV1
-        || compatibility_profile_for_version(invocation.adapter().version())
-            != Some(CodexCompatibilityProfile::CodexAppServerV1)
-        || !invocation.adapter().executable().is_absolute()
-    {
-        return Err(AgentFailureCause::HarnessSetupFailed {
-            stage: AgentHarnessSetupStage::ExecutableLaunch,
-        });
-    }
-    invocation
-        .diagnostic_session()
-        .verify_path_binding()
-        .map_err(|error| {
-            AgentFailureCause::start_failure("codex diagnostic session binding", error)
-        })?;
     let expected_cwd =
         invocation
             .process()
@@ -502,139 +386,41 @@ fn prepare_sqlite_state(
     Ok(sqlite_state)
 }
 
-struct LaunchedCodexProcess {
-    child: CodexChild,
-    process_group: Pid,
-    standard_input: UnixStream,
-    standard_output: ChildStdout,
-}
+type LaunchedCodexProcess = StdioProcess;
 
-struct CodexChild {
-    child: StoppedChildGuard,
-    registration: Option<ProcessGuardRegistration>,
-}
-
-impl CodexChild {
-    fn force_process_group(&self) {
-        let _ = terminate_authenticated_process_group(self.child.identity());
-    }
-
-    async fn wait(&mut self) -> Result<ExitStatus, ()> {
-        let status = self.child.wait().await.map_err(|_| ())?;
-        mark_process_guard_quiesced(&mut self.registration).await?;
-        Ok(status)
-    }
-
-    async fn force_stop(&mut self, process_group: Pid) -> Result<(), ()> {
-        self.force_process_group();
-        self.child.force_stop().await.map_err(|_| ())?;
-        mark_process_guard_quiesced(&mut self.registration).await?;
-        if process_group_is_quiescent(process_group) {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-}
-
-fn launch_process<Sink>(
-    invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
-    plan: &CodexAppServerV1LaunchPlan,
-    cancellation: &ChildGuardCancellation,
-) -> Result<(LaunchedCodexProcess, tokio::process::ChildStderr), AgentFailureCause>
-where
-    Sink: AgentObservationSink,
+impl<Sink: AgentObservationSink>
+    agent_process_driver::StdioLaunchPlan<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>
+    for CodexAppServerV1LaunchPlan
 {
-    // The guarded launch sequence stays beside Codex's stdio topology, diagnostic session,
-    // and setup-stage attribution instead of creating a cross-harness launch abstraction.
-    // jscpd:ignore-start
-    let environment = invocation_environment(invocation);
-    let (mut child, standard_input) = StoppedChildGuard::spawn_with_stdin_cancellable(
-        invocation.adapter().executable(),
-        &plan.arguments,
-        &environment,
-        cancellation,
-        |command| {
-            invocation
-                .process()
-                .bind_command(command)
-                .map_err(|_| io::Error::other("agent working directory is unavailable"))
-        },
-    )
-    .map_err(|error| AgentFailureCause::start_failure("codex process spawn", error))?;
-    let process_group = child.identity().process_group();
-    let (Some(standard_output), Some(standard_error)) = (child.take_stdout(), child.take_stderr())
-    else {
-        let _ = child.force_stop_blocking();
-        return Err(AgentFailureCause::HarnessSetupFailed {
-            stage: AgentHarnessSetupStage::ExecutableLaunch,
-        });
-    };
-    let mut registration = match invocation.process_guards().register(
-        invocation.identity().step(),
-        invocation.identity().invocation().transition_sequence.get(),
-        child.identity(),
-    ) {
-        Ok(registration) => registration,
-        Err(_) => {
-            let _ = child.force_stop_blocking();
-            return Err(AgentFailureCause::HarnessSetupFailed {
-                stage: AgentHarnessSetupStage::ExecutableLaunch,
-            });
-        }
-    };
-    if let Err(cause) = release_guarded_codex(invocation.diagnostic_session(), || {
-        child
-            .continue_execution_cancellable(cancellation)
-            .map_err(|error| AgentFailureCause::start_failure("codex process release", error))?;
-        registration
-            .mark_released()
-            .map_err(|_| setup_failure(AgentHarnessSetupStage::ExecutableLaunch))
-    }) {
-        let _ = child.force_stop_blocking();
-        let _ = registration.mark_quiesced();
-        return Err(cause);
+    fn arguments(&self) -> &[OsString] {
+        &self.arguments
     }
-    // jscpd:ignore-end
-    Ok((
-        LaunchedCodexProcess {
-            child: CodexChild {
-                child,
-                registration: Some(registration),
-            },
-            process_group,
-            standard_input,
-            standard_output,
-        },
-        standard_error,
-    ))
-}
-
-fn release_guarded_codex(
-    diagnostic_session: &AgentDiagnosticSession,
-    release: impl FnOnce() -> Result<(), AgentFailureCause>,
-) -> Result<(), AgentFailureCause> {
-    diagnostic_session.verify_path_binding().map_err(|error| {
-        AgentFailureCause::start_failure("codex diagnostic session binding", error)
-    })?;
-    release()
-}
-
-fn invocation_environment<Sink>(
-    invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
-) -> Vec<(OsString, OsString)>
-where
-    Sink: AgentObservationSink,
-{
-    invocation
-        .process()
-        .environment()
-        .variables()
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>()
-        .into_iter()
-        .collect()
+    fn environment(
+        &self,
+        invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+    ) -> Vec<(OsString, OsString)> {
+        agent_process_driver::invocation_environment(invocation)
+            .into_iter()
+            .collect()
+    }
+    fn verify_binding(
+        &self,
+        invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+    ) -> Result<(), AgentFailureCause> {
+        agent_process_driver::verify_session_binding(
+            invocation.diagnostic_session().verify_path_binding(),
+            "codex diagnostic session binding",
+        )
+    }
+    fn spawn_stage(&self) -> &'static str {
+        "codex process spawn"
+    }
+    fn release_stage(&self) -> &'static str {
+        "codex process release"
+    }
+    fn guard_failure(&self) -> AgentFailureCause {
+        setup_failure(AgentHarnessSetupStage::ExecutableLaunch)
+    }
 }
 
 struct ProcessTimingConfiguration<Clock> {
@@ -646,13 +432,436 @@ struct ProcessTimingConfiguration<Clock> {
 
 type ResultSettlementWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+enum CodexExtra {
+    Interrupt(Option<()>),
+    CleanupDeadline,
+    SettlementDeadline,
+}
+
+struct CodexProtocol<'a, Clock, Worker, Sink> {
+    invocation: &'a AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+    started: &'a AgentStartCallback,
+    parser: CodexAppServerV1Parser,
+    result_validator: Option<AuthoritativeResultValidator<Clock, Worker>>,
+    standard_input: Option<UnixStream>,
+    cooperative_interrupts: mpsc::UnboundedReceiver<()>,
+    cooperative_interrupt_started: bool,
+    cooperative_interrupts_open: bool,
+    cleanup_deadline: ResultSettlementWait,
+    cleanup_deadline_armed: bool,
+    result_settlement_wait: Option<ResultSettlementWait>,
+    write_timeout: Duration,
+    cleanup_timeout: Duration,
+    settlement_grace: PositiveDuration,
+    start_reported: bool,
+    failure: Option<AgentFailureCause>,
+}
+
+impl<Clock, Worker, Sink> CodexProtocol<'_, Clock, Worker, Sink>
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+    Sink: AgentObservationSink,
+{
+    fn arm_cleanup(&mut self, mut clock: Clock) {
+        let deadline = clock.now() + self.cleanup_timeout;
+        let deadline_clock = clock;
+        self.cleanup_deadline = Box::pin(async move { deadline_clock.wait_until(deadline).await });
+        self.cleanup_deadline_armed = true;
+    }
+
+    async fn interrupt(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if self.cooperative_interrupt_started {
+            return;
+        }
+        self.cooperative_interrupt_started = true;
+        if begin_cooperative_interrupt(
+            &mut self.standard_input,
+            &mut self.parser,
+            &mut state.clock,
+            self.write_timeout,
+        )
+        .await
+        .is_err()
+        {
+            state.parser_enabled = false;
+            let _ = close_standard_input(&mut self.standard_input).await;
+        }
+    }
+}
+
+impl<Clock, Worker, Sink> agent_process_driver::Protocol<Clock>
+    for CodexProtocol<'_, Clock, Worker, Sink>
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+    Sink: AgentObservationSink,
+{
+    type Extra = CodexExtra;
+
+    async fn on_start(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if let Err(cause) = write_pending_frames(
+            &mut self.standard_input,
+            &mut self.parser,
+            &mut state.clock,
+            self.write_timeout,
+        )
+        .await
+        {
+            self.failure = Some(cause);
+            state.parser_enabled = false;
+            self.arm_cleanup(state.clock.clone());
+        }
+    }
+
+    fn extra_enabled(&self, _state: &agent_process_driver::State<Clock>) -> bool {
+        (self.cooperative_interrupts_open && !self.cooperative_interrupt_started)
+            || self.cleanup_deadline_armed
+            || self.result_settlement_wait.is_some()
+    }
+
+    async fn extra(&mut self) -> CodexExtra {
+        tokio::select! {
+            biased;
+            requested = self.cooperative_interrupts.recv(), if self.cooperative_interrupts_open && !self.cooperative_interrupt_started => CodexExtra::Interrupt(requested),
+            () = &mut self.cleanup_deadline, if self.cleanup_deadline_armed => CodexExtra::CleanupDeadline,
+            () = wait_for_result_settlement(&mut self.result_settlement_wait), if self.result_settlement_wait.is_some() => CodexExtra::SettlementDeadline,
+        }
+    }
+
+    async fn on_extra(
+        &mut self,
+        event: CodexExtra,
+        state: &mut agent_process_driver::State<Clock>,
+    ) {
+        match event {
+            CodexExtra::Interrupt(Some(())) => {
+                if let Some(reason) = state.cancellation.cancellation_reason() {
+                    state.cancelled = Some(reason);
+                }
+                self.interrupt(state).await;
+            }
+            CodexExtra::Interrupt(None) => self.cooperative_interrupts_open = false,
+            CodexExtra::CleanupDeadline => {
+                self.cleanup_deadline_armed = false;
+                state.force_group();
+            }
+            CodexExtra::SettlementDeadline => {
+                self.result_settlement_wait = None;
+                self.failure = Some(AgentFailureCause::ResultSettlementFailed);
+                state.parser_enabled = false;
+                self.standard_input.take();
+                state.force_group();
+            }
+        }
+    }
+
+    async fn on_cancel(
+        &mut self,
+        _reason: crate::workflow::admission::CancellationReason,
+        state: &mut agent_process_driver::State<Clock>,
+    ) {
+        self.interrupt(state).await;
+    }
+
+    async fn on_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
+        let (parsed, observations) = agent_process_driver::collect_stdout_observations(|emit| {
+            self.parser.push_stdout(bytes, emit)
+        });
+        match parsed {
+            Ok(progress) => {
+                if state.cancelled.is_none()
+                    && let Some(reason) = state.cancellation.cancellation_reason()
+                {
+                    state.cancelled = Some(reason);
+                    self.interrupt(state).await;
+                }
+                if state.cancelled.is_none() && progress.start_acknowledged {
+                    if self.start_reported || self.started.report().is_err() {
+                        self.parser.record_rejection(
+                            CodexAppServerV1RejectionReason::StartAcknowledgementFailed,
+                        );
+                        self.failure = Some(AgentFailureCause::HarnessSetupFailed {
+                            stage: AgentHarnessSetupStage::StartAcknowledgement,
+                        });
+                        state.parser_enabled = false;
+                        state.force_group();
+                    } else {
+                        self.start_reported = true;
+                    }
+                }
+                if state.parser_enabled
+                    && state.cancelled.is_none()
+                    && emit_observations(self.invocation, observations)
+                        .await
+                        .is_err()
+                {
+                    self.failure =
+                        Some(self.parser.failure_for(
+                            CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
+                        ));
+                    state.parser_enabled = false;
+                    state.force_group();
+                }
+                if state.parser_enabled
+                    && let Err(cause) = write_pending_frames(
+                        &mut self.standard_input,
+                        &mut self.parser,
+                        &mut state.clock,
+                        self.write_timeout,
+                    )
+                    .await
+                {
+                    if state.cancelled.is_none() {
+                        self.failure = Some(cause);
+                        self.arm_cleanup(state.clock.clone());
+                    }
+                    state.parser_enabled = false;
+                }
+                if progress.close_standard_input
+                    && close_standard_input(&mut self.standard_input)
+                        .await
+                        .is_err()
+                {
+                    if state.cancelled.is_none() {
+                        self.failure = Some(self.parser.failure_for(
+                            CodexAppServerV1RejectionReason::StandardInputCloseFailed,
+                        ));
+                        state.force_group();
+                    }
+                    state.parser_enabled = false;
+                }
+            }
+            Err(mut cause) => {
+                if state.cancelled.is_none()
+                    && !self.start_reported
+                    && self.parser.start_acknowledged()
+                {
+                    if self.started.report().is_err() {
+                        self.parser.record_rejection(
+                            CodexAppServerV1RejectionReason::StartAcknowledgementFailed,
+                        );
+                        cause = AgentFailureCause::HarnessSetupFailed {
+                            stage: AgentHarnessSetupStage::StartAcknowledgement,
+                        };
+                    } else {
+                        self.start_reported = true;
+                    }
+                }
+                if state.cancelled.is_none()
+                    && emit_observations(self.invocation, observations)
+                        .await
+                        .is_err()
+                {
+                    cause = self
+                        .parser
+                        .failure_for(CodexAppServerV1RejectionReason::ObservationDeliveryFailed);
+                }
+                self.parser.prevent_value_commit();
+                let _ = self.parser.request_turn_interrupt();
+                let _ = write_pending_frames(
+                    &mut self.standard_input,
+                    &mut self.parser,
+                    &mut state.clock,
+                    self.write_timeout,
+                )
+                .await;
+                let _ = close_standard_input(&mut self.standard_input).await;
+                state.parser_enabled = false;
+                if state.cancelled.is_none() {
+                    self.failure = Some(cause);
+                    self.arm_cleanup(state.clock.clone());
+                }
+            }
+        }
+    }
+
+    fn classify_read_failure(&mut self) {
+        self.failure = Some(
+            self.parser
+                .failure_for(CodexAppServerV1RejectionReason::ProcessOutputReadFailed),
+        );
+    }
+
+    async fn on_wait_error(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if state.cancelled.is_none() {
+            self.failure.get_or_insert_with(|| {
+                self.parser
+                    .failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed)
+            });
+        }
+        state.force_group();
+    }
+
+    async fn after_event(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if state.parser_enabled
+            && let Some(candidate) = self.parser.take_result_candidate()
+        {
+            let Some(validator) = self.result_validator.as_mut() else {
+                self.failure = Some(
+                    self.parser
+                        .failure_for(CodexAppServerV1RejectionReason::ResultValidatorMissing),
+                );
+                state.parser_enabled = false;
+                self.standard_input.take();
+                state.force_group();
+                return;
+            };
+            let progress = match validator.validate(candidate, &state.cancellation).await {
+                ResultValidationOutcome::Cancelled { reason } => {
+                    state.cancelled = Some(reason);
+                    state.parser_enabled = false;
+                    self.standard_input.take();
+                    None
+                }
+                ResultValidationOutcome::Decided(ResultValidationDecision::Fatal(fatal)) => {
+                    self.failure = Some(AgentFailureCause::from(fatal));
+                    state.parser_enabled = false;
+                    self.standard_input.take();
+                    state.force_group();
+                    None
+                }
+                ResultValidationOutcome::Decided(ResultValidationDecision::Rejected {
+                    feedback,
+                }) => {
+                    let progress = self.parser.reject_result(Arc::clone(&feedback));
+                    let mut observations = vec![AgentObservation::ValueRejected {
+                        kind: crate::workflow::agent::AgentValueKind::Result,
+                        feedback,
+                    }];
+                    observations.extend(self.parser.take_observations());
+                    Some((progress, observations, false))
+                }
+                ResultValidationOutcome::Decided(ResultValidationDecision::Valid(result)) => {
+                    let progress = self.parser.accept_result(result);
+                    Some((progress, self.parser.take_observations(), true))
+                }
+            };
+            if let Some((progress, observations, accepted)) = progress {
+                if emit_observations(self.invocation, observations)
+                    .await
+                    .is_err()
+                {
+                    self.failure =
+                        Some(self.parser.failure_for(
+                            CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
+                        ));
+                    state.parser_enabled = false;
+                    self.standard_input.take();
+                    state.force_group();
+                } else {
+                    if accepted {
+                        let mut settlement_clock = state.clock.clone();
+                        let deadline = settlement_clock.now().add(self.settlement_grace.get());
+                        self.result_settlement_wait = Some(Box::pin(async move {
+                            settlement_clock.wait_until(deadline).await;
+                        }));
+                    }
+                    if let Err(cause) = apply_result_progress(
+                        progress,
+                        &mut self.standard_input,
+                        &mut self.parser,
+                        &mut state.clock,
+                        self.write_timeout,
+                    )
+                    .await
+                    {
+                        self.failure = Some(cause);
+                        state.parser_enabled = false;
+                        self.standard_input.take();
+                        state.force_group();
+                    }
+                }
+            }
+        }
+    }
+
+    fn needs_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        self.result_settlement_wait.is_some() && !state.group_quiescent
+    }
+    fn probe_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        self.result_settlement_wait.is_some() && state.output_closed && state.completion.is_some()
+    }
+    fn on_group_quiescent(&mut self, _state: &mut agent_process_driver::State<Clock>) {
+        self.result_settlement_wait = None;
+    }
+    fn force_before_settle(&self, _state: &agent_process_driver::State<Clock>) -> bool {
+        false
+    }
+
+    async fn finish(
+        mut self,
+        mut state: agent_process_driver::State<Clock>,
+        supervisor_quiesced: bool,
+    ) -> AgentOutcome {
+        if state.cancelled.is_none() {
+            state.cancelled = state.cancellation.cancellation_reason();
+        }
+        if state.cancelled.is_none() && self.failure.is_none() {
+            let settlement_failed = state.wait_failed
+                || !supervisor_quiesced
+                || !agent_process_driver::group_is_quiescent(state.process_group)
+                || !state.output_closed
+                || emit_observations(
+                    self.invocation,
+                    vec![AgentObservation::Lifecycle {
+                        milestone: AgentLifecycleMilestone::HarnessQuiescent,
+                    }],
+                )
+                .await
+                .is_err();
+            if settlement_failed {
+                self.failure = Some(
+                    self.parser
+                        .failure_for(CodexAppServerV1RejectionReason::ProcessSettlementFailed),
+                );
+            } else if state.completion.is_none() {
+                self.failure = Some(
+                    self.parser
+                        .failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed),
+                );
+            }
+        }
+        let outcome = if let Some(reason) = state.cancelled {
+            AgentOutcome::Cancelled { reason }
+        } else if let Some(cause) = self.failure {
+            failed_agent_outcome(cause)
+        } else if let Some(status) = state.completion {
+            self.parser.finish(status.success())
+        } else {
+            failed_agent_outcome(
+                self.parser
+                    .failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed),
+            )
+        };
+        self.parser.prepare_completion_rejection();
+        let protocol_rejection = self.parser.protocol_rejection();
+        match outcome {
+            AgentOutcome::Failed(failure)
+                if matches!(
+                    failure.cause(),
+                    AgentFailureCause::HarnessSetupFailed { .. }
+                        | AgentFailureCause::HarnessSetupRejected { .. }
+                        | AgentFailureCause::HarnessProtocolFailed
+                ) =>
+            {
+                AgentOutcome::Failed(AgentFailure::with_protocol_rejection(
+                    failure.cause().clone(),
+                    protocol_rejection.clone(),
+                ))
+            }
+            outcome => outcome,
+        }
+    }
+}
+
 async fn drive_process<Clock, Worker, Sink>(
     invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
     started: &AgentStartCallback,
     process: LaunchedCodexProcess,
-    mut parser: CodexAppServerV1Parser,
+    parser: CodexAppServerV1Parser,
     process_directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
-    mut result_validator: Option<AuthoritativeResultValidator<Clock, Worker>>,
+    result_validator: Option<AuthoritativeResultValidator<Clock, Worker>>,
     timing: ProcessTimingConfiguration<Clock>,
 ) -> AgentOutcome
 where
@@ -660,437 +869,46 @@ where
     Worker: ResultValidationWorker,
     Sink: AgentObservationSink,
 {
-    let LaunchedCodexProcess {
-        mut child,
-        process_group,
-        standard_input,
-        mut standard_output,
-    } = process;
-    let cancellation = invocation.cancellation().clone();
-    let (cooperative_interrupt, mut cooperative_interrupts) = mpsc::unbounded_channel();
-    let (stop_supervisor, supervisor_shutdown) = oneshot::channel();
-    let supervisor = tokio::spawn(supervise_process_group(
-        process_group,
-        cancellation.clone(),
-        process_directives,
-        cooperative_interrupt,
-        supervisor_shutdown,
-    ));
-    let mut standard_input = Some(standard_input);
-    let mut standard_output_closed = false;
-    let mut process_completion = None;
-    let mut wait_failed = false;
-    let mut parser_enabled = true;
-    let mut start_reported = false;
-    let mut failure = None;
-    let mut cancelled = None;
-    let mut cooperative_interrupt_started = false;
-    let mut cooperative_interrupts_open = true;
-    let mut cleanup_deadline_armed = false;
-    let mut cleanup_deadline: Pin<Box<dyn Future<Output = ()> + Send>> =
-        Box::pin(std::future::pending());
-    let write_timeout = timing.standard_input_write_timeout;
-    let cleanup_timeout = timing.post_failure_cleanup_timeout;
-    let mut result_settlement_wait: Option<ResultSettlementWait> = None;
-    let mut clock = timing.clock.clone();
-    let mut process_group_probe_clock = timing.clock.clone();
-
-    if let Err(cause) =
-        write_pending_frames(&mut standard_input, &mut parser, &mut clock, write_timeout).await
-    {
-        failure = Some(cause);
-        parser_enabled = false;
-        let deadline = clock.now() + cleanup_timeout;
-        let deadline_clock = clock.clone();
-        cleanup_deadline = Box::pin(async move {
-            deadline_clock.wait_until(deadline).await;
-        });
-        cleanup_deadline_armed = true;
-    }
-
-    let accepted_cancellation = cancellation.wait_for_cancellation();
-    tokio::pin!(accepted_cancellation);
-    let mut buffer = [0_u8; READ_BUFFER_BYTES];
-    while !standard_output_closed
-        || (process_completion.is_none() && !wait_failed)
-        || (result_settlement_wait.is_some() && !process_group_is_quiescent(process_group))
-    {
-        tokio::select! {
-            biased;
-            // Codex's cancellation branch writes the native interruption before shared
-            // deadline escalation can force the guarded process group.
-            // jscpd:ignore-start
-            reason = &mut accepted_cancellation, if cancelled.is_none() => {
-                cancelled = Some(reason);
-                if !cooperative_interrupt_started {
-                    cooperative_interrupt_started = true;
-                    if begin_cooperative_interrupt(
-                        &mut standard_input,
-                        &mut parser,
-                        &mut clock,
-                        write_timeout,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        parser_enabled = false;
-                        let _ = close_standard_input(&mut standard_input).await;
-                    }
-                }
-            }
-            requested = cooperative_interrupts.recv(),
-                if cooperative_interrupts_open && !cooperative_interrupt_started =>
-            {
-                match requested {
-                    Some(()) => {
-                        cooperative_interrupt_started = true;
-                        if let Some(reason) = cancellation.cancellation_reason() {
-                            cancelled = Some(reason);
-                        }
-                        if begin_cooperative_interrupt(
-                            &mut standard_input,
-                            &mut parser,
-                            &mut clock,
-                            write_timeout,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            parser_enabled = false;
-                            let _ = close_standard_input(&mut standard_input).await;
-                        }
-                    }
-                    None => cooperative_interrupts_open = false,
-                }
-            }
-            () = &mut cleanup_deadline, if cleanup_deadline_armed => {
-                cleanup_deadline_armed = false;
-                child.force_process_group();
-            }
-            read = standard_output.read(&mut buffer), if !standard_output_closed => {
-                match read {
-                    Ok(0) => standard_output_closed = true,
-                    Ok(read) if parser_enabled => {
-                        let mut observations = Vec::new();
-                        let parsed = parser.push_stdout(&buffer[..read], |observation| {
-                            observations.push(observation);
-                        });
-                        // jscpd:ignore-end
-                        match parsed {
-                            Ok(progress) => {
-                                if cancelled.is_none()
-                                    && let Some(reason) = cancellation.cancellation_reason()
-                                {
-                                    cancelled = Some(reason);
-                                    if !cooperative_interrupt_started {
-                                        cooperative_interrupt_started = true;
-                                        if begin_cooperative_interrupt(
-                                            &mut standard_input,
-                                            &mut parser,
-                                            &mut clock,
-                                            write_timeout,
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            parser_enabled = false;
-                                            let _ = close_standard_input(&mut standard_input).await;
-                                        }
-                                    }
-                                }
-                                if cancelled.is_none() && progress.start_acknowledged {
-                                    if start_reported || started.report().is_err() {
-                                        parser.record_rejection(
-                                            CodexAppServerV1RejectionReason::StartAcknowledgementFailed,
-                                        );
-                                        failure = Some(AgentFailureCause::HarnessSetupFailed {
-                                            stage: AgentHarnessSetupStage::StartAcknowledgement,
-                                        });
-                                        parser_enabled = false;
-                                        child.force_process_group();
-                                    } else {
-                                        start_reported = true;
-                                    }
-                                }
-                                if parser_enabled
-                                    && cancelled.is_none()
-                                    && emit_observations(invocation, observations).await.is_err()
-                                {
-                                    failure = Some(parser.failure_for(
-                                        CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
-                                    ));
-                                    parser_enabled = false;
-                                    child.force_process_group();
-                                }
-                                if parser_enabled
-                                    && let Err(cause) = write_pending_frames(
-                                        &mut standard_input,
-                                        &mut parser,
-                                        &mut clock,
-                                        write_timeout,
-                                    ).await
-                                {
-                                    if cancelled.is_none() {
-                                        failure = Some(cause);
-                                        let deadline = clock.now() + cleanup_timeout;
-                                        let deadline_clock = clock.clone();
-                                        cleanup_deadline = Box::pin(async move {
-                                            deadline_clock.wait_until(deadline).await;
-                                        });
-                                        cleanup_deadline_armed = true;
-                                    }
-                                    parser_enabled = false;
-                                }
-                                if progress.close_standard_input
-                                    && close_standard_input(&mut standard_input).await.is_err()
-                                {
-                                    if cancelled.is_none() {
-                                        failure = Some(parser.failure_for(
-                                            CodexAppServerV1RejectionReason::StandardInputCloseFailed,
-                                        ));
-                                        child.force_process_group();
-                                    }
-                                    parser_enabled = false;
-                                }
-                            }
-                            Err(mut cause) => {
-                                if cancelled.is_none()
-                                    && !start_reported
-                                    && parser.start_acknowledged()
-                                {
-                                    if started.report().is_err() {
-                                        parser.record_rejection(
-                                            CodexAppServerV1RejectionReason::StartAcknowledgementFailed,
-                                        );
-                                        cause = AgentFailureCause::HarnessSetupFailed {
-                                            stage: AgentHarnessSetupStage::StartAcknowledgement,
-                                        };
-                                    } else {
-                                        start_reported = true;
-                                    }
-                                }
-                                if cancelled.is_none()
-                                    && emit_observations(invocation, observations).await.is_err()
-                                {
-                                    cause = parser.failure_for(
-                                        CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
-                                    );
-                                }
-                                parser.prevent_value_commit();
-                                let _ = parser.request_turn_interrupt();
-                                let _ = write_pending_frames(
-                                    &mut standard_input,
-                                    &mut parser,
-                                    &mut clock,
-                                    write_timeout,
-                                )
-                                .await;
-                                let _ = close_standard_input(&mut standard_input).await;
-                                parser_enabled = false;
-                                if cancelled.is_none() {
-                                    failure = Some(cause);
-                                    let deadline = clock.now() + cleanup_timeout;
-                                    let deadline_clock = clock.clone();
-                                    cleanup_deadline = Box::pin(async move {
-                                        deadline_clock.wait_until(deadline).await;
-                                    });
-                                    cleanup_deadline_armed = true;
-                                }
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => {
-                        standard_output_closed = true;
-                        if parser_enabled {
-                            failure = Some(parser.failure_for(
-                                CodexAppServerV1RejectionReason::ProcessOutputReadFailed,
-                            ));
-                            parser_enabled = false;
-                            child.force_process_group();
-                        }
-                    }
-                }
-            }
-            waited = child.wait(), if process_completion.is_none() && !wait_failed => {
-                match waited {
-                    Ok(status) => process_completion = Some(status),
-                    Err(()) => {
-                        wait_failed = true;
-                        if cancelled.is_none() {
-                            failure.get_or_insert_with(|| {
-                                parser.failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed)
-                            });
-                        }
-                        parser_enabled = false;
-                        child.force_process_group();
-                    }
-                }
-            }
-            () = wait_for_result_settlement(&mut result_settlement_wait),
-                if result_settlement_wait.is_some() =>
-            {
-                result_settlement_wait = None;
-                failure = Some(AgentFailureCause::ResultSettlementFailed);
-                parser_enabled = false;
-                standard_input.take();
-                child.force_process_group();
-            }
-            () = wait_for_process_group_probe(&mut process_group_probe_clock),
-                if result_settlement_wait.is_some()
-                    && standard_output_closed
-                    && process_completion.is_some() => {}
-        }
-
-        if parser_enabled && let Some(candidate) = parser.take_result_candidate() {
-            let Some(validator) = result_validator.as_mut() else {
-                failure = Some(
-                    parser.failure_for(CodexAppServerV1RejectionReason::ResultValidatorMissing),
-                );
-                parser_enabled = false;
-                standard_input.take();
-                child.force_process_group();
-                continue;
-            };
-            let progress = match validator.validate(candidate, &cancellation).await {
-                ResultValidationOutcome::Cancelled { reason } => {
-                    cancelled = Some(reason);
-                    parser_enabled = false;
-                    standard_input.take();
-                    None
-                }
-                ResultValidationOutcome::Decided(ResultValidationDecision::Fatal(fatal)) => {
-                    failure = Some(AgentFailureCause::from(fatal));
-                    parser_enabled = false;
-                    standard_input.take();
-                    child.force_process_group();
-                    None
-                }
-                ResultValidationOutcome::Decided(ResultValidationDecision::Rejected {
-                    feedback,
-                }) => {
-                    let progress = parser.reject_result(Arc::clone(&feedback));
-                    let mut observations = vec![AgentObservation::ValueRejected {
-                        kind: crate::workflow::agent::AgentValueKind::Result,
-                        feedback,
-                    }];
-                    observations.extend(parser.take_observations());
-                    Some((progress, observations, false))
-                }
-                ResultValidationOutcome::Decided(ResultValidationDecision::Valid(result)) => {
-                    let progress = parser.accept_result(result);
-                    Some((progress, parser.take_observations(), true))
-                }
-            };
-            if let Some((progress, observations, accepted)) = progress {
-                if emit_observations(invocation, observations).await.is_err() {
-                    failure =
-                        Some(parser.failure_for(
-                            CodexAppServerV1RejectionReason::ObservationDeliveryFailed,
-                        ));
-                    parser_enabled = false;
-                    standard_input.take();
-                    child.force_process_group();
-                } else {
-                    if accepted {
-                        let mut settlement_clock = timing.clock.clone();
-                        let deadline = settlement_clock
-                            .now()
-                            .add(timing.result_settlement_grace.get());
-                        result_settlement_wait = Some(Box::pin(async move {
-                            settlement_clock.wait_until(deadline).await;
-                        }));
-                    }
-                    if let Err(cause) = apply_result_progress(
-                        progress,
-                        &mut standard_input,
-                        &mut parser,
-                        &mut clock,
-                        write_timeout,
-                    )
-                    .await
-                    {
-                        failure = Some(cause);
-                        parser_enabled = false;
-                        standard_input.take();
-                        child.force_process_group();
-                    }
-                }
-            }
-        }
-
-        if result_settlement_wait.is_some()
-            && standard_output_closed
-            && process_completion.is_some()
-            && process_group_is_quiescent(process_group)
-        {
-            result_settlement_wait = None;
-        }
-    }
-
-    // Codex must settle its guarded child before interpreting App Server terminal state;
-    // this remains local because other profiles have different validation workers.
-    // jscpd:ignore-start
-    if process_completion.is_none() {
-        process_completion = child.wait().await.ok();
-        if process_completion.is_none() {
-            let _ = child.force_stop(process_group).await;
-        }
-    }
-    let _ = stop_supervisor.send(());
-    let supervisor_quiesced = supervisor.await.is_ok();
-    // jscpd:ignore-end
-    if cancelled.is_none() {
-        cancelled = cancellation.cancellation_reason();
-    }
-    if cancelled.is_none() && failure.is_none() {
-        let settlement_failed = wait_failed
-            || !supervisor_quiesced
-            || !process_group_is_quiescent(process_group)
-            || !standard_output_closed
-            || emit_observations(
-                invocation,
-                vec![AgentObservation::Lifecycle {
-                    milestone: AgentLifecycleMilestone::HarnessQuiescent,
-                }],
-            )
-            .await
-            .is_err();
-        if settlement_failed {
-            failure =
-                Some(parser.failure_for(CodexAppServerV1RejectionReason::ProcessSettlementFailed));
-        } else if process_completion.is_none() {
-            failure = Some(parser.failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed));
-        }
-    }
-    let outcome = if let Some(reason) = cancelled {
-        AgentOutcome::Cancelled { reason }
-    } else if let Some(cause) = failure {
-        failed_agent_outcome(cause)
-    } else if let Some(status) = process_completion {
-        parser.finish(status.success())
-    } else {
-        failed_agent_outcome(parser.failure_for(CodexAppServerV1RejectionReason::ProcessWaitFailed))
+    let (cooperative_interrupt, cooperative_interrupts) = mpsc::unbounded_channel();
+    let protocol = CodexProtocol {
+        invocation,
+        started,
+        parser,
+        result_validator,
+        standard_input: Some(process.standard_input),
+        cooperative_interrupts,
+        cooperative_interrupt_started: false,
+        cooperative_interrupts_open: true,
+        cleanup_deadline: Box::pin(pending()),
+        cleanup_deadline_armed: false,
+        result_settlement_wait: None,
+        write_timeout: timing.standard_input_write_timeout,
+        cleanup_timeout: timing.post_failure_cleanup_timeout,
+        settlement_grace: timing.result_settlement_grace,
+        start_reported: false,
+        failure: None,
     };
-    parser.prepare_completion_rejection();
-    let protocol_rejection = parser.protocol_rejection();
-    match outcome {
-        AgentOutcome::Failed(failure)
-            if matches!(
-                failure.cause(),
-                AgentFailureCause::HarnessSetupFailed { .. }
-                    | AgentFailureCause::HarnessSetupRejected { .. }
-                    | AgentFailureCause::HarnessProtocolFailed
-            ) =>
-        {
-            AgentOutcome::Failed(AgentFailure::with_protocol_rejection(
-                failure.cause().clone(),
-                protocol_rejection.clone(),
-            ))
-        }
-        outcome => outcome,
-    }
+    let state = agent_process_driver::State::new(
+        agent_process_driver::ProcessOutput {
+            child: process.child,
+            process_group: process.process_group,
+            standard_output: process.standard_output,
+        },
+        invocation.cancellation().clone(),
+        timing.clock,
+    );
+    agent_process_driver::drive(
+        state,
+        protocol,
+        agent_process_driver::Supervisor {
+            directives: process_directives,
+            interrupt: Box::new(move || {
+                let _ = cooperative_interrupt.send(());
+            }),
+            settlement: None,
+        },
+    )
+    .await
 }
 
 async fn begin_cooperative_interrupt<Clock: CoordinatorClock>(
@@ -1111,7 +929,6 @@ async fn begin_cooperative_interrupt<Clock: CoordinatorClock>(
 
 // Codex applies correction frames and accepted-result stdin closure inside its JSON-RPC
 // driver; sharing Claude's exchange progress helper would couple distinct protocols.
-// jscpd:ignore-start
 async fn apply_result_progress<Clock: CoordinatorClock>(
     progress: Result<ParserProgress, AgentFailureCause>,
     standard_input: &mut Option<UnixStream>,
@@ -1128,11 +945,9 @@ async fn apply_result_progress<Clock: CoordinatorClock>(
     }
     Ok(())
 }
-// jscpd:ignore-end
 
-// Codex owns when its accepted-turn settlement timer and group probes are active;
-// sharing another profile's waits would couple native terminal state machines.
-// jscpd:ignore-start
+// The native accepted-turn settlement deadline is a Codex protocol hook; the
+// shared loop owns its wait and group probe.
 async fn wait_for_result_settlement(wait: &mut Option<ResultSettlementWait>) {
     match wait {
         Some(wait) => wait.await,
@@ -1140,20 +955,12 @@ async fn wait_for_result_settlement(wait: &mut Option<ResultSettlementWait>) {
     }
 }
 
-async fn wait_for_process_group_probe<Clock: CoordinatorClock>(clock: &mut Clock) {
-    let deadline = clock.now().add(PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL);
-    clock.clone().wait_until(deadline).await;
-}
-// jscpd:ignore-end
-
 async fn write_pending_frames<Clock: CoordinatorClock>(
     standard_input: &mut Option<UnixStream>,
     parser: &mut CodexAppServerV1Parser,
     clock: &mut Clock,
     write_timeout: Duration,
 ) -> Result<(), AgentFailureCause> {
-    let deadline = clock.now() + write_timeout;
-    let deadline_clock = clock.clone();
     let write = async {
         while let Some(frame) = parser.take_outbound() {
             let Some(input) = standard_input.as_mut() else {
@@ -1163,36 +970,15 @@ async fn write_pending_frames<Clock: CoordinatorClock>(
         }
         Ok(())
     };
-    let (result, reason) = tokio::select! {
-        biased;
-        result = write => (result, CodexAppServerV1RejectionReason::StandardInputWriteFailed),
-        () = deadline_clock.wait_until(deadline) => (
-            Err(()),
-            CodexAppServerV1RejectionReason::StandardInputWriteTimedOut,
-        ),
+    let reason = match agent_process_driver::write_until(clock, write_timeout, write).await {
+        Ok(()) => return Ok(()),
+        Err(WriteDeadline::Failed(())) => CodexAppServerV1RejectionReason::StandardInputWriteFailed,
+        Err(WriteDeadline::TimedOut) => CodexAppServerV1RejectionReason::StandardInputWriteTimedOut,
     };
-    if result.is_ok() {
-        return Ok(());
-    }
     let failure = parser.failure_for(reason);
     let _ = close_standard_input(standard_input).await;
     Err(failure)
 }
-
-// Codex closes this stream only after its native terminal frame; keeping the helper local
-// prevents another streaming profile from acquiring that protocol transition.
-// jscpd:ignore-start
-async fn close_standard_input(standard_input: &mut Option<UnixStream>) -> Result<(), ()> {
-    let Some(input) = standard_input.take() else {
-        return Ok(());
-    };
-    match rustix::net::shutdown(&input, rustix::net::Shutdown::Write) {
-        Ok(()) => Ok(()),
-        Err(error) if error == rustix::io::Errno::NOTCONN => Ok(()),
-        Err(_) => Err(()),
-    }
-}
-// jscpd:ignore-end
 
 async fn emit_observations<Sink>(
     invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
@@ -1211,55 +997,6 @@ where
     Ok(())
 }
 
-async fn supervise_process_group(
-    process_group: Pid,
-    cancellation: CancellationSource,
-    mut directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
-    cooperative_interrupt: mpsc::UnboundedSender<()>,
-    mut shutdown: oneshot::Receiver<()>,
-) {
-    let accepted_cancellation = cancellation.wait_for_cancellation();
-    tokio::pin!(accepted_cancellation);
-    let mut cancellation_observed = false;
-    let mut interrupt_requested = false;
-    let mut directives_open = true;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => return,
-            // The supervisor keeps forced containment independent from blocked stdio, but
-            // routes every graceful request back through App Server's native interrupt.
-            // jscpd:ignore-start
-            _ = &mut accepted_cancellation, if !cancellation_observed => {
-                cancellation_observed = true;
-                if !interrupt_requested {
-                    let _ = cooperative_interrupt.send(());
-                    interrupt_requested = true;
-                }
-            }
-            directive = directives.recv(), if directives_open => {
-                match directive {
-                    Some(AgentProcessDirective::Interrupt) if !interrupt_requested => {
-                        let _ = cooperative_interrupt.send(());
-                        interrupt_requested = true;
-                    }
-                    Some(AgentProcessDirective::Interrupt) => {}
-                    Some(AgentProcessDirective::Force) => {
-                        terminate_process_group(process_group);
-                        return;
-                    }
-                    None => directives_open = false,
-                }
-            }
-            // jscpd:ignore-end
-        }
-    }
-}
-
 fn setup_failure(stage: AgentHarnessSetupStage) -> AgentFailureCause {
     AgentFailureCause::HarnessSetupFailed { stage }
-}
-
-fn setup_failed(stage: AgentHarnessSetupStage) -> AgentOutcome {
-    failed_agent_outcome(setup_failure(stage))
 }

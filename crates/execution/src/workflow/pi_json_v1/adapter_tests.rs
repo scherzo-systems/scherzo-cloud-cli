@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::future::{Future, pending, ready};
+use std::future::{Future, pending};
 use std::io::{Read as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
-use rustix::process::{Pid, WaitId, WaitIdOptions, getpgid, waitid};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, getpgid, kill_process, kill_process_group, waitid,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -41,10 +43,7 @@ use crate::workflow::process_group::{
     AuthenticatedProcessGroup, DurableProcessGuardStore, ProcessGuardRegistry,
     ProcessGuardStoreError, process_group_is_quiescent,
 };
-use crate::workflow::result_validation::{
-    ResultValidationWorker, RunningResultValidation, ValidationWorkerDecision,
-    ValidationWorkerRequest,
-};
+use crate::workflow::result_validation::{ResultValidationWorker, ValidationWorkerRequest};
 use crate::workflow::runtime::{ActionId, TransitionSequence};
 use crate::workflow::test_support::{
     process_fixture_interrupt_receiver, process_fixture_output, run_with_stalled_child_guard,
@@ -232,11 +231,17 @@ case "$PI_FIXTURE_MODE" in
     "$PI_FIXTURE_DETACHED_HOLDER" \
       --exact workflow::pi_json_v1::adapter_tests::detached_standard_output_holder_process \
       --ignored 3>&1 >/dev/null 2>&1 &
+    # The guard reaps the group as soon as the leader exits. Wait for the holder
+    # to detach before letting the leader exit; the FIFO is a readiness barrier.
+    IFS= read -r detached < "$PI_FIXTURE_GROUP_DETACHED"
     ;;
   result-bridge-in-group-descendant)
     "$PI_FIXTURE_DETACHED_HOLDER" \
       --exact workflow::pi_json_v1::adapter_tests::in_group_descendant_reaper_process \
       --ignored >/dev/null 2>&1 &
+    IFS= read -r detached < "$PI_FIXTURE_GROUP_DETACHED"
+    # Remain the group leader until the injected settlement deadline kills us.
+    IFS= read -r stopped < "$PI_FIXTURE_LEADER_HOLD"
     ;;
 esac
 "#;
@@ -479,6 +484,10 @@ impl ProcessFixture {
         let result_first_release = controls.join("result-first-release");
         let result_second_ready = controls.join("result-second-ready");
         let result_second_release = controls.join("result-second-release");
+        let group_detached = controls.join("group-detached");
+        let leader_hold = controls.join("leader-hold");
+        let reaper = controls.join("reaper");
+        let detached_done = controls.join("detached-done");
         let result_settlement_ready = controls.join("result-settlement-ready");
         let result_settlement_release = controls.join("result-settlement-release");
         fs::write(&phase_transcript, []).unwrap();
@@ -492,6 +501,9 @@ impl ProcessFixture {
             &result_first_release,
             &result_second_ready,
             &result_second_release,
+            &group_detached,
+            &leader_hold,
+            &detached_done,
             &result_settlement_ready,
             &result_settlement_release,
         ] {
@@ -613,6 +625,22 @@ impl ProcessFixture {
                 result_second_release.as_os_str().to_owned(),
             ),
             (
+                OsString::from("PI_FIXTURE_DETACHED_DONE"),
+                detached_done.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("PI_FIXTURE_REAPER"),
+                reaper.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("PI_FIXTURE_GROUP_DETACHED"),
+                group_detached.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("PI_FIXTURE_LEADER_HOLD"),
+                leader_hold.as_os_str().to_owned(),
+            ),
+            (
                 OsString::from("PI_FIXTURE_RESULT_SETTLEMENT_READY"),
                 result_settlement_ready.as_os_str().to_owned(),
             ),
@@ -731,43 +759,16 @@ pub(super) fn invocation_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimit
     )
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct InlineValidationWorker;
+pub(super) use crate::workflow::agent_process_driver::test_support::InlineValidationWorker;
 
 #[derive(Clone, Copy)]
 struct DeadlineValidationWorker;
-
-pub(super) struct InlineValidation {
-    decision: Option<Result<ValidationWorkerDecision, ()>>,
-}
-
-impl ResultValidationWorker for InlineValidationWorker {
-    type Running = InlineValidation;
-
-    fn start(&self, request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        Ok(InlineValidation {
-            decision: Some(request.evaluate()),
-        })
-    }
-}
 
 impl ResultValidationWorker for DeadlineValidationWorker {
     type Running = PendingResultValidation;
 
     fn start(&self, _request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
         Ok(PendingResultValidation)
-    }
-}
-
-impl RunningResultValidation for InlineValidation {
-    fn wait(&mut self) -> impl Future<Output = Result<ValidationWorkerDecision, ()>> + Send {
-        ready(self.decision.take().unwrap())
-    }
-
-    fn request_stop(&mut self) {}
-
-    fn quiesce(self) -> impl Future<Output = ()> + Send {
-        ready(())
     }
 }
 
@@ -855,7 +856,7 @@ where
     let value_mode = invocation.value_mode().clone();
     let (started_callback, started) = agent_start_channel();
     let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
-    let adapter = PiJsonV1Adapter::with_validation_worker(
+    let adapter = PiJsonV1Adapter::with_worker(
         diagnostics,
         NonZeroU64::new(1024).unwrap(),
         clock,
@@ -1026,6 +1027,7 @@ struct RunningResultFixture {
     settlement_release: PathBuf,
     process: PathBuf,
     descendant: PathBuf,
+    #[cfg(not(target_os = "linux"))]
     descendant_ready: PathBuf,
     tool_name: String,
     observations: mpsc::UnboundedReceiver<AgentObservationEnvelope>,
@@ -1209,6 +1211,7 @@ where
         settlement_release: fixture.result_settlement_release,
         process: fixture.process,
         descendant: fixture.descendant,
+        #[cfg(not(target_os = "linux"))]
         descendant_ready: fixture.descendant_ready,
         tool_name,
         observations: fixture.observations,
@@ -1787,7 +1790,7 @@ async fn cancelled_stalled_guarded_launch_cleans_worker_fixture() {
 }
 
 #[tokio::test]
-async fn launch_uses_exact_direct_process_contract_and_delays_started_until_agent_start() {
+async fn launch_uses_exact_process_contract_and_delays_started_until_agent_start() {
     with_watchdog(async {
         let message = "@/caller/path\n$HOME; * remains literal";
         let inspected =
@@ -2117,6 +2120,8 @@ async fn adapter_waits_for_a_terminated_process_group_to_be_observed_absent() {
     with_watchdog(async {
         let (mut running, now_seconds, deadline_release, mut registered_deadlines) =
             launch_controlled_settlement_fixture("result-bridge-in-group-descendant").await;
+        let mut cleanup = DetachedFixtureCleanup::new(&running.process, &running.descendant);
+        cleanup.reaper = Some(running.process.parent().unwrap().join("reaper"));
         advance_result_fixture_to_settlement(&mut running, &mut registered_deadlines).await;
         let process = process_id(&fs::read(&running.process).unwrap());
         let descendant = process_id(&fs::read(&running.descendant).unwrap());
@@ -2124,40 +2129,54 @@ async fn adapter_waits_for_a_terminated_process_group_to_be_observed_absent() {
 
         now_seconds.store(130, Ordering::SeqCst);
         deadline_release.send_replace(true);
-        read_signal(running.descendant_ready.clone()).await;
-        assert!(
-            !process_group_is_quiescent(process),
-            "the unreaped descendant must keep the process group observable"
-        );
-        assert!(
-            !running.terminal.is_finished(),
-            "the adapter must not report completion while the process group still exists"
-        );
-
-        write_signal(running.settlement_release.clone()).await;
+        #[cfg(not(target_os = "linux"))]
+        {
+            read_signal(running.descendant_ready.clone()).await;
+            assert!(!process_group_is_quiescent(process));
+            assert!(!running.terminal.is_finished());
+            write_signal(running.settlement_release.clone()).await;
+            read_signal(running.process.parent().unwrap().join("detached-done")).await;
+        }
         assert_agent_failure(
             &running.finish().await,
             AgentFailureCause::ResultSettlementFailed,
         );
         assert!(process_group_is_quiescent(process));
+        assert!(getpgid(Some(descendant)).is_err());
+        cleanup.disarm();
     })
     .await;
 }
 
 #[tokio::test]
-async fn stdout_eof_after_settlement_grace_discards_the_candidate() {
+async fn detached_stdout_holder_obeys_the_platform_cleanup_boundary() {
     with_watchdog(async {
         let (mut running, now_seconds, deadline_release, mut registered_deadlines) =
             launch_controlled_settlement_fixture("result-bridge-settlement-eof-after-grace").await;
+        let mut cleanup = DetachedFixtureCleanup::new(&running.process, &running.descendant);
         advance_result_fixture_to_settlement(&mut running, &mut registered_deadlines).await;
-
-        now_seconds.store(130, Ordering::SeqCst);
-        deadline_release.send_replace(true);
-        let outcome = (&mut running.terminal).await.unwrap().unwrap();
-        write_signal(running.settlement_release.clone()).await;
-        (&mut running.task).await.unwrap();
-
-        assert_agent_failure(&outcome, AgentFailureCause::ResultSettlementFailed);
+        #[cfg(target_os = "linux")]
+        {
+            let holder = process_id(&fs::read(&running.descendant).unwrap());
+            assert!(matches!(
+                running.finish().await,
+                AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+            ));
+            assert!(getpgid(Some(holder)).is_err());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            now_seconds.store(130, Ordering::SeqCst);
+            deadline_release.send_replace(true);
+            let outcome = (&mut running.terminal).await.unwrap().unwrap();
+            write_signal(running.settlement_release.clone()).await;
+            read_signal(running.process.parent().unwrap().join("detached-done")).await;
+            (&mut running.task).await.unwrap();
+            assert_agent_failure(&outcome, AgentFailureCause::ResultSettlementFailed);
+        }
+        #[cfg(target_os = "linux")]
+        let _ = (now_seconds, deadline_release);
+        cleanup.disarm();
     })
     .await;
 }
@@ -2391,7 +2410,7 @@ async fn exact_input_limits_prepare_unchanged_and_one_excess_byte_never_launches
             let value_mode = fixture.invocation.value_mode().clone();
             let (started_callback, started) = agent_start_channel();
             let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
-            let adapter = PiJsonV1Adapter::<TestClock, _>::new(
+            let adapter = PiJsonV1Adapter::<TestClock, _>::new_default(
                 fixture.diagnostics,
                 NonZeroU64::new(1024).unwrap(),
                 TestClock::Pending,
@@ -2453,7 +2472,7 @@ async fn every_pre_agent_start_process_failure_is_a_start_failure_without_starte
         let value_mode = fixture.invocation.value_mode().clone();
         let (started_callback, started) = agent_start_channel();
         let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
-        let adapter = PiJsonV1Adapter::<TestClock, _>::new(
+        let adapter = PiJsonV1Adapter::<TestClock, _>::new_default(
             fixture.diagnostics,
             NonZeroU64::new(1024).unwrap(),
             TestClock::Pending,
@@ -2650,6 +2669,8 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
             registrations,
             release: release_deadline,
         };
+        let mut cleanup = DetachedFixtureCleanup::new(&fixture.process, &fixture.descendant);
+        cleanup.reaper = Some(fixture.process.parent().unwrap().join("reaper"));
         let (task, _started, terminal) = start_invocation(fixture.invocation, diagnostics.clone());
 
         read_signal(fixture.descendant_ready.clone()).await;
@@ -2678,17 +2699,17 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
 
         deadline_release.send(true).unwrap();
         deadline_task.await.unwrap();
-        read_signal(fixture.descendant_ready).await;
-        assert!(
-            !process_group_is_quiescent(process),
-            "the unreaped descendant must keep the process group observable"
-        );
-        assert!(
-            !task.is_finished(),
-            "cancellation must not become terminal while the process group still exists"
-        );
-        write_signal(fixture.result_settlement_release).await;
+        #[cfg(not(target_os = "linux"))]
+        {
+            read_signal(fixture.descendant_ready).await;
+            assert!(!process_group_is_quiescent(process));
+            assert!(!task.is_finished());
+            write_signal(fixture.result_settlement_release).await;
+            read_signal(fixture.process.parent().unwrap().join("detached-done")).await;
+        }
         assert_user_cancellation(task, terminal).await;
+        assert!(process_group_is_quiescent(process));
+        cleanup.disarm();
         let diagnostic = diagnostics.get("agent-step").unwrap();
         assert_eq!(diagnostic.standard_error().bytes(), b"phase diagnostic\n");
         assert!(diagnostic.standard_output().fully_drained());
@@ -2779,6 +2800,55 @@ fn stubborn_descendant_process_fixture() {
     }
 }
 
+// A watchdog drops the test future, not the independently detached fixture processes.
+// Keep their IDs and stop them on any failed assertion or anti-hang expiry.
+struct DetachedFixtureCleanup {
+    process: PathBuf,
+    descendant: PathBuf,
+    reaper: Option<PathBuf>,
+    armed: bool,
+}
+
+impl DetachedFixtureCleanup {
+    fn new(process: &Path, descendant: &Path) -> Self {
+        Self {
+            process: process.to_owned(),
+            descendant: descendant.to_owned(),
+            reaper: None,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DetachedFixtureCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(bytes) = fs::read(&self.process)
+            && let Ok(raw) = String::from_utf8_lossy(&bytes).trim().parse::<i32>()
+            && let Some(pid) = Pid::from_raw(raw)
+        {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+        for path in [Some(&self.descendant), self.reaper.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(bytes) = fs::read(path)
+                && let Ok(raw) = String::from_utf8_lossy(&bytes).trim().parse::<i32>()
+                && let Some(pid) = Pid::from_raw(raw)
+            {
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
@@ -2794,10 +2864,34 @@ async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
 #[ignore = "launched as a detached stdout holder by the settlement regression"]
 fn detached_standard_output_holder_process() {
     rustix::process::setsid().unwrap();
+    fs::write(
+        std::env::var_os("PI_FIXTURE_DESCENDANT").unwrap(),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
     let ready = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_READY").unwrap();
     fs::write(ready, b"settlement-ready\n").unwrap();
-    let release = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_RELEASE").unwrap();
-    assert!(!fs::read(release).unwrap().is_empty());
+    fs::write(
+        std::env::var_os("PI_FIXTURE_GROUP_DETACHED").unwrap(),
+        b"detached\n",
+    )
+    .unwrap();
+    // Only Linux adopts detached children. Elsewhere the test releases this holder
+    // after observing settlement expiry, so EOF cannot be mistaken for quiescence.
+    #[cfg(target_os = "linux")]
+    loop {
+        std::thread::park();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let release = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_RELEASE").unwrap();
+        assert!(!fs::read(release).unwrap().is_empty());
+        fs::write(
+            std::env::var_os("PI_FIXTURE_DETACHED_DONE").unwrap(),
+            b"holder-released\n",
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -2827,21 +2921,44 @@ fn run_descendant_reaper_process(descendant_test: &str) {
     let descendant_pid =
         Pid::from_raw(i32::try_from(descendant.id()).unwrap()).expect("child PID must be positive");
     rustix::process::setsid().unwrap();
+    fs::write(
+        std::env::var_os("PI_FIXTURE_REAPER").unwrap(),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
     let descendant_path = std::env::var_os("PI_FIXTURE_DESCENDANT").unwrap();
     fs::write(descendant_path, format!("{}\n", descendant.id())).unwrap();
     let settlement_ready = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_READY").unwrap();
     fs::write(settlement_ready, b"settlement-ready\n").unwrap();
+    fs::write(
+        std::env::var_os("PI_FIXTURE_GROUP_DETACHED").unwrap(),
+        b"detached\n",
+    )
+    .unwrap();
 
     waitid(
         WaitId::Pid(descendant_pid),
         WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
     )
     .unwrap();
-    let descendant_ready = std::env::var_os("PI_FIXTURE_DESCENDANT_READY").unwrap();
-    fs::write(descendant_ready, b"descendant-zombie\n").unwrap();
-    let release = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_RELEASE").unwrap();
-    assert!(!fs::read(release).unwrap().is_empty());
+    // On Linux the adapter must observe the group absent before reporting terminal.
+    // Waiting here for a test-side release deadlocks that observation when the
+    // descendant's zombie still belongs to this reaper. Non-Linux tests explicitly
+    // hold the zombie to exercise the observable quiescence boundary.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let descendant_ready = std::env::var_os("PI_FIXTURE_DESCENDANT_READY").unwrap();
+        fs::write(descendant_ready, b"descendant-zombie\n").unwrap();
+        let release = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_RELEASE").unwrap();
+        assert!(!fs::read(release).unwrap().is_empty());
+    }
     assert!(!descendant.wait().unwrap().success());
+    #[cfg(not(target_os = "linux"))]
+    fs::write(
+        std::env::var_os("PI_FIXTURE_DETACHED_DONE").unwrap(),
+        b"descendant-reaped\n",
+    )
+    .unwrap();
 }
 
 #[test]

@@ -817,6 +817,33 @@ fn retained_reconstruction_and_frame_bounds_remain_authoritative() {
 }
 
 #[test]
+fn frame_limit_is_enforced_while_reading_bytes() {
+    let limits = PiJsonV1ProtocolLimits {
+        maximum_frame_bytes: NonZeroU64::new(8).unwrap(),
+    };
+    let make_parser = || {
+        PiJsonV1Parser::new(
+            Arc::from(CWD),
+            AgentValueKind::None,
+            NonZeroU64::new(1024).unwrap(),
+            limits,
+            None,
+        )
+    };
+    let mut at_limit = make_parser();
+    at_limit.push_ignoring(b"{}      ").unwrap();
+    assert!(at_limit.push_ignoring(b"\n").is_err());
+    let at_limit = protocol_rejection(&at_limit.finish(PiJsonV1ProcessCompletion::exited(true)));
+    assert_ne!(at_limit["detail"]["reason"], "frame_too_large");
+
+    let mut over_limit = make_parser();
+    assert!(over_limit.push_ignoring(b"{}      X").is_err());
+    let over_limit =
+        protocol_rejection(&over_limit.finish(PiJsonV1ProcessCompletion::exited(true)));
+    assert_eq!(over_limit["detail"]["reason"], "frame_too_large");
+}
+
+#[test]
 fn retained_delta_limit_accepts_the_exact_boundary() {
     let maximum_retained_bytes = 512;
     let limits = PiJsonV1ProtocolLimits {

@@ -2,6 +2,7 @@ pub(crate) mod admission;
 pub(crate) mod agent;
 pub(crate) mod agent_diagnostics;
 pub(crate) mod agent_input;
+mod agent_process_driver;
 pub(crate) mod archived_attempt;
 pub(crate) mod archived_presentation;
 pub(crate) mod artifact;
