@@ -522,9 +522,9 @@ def parse_candidate(value: bytes) -> tuple[dict[str, str], bytes]:
 def mirror_metadata(repository: GitRepository, commit: str) -> CommitMetadata:
     metadata = repository.metadata(commit)
     if (
-        metadata.author != "Useful Machinery Mirror"
+        metadata.author not in {"Scherzo Cloud Mirror", "Useful Machinery Mirror"}
         or metadata.author_email != "mirror@scherzo.dev"
-        or metadata.committer != "Useful Machinery Mirror"
+        or metadata.committer != metadata.author
         or metadata.committer_email != "mirror@scherzo.dev"
     ):
         fail("public commit does not use the synthetic mirror identity")

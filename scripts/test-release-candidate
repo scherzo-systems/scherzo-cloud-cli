@@ -230,7 +230,9 @@ class Fixture:
         git(self.checkout, "update-ref", "-d", "refs/tags/v0.25.0")
 
 
-def build_fixture(module: ModuleType, root: Path) -> Fixture:
+def build_fixture(
+    module: ModuleType, root: Path, *, candidate_identity: str = "Scherzo Cloud Mirror"
+) -> Fixture:
     source = root / "source"
     source.mkdir()
     git(source, "init", "--quiet", "--initial-branch=main")
@@ -249,7 +251,7 @@ def build_fixture(module: ModuleType, root: Path) -> Fixture:
             f"Release-Plan-Digest: {'c' * 64}\n"
         ).encode("ascii"),
         parent=None,
-        identity="Useful Machinery Mirror",
+        identity="Scherzo Cloud Mirror",
         email="mirror@scherzo.dev",
     )
     git(source, "update-ref", "refs/tags/v0.24.0", base)
@@ -287,7 +289,7 @@ def build_fixture(module: ModuleType, root: Path) -> Fixture:
         candidate_tree,
         candidate_message(module, plan, source_revision),
         parent=base,
-        identity="Useful Machinery Mirror",
+        identity=candidate_identity,
         email="mirror@scherzo.dev",
     )
     git(source, "update-ref", "refs/heads/main", candidate)
@@ -679,6 +681,11 @@ def main() -> int:
             except module.VerificationError:
                 continue
             fail(f"candidate field tampering passed: {field}")
+
+    with tempfile.TemporaryDirectory(prefix="cli-release-candidate-new-identity.") as temporary:
+        run_verifier(
+            build_fixture(module, Path(temporary), candidate_identity="Useful Machinery Mirror")
+        )
 
     print("CLI release-candidate fixture passed.")
     return 0
