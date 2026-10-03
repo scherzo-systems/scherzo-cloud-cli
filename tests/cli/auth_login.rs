@@ -28,7 +28,7 @@ fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
     let actions = serde_json::json!([{
         "id": "organization.create",
         "kind": "playbook",
-        "guide": "https://docs.scherzo.dev/agent/actions/organization.create.md"
+        "guide": "https://docs.usefulmachinery.com/agent/actions/organization.create.md"
     }]);
     let server = ScriptedServer::respond(vec![
         json_http_response(

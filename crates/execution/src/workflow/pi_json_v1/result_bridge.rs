@@ -28,7 +28,7 @@ fn invalid_bridge(error: impl std::fmt::Display) -> io::Error {
 }
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
-const RESOURCE_ID_PREFIX: &str = "https://schemas.scherzo.invalid/workflow-result/";
+const RESOURCE_ID_PREFIX: &str = "https://schemas.usefulmachinery.invalid/workflow-result/";
 const MAX_MODEL_REFERENCE_EXPANSIONS: usize = 128;
 const TOOL_NAME_PREFIX: &str = "scherzo_result_";
 const EXTENSION_FILE_NAME: &str = "pi-json-v1-result-extension.ts";

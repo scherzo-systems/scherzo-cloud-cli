@@ -33,7 +33,7 @@ use um_runner_protocol::{
     RunnerFrame, decode_cloud_frame, encode_runner_frame,
 };
 
-const SUBPROTOCOL: &str = "scherzo.runner.v1";
+const SUBPROTOCOL: &str = "um.runner.v1";
 const MAX_INBOUND_MESSAGE_BYTES: usize = MAXIMUM_ORDINARY_FRAME_BYTES;
 const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAXIMUM_TERMINAL_FRAME_BYTES;
 const OBSERVATION_WINDOW: usize = 32;
@@ -4809,11 +4809,11 @@ mod tests {
                 );
                 assert_eq!(
                     request.headers().get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|value| value.to_str().ok()),
-                    Some("scherzo.runner.v1"),
+                    Some("um.runner.v1"),
                 );
                 response.headers_mut().insert(
                     header::SEC_WEBSOCKET_PROTOCOL,
-                    HeaderValue::from_static("scherzo.runner.v1"),
+                    HeaderValue::from_static("um.runner.v1"),
                 );
                 Ok(response)
             })

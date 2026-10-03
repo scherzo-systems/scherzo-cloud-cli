@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.scherzo.dev/runner-control-v1.schema.json",
+  "$id": "https://docs.usefulmachinery.com/schemas/runner-control-v1.schema.json",
   "title": "Scherzo Runner Local Control Protocol V1",
   "description": "One closed request or response JSON object. The wire protocol appends exactly one LF and limits requests to 4096 bytes and responses to 65536 bytes, including that LF.",
   "oneOf": [

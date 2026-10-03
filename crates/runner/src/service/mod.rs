@@ -1802,7 +1802,7 @@ mod tests {
             |_request: &HandshakeRequest, mut response: HandshakeResponse| {
                 response.headers_mut().insert(
                     header::SEC_WEBSOCKET_PROTOCOL,
-                    HeaderValue::from_static("scherzo.runner.v1"),
+                    HeaderValue::from_static("um.runner.v1"),
                 );
                 Ok(response)
             },

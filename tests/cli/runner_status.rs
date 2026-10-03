@@ -235,7 +235,7 @@ async fn accept_runner_socket(
          mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
             response.headers_mut().insert(
                 header::SEC_WEBSOCKET_PROTOCOL,
-                HeaderValue::from_static("scherzo.runner.v1"),
+                HeaderValue::from_static("um.runner.v1"),
             );
             Ok(response)
         },

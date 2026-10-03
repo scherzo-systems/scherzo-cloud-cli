@@ -235,8 +235,7 @@ impl From<anyhow::Error> for CommandFailure {
     }
 }
 
-const AFTER_HELP: &str =
-    "Documentation:\n  Public API contract: https://docs.scherzo.dev/openapi/public-api.yaml";
+const AFTER_HELP: &str = "Documentation:\n  Public API contract: https://docs.usefulmachinery.com/openapi/public-api.yaml";
 
 #[derive(Debug, Args)]
 #[command(

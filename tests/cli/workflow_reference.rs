@@ -75,9 +75,9 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
         ],
     );
     for required_handoff in [
-        "https://docs.scherzo.dev/agent/workflow-authoring.md",
-        "https://docs.scherzo.dev/reference/workflow-v1.md",
-        "https://docs.scherzo.dev/schemas/workflow-v1.schema.json",
+        "https://docs.usefulmachinery.com/agent/workflow-authoring.md",
+        "https://docs.usefulmachinery.com/reference/workflow-v1.md",
+        "https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json",
         "scherzo-cloud workflow schema",
         "workflow validate --json",
     ] {

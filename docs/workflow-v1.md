@@ -1,14 +1,14 @@
 # Workflow V1 authoring reference
 
-Reference ID: `scherzo.workflow.v1.authoring`
+Reference ID: `um.workflow.v1.authoring`
 
 Language version: `1`
 
-Authoring guide: <https://docs.scherzo.dev/agent/workflow-authoring.md>
+Authoring guide: <https://docs.usefulmachinery.com/agent/workflow-authoring.md>
 
-Full language reference: <https://docs.scherzo.dev/reference/workflow-v1.md>
+Full language reference: <https://docs.usefulmachinery.com/reference/workflow-v1.md>
 
-Raw schema: <https://docs.scherzo.dev/schemas/workflow-v1.schema.json>
+Raw schema: <https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json>
 
 Embedded in `scherzo-cloud`: Workflow V1 authoring and validation, not execution or
 repository changes.
@@ -274,7 +274,7 @@ checked only when a separately authorized run uses them.
 
 <!-- workflow-reference-fixture:installed-workflow:begin -->
 ```yaml
-# yaml-language-server: $schema=https://docs.scherzo.dev/schemas/workflow-v1.schema.json
+# yaml-language-server: $schema=https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json
 schemaVersion: 1
 description: Build and summarize a report, then always clean up.
 
@@ -368,6 +368,6 @@ execute commands or agents, inspect credentials, check model access, or contact 
 Cloud.
 
 For the complete online contract, use the public
-[authoring guide](https://docs.scherzo.dev/agent/workflow-authoring.md),
-[language reference](https://docs.scherzo.dev/reference/workflow-v1.md), and
-[raw schema](https://docs.scherzo.dev/schemas/workflow-v1.schema.json).
+[authoring guide](https://docs.usefulmachinery.com/agent/workflow-authoring.md),
+[language reference](https://docs.usefulmachinery.com/reference/workflow-v1.md), and
+[raw schema](https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json).

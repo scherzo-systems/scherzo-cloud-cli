@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://scherzo.dev/contracts/runner-protocol-v1.schema.json",
+  "$id": "https://docs.usefulmachinery.com/schemas/runner-protocol-v1.schema.json",
   "title": "Runner protocol version 1",
   "description": "Closed JSON text frames exchanged by a Scherzo runner and gateway.",
   "oneOf": [

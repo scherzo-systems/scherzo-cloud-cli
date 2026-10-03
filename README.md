@@ -65,7 +65,7 @@ flowchart LR
 In scherzo workflows, output references create the data-flow edges automatically:
 
 ```yaml
-# yaml-language-server: $schema=https://docs.scherzo.dev/schemas/workflow-v1.schema.json
+# yaml-language-server: $schema=https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json
 schemaVersion: 1
 
 description: Check a repository, review it in parallel, and combine the findings.
@@ -301,7 +301,7 @@ membership or any other authority.
 
 Download the customer OpenAPI contract from its stable public URL:
 
-<https://docs.scherzo.dev/openapi/public-api.yaml>
+<https://docs.usefulmachinery.com/openapi/public-api.yaml>
 
 The hosted file describes the API deployed at `https://api.scherzo.dev`. A particular CLI
 build remains self-contained: it uses the generated Rust client committed under
@@ -345,9 +345,9 @@ The command writes its version-aligned embedded Markdown unchanged to standard o
 It includes the supported authoring loop, language semantics, safety boundaries, a
 checked example, and these stable public handoffs:
 
-- [Workflow V1 authoring guide](https://docs.scherzo.dev/agent/workflow-authoring.md)
-- [Workflow V1 language reference](https://docs.scherzo.dev/reference/workflow-v1.md)
-- [Workflow V1 raw schema](https://docs.scherzo.dev/schemas/workflow-v1.schema.json)
+- [Workflow V1 authoring guide](https://docs.usefulmachinery.com/agent/workflow-authoring.md)
+- [Workflow V1 language reference](https://docs.usefulmachinery.com/reference/workflow-v1.md)
+- [Workflow V1 raw schema](https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json)
 
 It needs no source checkout, workflow file, configuration, credentials, or network
 access.

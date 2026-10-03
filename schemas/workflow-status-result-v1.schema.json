@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://scherzo.dev/contracts/workflow-status-result-v1.schema.json",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-status-result-v1.schema.json",
   "title": "Scherzo Cloud Workflow Status Result Schema 1",
   "oneOf": [
     {

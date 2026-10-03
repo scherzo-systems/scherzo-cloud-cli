@@ -593,7 +593,7 @@ pub(crate) async fn accept_fixture_socket_with_headers(
             .expect("capture fixture upgrade headers");
         response.headers_mut().insert(
             header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("scherzo.runner.v1"),
+            HeaderValue::from_static("um.runner.v1"),
         );
         Ok(response)
     })

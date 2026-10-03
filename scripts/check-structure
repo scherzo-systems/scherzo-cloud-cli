@@ -193,10 +193,10 @@ python3 "$public_root/scripts/test-release-package"
 for readme_contract in \
   'scherzo-cloud workflow reference' \
   'scherzo-cloud workflow schema > workflow-v1.schema.json' \
-  'https://docs.scherzo.dev/agent/workflow-authoring.md' \
-  'https://docs.scherzo.dev/reference/workflow-v1.md' \
-  'https://docs.scherzo.dev/schemas/workflow-v1.schema.json' \
-  'https://docs.scherzo.dev/openapi/public-api.yaml'; do
+  'https://docs.usefulmachinery.com/agent/workflow-authoring.md' \
+  'https://docs.usefulmachinery.com/reference/workflow-v1.md' \
+  'https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json' \
+  'https://docs.usefulmachinery.com/openapi/public-api.yaml'; do
   if ! grep --fixed-strings --quiet -- "$readme_contract" "$public_root/README.md"; then
     echo "The public README is missing required guidance: $readme_contract" >&2
     exit 1

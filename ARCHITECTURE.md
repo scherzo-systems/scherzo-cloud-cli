@@ -331,7 +331,7 @@ are not part of the public source. Each generated Rust file identifies OpenAPI G
 7.22.0, the canonical customer contract path, and its digest. Monorepo tooling regenerates
 the client, rejects operator bindings, and checks it for drift before the public source
 is mirrored. The hosted contract at
-<https://docs.scherzo.dev/openapi/public-api.yaml> describes the deployed API; the digest
+<https://docs.usefulmachinery.com/openapi/public-api.yaml> describes the deployed API; the digest
 in a CLI build's generated source identifies the exact contract used to generate that
 build.
 
