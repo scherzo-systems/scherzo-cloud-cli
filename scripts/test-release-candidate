@@ -118,10 +118,10 @@ def legacy_asset_names(version: str) -> list[str]:
     return sorted(
         [
             "SHA256SUMS",
-            f"um-{version}-aarch64-apple-darwin.tar.gz",
-            f"um-{version}-aarch64-unknown-linux-gnu.tar.gz",
-            f"um-{version}-x86_64-apple-darwin.tar.gz",
-            f"um-{version}-x86_64-unknown-linux-gnu.tar.gz",
+            f"scherzo-cloud-{version}-aarch64-apple-darwin.tar.gz",
+            f"scherzo-cloud-{version}-aarch64-unknown-linux-gnu.tar.gz",
+            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
+            f"scherzo-cloud-{version}-x86_64-unknown-linux-gnu.tar.gz",
         ],
         key=os.fsencode,
     )
@@ -144,7 +144,7 @@ def release_document(tag: str, commit: str, body: str, identifier: int) -> dict[
         "id": identifier,
         "tag_name": tag,
         "target_commitish": commit,
-        "name": f"Useful Machinery CLI {tag}",
+        "name": f"Scherzo Cloud CLI {tag}",
         "body": body,
         "published_at": "2026-09-01T00:00:00Z",
         "draft": False,
