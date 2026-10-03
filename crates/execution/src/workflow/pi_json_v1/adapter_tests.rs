@@ -2675,9 +2675,11 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
 
         read_signal(fixture.descendant_ready.clone()).await;
         read_signal(fixture.result_settlement_ready).await;
+        // Let the reaper reach its wait for the descendant's exit.
+        read_signal(fixture.process.parent().unwrap().join("group-detached")).await;
         read_signal(fixture.ready).await;
-        let process = process_id(&fs::read(fixture.process).unwrap());
-        let descendant = process_id(&fs::read(fixture.descendant).unwrap());
+        let process = process_id(&fs::read(&fixture.process).unwrap());
+        let descendant = process_id(&fs::read(&fixture.descendant).unwrap());
         assert_eq!(getpgid(Some(process)).unwrap(), process);
         assert_eq!(getpgid(Some(descendant)).unwrap(), process);
 
