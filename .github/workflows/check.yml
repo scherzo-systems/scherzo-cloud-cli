@@ -210,8 +210,8 @@ jobs:
           EXPECTED_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
-          binary="target/${{ matrix.target }}/release/scherzo-cloud"
-          test "$("$binary" --version)" = "scherzo-cloud $EXPECTED_VERSION"
+          binary="target/${{ matrix.target }}/release/um"
+          test "$("$binary" --version)" = "um $EXPECTED_VERSION"
           version_json=$("$binary" version --json)
           python3 - "$version_json" "$EXPECTED_VERSION" "$EXPECTED_SOURCE_REVISION" <<'PY'
           import json
@@ -220,7 +220,7 @@ jobs:
           document = json.loads(sys.argv[1])
           expected = {
               "schemaVersion": 1,
-              "command": "scherzo-cloud",
+              "command": "um",
               "version": sys.argv[2],
               "buildIdentity": sys.argv[3],
           }
@@ -241,7 +241,7 @@ jobs:
           test ! -e "$release_dist"
           archive=$(
             ./scripts/package-release-archive \
-              --binary "target/$TARGET/release/scherzo-cloud" \
+              --binary "target/$TARGET/release/um" \
               --output "$release_dist" \
               --target "$TARGET" \
               --version "$VERSION"

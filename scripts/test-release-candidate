@@ -562,6 +562,10 @@ def prove_workflow_contract() -> None:
         "./scripts/verify-release-candidate",
         "environment: cli-release",
         "ref: ${{ needs.verify_release.outputs.candidate_mirror }}",
+        'binary="target/${{ matrix.target }}/release/um"',
+        'test "$("$binary" --version)" = "um $EXPECTED_VERSION"',
+        '"command": "um",',
+        '--binary "target/$TARGET/release/um"',
     )
     for text in required:
         if text not in workflow:
