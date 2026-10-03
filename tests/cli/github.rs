@@ -88,7 +88,7 @@ fn setup_begin_and_complete_preserve_the_browser_handoff() {
     assert!(human.contains(&format!("  Setup session: {SETUP_SESSION}\n")));
     assert!(human.contains(&format!("  {setup_url}\n")));
     assert!(human.contains(&format!(
-        "scherzo-cloud github setup complete {ORGANIZATION} {SETUP_SESSION} --provider-installation-id <INSTALLATION_ID>"
+        "um github setup complete {ORGANIZATION} {SETUP_SESSION} --provider-installation-id <INSTALLATION_ID>"
     )));
     assert!(!human.contains("setup-response-sentinel"));
     assert!(begin.stderr.is_empty());
@@ -482,7 +482,7 @@ fn setup_conflict_is_actionable_on_standard_error_without_problem_prose() {
     let diagnostic = String::from_utf8(output.stderr).unwrap();
     assert!(diagnostic.starts_with("error: "));
     assert!(diagnostic.contains("\n\n"));
-    assert!(diagnostic.contains("scherzo-cloud github setup begin <ORGANIZATION>"));
+    assert!(diagnostic.contains("um github setup begin <ORGANIZATION>"));
     assert!(!diagnostic.contains("private-github"));
     assert!(!diagnostic.contains(TOKEN));
     assert_eq!(server.finish().len(), 1);

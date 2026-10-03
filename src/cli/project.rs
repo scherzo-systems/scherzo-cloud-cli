@@ -11,7 +11,7 @@ use um_human_auth::Deployment;
 
 use super::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud projects";
+pub(super) const ABOUT: &str = "Manage Useful Machinery projects";
 const NAME: &str = "project";
 
 #[derive(Debug, Args)]
@@ -301,7 +301,7 @@ fn execute_leaf<T>(
     super::execute_deployment_command(
         Some(command),
         &[NAME],
-        "configure Scherzo Cloud project access",
+        "configure Useful Machinery project access",
         |command, deployment| execute(command, deployment).map_err(Into::into),
     )
 }

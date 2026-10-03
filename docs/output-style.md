@@ -1,6 +1,6 @@
 # CLI output style
 
-Conventions for every human-facing string the `scherzo-cloud` CLI prints: help
+Conventions for every human-facing string the `um` CLI prints: help
 text, errors, warnings, progress, reports, and prompts. Machine surfaces (JSON
 documents, schema files, protocol messages) are governed by their contracts,
 not this guide.
@@ -11,7 +11,7 @@ Register follows the **subject** of the message:
 
 - **Second person when the subject is the user** — identity, account, sign-in
   state, permissions. Contractions are allowed here.
-  - `! You're not signed in to Scherzo Cloud.`
+  - `! You're not signed in to Useful Machinery.`
 - **Neutral voice when the subject is a thing** — workflows, runs, artifacts,
   checks, the runner. No contractions.
   - `state: succeeded`, `Git 2.54.0 is available.`
@@ -31,7 +31,7 @@ An error has two parts: a **diagnostic line** and an optional **remedy block**.
 error: cannot retry run: attempt 1 succeeded
 
 A succeeded run cannot be retried. Start a new run instead:
-  scherzo-cloud workflow run --run-dir <NEW_DIR> <WORKFLOW>
+  um workflow run --run-dir <NEW_DIR> <WORKFLOW>
 ```
 
 Diagnostic line rules:
@@ -56,10 +56,10 @@ Remedy block rules:
 - Full imperative sentences. Commands go on their own indented line:
 
 ```
-! You must sign in before managing Scherzo Cloud organizations.
+! You must sign in before managing Useful Machinery organizations.
 
 Run:
-  scherzo-cloud auth login
+  um auth login
 ```
 
 - Every dead end gets a remedy or an explicit statement that none exists.
@@ -91,7 +91,7 @@ Before and after:
 | 1 | `GeneralFailure` | The command failed without a more specific registered class. |
 | 2 | `UsageError` | The command line is invalid; this is clap's usage-error code. |
 | 3 | `AuthenticationRequired` | The command requires a signed-in identity. |
-| 4 | `Unavailable` | Scherzo Cloud is unreachable or the request is temporarily rate limited. |
+| 4 | `Unavailable` | Useful Machinery is unreachable or the request is temporarily rate limited. |
 | 5 | `RunnerRecoveryRequired` | Runner Serve stopped non-admitting for operator recovery. |
 | 130 | `Interrupted` | The command was interrupted by the user. |
 | 143 | `Terminated` | The command received a termination request. |

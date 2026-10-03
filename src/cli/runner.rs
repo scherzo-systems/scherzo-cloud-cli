@@ -29,7 +29,7 @@ use um_support::generate_idempotency_key;
 
 use super::{OrganizationArg, PaginationArgs, PoolArg};
 
-pub(super) const ABOUT: &str = "Manage the Scherzo Cloud runner";
+pub(super) const ABOUT: &str = "Manage the Useful Machinery runner";
 const NAME: &str = "runner";
 
 #[derive(Debug, Args)]
@@ -608,7 +608,7 @@ fn execute_deletion_command(invocation: DeletionInvocation) -> super::CommandRes
     super::execute_deployment_command(
         Some(invocation),
         &[NAME],
-        "configure Scherzo Cloud runner deletion",
+        "configure Useful Machinery runner deletion",
         |invocation, deployment| execute_deletion_with_signals(invocation, deployment.clone()),
     )
 }
@@ -765,7 +765,7 @@ fn execute_cloud<T>(
     super::execute_deployment_leaf(
         command,
         &[NAME],
-        "configure Scherzo Cloud runner administration",
+        "configure Useful Machinery runner administration",
         execute,
     )
 }

@@ -3,13 +3,13 @@ name = "um-cli"
 version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.97"
-description = "Command-line interface and runner for Scherzo Cloud"
+description = "Command-line interface and runner for Useful Machinery"
 license = "Apache-2.0"
 repository = "https://github.com/useful-machinery/um"
 publish = false
 
 [[bin]]
-name = "scherzo-cloud"
+name = "um"
 path = "src/main.rs"
 
 [workspace]

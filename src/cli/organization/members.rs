@@ -11,7 +11,7 @@ use um_human_auth::Deployment;
 use super::{LeafOptions, output};
 use crate::cli::{OrganizationArg, PaginationArgs};
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud organization members";
+pub(super) const ABOUT: &str = "Manage Useful Machinery organization members";
 const LIST_ABOUT: &str = "List organization members";
 const HISTORY_ABOUT: &str = "List organization membership history";
 const UPDATE_ABOUT: &str = "Update an organization member's role";
@@ -42,7 +42,7 @@ impl Command {
         super::super::execute_deployment_command(
             self.command,
             &["organization", "member"],
-            "configure Scherzo Cloud organization access",
+            "configure Useful Machinery organization access",
             |command, deployment| match command {
                 MembersCommand::List(command) => command
                     .execute(

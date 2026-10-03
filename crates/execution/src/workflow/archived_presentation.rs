@@ -18,7 +18,7 @@ use super::presentation_feed::{WorkflowPresentationStep, normalize_terminal_scal
 use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
 use super::validated::WorkflowNodeRole;
 
-const COMMAND: &str = "scherzo-cloud workflow view";
+const COMMAND: &str = "um workflow view";
 use super::render_style::{
     STYLE_BLOCKED, STYLE_FAILURE, STYLE_MUTED, STYLE_PRIMARY, STYLE_SECONDARY, STYLE_SUCCESS,
 };

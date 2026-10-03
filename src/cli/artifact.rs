@@ -146,7 +146,7 @@ fn execute_remote<O: RemoteArtifactOperation + Args>(
     super::execute_deployment_leaf(
         command,
         &[NAME],
-        "configure Scherzo Cloud Artifact Set access",
+        "configure Useful Machinery Artifact Set access",
         RemoteArtifactCommand::execute,
     )
 }

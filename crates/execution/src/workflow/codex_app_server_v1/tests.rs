@@ -90,7 +90,7 @@ fn initialize(parser: &mut CodexAppServerV1Parser) {
             "method": "initialize",
             "params": {
                 "clientInfo": {
-                    "name": "scherzo-cloud",
+                    "name": "um",
                     "version": CLIENT_VERSION,
                 }
             }

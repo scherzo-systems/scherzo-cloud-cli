@@ -123,7 +123,7 @@ this repository.
 ## Architecture
 
 Keep human API commands, runner machine behavior, and workflow execution separate
-internally even while they share the `scherzo-cloud` executable. In particular, never
+internally even while they share the `um` executable. In particular, never
 allow the runner to discover or read a human OAuth credential store. Workflow scheduling
 and execution belong to the embedded execution component, not runner connectivity code.
 Implement that execution component within this repository and keep it inside the public

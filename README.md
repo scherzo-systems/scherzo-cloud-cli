@@ -1,11 +1,11 @@
-# Scherzo Cloud CLI
+# Useful Machinery CLI
 
-Scherzo Cloud CLI turns repeatable engineering work into explicit, durable workflows.
+Useful Machinery CLI turns repeatable engineering work into explicit, durable workflows.
 Define commands and coding agents in one repository-owned YAML file, connect typed
 outputs to downstream steps, run independent work concurrently, and retain a result you
 can inspect instead of reconstructing what happened from terminal scrollback.
 
-The CLI is the open-source command-line and runner executable for Scherzo Cloud. It can
+The CLI is the open-source command-line and runner executable for Useful Machinery. It can
 run workflows locally with Pi, Claude Code, and Codex, or serve them from an enrolled
 outbound runner. The project is early, but the local workflow engine and its authoring,
 execution, and inspection tools are available today.
@@ -136,18 +136,18 @@ referenced prompt files. Then validate the bundle without executing it, run it i
 durable run directory, and return to that run later:
 
 ```sh
-scherzo-cloud workflow validate \
+um workflow validate \
   --source-root . \
   .scherzo/workflows/review.yaml
 
-scherzo-cloud workflow run \
+um workflow run \
   --source-root . \
   --execution-root . \
   --run-dir ~/.scherzo/runs/review-001 \
   .scherzo/workflows/review.yaml
 
-scherzo-cloud workflow status ~/.scherzo/runs/review-001
-scherzo-cloud workflow view ~/.scherzo/runs/review-001
+um workflow status ~/.scherzo/runs/review-001
+um workflow view ~/.scherzo/runs/review-001
 ```
 
 During execution, Scherzo schedules ready steps, supervises each command or fresh agent
@@ -192,7 +192,7 @@ Create a service principal while signed in as a human, and direct its show-once 
 API key to a new private file:
 
 ```sh
-scherzo-cloud service-principal create \
+um service-principal create \
   --display-name "Build agent" \
   --api-key-file ./build-agent.key
 ```
@@ -217,14 +217,14 @@ Service credentials are explicit per invocation. The CLI does not persist a serv
 key or fall back between a service key and the human credential store:
 
 ```sh
-scherzo-cloud service-principal credential list \
+um service-principal credential list \
   --service-api-key-file ./build-agent.key
 
-scherzo-cloud service-principal credential issue \
+um service-principal credential issue \
   --service-api-key-file ./build-agent.key \
   --api-key-file ./build-agent-next.key
 
-scherzo-cloud service-principal credential revoke \
+um service-principal credential revoke \
   crd_01k0z6r1w8f4jy2m7q9v3x5abc \
   --service-api-key-file ./build-agent-next.key \
   --yes
@@ -264,7 +264,7 @@ runner activation or runner credential.
 A signed-in human proposes a delegation to one exact active service principal:
 
 ```sh
-scherzo-cloud delegation propose prn_01k0z6r1w8f4jy2m7q9v3x5abc
+um delegation propose prn_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
 Proposal is deliberately human-only. Acceptance is deliberately service-only and always
@@ -272,7 +272,7 @@ requires the nominated service's explicit API-key input; the CLI never substitut
 stored human session:
 
 ```sh
-scherzo-cloud delegation accept dlg_01k0z6r1w8f4jy2m7q9v3x5abc \
+um delegation accept dlg_01k0z6r1w8f4jy2m7q9v3x5abc \
   --service-api-key-file ./build-agent.key
 ```
 
@@ -282,11 +282,11 @@ service. Listing returns one page and exposes an opaque next cursor when another
 available:
 
 ```sh
-scherzo-cloud delegation list --limit 50
-scherzo-cloud delegation list --cursor <CURSOR> \
+um delegation list --limit 50
+um delegation list --cursor <CURSOR> \
   --service-api-key-file ./build-agent.key
-scherzo-cloud delegation show dlg_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud delegation end dlg_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+um delegation show dlg_01k0z6r1w8f4jy2m7q9v3x5abc
+um delegation end dlg_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Ended relationships remain visible in delegation history with their terminal timestamp
@@ -312,11 +312,11 @@ that CLI build even when the deployed API contract has since changed.
 
 ## Local workflow validation
 
-Use `scherzo-cloud workflow validate` to resolve a checked-out Workflow V1 bundle
+Use `um workflow validate` to resolve a checked-out Workflow V1 bundle
 without running it:
 
 ```sh
-scherzo-cloud workflow validate \
+um workflow validate \
   --source-root ./my-repository \
   ./my-repository/.scherzo/workflows/check.yaml
 ```
@@ -338,7 +338,7 @@ directory.
 For concise, version-aligned authoring guidance from the installed executable, run:
 
 ```sh
-scherzo-cloud workflow reference
+um workflow reference
 ```
 
 The command writes its version-aligned embedded Markdown unchanged to standard output.
@@ -356,7 +356,7 @@ Retrieve the self-contained Workflow V1 JSON Schema from an installed executable
 without a source checkout:
 
 ```sh
-scherzo-cloud workflow schema > workflow-v1.schema.json
+um workflow schema > workflow-v1.schema.json
 ```
 
 The command writes raw JSON Schema bytes without a wrapper or preamble and preserves the
@@ -380,7 +380,7 @@ bounded CLI-owned diagnostic rather than parser or schema-library error text.
 
 This command performs definition resolution only. It does not admit or start a run,
 execute command or agent steps, check harness or model availability, read human or
-runner credentials, or contact Scherzo Cloud. A zero exit status means only that the
+runner credentials, or contact Useful Machinery. A zero exit status means only that the
 local definition resolved successfully.
 
 ## Remote artifact metadata and download
@@ -388,7 +388,7 @@ local definition resolved successfully.
 List one page of a run's sealed Artifact Set without downloading it:
 
 ```sh
-scherzo-cloud artifact list acme-research run_01k0z6r1w8f4jy2m7q9v3x5abc \
+um artifact list acme-research run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --limit 50
 ```
 
@@ -408,7 +408,7 @@ network, invalid-cursor, and invalid-response outcomes.
 Download and verify the complete set only when its bytes are needed:
 
 ```sh
-scherzo-cloud artifact download acme-research \
+um artifact download acme-research \
   run_01k0z6r1w8f4jy2m7q9v3x5abc --output ./downloaded-attempt-result
 ```
 
@@ -425,7 +425,7 @@ Validate one copied or downloaded Artifact Set V1 directory without its original
 workflow source, or execution checkout:
 
 ```sh
-scherzo-cloud artifact validate ./downloaded-attempt-result
+um artifact validate ./downloaded-attempt-result
 ```
 
 The command validates the complete closed `result.json` contract and every declared
@@ -439,7 +439,7 @@ mode.
 
 Validation opens the selected directory read-only, follows no symbolic link beneath its
 opened root, and leaves the set unchanged. It does not read workflow-run state,
-credentials, or configuration, and it does not contact Scherzo Cloud, a provider, a Git
+credentials, or configuration, and it does not contact Useful Machinery, a provider, a Git
 remote, or any other network service.
 
 Add `--json` for one Artifact Validate Result Schema 1 document. A valid result has
@@ -451,13 +451,13 @@ return 2 and do not inspect the artifact directory.
 
 ## Local workflow execution
 
-Use `scherzo-cloud workflow run` to execute a mixed command, PiJsonV1,
+Use `um workflow run` to execute a mixed command, PiJsonV1,
 ClaudeCodeStreamJsonV1, and CodexAppServerV1 agent Workflow V1 DAG in an existing
 caller-owned directory and create one durable local run
 directory:
 
 ```sh
-scherzo-cloud workflow run \
+um workflow run \
   --source-root ./my-repository \
   --execution-root ./my-checkout \
   --run-dir ./runs/check-001 \
@@ -584,7 +584,7 @@ executable. Command-only workflows probe no harness; each single-harness workflo
 requires no unrelated installation. A mixed workflow requires exactly its selected
 harnesses and never substitutes or falls back between them. Workflow definitions,
 imports, and remote values cannot supply an executable or alter selection. The adapter
-does not read Scherzo human or runner credentials and does not contact Scherzo Cloud; an
+does not read Scherzo human or runner credentials and does not contact Useful Machinery; an
 admitted agent harness may use the provider and other host authority selected by its
 closed profile and inherited environment.
 
@@ -606,22 +606,22 @@ Inspect the durable state and retry eligibility of an existing local run without
 it:
 
 ```sh
-scherzo-cloud workflow status ./runs/check-001
+um workflow status ./runs/check-001
 ```
 
 The run-directory positional is an ordinary host path resolved from the process's
 initial working directory. Retry uses the same durable handle explicitly:
 
 ```sh
-scherzo-cloud workflow retry ./runs/check-001 --execution-root ./my-checkout
+um workflow retry ./runs/check-001 --execution-root ./my-checkout
 ```
 
 To reexecute a selected ordinary step and its downstream ordinary dependents,
 inherit the other eligible ordinary steps by reference, and rerun all finalizers:
 
 ```sh
-scherzo-cloud workflow continue ./runs/check-001 --from build --from verify
-scherzo-cloud workflow continue ./runs/check-001 --from verify \
+um workflow continue ./runs/check-001 --from build --from verify
+um workflow continue ./runs/check-001 --from verify \
   --workflow ./revised-workflow.yaml --execution-root ./another-checkout
 ```
 
@@ -677,7 +677,7 @@ respectively.
 View a successfully published terminal attempt from one stable read-only snapshot:
 
 ```sh
-scherzo-cloud workflow view ./runs/check-001 [--attempt 1] [--plain | --json]
+um workflow view ./runs/check-001 [--attempt 1] [--plain | --json]
 ```
 
 Omitting `--attempt` selects the current attempt from the snapshot. Without an explicit
@@ -715,15 +715,15 @@ workflow. `--color` affects only plain and TUI styling; JSON is always ANSI-free
 
 ## Version inspection
 
-Use `scherzo-cloud --version` or `scherzo-cloud version` for conventional one-line
-output. Use `scherzo-cloud version --json` for the schema-version-1 structured contract:
+Use `um --version` or `um version` for conventional one-line
+output. Use `um version --json` for the schema-version-1 structured contract:
 
 ```json
 {
   "schemaVersion": 1,
-  "command": "scherzo-cloud",
+  "command": "um",
   "version": "0.10.0",
-  "executablePath": "/resolved/path/to/scherzo-cloud",
+  "executablePath": "/resolved/path/to/um",
   "buildIdentity": "unknown"
 }
 ```
@@ -733,13 +733,13 @@ The schema does not define a release channel.
 
 ## Human authentication
 
-Use `scherzo-cloud auth login` to authenticate through a browser on the same machine or
+Use `um auth login` to authenticate through a browser on the same machine or
 another machine. The CLI prints an activation URL and user code, never opens a browser,
 and never listens for an inbound callback. Add `--json` to receive newline-delimited
 schema-version-1 events. Use `--force` to start a new device authorization transaction
 without checking an existing credential with the API.
 
-Use `scherzo-cloud auth status` to ask the selected deployment whether the current
+Use `um auth status` to ask the selected deployment whether the current
 identity is authenticated, requires signup, is unauthenticated, or is unreachable. Add
 `--json` for the schema-version-1 structured result. Authenticated and signup-required
 results preserve any server actions as complete opaque JSON values. The CLI does not
@@ -750,16 +750,16 @@ Manage the OIDC identities linked to the signed-in account under `auth identity`
 
 ```sh
 # List one page; the current local-session identity is marked when that page contains it.
-scherzo-cloud auth identity list --limit 50
+um auth identity list --limit 50
 
 # Continue when the result includes a next cursor.
-scherzo-cloud auth identity list --limit 50 --cursor "$NEXT_CURSOR"
+um auth identity list --limit 50 --cursor "$NEXT_CURSOR"
 
 # Prove control of another identity in a fresh browser/device flow and link it.
-scherzo-cloud auth identity link
+um auth identity link
 
 # Remove a non-current identity by the opaque ID returned by list.
-scherzo-cloud auth identity remove idn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+um auth identity remove idn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 `auth identity link` keeps the session that passed preflight as the acting identity
@@ -780,7 +780,7 @@ minutes and refuses to remove either its exact identity or the last usable ident
 remove the identity currently used on this device, first find the item marked `current`
 in `list`. Listing is oldest-first and returns one page, so follow each `nextCursor` with
 `--cursor` until the marked identity appears. Record that ID, run
-`scherzo-cloud auth login --force`, and choose a different identity already linked to
+`um auth login --force`, and choose a different identity already linked to
 the same account. That fresh login replaces the local session. Removing the former
 identity then leaves the replacement local session signed in and unchanged. A removal
 command never deletes or revokes the current local credential. With
@@ -799,7 +799,7 @@ access token, its expiration, and a rotating refresh token in
 command while the refresh session remains valid. Auth0 expires refresh sessions after 30
 days idle or 90 days total.
 
-Use `scherzo-cloud auth logout` to remove the human credential for the active deployment
+Use `um auth logout` to remove the human credential for the active deployment
 and ask Auth0 to revoke its refresh token. The result distinguishes confirmed and
 unconfirmed server revocation; local removal still completes when Auth0 is unreachable.
 The human store remains separate from workflow-run state and all runner credentials.
@@ -811,9 +811,9 @@ the option is not global.
 
 ## Account management
 
-OAuth login does not implicitly create a Scherzo Cloud account. When authentication
+OAuth login does not implicitly create a Useful Machinery account. When authentication
 status is `signup_required` and the deployment advertises signup, use
-`scherzo-cloud account signup` after the customer explicitly approves account creation.
+`um account signup` after the customer explicitly approves account creation.
 Add `--json` for a schema-version-1 structured result. The CLI authenticates the request
 with the existing human credential and retries an ambiguous transport failure once with
 the same opaque idempotency key.
@@ -822,8 +822,8 @@ Set or clear the authenticated account's optional display name with exactly one 
 options:
 
 ```sh
-scherzo-cloud account update --display-name "Ada Lovelace"
-scherzo-cloud account update --clear-display-name
+um account update --display-name "Ada Lovelace"
+um account update --clear-display-name
 ```
 
 The deployment removes surrounding Unicode whitespace and accepts 1 through 200 Unicode
@@ -834,7 +834,7 @@ name is `set` or `cleared`; `--json` reports the same stable `outcome` and the a
 
 Each invocation generates a fresh opaque idempotency key. After an ambiguous transport
 failure, the CLI retries once with the same key and exact merge patch. If the result still
-cannot be confirmed, check `scherzo-cloud auth status` before issuing another update.
+cannot be confirmed, check `um auth status` before issuing another update.
 Structured failures report one of `invalid_display_name`, `unauthenticated`, `forbidden`,
 `idempotency_conflict`, `request_too_large`, `unsupported_media_type`, or `unreachable`.
 
@@ -842,7 +842,7 @@ Schedule deletion of the authenticated human account only after reviewing the 30
 window and confirming explicitly:
 
 ```sh
-scherzo-cloud account deletion request --yes
+um account deletion request --yes
 ```
 
 A successful request reports the principal ID, `deletion_pending` state, request time,
@@ -862,14 +862,14 @@ credential store.
 Cancel before the deadline with a fresh browser proof from the same still-linked identity:
 
 ```sh
-scherzo-cloud account deletion cancel
+um account deletion cancel
 ```
 
 Cancellation does not use or require the stored local session. It requests a fresh
 browser/device access token without `offline_access`, sends that token only as the API
 bearer, and never stores it or a refresh token. A successful cancellation reports the
 returned active lifecycle transition while leaving the credential store unchanged; run
-`scherzo-cloud auth login` afterward to establish a renewable local session. This
+`um auth login` afterward to establish a renewable local session. This
 separation is intentional: an old stored credential, a refreshed background session, or
 a different linked identity does not replace the API's distinct, later, same-identity
 proof requirement.
@@ -898,52 +898,52 @@ and passes accepted references to the deployment without normalization.
 
 ```sh
 # Discover your organization memberships and their organization IDs and slugs.
-scherzo-cloud organization list --limit 50
+um organization list --limit 50
 
 # Create an organization. The deployment may assign the slug when it is omitted.
-scherzo-cloud organization create \
+um organization create \
   --display-name "Acme Research" \
   --slug acme-research
 
 # Read an accessible active organization by ID or exact slug.
-scherzo-cloud organization show acme-research
+um organization show acme-research
 
 # Update the display name, slug, or both. At least one option is required.
-scherzo-cloud organization update acme-research \
+um organization update acme-research \
   --display-name "Acme Labs" \
   --slug acme-labs
 
 # Schedule deletion for 30 days as a current active human owner.
-scherzo-cloud organization deletion request acme-labs --yes
+um organization deletion request acme-labs --yes
 
 # Cancel before the deadline with a fresh browser proof.
-scherzo-cloud organization deletion cancel acme-labs
+um organization deletion cancel acme-labs
 
 # Read one active member-directory page. Both pagination options are optional.
-scherzo-cloud organization member list acme-labs \
+um organization member list acme-labs \
   --limit 50 \
   --cursor opaque-continuation
 
 # Read one owner-only page containing active, suspended, and ended memberships.
-scherzo-cloud organization member history acme-labs --limit 50
+um organization member history acme-labs --limit 50
 
 # Read one owner-only page of privacy-safe audit records.
-scherzo-cloud organization audit list acme-labs \
+um organization audit list acme-labs \
   --limit 50 \
   --cursor opaque-continuation
 
 # Change another member's organization role.
-scherzo-cloud organization member update acme-labs \
+um organization member update acme-labs \
   mem_01k0z6r1w8f4jy2m7q9v3x5abc \
   --role owner
 
 # Permanently end another member's membership.
-scherzo-cloud organization member remove acme-labs \
+um organization member remove acme-labs \
   mem_01k0z6r1w8f4jy2m7q9v3x5abc \
   --yes
 
 # Permanently end your own membership.
-scherzo-cloud organization leave acme-labs --yes
+um organization leave acme-labs --yes
 ```
 
 Add `--json` to any of these leaves for its schema-version-1 result. Organization
@@ -1012,16 +1012,16 @@ invitation history, and revoke an outstanding invitation:
 
 ```sh
 # Issue to exactly one target kind.
-scherzo-cloud organization invitation issue acme-labs \
+um organization invitation issue acme-labs \
   --principal-id prn_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud organization invitation issue acme-labs \
+um organization invitation issue acme-labs \
   --email teammate@example.com
 
 # Read one owner-only page, including terminal history.
-scherzo-cloud organization invitation list acme-labs --limit 50
+um organization invitation list acme-labs --limit 50
 
 # Revoke an outstanding invitation.
-scherzo-cloud organization invitation revoke acme-labs \
+um organization invitation revoke acme-labs \
   inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
@@ -1029,19 +1029,19 @@ The current principal can list directly targeted outstanding invitations, previe
 invitation, and accept or decline it:
 
 ```sh
-scherzo-cloud invitation list --limit 50
-scherzo-cloud invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud invitation decline inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+um invitation list --limit 50
+um invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc
+um invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc
+um invitation decline inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Email-targeted invitation links contain a bearer capability. Supply it only through a
 private regular file owned by the current Unix user, or through explicit standard input:
 
 ```sh
-scherzo-cloud invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc \
+um invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc \
   --capability-file ~/.config/scherzo/invitation.capability
-scherzo-cloud invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc \
+um invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc \
   --capability-file - < ~/.config/scherzo/invitation.capability
 ```
 
@@ -1077,15 +1077,15 @@ Setup is deliberately split around browser consent. The CLI neither opens a brow
 listens for an inbound callback. Begin a ten-minute, single-use setup session:
 
 ```sh
-scherzo-cloud github setup begin acme-labs
+um github setup begin acme-labs
 ```
 
 Open the reported URL in a browser and approve the GitHub account and repositories.
 After GitHub returns from setup, copy the decimal installation ID from the browser return
-URL and complete the same session as the same Scherzo Cloud principal:
+URL and complete the same session as the same Useful Machinery principal:
 
 ```sh
-scherzo-cloud github setup complete \
+um github setup complete \
   acme-labs \
   ghs_01k0z6r1w8f4jy2m7q9v3x5abc \
   --provider-installation-id 12345678
@@ -1102,7 +1102,7 @@ List the organization's stable installation bindings and their current `active`,
 `disconnected`, or `revoked` state:
 
 ```sh
-scherzo-cloud github installation list acme-labs
+um github installation list acme-labs
 ```
 
 Discover the repositories currently authorized through one active binding. This is a
@@ -1110,15 +1110,15 @@ live provider-backed read and may update existing repository availability projec
 it does not bind a project or create repository connections eagerly:
 
 ```sh
-scherzo-cloud github repository list \
+um github repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
-Remove an installation binding from Scherzo Cloud with its stable binding ID:
+Remove an installation binding from Useful Machinery with its stable binding ID:
 
 ```sh
-scherzo-cloud github installation remove \
+um github installation remove \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
@@ -1146,8 +1146,8 @@ It does not open a browser or listen for the callback. Use the selected human se
 (or explicitly pass `--service-api-key-file PATH|-` for the same authorized principal):
 
 ```sh
-scherzo-cloud connection linear authorization create acme-labs
-scherzo-cloud connection linear authorization create acme-labs --connection-id lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+um connection linear authorization create acme-labs
+um connection linear authorization create acme-labs --connection-id lcn_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
 Open the URL in a browser as the initiating owner. By default, the command polls the
@@ -1158,12 +1158,12 @@ access cancels callback processing. Save the session ID and inspect it later as 
 same owner; do not start another session merely because polling stopped:
 
 ```sh
-scherzo-cloud connection linear authorization show acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud connection linear authorization wait acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc --timeout 5m
-scherzo-cloud connection linear list acme-labs
-scherzo-cloud connection linear show acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud connection linear remove acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
-scherzo-cloud connection linear delete acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+um connection linear authorization show acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc
+um connection linear authorization wait acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc --timeout 5m
+um connection linear list acme-labs
+um connection linear show acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+um connection linear remove acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+um connection linear delete acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Remove erases the credential but reserves the workspace binding; delete also
@@ -1189,18 +1189,18 @@ discovering those values:
 
 ```sh
 # Discover the current account's organization memberships.
-scherzo-cloud organization list
+um organization list
 
 # Discover active and retained GitHub installation bindings for one organization.
-scherzo-cloud github installation list acme-labs
+um github installation list acme-labs
 
 # Discover the repositories currently authorized for one installation.
-scherzo-cloud github repository list \
+um github repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Discover existing runner pools and copy a pool ID or exact name when needed.
-scherzo-cloud runner pool list acme-labs
+um runner pool list acme-labs
 ```
 
 Create a project from one discovered repository. Omit `--default-branch` to select the
@@ -1208,24 +1208,24 @@ provider-observed default branch, and omit `--pool-id` to create a valid project
 that reports `runner_pool_unassigned` until configured:
 
 ```sh
-scherzo-cloud project create acme-labs \
-  --name scherzo-cloud \
+um project create acme-labs \
+  --name um \
   --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
   --repository-id 123456789 \
   --default-branch release \
   --pool-id rpl_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Page projects and show one complete configuration and readiness projection.
-scherzo-cloud project list acme-labs --limit 50
-scherzo-cloud project show \
+um project list acme-labs --limit 50
+um project show \
   acme-labs \
   prj_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Rename without changing execution configuration.
-scherzo-cloud project rename \
+um project rename \
   acme-labs \
   prj_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --name scherzo-cloud-release
+  --name um-release
 ```
 
 Repository and runner-pool settings are independent. `set` assigns or atomically
@@ -1233,23 +1233,23 @@ replaces the current value. Repeated removals are API-defined no-ops:
 
 ```sh
 # Read, replace, update, or remove the repository binding.
-scherzo-cloud project repository show \
+um project repository show \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud project repository set \
+um project repository set \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
   --repository-id 123456789
-scherzo-cloud project repository update \
+um project repository update \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --default-branch stable
-scherzo-cloud project repository remove \
+um project repository remove \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Assign, replace, or remove the runner pool.
-scherzo-cloud project runner-pool set \
+um project runner-pool set \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   rpl_01k0z6r1w8f4jy2m7q9v3x5abc
-scherzo-cloud project runner-pool remove \
+um project runner-pool remove \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
@@ -1267,11 +1267,11 @@ List materialized runs within one organization (newest first) with bounded,
 opaque-cursor pages. Filters combine with AND; repeat exact context matches:
 
 ```sh
-scherzo-cloud run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+um run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --state-group active --created-after 2025-01-01T00:00:00Z \
   --integration-context source=linear --integration-context linearIssue=LIV-123 \
   --limit 50 --json
-scherzo-cloud run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+um run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --state-group active --created-after 2025-01-01T00:00:00Z \
   --integration-context source=linear --integration-context linearIssue=LIV-123 \
   --limit 50 --cursor 'CURSOR_FROM_NEXT_CURSOR' --json
@@ -1286,19 +1286,19 @@ using context filters, and do not put context in logs. For ticket dispatch, writ
 
 Run commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when an API operation permits a service actor. They use
-the configured Scherzo Cloud deployment and remain separate from `scherzo-cloud workflow`,
+the configured Useful Machinery deployment and remain separate from `um workflow`,
 which runs and inspects local workflow definitions and run directories.
 
 ```sh
 # Admit an inputless run without waiting for execution.
-scherzo-cloud run create acme-labs \
+um run create acme-labs \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --workflow-path workflows/build.yaml \
   --source-branch main \
   --display-name "Release checks"
 
 # Or bind mixed values, including ordered and explicitly empty collections.
-scherzo-cloud run create acme-labs \
+um run create acme-labs \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --workflow-path workflows/build.yaml \
   --input-text-file request ./request.txt \
@@ -1309,7 +1309,7 @@ scherzo-cloud run create acme-labs \
   --input-attachments-empty optionalEvidence
 
 # Create an open immutable set, upload its object members, and then seal it.
-scherzo-cloud run input-set create acme-labs \
+um run input-set create acme-labs \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --input-text-file request ./request.txt \
   --input-attachment evidence text/plain ./notes.txt \
@@ -1317,32 +1317,32 @@ scherzo-cloud run input-set create acme-labs \
   --json > input-set.json
 input_set_id=$(jq -er '.inputSet.id' input-set.json)
 
-scherzo-cloud run input-set upload acme-labs "$input_set_id" \
+um run input-set upload acme-labs "$input_set_id" \
   --member-file inputs/request ./request.txt \
   --member-file inputs/evidence/000000 ./notes.txt \
   --member-file inputs/evidence/000001 ./report.pdf
-scherzo-cloud run input-set seal acme-labs "$input_set_id"
+um run input-set seal acme-labs "$input_set_id"
 
-scherzo-cloud run create acme-labs \
+um run create acme-labs \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --workflow-path workflows/build.yaml \
   --input-set-id "$input_set_id"
 
 # Read the latest public projection.
-scherzo-cloud run show \
+um run show \
   acme-labs \
   run_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Observe settlement for up to 30 minutes without changing the run.
-scherzo-cloud run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+um run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 
 # Retry an eligible terminal run; observe the durable receipt until it resolves.
-scherzo-cloud run retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+um run retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --expected-version 7 --timeout 30m
 
 # Request graceful cancellation; force is a separate explicit, separately keyed choice.
-scherzo-cloud run cancel acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+um run cancel acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 ```
 
@@ -1406,12 +1406,12 @@ than claiming no run was created.
 Retained content is explicit run-scoped administration:
 
 ```sh
-scherzo-cloud run input show acme-labs "$run_id" --json
+um run input show acme-labs "$run_id" --json
 # Omit --member to download every member, or repeat it for an exact subset.
-scherzo-cloud run input download acme-labs "$run_id" \
+um run input download acme-labs "$run_id" \
   --member inputs/request \
   --output ./retained-inputs --json
-scherzo-cloud run input delete acme-labs "$run_id" --yes
+um run input delete acme-labs "$run_id" --yes
 ```
 
 A download first validates the retained inventory, requests capabilities in batches of at
@@ -1488,18 +1488,18 @@ project=prj_01k0z6r1w8f4jy2m7q9v3x5abc
 request_path=./request.txt
 artifact_path=./downloaded-run
 
-scherzo-cloud run create "$organization" \
+um run create "$organization" \
   --project-id "$project" \
   --workflow-path workflows/build.yaml \
   --input-text-file request "$request_path" \
   --json > create.json
 run_id=$(jq -er 'select(.outcome == "accepted") | .runId' create.json)
 
-scherzo-cloud run show "$organization" "$run_id" \
+um run show "$organization" "$run_id" \
   --wait --timeout 30m --json > observed.json
 jq -e '.outcome == "settled" and .run.state == "succeeded"' observed.json >/dev/null
 
-scherzo-cloud artifact download "$organization" "$run_id" \
+um artifact download "$organization" "$run_id" \
   --output "$artifact_path" --json > download.json
 jq -e '.outcome == "downloaded"' download.json >/dev/null
 jq . "$artifact_path/result.json"
@@ -1522,20 +1522,20 @@ The complete Publication command surface is:
 
 ```sh
 # Create one attempt for an exact export and retain its identity.
-scherzo-cloud publication create acme-labs "$run_id" \
+um publication create acme-labs "$run_id" \
   --export changes --json > publication-create.json
 publication_id=$(jq -er '.publication.id' publication-create.json)
 
 # Create another attempt and wait locally for its terminal outcome.
-scherzo-cloud publication create acme-labs "$run_id" \
+um publication create acme-labs "$run_id" \
   --export changes --wait --timeout 30m
 
 # Read the current attempt, optionally waiting for a terminal snapshot.
-scherzo-cloud publication show \
+um publication show \
   acme-labs "$run_id" "$publication_id" --wait --timeout 30m
 
 # List one oldest-first page of attempts beneath the run.
-scherzo-cloud publication list \
+um publication list \
   acme-labs "$run_id" --limit 50
 ```
 
@@ -1547,16 +1547,16 @@ set -euo pipefail
 organization=acme-labs
 project=prj_01k0z6r1w8f4jy2m7q9v3x5abc
 
-scherzo-cloud run create "$organization" \
+um run create "$organization" \
   --project-id "$project" \
   --workflow-path workflows/publish.yaml \
   --json > run-create.json
 run_id=$(jq -er '.runId' run-create.json)
-scherzo-cloud run show "$organization" "$run_id" \
+um run show "$organization" "$run_id" \
   --wait --timeout 30m --json > run-observed.json
 jq -e '.outcome == "settled" and .run.state == "succeeded"' run-observed.json >/dev/null
 
-scherzo-cloud publication create "$organization" "$run_id" \
+um publication create "$organization" "$run_id" \
   --export changes --wait --timeout 30m --json > publication.json
 jq -e '.outcome == "succeeded"' publication.json >/dev/null
 publication_id=$(jq -er '.publication.id' publication.json)
@@ -1595,7 +1595,7 @@ logs or expose credentials.
 
 ## Runner doctor
 
-Use `scherzo-cloud runner doctor` to inspect the local prerequisites currently known to
+Use `um runner doctor` to inspect the local prerequisites currently known to
 the runner. The default set contains only `environment.command.git`. It executes the
 `git` resolved from the runner process's `PATH`, requires a parseable version at least
 `2.29.0`, and reports a pass or failure for that check. Select
@@ -1608,28 +1608,28 @@ execution requirements are not all checked yet.
 
 ```sh
 # Run the default checks.
-scherzo-cloud runner doctor
+um runner doctor
 
 # Run a named check. Repeat --check to select more than one registered check.
-scherzo-cloud runner doctor --check environment.command.git
+um runner doctor --check environment.command.git
 
 # Validate the Pi installation selected from inherited PATH only.
-scherzo-cloud runner doctor \
+um runner doctor \
   --check execution.harness.pi-json-v1
 
 # Validate Claude Code independently, or repeat --check to inspect multiple harnesses.
-scherzo-cloud runner doctor \
+um runner doctor \
   --check execution.harness.claude-code-stream-json-v1
 
 # Validate Codex independently.
-scherzo-cloud runner doctor \
+um runner doctor \
   --check execution.harness.codex-app-server-v1
 
 # List IDs without running any checks.
-scherzo-cloud runner doctor --list-checks
+um runner doctor --list-checks
 
 # Emit the schema-version-1 JSON report.
-scherzo-cloud runner doctor --json
+um runner doctor --json
 ```
 
 A selected harness check identifies its execution profile and compatibility policy in
@@ -1640,7 +1640,7 @@ that qualification version separately rather than presenting it as the only admi
 release.
 
 Checks are registered statically by components compiled into this executable. The
-command does not load plugins, read human credentials, contact Scherzo Cloud, or change
+command does not load plugins, read human credentials, contact Useful Machinery, or change
 runner configuration. It executes `git --version` with a five-second deadline, bounds
 captured standard output, drains standard error without reporting it, and exposes only
 a normalized numeric version in its report.
@@ -1695,16 +1695,16 @@ closed operator configuration:
 {
   "schemaVersion": 1,
   "deploymentMode": "production",
-  "runnerStatePath": "/var/lib/scherzo-cloud/runner-state.json",
-  "controlSocketPath": "/run/scherzo-cloud/runner.sock",
-  "workRoot": "/var/lib/scherzo-cloud/work"
+  "runnerStatePath": "/var/lib/um/runner-state.json",
+  "controlSocketPath": "/run/um/runner.sock",
+  "workRoot": "/var/lib/um/work"
 }
 ```
 
 After enrollment has committed protected state, start the service with one value:
 
 ```sh
-scherzo-cloud runner serve --config /etc/scherzo/runner.json
+um runner serve --config /etc/scherzo/runner.json
 ```
 
 Production operators should follow the private monorepo's
@@ -1724,7 +1724,7 @@ and every runner materializes and verifies that source before admission.
 Rotate a running host only with a replacement activation issued for its existing runner:
 
 ```sh
-scherzo-cloud runner enroll \
+um runner enroll \
   --replace-credential \
   --activation-file /protected/path/replacement-activation.json \
   --config /etc/scherzo/runner.json
@@ -1836,7 +1836,7 @@ For example, the receiver and its credential both remain under the operator's co
 ```sh
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://telemetry.example.test/v1/traces \
 OTEL_EXPORTER_OTLP_TRACES_HEADERS='authorization=Bearer%20operator-owned-token' \
-  scherzo-cloud runner serve --config /etc/scherzo/runner.json
+  um runner serve --config /etc/scherzo/runner.json
 ```
 
 `OTEL_SDK_DISABLED` is the sole remote-export privacy switch. Case-insensitive `true`
@@ -1916,7 +1916,7 @@ Release binaries are not currently signed or notarized. Verify a downloaded arch
 with the attached checksums and GitHub attestation before running it:
 
 ```sh
-archive='scherzo-cloud-<version>-<target>.tar.gz'
+archive='um-<version>-<target>.tar.gz'
 
 # Linux
 sha256sum --ignore-missing --check SHA256SUMS
@@ -1964,4 +1964,4 @@ tests, and release-archive packaging of the tested binary.
 
 ## License
 
-Scherzo Cloud CLI is licensed under the Apache License 2.0. See `LICENSE`.
+Useful Machinery CLI is licensed under the Apache License 2.0. See `LICENSE`.

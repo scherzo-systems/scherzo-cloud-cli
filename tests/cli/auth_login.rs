@@ -243,7 +243,7 @@ fn human_login_writes_activation_and_terminal_result_to_stdout() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         concat!(
-            "Sign in to Scherzo Cloud\n",
+            "Sign in to Useful Machinery\n",
             "\n",
             "  Open: https://auth.fixture.example/activate\n",
             "  Code: HUMAN-CODE\n",
@@ -309,15 +309,15 @@ fn human_login_prefers_the_direct_link_and_explains_required_signup() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         concat!(
-            "Sign in to Scherzo Cloud\n",
+            "Sign in to Useful Machinery\n",
             "\n",
             "  Open: https://auth.fixture.example/activate?user_code=SIGNUP-CODE\n",
             "  Code: SIGNUP-CODE\n",
             "\n",
             "Waiting for authorization...\n",
             "\n",
-            "✓ Signed in to Scherzo Cloud.\n",
-            "! Your Scherzo Cloud account still needs to be set up.\n"
+            "✓ Signed in to Useful Machinery.\n",
+            "! Your Useful Machinery account still needs to be set up.\n"
         )
     );
     assert!(output.stderr.is_empty());
@@ -790,7 +790,7 @@ fn interrupting_login_emits_cancellation_and_exits_130() {
     let before = fs::read(&credential_path).unwrap();
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = login_environment(&server, credential_path_string);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "auth",
@@ -890,7 +890,7 @@ fn interrupt_after_persistence_does_not_report_cancellation() {
     let credential_path = credential_directory.path().join("credentials.json");
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = login_environment(&server, credential_path_string);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "auth",

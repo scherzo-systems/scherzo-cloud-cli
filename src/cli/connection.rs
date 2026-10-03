@@ -912,7 +912,7 @@ fn failure_output(
         LinearFailure::Unauthenticated => (
             "unauthenticated",
             OutcomeClass::Unauthenticated,
-            auth.rejected_remedy("Sign in again with scherzo-cloud auth login."),
+            auth.rejected_remedy("Sign in again with um auth login."),
         ),
         LinearFailure::Forbidden => (
             "forbidden",

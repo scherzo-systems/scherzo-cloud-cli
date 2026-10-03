@@ -98,7 +98,7 @@ impl super::RemoteArtifactOperation for Operation {
                 };
                 let remedy = match &error {
                     ArtifactAssemblyError::Api(ArtifactApiError::Unauthenticated) => {
-                        authentication.rejected_remedy("Sign in first:\n  scherzo-cloud auth login")
+                        authentication.rejected_remedy("Sign in first:\n  um auth login")
                     }
                     ArtifactAssemblyError::DestinationExists => {
                         "Choose an output path that does not exist, then try again."

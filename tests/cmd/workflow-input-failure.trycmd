@@ -1,5 +1,5 @@
 ```console
-$ scherzo-cloud workflow run --source-root . --execution-root . --run-dir unused-input-failure --input-json request not-json absent.yaml
+$ um workflow run --source-root . --execution-root . --run-dir unused-input-failure --input-json request not-json absent.yaml
 ? 1
 Error: acquire local workflow input request: input is not valid JSON
 

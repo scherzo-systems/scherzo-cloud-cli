@@ -2239,7 +2239,7 @@
           "const": 1
         },
         "command": {
-          "const": "scherzo-cloud workflow view"
+          "const": "um workflow view"
         },
         "outcome": {
           "const": "view"
@@ -2372,7 +2372,7 @@
           "const": 1
         },
         "command": {
-          "const": "scherzo-cloud workflow view"
+          "const": "um workflow view"
         },
         "outcome": {
           "const": "error"

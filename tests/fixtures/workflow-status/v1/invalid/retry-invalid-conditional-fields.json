@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "command": "scherzo-cloud workflow status",
+  "command": "um workflow status",
   "outcome": "status",
   "exitStatus": 0,
   "runDirectory": "/tmp/runs/example",

@@ -76,7 +76,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
-    assert_eq!(rejected["command"], "scherzo-cloud workflow retry");
+    assert_eq!(rejected["command"], "um workflow retry");
     assert_eq!(rejected["phase"], "admission");
     assert_eq!(
         rejected["diagnostics"][0]["code"],
@@ -104,7 +104,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
         String::from_utf8_lossy(&output.stderr)
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(terminal["command"], "scherzo-cloud workflow retry");
+    assert_eq!(terminal["command"], "um workflow retry");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["attemptNumber"], 2);
     assert_eq!(terminal["result"]["attemptNumber"], 2);
@@ -143,7 +143,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
-    assert_eq!(rejected["command"], "scherzo-cloud workflow retry");
+    assert_eq!(rejected["command"], "um workflow retry");
     assert_eq!(rejected["phase"], "retry");
     assert_eq!(rejected["attemptNumber"], 2);
     assert_eq!(
@@ -273,7 +273,7 @@ fn finalizer_retry_reruns_both_graphs_with_a_fresh_attempt() {
         String::from_utf8_lossy(&retried.stderr)
     );
     let retried: serde_json::Value = serde_json::from_slice(&retried.stdout).unwrap();
-    assert_eq!(retried["command"], "scherzo-cloud workflow retry");
+    assert_eq!(retried["command"], "um workflow retry");
     assert_eq!(retried["attemptNumber"], 2);
     assert_eq!(retried["result"]["finalization"]["trigger"], "failed");
     assert_eq!(

@@ -87,7 +87,7 @@ pub(super) fn write_remove(
             "reauthentication_required",
             None,
             authentication.rejected_notice(
-                "! Recent sign-in is required before removing a linked identity.\n\nSign in again with a linked identity that will remain:\n  scherzo-cloud auth login --force",
+                "! Recent sign-in is required before removing a linked identity.\n\nSign in again with a linked identity that will remain:\n  um auth login --force",
             ),
             OutcomeClass::Forbidden,
             json,
@@ -96,7 +96,7 @@ pub(super) fn write_remove(
             deployment,
             "not_found",
             None,
-            "! Linked identity not found or unavailable.\n\nList the identities attached to your account:\n  scherzo-cloud auth identity list",
+            "! Linked identity not found or unavailable.\n\nList the identities attached to your account:\n  um auth identity list",
             OutcomeClass::GeneralFailure,
             json,
         ),
@@ -181,7 +181,7 @@ impl LinkOutput {
         } else {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            writeln!(stdout, "Link a sign-in identity to Scherzo Cloud\n")?;
+            writeln!(stdout, "Link a sign-in identity to Useful Machinery\n")?;
             writeln!(stdout, "open: {}", authorization.activation_uri())?;
             writeln!(stdout, "code: {}", authorization.user_code())?;
             writeln!(stdout, "\nSign in with the identity you want to link.")?;
@@ -255,7 +255,7 @@ impl LinkOutput {
                     if service_authentication {
                         "! The service API key was rejected.\n\nUse a different active service API key."
                     } else {
-                        "! You must sign in before linking another identity.\n\nRun:\n  scherzo-cloud auth login"
+                        "! You must sign in before linking another identity.\n\nRun:\n  um auth login"
                     },
                     OutcomeClass::Unauthenticated,
                 ),
@@ -281,7 +281,7 @@ impl LinkOutput {
                         local_session_identity: "unchanged",
                     }
                     .with_credential_state(credential_state),
-                    "! The identity-link result is unknown.\n\nList linked identities before trying again:\n  scherzo-cloud auth identity list",
+                    "! The identity-link result is unknown.\n\nList linked identities before trying again:\n  um auth identity list",
                     super::super::super::unreachable_outcome_class(*category),
                 ),
             },
@@ -400,7 +400,7 @@ pub(super) fn write_common(
             "unauthenticated",
             None,
             authentication.rejected_notice(
-                "! You must sign in before managing linked identities.\n\nRun:\n  scherzo-cloud auth login",
+                "! You must sign in before managing linked identities.\n\nRun:\n  um auth login",
             ),
             OutcomeClass::Unauthenticated,
             json,
@@ -426,7 +426,7 @@ pub(super) fn write_common(
             "unreachable",
             Some(category.as_str()),
             &format!(
-                "! The Scherzo Cloud deployment is unreachable ({}).",
+                "! The Useful Machinery deployment is unreachable ({}).",
                 category.as_str()
             ),
             super::super::super::unreachable_outcome_class(*category),

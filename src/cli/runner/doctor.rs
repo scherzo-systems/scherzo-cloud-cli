@@ -8,7 +8,7 @@ use crate::exit_code::ExitCode;
 use um_runner::{CheckResult, Report, Status, built_in_registry};
 
 pub(super) const ABOUT: &str = "Check local runner prerequisites";
-const COMMAND_NAME: &str = "scherzo-cloud runner doctor";
+const COMMAND_NAME: &str = "um runner doctor";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -71,7 +71,7 @@ fn write_human_report(report: &Report) -> anyhow::Result<()> {
 }
 
 fn write_human_report_to(output: &mut impl Write, report: &Report) -> anyhow::Result<()> {
-    writeln!(output, "Scherzo Cloud runner doctor")?;
+    writeln!(output, "Useful Machinery runner doctor")?;
     writeln!(output)?;
 
     for result in &report.results {

@@ -53,9 +53,9 @@ use super::validated::{ResolvedOutputSource, WorkflowValueType};
 use super::value::CapturedValue;
 use super::workspace_snapshot::WorkspaceSnapshotV1;
 
-const COMMAND: &str = "scherzo-cloud workflow run";
-const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
-const CONTINUE_COMMAND: &str = "scherzo-cloud workflow continue";
+const COMMAND: &str = "um workflow run";
+const RETRY_COMMAND: &str = "um workflow retry";
+const CONTINUE_COMMAND: &str = "um workflow continue";
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
 const STAGING_ATTEMPTS: usize = 16;

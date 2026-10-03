@@ -42,9 +42,9 @@ use super::step_runtime::{CommandExecutionFailure, StepExecutionFailure, StepFai
 use super::validated::ValidatedStep;
 use crate::AgentHarnessInstallationFailure;
 
-const RUN_COMMAND: &str = "scherzo-cloud workflow run";
-const RETRY_COMMAND: &str = "scherzo-cloud workflow retry";
-const CONTINUE_COMMAND: &str = "scherzo-cloud workflow continue";
+const RUN_COMMAND: &str = "um workflow run";
+const RETRY_COMMAND: &str = "um workflow retry";
+const CONTINUE_COMMAND: &str = "um workflow continue";
 const EVENT_TOKEN_WIDTH: usize = 10;
 const MIN_INLINE_DETAIL_WIDTH: usize = 24;
 const STACKED_DETAIL_INDENT: usize = 2;
@@ -773,10 +773,10 @@ fn human_retry_rejection(rejection: &LocalRetryRejection) -> String {
             "retry blocked: attempt {attempt} has an active execution owner\n\nWait for the current attempt to finish, then retry."
         ),
         RetryIneligibilityReason::LatestAttemptSucceeded => format!(
-            "cannot retry run: attempt {attempt} succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  scherzo-cloud workflow run --run-dir <NEW_DIR> <WORKFLOW>"
+            "cannot retry run: attempt {attempt} succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  um workflow run --run-dir <NEW_DIR> <WORKFLOW>"
         ),
         RetryIneligibilityReason::LatestAttemptRejected => format!(
-            "cannot retry run: attempt {attempt} was rejected\n\nStart a new run with a corrected workflow definition instead:\n  scherzo-cloud workflow run --run-dir <NEW_DIR> <WORKFLOW>"
+            "cannot retry run: attempt {attempt} was rejected\n\nStart a new run with a corrected workflow definition instead:\n  um workflow run --run-dir <NEW_DIR> <WORKFLOW>"
         ),
         RetryIneligibilityReason::OwnershipUnproven => format!(
             "retry blocked: process ownership for attempt {attempt} is unproven\n\nNo safe retry remedy is available for this run."

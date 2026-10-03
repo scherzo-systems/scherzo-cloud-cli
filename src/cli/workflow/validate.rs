@@ -12,7 +12,7 @@ use um_execution::{
 };
 
 pub(super) const ABOUT: &str = "Validate a local workflow definition";
-const COMMAND_NAME: &str = "scherzo-cloud workflow validate";
+const COMMAND_NAME: &str = "um workflow validate";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

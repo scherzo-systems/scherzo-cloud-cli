@@ -207,7 +207,7 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
 }
 
 fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &[u8]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args(args)
         .stdin(Stdio::piped())
@@ -249,7 +249,7 @@ fn run_with_env_from(
         .expect("temporary credential directory should be private");
     let default_credential_path = credential_directory.path().join("credentials.json");
     let default_path = tempfile::tempdir().expect("temporary empty PATH should be created");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command.args(args).env_remove(CREDENTIALS_FILE_VARIABLE);
     for variable in DEPLOYMENT_VARIABLES
         .into_iter()
@@ -273,7 +273,7 @@ fn run_with_env_from(
         command.current_dir(current_dir);
     }
 
-    command.output().expect("scherzo-cloud should run")
+    command.output().expect("um should run")
 }
 
 fn assert_human_doctor_detail_matches_json(
@@ -735,7 +735,7 @@ fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
 
 #[test]
 fn version_command_and_flag_report_the_resolved_build_version() {
-    let expected = format!("scherzo-cloud {BUILD_VERSION}\n");
+    let expected = format!("um {BUILD_VERSION}\n");
 
     for args in [["version"].as_slice(), ["--version"].as_slice()] {
         let output = run(args);
@@ -749,8 +749,8 @@ fn version_command_and_flag_report_the_resolved_build_version() {
 #[test]
 fn structured_version_reports_the_resolved_build_version_contract() {
     let output = run(&["version", "--json"]);
-    let expected_executable_path = std::fs::canonicalize(env!("CARGO_BIN_EXE_scherzo-cloud"))
-        .expect("scherzo-cloud executable path should resolve");
+    let expected_executable_path =
+        std::fs::canonicalize(env!("CARGO_BIN_EXE_um")).expect("um executable path should resolve");
     let mut actual: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("version output should be JSON");
     let actual_executable_path = actual
@@ -768,7 +768,7 @@ fn structured_version_reports_the_resolved_build_version_contract() {
         .remove("executablePath");
     let expected = serde_json::json!({
         "schemaVersion": 1,
-        "command": "scherzo-cloud",
+        "command": "um",
         "version": BUILD_VERSION,
         "buildIdentity": BUILD_IDENTITY,
     });
@@ -1501,7 +1501,7 @@ fn concurrent_processes_exchange_one_rotating_refresh_token_once() {
     let issuer = server.issuer.clone();
     let environment = deployment_environment_with_issuer(&api_url, &issuer, credential_path);
     let command = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args(["auth", "status", "--json", "--allow-insecure-http"])
             .stdout(Stdio::piped())
@@ -1974,7 +1974,7 @@ fn runner_doctor_reports_schema_one_json() {
         report,
         serde_json::json!({
             "schemaVersion": 1,
-            "command": "scherzo-cloud runner doctor",
+            "command": "um runner doctor",
             "deployment": null,
             "checks": [{
                 "id": "environment.command.git",

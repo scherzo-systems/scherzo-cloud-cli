@@ -49,7 +49,7 @@ macro_rules! write_cloud {
     };
 }
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud runs";
+pub(super) const ABOUT: &str = "Manage Useful Machinery runs";
 const NAME: &str = "run";
 
 #[derive(Debug, Args)]
@@ -60,7 +60,7 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum RunCommand {
-    #[command(about = "Request cancellation of a Scherzo Cloud run")]
+    #[command(about = "Request cancellation of a Useful Machinery run")]
     Cancel(CancelCommand),
     #[command(about = "Create a run")]
     Create(CreateCommand),
@@ -68,7 +68,7 @@ enum RunCommand {
     Input(inputs::Command),
     #[command(about = input_set::ABOUT)]
     InputSet(input_set::Command),
-    #[command(about = "List Scherzo Cloud runs")]
+    #[command(about = "List Useful Machinery runs")]
     List(ListCommand),
     #[command(about = "Retry a run")]
     Retry(retry::Command),
@@ -236,7 +236,7 @@ impl Command {
             Some(RunCommand::Create(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud run creation",
+                "configure Useful Machinery run creation",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::InputSet(command)) => command.execute(),
@@ -244,25 +244,25 @@ impl Command {
             Some(RunCommand::Show(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud run access",
+                "configure Useful Machinery run access",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::List(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud run access",
+                "configure Useful Machinery run access",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::Retry(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud run retry",
+                "configure Useful Machinery run retry",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::Cancel(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud run cancellation",
+                "configure Useful Machinery run cancellation",
                 |command, deployment| command.execute(deployment.clone()),
             ),
         }
@@ -1895,7 +1895,7 @@ fn write_failure_with_input_set(
             None,
             authentication
                 .rejected_error(
-                    "error: Cloud run access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                    "error: Cloud run access requires sign-in\n\nSign in first:\n  um auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -1987,7 +1987,7 @@ fn write_failure_with_input_set(
     } else if let Some(input_set_id) = input_set_id {
         writeln!(
             io::stderr().lock(),
-            "{human}\n\ninput set: {input_set_id}\n\nContinue explicitly with `scherzo-cloud run input-set show` before creating another set."
+            "{human}\n\ninput set: {input_set_id}\n\nContinue explicitly with `um run input-set show` before creating another set."
         )?;
     } else {
         writeln!(io::stderr().lock(), "{human}")?;
@@ -1998,7 +1998,7 @@ fn write_failure_with_input_set(
 fn write_staging_guidance(organization: &str, input_set_id: &str) -> anyhow::Result<()> {
     writeln!(
         io::stderr().lock(),
-        "input set: {input_set_id}\norganization: {organization}\n\nInspect with `scherzo-cloud run input-set show`; if open, resume upload and sealing, or delete the set explicitly. Reconcile any uncertain run acceptance before creating another run."
+        "input set: {input_set_id}\norganization: {organization}\n\nInspect with `um run input-set show`; if open, resume upload and sealing, or delete the set explicitly. Reconcile any uncertain run acceptance before creating another run."
     )?;
     Ok(())
 }

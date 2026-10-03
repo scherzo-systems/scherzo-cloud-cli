@@ -110,7 +110,7 @@ impl fmt::Display for StatusError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Session(error) => write!(formatter, "acquire human session: {error}"),
-            Self::PublicApi(error) => write!(formatter, "contact Scherzo Cloud: {error}"),
+            Self::PublicApi(error) => write!(formatter, "contact Useful Machinery: {error}"),
         }
     }
 }

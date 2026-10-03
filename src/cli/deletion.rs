@@ -118,7 +118,7 @@ impl AccountCommand {
         super::execute_deployment_command(
             self.command,
             &["account", "deletion"],
-            "configure Scherzo Cloud account deletion",
+            "configure Useful Machinery account deletion",
             |command, deployment| match command {
                 AccountDeletionCommand::Request(command) => command
                     .execute(deployment)
@@ -137,7 +137,7 @@ impl OrganizationCommand {
         super::execute_deployment_command(
             self.command,
             &["organization", "deletion"],
-            "configure Scherzo Cloud organization deletion",
+            "configure Useful Machinery organization deletion",
             |command, deployment| match command {
                 OrganizationDeletionCommand::Request(command) => command
                     .execute(deployment)
@@ -212,7 +212,7 @@ impl AccountRequestCommand {
             writeln!(stderr, "error: {error:#}")?;
             writeln!(
                 stderr,
-                "\nRemove the deployment's local credential before continuing:\n  scherzo-cloud auth logout"
+                "\nRemove the deployment's local credential before continuing:\n  um auth logout"
             )?;
             return Ok(ExitCode::GeneralFailure);
         }
@@ -398,18 +398,18 @@ impl DeletionTarget {
 
     fn cancellation_command(&self) -> String {
         match self {
-            Self::Account => "scherzo-cloud account deletion cancel".to_owned(),
+            Self::Account => "um account deletion cancel".to_owned(),
             Self::Organization(organization_ref) => {
-                format!("scherzo-cloud organization deletion cancel {organization_ref}")
+                format!("um organization deletion cancel {organization_ref}")
             }
         }
     }
 
     fn status_command(&self) -> String {
         match self {
-            Self::Account => "scherzo-cloud auth status".to_owned(),
+            Self::Account => "um auth status".to_owned(),
             Self::Organization(organization_ref) => {
-                format!("scherzo-cloud organization show {organization_ref}")
+                format!("um organization show {organization_ref}")
             }
         }
     }
@@ -1013,7 +1013,7 @@ impl<'a> CancellationOutput<'a> {
             if matches!(self.target, DeletionTarget::Account) {
                 writeln!(
                     stdout,
-                    "\nSign in to establish a renewable local session:\n  scherzo-cloud auth login"
+                    "\nSign in to establish a renewable local session:\n  um auth login"
                 )?;
             }
         } else {
@@ -1059,7 +1059,7 @@ fn common_lifecycle_failure(
             FailureOperation::Request => unauthenticated_failure(
                 target,
                 "requires sign-in",
-                "Sign in first:\n  scherzo-cloud auth login",
+                "Sign in first:\n  um auth login",
             ),
             FailureOperation::Cancellation => unauthenticated_failure(
                 target,

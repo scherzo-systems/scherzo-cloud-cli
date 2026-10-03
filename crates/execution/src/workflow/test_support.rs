@@ -69,7 +69,7 @@ pub(super) async fn run_with_stalled_child_guard(
     let pid_path = isolated.path().join("stalled-worker.pid");
     let guard_executable = isolated
         .path()
-        .join(format!("scherzo-cloud{}", std::env::consts::EXE_SUFFIX));
+        .join(format!("um{}", std::env::consts::EXE_SUFFIX));
     fs::write(
         &guard_executable,
         "#!/bin/sh\nroot=${0%/*}\nprintf '%s\\n' \"$$\" > \"$root/stalled-worker.pid\"\nIFS= read -r _\n",

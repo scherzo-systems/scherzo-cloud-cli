@@ -174,7 +174,7 @@ fn write_failure(
         ArtifactApiError::InvalidAuthorizationHeader => (
             "invalid_configuration",
             None,
-            "error: stored access token cannot be used for Artifact Set access\n\nSign in again:\n  scherzo-cloud auth login"
+            "error: stored access token cannot be used for Artifact Set access\n\nSign in again:\n  um auth login"
                 .to_owned(),
             OutcomeClass::GeneralFailure,
         ),
@@ -191,7 +191,7 @@ fn write_failure(
             None,
             authentication
                 .rejected_error(
-                    "error: Artifact Set access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                    "error: Artifact Set access requires sign-in\n\nSign in first:\n  um auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,

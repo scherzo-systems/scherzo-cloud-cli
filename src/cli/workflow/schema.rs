@@ -4,7 +4,7 @@ use um_execution::STRUCTURAL_SCHEMA;
 
 pub(super) const ABOUT: &str = "Show the workflow structural schema";
 pub(super) const AFTER_HELP: &str = "Scope:
-  This schema checks workflow document structure only. Use `scherzo-cloud workflow
+  This schema checks workflow document structure only. Use `um workflow
   validate` to validate the complete workflow definition and its referenced files.";
 
 #[derive(Debug, Args)]

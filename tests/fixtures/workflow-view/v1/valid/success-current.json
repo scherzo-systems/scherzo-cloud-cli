@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "command": "scherzo-cloud workflow view",
+  "command": "um workflow view",
   "outcome": "view",
   "exitStatus": 0,
   "runDirectory": "/tmp/run",

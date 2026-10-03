@@ -15,7 +15,7 @@ use um_execution::{
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
 
-const COMMAND: &str = "scherzo-cloud workflow status";
+const COMMAND: &str = "um workflow status";
 const STYLE_ACTIVE: &str = "38;2;137;180;250";
 const STYLE_SUCCESS: &str = "38;2;166;227;161";
 const STYLE_FAILURE: &str = "38;2;243;139;168";

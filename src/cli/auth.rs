@@ -7,7 +7,7 @@ use clap::{Args, Subcommand};
 
 use um_human_auth::Deployment;
 
-pub(super) const ABOUT: &str = "Manage your Scherzo Cloud sign-in";
+pub(super) const ABOUT: &str = "Manage your Useful Machinery sign-in";
 const NAME: &str = "auth";
 
 #[derive(Debug, Args)]
@@ -47,7 +47,7 @@ fn execute_leaf<T>(
     super::execute_deployment_command(
         Some(command),
         &[NAME],
-        "configure Scherzo Cloud sign-in",
+        "configure Useful Machinery sign-in",
         execute,
     )
 }

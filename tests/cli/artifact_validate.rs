@@ -292,7 +292,7 @@ fn copied_local_profile_set_validates_in_human_and_json_modes_without_mutation()
         report,
         json!({
             "schemaVersion": 1,
-            "command": "scherzo-cloud artifact validate",
+            "command": "um artifact validate",
             "outcome": "valid",
             "exitStatus": 0,
             "artifactSetVersion": 1,

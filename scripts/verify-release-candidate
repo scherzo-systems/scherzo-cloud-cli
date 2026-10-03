@@ -137,9 +137,9 @@ def digest_manifest(entries: Mapping[str, bytes]) -> bytes:
 def expected_asset_names(version: str) -> list[str]:
     return sorted(
         [
-            f"scherzo-cloud-{version}-aarch64-apple-darwin.tar.gz",
-            f"scherzo-cloud-{version}-aarch64-unknown-linux-gnu.tar.gz",
-            f"scherzo-cloud-{version}-x86_64-unknown-linux-gnu.tar.gz",
+            f"um-{version}-aarch64-apple-darwin.tar.gz",
+            f"um-{version}-aarch64-unknown-linux-gnu.tar.gz",
+            f"um-{version}-x86_64-unknown-linux-gnu.tar.gz",
             "SHA256SUMS",
         ],
         key=os.fsencode,
@@ -151,7 +151,7 @@ def prior_release_asset_inventories(version: str) -> tuple[list[str], list[str]]
     legacy = sorted(
         [
             *current,
-            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
+            f"um-{version}-x86_64-apple-darwin.tar.gz",
         ],
         key=os.fsencode,
     )
@@ -442,7 +442,7 @@ def normalize_latest_release(
     complete = (
         draft_value is False
         and prerelease_value is False
-        and name == f"Scherzo Cloud CLI {tag}"
+        and name == f"Useful Machinery CLI {tag}"
         and [asset.name for asset in assets]
         in prior_release_asset_inventories(tag.removeprefix("v"))
     )
@@ -522,9 +522,9 @@ def parse_candidate(value: bytes) -> tuple[dict[str, str], bytes]:
 def mirror_metadata(repository: GitRepository, commit: str) -> CommitMetadata:
     metadata = repository.metadata(commit)
     if (
-        metadata.author != "Scherzo Cloud Mirror"
+        metadata.author != "Useful Machinery Mirror"
         or metadata.author_email != "mirror@scherzo.dev"
-        or metadata.committer != "Scherzo Cloud Mirror"
+        or metadata.committer != "Useful Machinery Mirror"
         or metadata.committer_email != "mirror@scherzo.dev"
     ):
         fail("public commit does not use the synthetic mirror identity")
@@ -682,7 +682,7 @@ def verify_target_release(
     if (
         not isinstance(release_id, int)
         or release_id < 0
-        or name != f"Scherzo Cloud CLI {plan['tag']}"
+        or name != f"Useful Machinery CLI {plan['tag']}"
         or not isinstance(body, str)
         or body.encode("utf-8") != notes
         or not isinstance(draft_value, bool)

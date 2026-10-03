@@ -6,7 +6,7 @@ use super::{
     generate_idempotency_key,
 };
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud runner pools";
+pub(super) const ABOUT: &str = "Manage Useful Machinery runner pools";
 const COMMAND_PATH: &[&str] = &["runner", "pool"];
 
 #[derive(Debug, Args)]

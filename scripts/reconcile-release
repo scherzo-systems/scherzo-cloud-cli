@@ -60,7 +60,7 @@ class LocalAsset:
 
 
 def verify_archive(path: Path, version: str, target: str) -> None:
-    package = f"scherzo-cloud-{version}-{target}"
+    package = f"um-{version}-{target}"
     if path.read_bytes()[4:8] != b"\0\0\0\0":
         fail(f"release archive has a non-canonical gzip timestamp: {path.name}")
     try:
@@ -73,7 +73,7 @@ def verify_archive(path: Path, version: str, target: str) -> None:
         f"{package}/": ("directory", 0o755),
         f"{package}/LICENSE": ("file", 0o644),
         f"{package}/README.md": ("file", 0o644),
-        f"{package}/scherzo-cloud": ("file", 0o755),
+        f"{package}/um": ("file", 0o755),
     }
     actual: dict[str, tuple[str, int]] = {}
     for member in members:
@@ -109,7 +109,7 @@ def local_assets(dist: Path, version: str, expected_names: Sequence[str]) -> tup
     )
     archive_paths: dict[str, Path] = {}
     for target in targets:
-        name = f"scherzo-cloud-{version}-{target}.tar.gz"
+        name = f"um-{version}-{target}.tar.gz"
         archive_paths[name] = dist / name
         verify_archive(dist / name, version, target)
     checksums = b"".join(
@@ -283,7 +283,7 @@ def create_draft(inspection: Inspection) -> None:
             inspection.github.repository,
             "--verify-tag",
             "--title",
-            f"Scherzo Cloud CLI {verification.tag}",
+            f"Useful Machinery CLI {verification.tag}",
             "--notes-file",
             os.fspath(notes),
             "--draft",

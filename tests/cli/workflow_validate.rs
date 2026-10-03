@@ -271,7 +271,7 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
     let report: serde_json::Value =
         serde_json::from_slice(&json.stdout).expect("validation output should be JSON");
     assert_eq!(report["schemaVersion"], 1);
-    assert_eq!(report["command"], "scherzo-cloud workflow validate");
+    assert_eq!(report["command"], "um workflow validate");
     assert_eq!(report["outcome"], "valid");
     assert_eq!(report["workflow"]["path"], WORKFLOW_PATH);
     assert_eq!(report["digest"]["algorithm"], "sha256");
@@ -470,7 +470,7 @@ fn relative_workflow_file_is_cwd_relative_without_root_relative_fallback() {
     let bundle = WorkflowBundle::valid();
     let initial_cwd = bundle.root.parent().unwrap();
     let execute = |workflow_file: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_um"))
             .current_dir(initial_cwd)
             .args([
                 "workflow",
@@ -508,7 +508,7 @@ fn absolute_workflow_paths_do_not_require_a_named_current_directory() {
             "cd \"$1\" && rmdir \"$1\" && exec \"$2\" workflow validate --source-root \"$3\" \"$4\" --json",
             "sh",
             removed_cwd.to_str().unwrap(),
-            env!("CARGO_BIN_EXE_scherzo-cloud"),
+            env!("CARGO_BIN_EXE_um"),
             bundle.root_argument(),
             bundle.workflow_path().to_str().unwrap(),
         ])

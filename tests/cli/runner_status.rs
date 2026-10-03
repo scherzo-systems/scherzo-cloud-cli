@@ -305,7 +305,7 @@ fn terminal_authentication_remains_locally_inspectable() {
             .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
             .unwrap();
     });
-    let mut serve = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
         .args(["runner", "serve", "--config", &fixture.config])
         .env("OTEL_SDK_DISABLED", "true")
         .stdout(std::process::Stdio::null())
@@ -476,7 +476,7 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
                     .unwrap();
             });
     });
-    let mut serve = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
         .args(["runner", "serve", "--config", &fixture.config])
         .env("OTEL_SDK_DISABLED", "true")
         .stdout(std::process::Stdio::null())

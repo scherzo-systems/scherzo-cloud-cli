@@ -12,7 +12,7 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
     let api_url = format!("http://{}/api", listener.local_addr().unwrap());
     let entries_before = directory_entries(working_directory.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let output = Command::new(env!("CARGO_BIN_EXE_um"))
         .env_clear()
         .current_dir(working_directory.path())
         .args(["workflow", "reference"])
@@ -32,7 +32,7 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
         )
         .env("SCHERZO_CLOUD_AUTH_CLIENT_ID", "workflow-reference-client")
         .output()
-        .expect("scherzo-cloud should run");
+        .expect("um should run");
 
     assert!(output.status.success());
     assert_eq!(
@@ -78,7 +78,7 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
         "https://docs.usefulmachinery.com/agent/workflow-authoring.md",
         "https://docs.usefulmachinery.com/reference/workflow-v1.md",
         "https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json",
-        "scherzo-cloud workflow schema",
+        "um workflow schema",
         "workflow validate --json",
     ] {
         assert!(

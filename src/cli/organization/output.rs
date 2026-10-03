@@ -101,7 +101,7 @@ pub(super) fn write_show(
             common,
             authentication,
             json,
-            "The Scherzo Cloud deployment could not be reached",
+            "The Useful Machinery deployment could not be reached",
         ),
         GetOrganizationOutcome::NotFound => write_not_found(deployment, json),
     }
@@ -192,7 +192,7 @@ pub(super) fn write_members_list(
             common,
             authentication,
             json,
-            "The Scherzo Cloud deployment could not be reached",
+            "The Useful Machinery deployment could not be reached",
         ),
         ListOrganizationMembershipsOutcome::NotFound => write_not_found(deployment, json),
     }
@@ -487,14 +487,14 @@ struct CommonFailurePresentation {
 }
 
 const AUDIT_FAILURE_PRESENTATION: CommonFailurePresentation = CommonFailurePresentation {
-    unauthenticated: "error: organization audit records require sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+    unauthenticated: "error: organization audit records require sign-in\n\nSign in first:\n  um auth login",
     forbidden: "error: organization audit records unavailable for this account\n\nUse an active organization owner account.",
     invalid_input_subject: "organization audit request",
     invalid_input_remedy: "Check the organization reference, limit, and cursor, then try again.",
 };
 
 const MEMBERSHIP_FAILURE_PRESENTATION: CommonFailurePresentation = CommonFailurePresentation {
-    unauthenticated: "error: organization membership management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+    unauthenticated: "error: organization membership management requires sign-in\n\nSign in first:\n  um auth login",
     forbidden: "error: organization membership operation not permitted\n\nUse an active organization owner account.",
     invalid_input_subject: "organization membership input",
     invalid_input_remedy: "Check the organization reference, membership ID, and cursor, then try again.",
@@ -621,7 +621,7 @@ fn organization_operation_unreachable(
         "unreachable",
         Some(category.as_str()),
         format!(
-            "error: contact Scherzo Cloud API at {deployment}: {}\n\nCheck network access to the deployment and try again.",
+            "error: contact Useful Machinery API at {deployment}: {}\n\nCheck network access to the deployment and try again.",
             category.as_str()
         ),
         super::super::unreachable_outcome_class(category),
@@ -717,7 +717,7 @@ fn write_common(
             None,
             None,
             authentication.rejected_notice(
-                "! You must sign in before managing Scherzo Cloud organizations.\n\nRun:\n  scherzo-cloud auth login",
+                "! You must sign in before managing Useful Machinery organizations.\n\nRun:\n  um auth login",
             ),
             OutcomeClass::Unauthenticated,
             json,
@@ -946,7 +946,7 @@ fn write_current_membership_failure(
             None,
             authentication
                 .rejected_error(
-                    "error: organization membership history requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                    "error: organization membership history requires sign-in\n\nSign in first:\n  um auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,

@@ -246,7 +246,7 @@ fn replacement_resolution_failure_uses_the_continuation_diagnostic_vocabulary() 
     let output = isolated_command(&request).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["command"], "scherzo-cloud workflow continue");
+    assert_eq!(result["command"], "um workflow continue");
     assert_eq!(result["phase"], "continuation");
     assert_eq!(
         result["diagnostics"][0]["code"],
@@ -1164,7 +1164,7 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     assert_eq!(event["event"], "continuation_partition");
     assert_eq!(event["continuation"], continuation["continuation"]);
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(terminal["command"], "scherzo-cloud workflow continue");
+    assert_eq!(terminal["command"], "um workflow continue");
     assert_eq!(
         terminal["result"]["continuation"],
         continuation["continuation"]

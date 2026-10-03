@@ -236,7 +236,7 @@ impl fmt::Display for SelectionError {
         match self {
             Self::UnknownId(id) => write!(
                 formatter,
-                "unknown runner doctor check '{id}'; use 'scherzo-cloud runner doctor --list-checks' to list available checks"
+                "unknown runner doctor check '{id}'; use 'um runner doctor --list-checks' to list available checks"
             ),
         }
     }

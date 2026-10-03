@@ -14,7 +14,7 @@ use um_human_auth::Deployment;
 
 use super::OrganizationArg;
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud publications";
+pub(super) const ABOUT: &str = "Manage Useful Machinery publications";
 const NAME: &str = "publication";
 
 #[derive(Debug, Args)]
@@ -131,19 +131,19 @@ impl Command {
             Some(PublicationCommand::Create(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud publication creation",
+                "configure Useful Machinery publication creation",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(PublicationCommand::Show(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud publication access",
+                "configure Useful Machinery publication access",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(PublicationCommand::List(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
-                "configure Scherzo Cloud publication access",
+                "configure Useful Machinery publication access",
                 |command, deployment| command.execute(deployment.clone()),
             ),
         }
@@ -1064,9 +1064,9 @@ fn write_failure(
             context
                 .authentication
                 .rejected_error(if context.dispatched {
-                    "error: Cloud publication access requires sign-in\n\nSign in first, then retry with the same --idempotency-key:\n  scherzo-cloud auth login"
+                    "error: Cloud publication access requires sign-in\n\nSign in first, then retry with the same --idempotency-key:\n  um auth login"
                 } else {
-                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login"
+                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  um auth login"
                 })
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -1161,7 +1161,7 @@ fn write_read_failure(
             context
                 .authentication
                 .rejected_error(
-                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  um auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,

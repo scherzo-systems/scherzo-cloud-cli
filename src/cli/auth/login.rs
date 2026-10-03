@@ -248,7 +248,7 @@ fn handle_unreachable(
     } else {
         let error = match phase {
             Phase::ExistingCredentialCheck | Phase::PrincipalConfirmation => {
-                anyhow!("Scherzo Cloud is unreachable ({})", category.as_str())
+                anyhow!("Useful Machinery is unreachable ({})", category.as_str())
             }
             Phase::DeviceAuthorization | Phase::TokenPolling => anyhow!(
                 "authorization server is unreachable ({})",
@@ -395,7 +395,7 @@ impl LoginOutput {
         } else {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            writeln!(stdout, "Sign in to Scherzo Cloud\n").context("write sign-in output")?;
+            writeln!(stdout, "Sign in to Useful Machinery\n").context("write sign-in output")?;
             writeln!(stdout, "  Open: {}", authorization.activation_uri())
                 .context("write sign-in output")?;
             writeln!(stdout, "  Code: {}", authorization.user_code())

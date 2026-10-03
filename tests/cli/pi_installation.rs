@@ -567,7 +567,7 @@ fn pinned_real_pi_validation_does_not_read_trust_or_execute_project_extensions()
     .expect("saved trust should be written");
 
     let path = controlled_path_for(&executable);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_um"))
         .args(["runner", "doctor", "--check", PI_CHECK_ID, "--json"])
         .current_dir(project_directory.path())
         .env("PATH", path.path())

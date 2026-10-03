@@ -158,7 +158,7 @@ fn issuance_delivers_the_committed_key_when_interrupted_after_dispatch() {
     let missing_human_credentials = directory.path().join("human.json");
     let environment =
         service_environment(&server.api_url, missing_human_credentials.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "service-principal",

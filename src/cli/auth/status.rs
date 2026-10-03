@@ -145,10 +145,10 @@ pub(super) fn write_human_status(
             write_human_actions(&mut stdout, authenticated.actions.as_deref())
         }
         AuthenticationState::SignupRequired { actions } => {
-            writeln!(stdout, "✓ Signed in to Scherzo Cloud.").context("write sign-in status")?;
+            writeln!(stdout, "✓ Signed in to Useful Machinery.").context("write sign-in status")?;
             writeln!(
                 stdout,
-                "! Your Scherzo Cloud account still needs to be set up."
+                "! Your Useful Machinery account still needs to be set up."
             )
             .context("write sign-in status")?;
             write_human_actions(&mut stdout, actions.as_deref())
@@ -156,12 +156,12 @@ pub(super) fn write_human_status(
         AuthenticationState::Unauthenticated => writeln!(
             stdout,
             "{}",
-            authentication.rejected_notice("! You're not signed in to Scherzo Cloud.")
+            authentication.rejected_notice("! You're not signed in to Useful Machinery.")
         )
         .context("write sign-in status"),
         AuthenticationState::Unreachable(category) => writeln!(
             stdout,
-            "! Couldn't reach Scherzo Cloud ({}).",
+            "! Couldn't reach Useful Machinery ({}).",
             category.as_str()
         )
         .context("write sign-in status"),

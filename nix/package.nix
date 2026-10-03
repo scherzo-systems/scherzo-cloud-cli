@@ -25,7 +25,7 @@ let
   };
 
   commonArgs = {
-    pname = "scherzo-cloud";
+    pname = "um";
     inherit src;
     strictDeps = true;
   };
@@ -86,9 +86,9 @@ craneLib.buildPackage (
     };
 
     postInstall = ''
-      expected="scherzo-cloud ${version}"
+      expected="um ${version}"
       for invocation in "version" "--version"; do
-        actual="$($out/bin/scherzo-cloud "$invocation")"
+        actual="$($out/bin/um "$invocation")"
         if [ "$actual" != "$expected" ]; then
           echo "unexpected version output for $invocation: $actual" >&2
           echo "expected: $expected" >&2
@@ -96,14 +96,14 @@ craneLib.buildPackage (
         fi
       done
 
-      json="$($out/bin/scherzo-cloud version --json)"
+      json="$($out/bin/um version --json)"
       if ! printf '%s\n' "$json" | jq --exit-status \
         --arg buildIdentity ${lib.escapeShellArg buildIdentity} \
-        --arg executablePath "$out/bin/scherzo-cloud" \
+        --arg executablePath "$out/bin/um" \
         --arg version ${lib.escapeShellArg version} \
         '. == {
           "schemaVersion": 1,
-          "command": "scherzo-cloud",
+          "command": "um",
           "version": $version,
           "executablePath": $executablePath,
           "buildIdentity": $buildIdentity
@@ -114,9 +114,9 @@ craneLib.buildPackage (
     '';
 
     meta = {
-      description = "Command-line interface and runner for Scherzo Cloud";
+      description = "Command-line interface and runner for Useful Machinery";
       license = lib.licenses.asl20;
-      mainProgram = "scherzo-cloud";
+      mainProgram = "um";
       platforms = lib.platforms.unix;
     };
   }

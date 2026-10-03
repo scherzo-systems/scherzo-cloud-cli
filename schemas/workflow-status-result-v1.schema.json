@@ -2790,7 +2790,7 @@
           "const": 1
         },
         "command": {
-          "const": "scherzo-cloud workflow status"
+          "const": "um workflow status"
         },
         "outcome": {
           "const": "status"
@@ -2878,7 +2878,7 @@
           "const": 1
         },
         "command": {
-          "const": "scherzo-cloud workflow status"
+          "const": "um workflow status"
         },
         "outcome": {
           "const": "error"

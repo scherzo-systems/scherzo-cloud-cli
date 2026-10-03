@@ -59,17 +59,17 @@ fn write_human_result(outcome: &LogoutOutcome) -> anyhow::Result<()> {
     match (outcome.credential_removed(), outcome.revocation()) {
         (false, _) => writeln!(
             stdout,
-            "You're already signed out of Scherzo Cloud on this device."
+            "You're already signed out of Useful Machinery on this device."
         ),
         (true, RevocationState::Confirmed) => {
-            writeln!(stdout, "✓ Signed out of Scherzo Cloud.")
+            writeln!(stdout, "✓ Signed out of Useful Machinery.")
         }
         (true, RevocationState::Unconfirmed) => writeln!(
             stdout,
-            "✓ Signed out of Scherzo Cloud on this device.\n! Server sign-out wasn't confirmed."
+            "✓ Signed out of Useful Machinery on this device.\n! Server sign-out wasn't confirmed."
         ),
         (true, RevocationState::NotApplicable) => {
-            writeln!(stdout, "✓ Signed out of Scherzo Cloud on this device.")
+            writeln!(stdout, "✓ Signed out of Useful Machinery on this device.")
         }
     }
     .context("write sign-out result")

@@ -630,7 +630,7 @@ fn interrupted_removal_reports_unknown_commitment_without_retrying() {
     let directory = private_credential_directory();
     let path = directory.path().join("credentials.json");
     write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "connection",
@@ -687,7 +687,7 @@ fn interruption_after_start_preserves_session_for_later_inspection() {
         let directory = private_credential_directory();
         let path = directory.path().join("credentials.json");
         write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args([
                 "connection",
@@ -749,7 +749,7 @@ fn interruption_before_start_response_preserves_request_identity() {
         let directory = private_credential_directory();
         let path = directory.path().join("credentials.json");
         write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args([
                 "connection",

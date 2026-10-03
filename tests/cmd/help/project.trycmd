@@ -1,8 +1,8 @@
 ```console
-$ scherzo-cloud project --help
-Manage Scherzo Cloud projects
+$ um project --help
+Manage Useful Machinery projects
 
-Usage: scherzo-cloud project [COMMAND]
+Usage: um project [COMMAND]
 
 Commands:
   create       Create a project

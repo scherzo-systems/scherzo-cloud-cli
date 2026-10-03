@@ -497,7 +497,7 @@ mod retry_command_tests {
                 requests
             });
             let env = deployment_environment(&api_url, credentials_path.to_str().unwrap());
-            let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
             command
                 .args(args())
                 .stdin(Stdio::null())
@@ -696,7 +696,7 @@ fn list_runs_filters_and_renders_text_and_json() {
         String::from_utf8_lossy(&text.stderr)
     );
     let report = String::from_utf8(text.stdout).unwrap();
-    println!("scherzo-cloud run list {ORGANIZATION} [filters]:\n{report}");
+    println!("um run list {ORGANIZATION} [filters]:\n{report}");
     assert!(
         report.contains(RUN_ID)
             && report.contains("build-runner")
@@ -713,7 +713,7 @@ fn list_runs_filters_and_renders_text_and_json() {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
     println!(
-        "scherzo-cloud run list {ORGANIZATION} [filters] --json:\n{}",
+        "um run list {ORGANIZATION} [filters] --json:\n{}",
         String::from_utf8_lossy(&structured.stdout)
     );
     assert_eq!(parsed, body);
@@ -1071,7 +1071,7 @@ fn cancellation_signal_before_acceptance_preserves_key_and_never_observes() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "run",
@@ -1137,7 +1137,7 @@ fn cancellation_signal_after_acceptance_stops_observation_without_new_post() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "run",
@@ -2202,7 +2202,7 @@ fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
                     "missing {line} in {report}"
                 );
             }
-            assert!(report.contains("scherzo-cloud publication create"));
+            assert!(report.contains("um publication create"));
         }
         assert_eq!(
             server.finish().len(),
@@ -2287,7 +2287,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
             );
         }
         assert!(report.contains(publication_id));
-        assert!(report.contains("scherzo-cloud publication show"));
+        assert!(report.contains("um publication show"));
         assert_eq!(
             server.finish().len(),
             if operation == "create" { 3 } else { 2 }
@@ -2578,7 +2578,7 @@ fn create_signal_after_acceptance_stops_only_observation_and_keeps_replay() {
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
     let mut args = create_args(true);
     args.insert(args.len() - 1, "--wait");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args(args)
         .stdin(Stdio::null())
@@ -2634,7 +2634,7 @@ fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
         args.len() - 1..args.len() - 1,
         ["--publish-export", "changes", "--wait"],
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args(args)
         .stdin(Stdio::null())
@@ -3016,7 +3016,7 @@ fn run_create_consumes_an_explicit_sealed_input_set_without_restaging() {
 
 #[test]
 fn explicit_input_set_conflicts_with_acquired_inputs_before_cloud_access() {
-    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let output = Command::new(env!("CARGO_BIN_EXE_um"))
         .args([
             "run",
             "create",
@@ -3848,7 +3848,7 @@ fn input_set_mutation_commands_upload_seal_and_delete_with_fresh_requests() {
     let seal_key = header_value(&requests[1], "idempotency-key");
     assert_eq!(seal_key.len(), 64);
 
-    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_um"))
         .args(["run", "input-set", "delete", ORGANIZATION, INPUT_SET_ID])
         .output()
         .unwrap();
@@ -4510,7 +4510,7 @@ fn retained_inputs_download_accepts_a_relative_destination() {
     ]);
     let environment = deployment_environment(&server.api_url, &credential_path);
     let current_directory = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "run",
@@ -4557,7 +4557,7 @@ fn retained_inputs_json_download_rejects_an_unrepresentable_destination_before_t
     let destination = destination_parent
         .path()
         .join(std::ffi::OsString::from_vec(b"download-\xff".to_vec()));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args(["run", "input", "download", ORGANIZATION, RUN_ID, "--output"])
         .arg(&destination)
@@ -4675,7 +4675,7 @@ fn interrupted_retained_input_download_removes_verified_private_staging() {
     let environment = deployment_environment(&server.api_url, &credential_path);
     let destination_parent = tempfile::tempdir().unwrap();
     let destination = destination_parent.path().join("must-not-be-committed");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "run",
@@ -4742,7 +4742,7 @@ fn interrupted_retained_input_download_removes_verified_private_staging() {
 
 #[test]
 fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_request() {
-    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_um"))
         .args(["run", "input", "delete", ORGANIZATION, RUN_ID])
         .output()
         .unwrap();
@@ -6334,7 +6334,7 @@ fn signals_stop_only_active_cloud_run_show_observation() {
             "--json",
             "--allow-insecure-http",
         ];
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args(args)
             .stdin(Stdio::null())
@@ -6395,7 +6395,7 @@ fn signalled_create_reports_unknown_commitment_without_exposing_credentials() {
             );
             let environment =
                 deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-            let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
             command
                 .args(create_args(json))
                 .stdin(Stdio::null())
@@ -6468,7 +6468,7 @@ fn signalled_input_set_create_reports_unknown_without_an_invented_id() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "run",
@@ -6545,7 +6545,7 @@ fn signalled_input_set_seal_reports_one_unknown_receipt() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "run",
@@ -6620,7 +6620,7 @@ fn interruption_during_text_input_upload_never_claims_run_acceptance() {
             upload_capability_response(input_bytes, &signed_url),
         ]);
         let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args(create_args_with_text_input(
                 "request",

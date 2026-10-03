@@ -130,7 +130,7 @@ fn account_deletion_request_schedules_thirty_days_and_removes_the_local_session(
                 "local credential: removed\n",
                 "deployment: {}\n\n",
                 "Cancel before the deadline with fresh browser proof:\n",
-                "  scherzo-cloud account deletion cancel\n"
+                "  um account deletion cancel\n"
             ),
             PRINCIPAL_ID, server.api_url
         )
@@ -274,7 +274,7 @@ fn account_deletion_preserves_a_concurrently_replaced_credential_pair() {
         credential_path.to_str().unwrap(),
     );
     let empty_path = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "account",

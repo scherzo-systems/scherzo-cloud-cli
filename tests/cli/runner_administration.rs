@@ -192,7 +192,7 @@ fn runner_show_without_a_credential_reports_sign_in_on_stderr() {
         concat!(
             "error: runner administration requires sign-in\n\n",
             "Sign in first:\n",
-            "  scherzo-cloud auth login\n"
+            "  um auth login\n"
         )
     );
 }
@@ -656,7 +656,7 @@ fn post_dispatch_interrupt_and_termination_report_unknown_without_retry() {
         );
         let environment =
             deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args([
                 "runner",
@@ -1331,7 +1331,7 @@ fn enrollment_accepts_an_artifact_from_explicit_stdin() {
     }))
     .unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args([
             "runner",

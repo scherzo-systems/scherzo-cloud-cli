@@ -10,7 +10,7 @@ Full language reference: <https://docs.usefulmachinery.com/reference/workflow-v1
 
 Raw schema: <https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json>
 
-Embedded in `scherzo-cloud`: Workflow V1 authoring and validation, not execution or
+Embedded in `um`: Workflow V1 authoring and validation, not execution or
 repository changes.
 
 ## Authoring loop
@@ -91,7 +91,7 @@ activates.
   `gave_up` or handler failure stops recovery. Recovery has no condition-specific retry,
   delay/backoff, handler retry, capture-only retry, rollback, or session continuation.
 - Recovery effects are at-least-once. Authors supply stable domain idempotency keys
-  through existing explicit inputs or admitted environment, not Scherzo lifecycle IDs.
+  through existing explicit inputs or admitted environment, not Useful Machinery lifecycle IDs.
 
 ## Conditional steps and finalizers
 
@@ -185,7 +185,7 @@ conversation.
 For `claude_code`, session-specific transcript/resource symlinks live under
 `CLAUDE_CONFIG_DIR` (default `$HOME/.claude`) in project-history directories created
 as needed. Existing session entries are never replaced. After process-tree quiescence,
-only unchanged Scherzo-created links are removed; empty directories may remain.
+only unchanged links created by Useful Machinery are removed; empty directories may remain.
 Missing or empty transcripts emit the `Claude Code native transcript capture missing`
 warning. Retained transcripts are diagnostic only.
 
@@ -348,14 +348,14 @@ secret, environment, or workspace field.
 Print the installed raw structural contract, unchanged and without network access:
 
 ```sh
-scherzo-cloud workflow schema
+um workflow schema
 ```
 
 The schema checks document structure only. Validate a complete materialized source
 bundle with the installed CLI:
 
 ```sh
-scherzo-cloud workflow validate \
+um workflow validate \
   --source-root <ROOT> \
   <WORKFLOW_FILE> \
   --json
@@ -364,8 +364,8 @@ scherzo-cloud workflow validate \
 `workflow validate --json` is authoritative for graph, type, reference, path, policy,
 and static-source validation. It returns one structured result. Accept the definition
 only when the process succeeds and the closed `outcome` is `valid`. Validation does not
-execute commands or agents, inspect credentials, check model access, or contact Scherzo
-Cloud.
+execute commands or agents, inspect credentials, check model access, or contact
+Useful Machinery.
 
 For the complete online contract, use the public
 [authoring guide](https://docs.usefulmachinery.com/agent/workflow-authoring.md),

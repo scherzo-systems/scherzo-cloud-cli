@@ -153,7 +153,7 @@ fn write_human_result(
         ),
         UpdateProfileOutcome::Unauthenticated => writeln!(
             stdout,
-            "! You're not signed in to Scherzo Cloud.\n\nSign in to update your account:\n  scherzo-cloud auth login"
+            "! You're not signed in to Useful Machinery.\n\nSign in to update your account:\n  um auth login"
         ),
         UpdateProfileOutcome::Forbidden => writeln!(
             stdout,
@@ -173,7 +173,7 @@ fn write_human_result(
         ),
         UpdateProfileOutcome::Unreachable(category) => writeln!(
             stdout,
-            "! Your account display name update is unconfirmed ({}).\n\nCheck your account before trying again:\n  scherzo-cloud auth status",
+            "! Your account display name update is unconfirmed ({}).\n\nCheck your account before trying again:\n  um auth status",
             category.as_str()
         ),
     }

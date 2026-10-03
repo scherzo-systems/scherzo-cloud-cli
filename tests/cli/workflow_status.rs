@@ -372,7 +372,7 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
         ]
     );
     assert_eq!(result["schemaVersion"], 1);
-    assert_eq!(result["command"], "scherzo-cloud workflow status");
+    assert_eq!(result["command"], "um workflow status");
     assert_eq!(result["outcome"], "status");
     assert_eq!(result["exitStatus"], 0);
     assert_eq!(result["recovery"], serde_json::json!({"status": "settled"}));

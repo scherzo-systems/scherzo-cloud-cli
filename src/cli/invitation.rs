@@ -23,9 +23,9 @@ use um_human_auth::SecretToken;
 
 use super::{OrganizationArg, PaginationArgs};
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud invitations";
+pub(super) const ABOUT: &str = "Manage Useful Machinery invitations";
 const NAME: &str = "invitation";
-const ERROR_CONTEXT: &str = "configure Scherzo Cloud invitation access";
+const ERROR_CONTEXT: &str = "configure Useful Machinery invitation access";
 const MAX_CAPABILITY_BYTES: u64 = 128;
 
 #[derive(Debug, Args)]

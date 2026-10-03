@@ -297,7 +297,7 @@ fn write_common(
             None,
             authentication
                 .rejected_error(
-                    "error: invitation management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                    "error: invitation management requires sign-in\n\nSign in first:\n  um auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,

@@ -70,7 +70,7 @@ fn human_signup_creates_and_reports_the_account() {
     assert_eq!(
         output.stdout,
         concat!(
-            "✓ Scherzo Cloud account created.\n",
+            "✓ Useful Machinery account created.\n",
             "\n",
             "  Account:    Ada Lovelace\n",
             "  Principal:  prn_fixture\n",
@@ -185,7 +185,7 @@ fn already_provisioned_signup_directs_the_human_to_status() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         output.stdout,
-        b"! This identity already has a Scherzo Cloud account.\n\nRun:\n  scherzo-cloud auth status\n"
+        b"! This identity already has a Useful Machinery account.\n\nRun:\n  um auth status\n"
     );
     assert!(output.stderr.is_empty());
     server.finish();

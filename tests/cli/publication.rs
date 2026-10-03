@@ -51,12 +51,12 @@ fn publication_body() -> serde_json::Value {
         "target": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456",
-            "fullName": "scherzo-systems/scherzo-cloud",
+            "fullName": "scherzo-systems/um",
             "baseBranch": "main",
             "destinationBranch": format!("scherzo/{RUN_ID}/{EXPORT_NAME}")
         },
         "pullRequestMetadata": {
-            "title": "Scherzo Cloud run: changes",
+            "title": "Useful Machinery run: changes",
             "body": format!("Run: {RUN_ID}\nExport: {EXPORT_NAME}\n<!-- publication-marker -->")
         },
         "branch": null,
@@ -122,12 +122,12 @@ fn succeeded_publication(outcome: &str) -> serde_json::Value {
         publication["branch"] = serde_json::json!({
             "headOid": publication["artifact"]["headOid"].clone(),
             "disposition": if merged { "reused" } else { "created" },
-            "url": "https://github.example/scherzo-systems/scherzo-cloud/tree/changes"
+            "url": "https://github.example/scherzo-systems/um/tree/changes"
         });
         publication["pullRequest"] = serde_json::json!({
             "providerId": "987654",
             "number": 17,
-            "url": "https://github.example/scherzo-systems/scherzo-cloud/pulls/17",
+            "url": "https://github.example/scherzo-systems/um/pulls/17",
             "disposition": if merged { "reused" } else { "created" },
             "state": if merged { "merged" } else { "open" }
         });
@@ -402,7 +402,7 @@ fn publication_create_sends_the_closed_request_and_renders_plain_and_json_receip
                 format!("run: {RUN_ID}"),
                 format!("export: {EXPORT_NAME}"),
                 "state: queued".to_owned(),
-                "repository: scherzo-systems/scherzo-cloud".to_owned(),
+                "repository: scherzo-systems/um".to_owned(),
                 format!("destination branch: scherzo/{RUN_ID}/{EXPORT_NAME}"),
                 format!("idempotency key: {CALLER_KEY}"),
             ] {
@@ -1325,7 +1325,7 @@ fn create_wait_timeout_and_signal_after_acceptance_stop_only_observation() {
         );
         let environment =
             deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args(create_wait_args(true, true, timeout))
             .stdin(Stdio::null())
@@ -1401,7 +1401,7 @@ fn timeout_and_signals_stop_only_local_publication_show_observation() {
         );
         let environment =
             deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
             .args(show_wait_args(true, timeout))
             .stdin(Stdio::null())
@@ -1474,7 +1474,7 @@ fn signal_during_session_acquisition_emits_no_false_publication_receipt() {
         &server.issuer,
         credential_path.to_str().unwrap(),
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args(create_args(true, false))
         .stdin(Stdio::null())

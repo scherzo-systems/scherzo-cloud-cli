@@ -16,9 +16,9 @@ use um_human_auth::Deployment;
 
 use super::write_api_failure as write_failure;
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud service principals";
+pub(super) const ABOUT: &str = "Manage Useful Machinery service principals";
 const NAME: &str = "service-principal";
-const ERROR_CONTEXT: &str = "configure Scherzo Cloud service-principal access";
+const ERROR_CONTEXT: &str = "configure Useful Machinery service-principal access";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -964,7 +964,7 @@ fn authentication_failure(deployment: &str, json: bool) -> anyhow::Result<ExitCo
         "unauthenticated",
         None,
         None,
-        "error: service-principal creation requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+        "error: service-principal creation requires sign-in\n\nSign in first:\n  um auth login",
         OutcomeClass::Unauthenticated,
         json,
     )

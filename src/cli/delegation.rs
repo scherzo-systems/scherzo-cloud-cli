@@ -17,9 +17,9 @@ use um_api::{
 use um_human_auth::Deployment;
 // jscpd:ignore-end
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud delegations";
+pub(super) const ABOUT: &str = "Manage Useful Machinery delegations";
 const NAME: &str = "delegation";
-const ERROR_CONTEXT: &str = "configure Scherzo Cloud delegation access";
+const ERROR_CONTEXT: &str = "configure Useful Machinery delegation access";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -505,7 +505,7 @@ fn write_common(
             None,
             authentication
                 .rejected_error(
-                    "error: delegation management requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                    "error: delegation management requires sign-in\n\nSign in first:\n  um auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,

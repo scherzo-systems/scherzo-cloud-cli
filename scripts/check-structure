@@ -191,8 +191,8 @@ python3 "$public_root/scripts/test-release-package"
 "$public_root/scripts/check-release"
 
 for readme_contract in \
-  'scherzo-cloud workflow reference' \
-  'scherzo-cloud workflow schema > workflow-v1.schema.json' \
+  'um workflow reference' \
+  'um workflow schema > workflow-v1.schema.json' \
   'https://docs.usefulmachinery.com/agent/workflow-authoring.md' \
   'https://docs.usefulmachinery.com/reference/workflow-v1.md' \
   'https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json' \

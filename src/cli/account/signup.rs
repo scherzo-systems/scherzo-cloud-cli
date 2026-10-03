@@ -96,15 +96,15 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Resu
         }
         SignupOutcome::Unauthenticated => writeln!(
             stdout,
-            "! You're not signed in to Scherzo Cloud.\n\nSign in to create your account:\n  scherzo-cloud auth login"
+            "! You're not signed in to Useful Machinery.\n\nSign in to create your account:\n  um auth login"
         ),
         SignupOutcome::SignupNotPermitted => writeln!(
             stdout,
-            "! Account signup is not available for this Scherzo Cloud deployment."
+            "! Account signup is not available for this Useful Machinery deployment."
         ),
         SignupOutcome::AlreadyProvisioned => writeln!(
             stdout,
-            "! This identity already has a Scherzo Cloud account.\n\nRun:\n  scherzo-cloud auth status"
+            "! This identity already has a Useful Machinery account.\n\nRun:\n  um auth status"
         ),
         SignupOutcome::IdempotencyConflict => writeln!(
             stdout,
@@ -112,7 +112,7 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Resu
         ),
         SignupOutcome::Unreachable(category) => writeln!(
             stdout,
-            "! Couldn't confirm Scherzo Cloud account creation ({}).\n\nRun before trying again:\n  scherzo-cloud auth status",
+            "! Couldn't confirm Useful Machinery account creation ({}).\n\nRun before trying again:\n  um auth status",
             category.as_str()
         ),
     }
@@ -124,7 +124,7 @@ fn write_created_account(
     deployment: &str,
     principal: &HumanPrincipal,
 ) -> io::Result<()> {
-    writeln!(output, "✓ Scherzo Cloud account created.\n")?;
+    writeln!(output, "✓ Useful Machinery account created.\n")?;
     if let Some(display_name) = &principal.display_name {
         writeln!(output, "  Account:    {display_name}")?;
     }

@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Print version information";
-const COMMAND_NAME: &str = "scherzo-cloud";
+const COMMAND_NAME: &str = "um";
 
 pub(super) type Command = super::JsonArgs<super::VersionJson>;
 

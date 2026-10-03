@@ -28,7 +28,7 @@ impl Command {
         super::super::execute_deployment_command(
             self.command,
             &["organization", "audit"],
-            "configure Scherzo Cloud organization audit access",
+            "configure Useful Machinery organization audit access",
             |command, deployment| match command {
                 AuditCommand::List(command) => command.execute(deployment).map_err(Into::into),
             },

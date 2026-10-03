@@ -40,7 +40,7 @@ impl Command {
         super::super::execute_deployment_command(
             self.command,
             &["auth", "identity"],
-            "configure Scherzo Cloud identity access",
+            "configure Useful Machinery identity access",
             |command, deployment| match command {
                 IdentityCommand::List(command) => {
                     execute_leaf(command, deployment, list::Command::run)

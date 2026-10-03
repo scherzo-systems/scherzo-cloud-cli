@@ -252,7 +252,7 @@ impl RunBundle {
 }
 
 pub(super) fn isolated_command(args: &[String]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args(args)
         .env_remove(CREDENTIALS_FILE_VARIABLE)
@@ -3441,7 +3441,7 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     let destination = bundle.result("mixed-agent");
     let mut args = bundle.args(&destination);
     args.insert(args.len() - 1, "--json".to_owned());
-    let output = Command::new(env!("CARGO_BIN_EXE_scherzo-cloud"))
+    let output = Command::new(env!("CARGO_BIN_EXE_um"))
         .args(args)
         .env_clear()
         .env("PATH", isolated_path.path())
@@ -3617,7 +3617,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["schemaVersion"], 1);
-    assert_eq!(terminal["command"], "scherzo-cloud workflow run");
+    assert_eq!(terminal["command"], "um workflow run");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["exitStatus"], 0);
     let normalized_run = normalized_run_directory(&destination);
@@ -5072,7 +5072,7 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
              printf '%s\\n' \"$guard\" > \"$GUARD_PID\"; wait \"$guard\"",
         )
         .env("CONTROL", &control)
-        .env("GUARD_BIN", env!("CARGO_BIN_EXE_scherzo-cloud"))
+        .env("GUARD_BIN", env!("CARGO_BIN_EXE_um"))
         .env("GUARD_PID", &guard_pid)
         .env("SCHERZO_INTERNAL_CHILD_GUARD_WORKER", "guard-v1")
         .env("SCHERZO_INTERNAL_CHILD_GUARD_ROOT", staging.path())

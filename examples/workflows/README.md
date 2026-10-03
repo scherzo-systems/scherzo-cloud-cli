@@ -55,7 +55,7 @@ command, captures text, JSON, and file outputs from paths, and supplies all thre
 to a downstream command:
 
 ```sh
-scherzo-cloud workflow run \
+um workflow run \
   --source-root . \
   --execution-root "$execution_root" \
   --run-dir "$run_dir" \
@@ -69,7 +69,7 @@ The Claude attachment workflow includes `attachments/aurora-brief.txt` staticall
 accepts required named instructions and updates:
 
 ```sh
-scherzo-cloud workflow run \
+um workflow run \
   --source-root . \
   --execution-root "$execution_root" \
   --run-dir "$run_dir" \
@@ -104,7 +104,7 @@ the workflow succeeds.
 Definition validation is offline and does not contact a model provider:
 
 ```sh
-scherzo-cloud workflow validate \
+um workflow validate \
   --source-root . \
   agent-codex-basic.yaml
 ```
@@ -114,7 +114,7 @@ remain test fixtures rather than public runnable examples.
 
 ## Run and inspect a workflow
 
-From this directory, with `scherzo-cloud` on `PATH`, the following example validates and
+From this directory, with `um` on `PATH`, the following example validates and
 runs a command-only workflow, emits the terminal result as JSON, then reads the retained
 run through both status and archived-view commands:
 
@@ -129,11 +129,11 @@ run through both status and archived-view commands:
   run_dir="$tmp_dir/results/${workflow%.yaml}"
   mkdir "$execution_root" "$tmp_dir/results"
 
-  scherzo-cloud workflow validate \
+  um workflow validate \
     --source-root . \
     "$workflow"
 
-  scherzo-cloud workflow run \
+  um workflow run \
     --source-root . \
     --execution-root "$execution_root" \
     --run-dir "$run_dir" \
@@ -141,8 +141,8 @@ run through both status and archived-view commands:
     --json \
     "$workflow"
 
-  scherzo-cloud workflow status "$run_dir" --json
-  scherzo-cloud workflow view "$run_dir" --plain
+  um workflow status "$run_dir" --json
+  um workflow view "$run_dir" --plain
 )
 ```
 
@@ -151,7 +151,7 @@ whose latest attempt failed or was cancelled, first use `workflow status` to con
 that it is eligible, then run:
 
 ```sh
-scherzo-cloud workflow retry \
+um workflow retry \
   "$run_dir" \
   --execution-root "$execution_root" \
   --json

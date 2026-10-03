@@ -187,7 +187,7 @@ case $host_target in
     release_dist=$long_tmp_parent/release-dist
     archive=$(
       "$public_root/scripts/package-release-archive" \
-        --binary "$cargo_target_dir/debug/scherzo-cloud" \
+        --binary "$cargo_target_dir/debug/um" \
         --output "$release_dist" \
         --target "$host_target" \
         --version 0.0.0-dev

@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VERIFIER = ROOT / "scripts/verify-release-candidate"
 RECONCILER = ROOT / "scripts/reconcile-release"
 WORKFLOW = ROOT / ".github/workflows/check.yml"
-REPOSITORY_NAME = "fixture/scherzo-cloud-cli"
+REPOSITORY_NAME = "fixture/um-cli"
 
 
 def fail(message: str) -> None:
@@ -118,10 +118,10 @@ def legacy_asset_names(version: str) -> list[str]:
     return sorted(
         [
             "SHA256SUMS",
-            f"scherzo-cloud-{version}-aarch64-apple-darwin.tar.gz",
-            f"scherzo-cloud-{version}-aarch64-unknown-linux-gnu.tar.gz",
-            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
-            f"scherzo-cloud-{version}-x86_64-unknown-linux-gnu.tar.gz",
+            f"um-{version}-aarch64-apple-darwin.tar.gz",
+            f"um-{version}-aarch64-unknown-linux-gnu.tar.gz",
+            f"um-{version}-x86_64-apple-darwin.tar.gz",
+            f"um-{version}-x86_64-unknown-linux-gnu.tar.gz",
         ],
         key=os.fsencode,
     )
@@ -144,7 +144,7 @@ def release_document(tag: str, commit: str, body: str, identifier: int) -> dict[
         "id": identifier,
         "tag_name": tag,
         "target_commitish": commit,
-        "name": f"Scherzo Cloud CLI {tag}",
+        "name": f"Useful Machinery CLI {tag}",
         "body": body,
         "published_at": "2026-09-01T00:00:00Z",
         "draft": False,
@@ -249,7 +249,7 @@ def build_fixture(module: ModuleType, root: Path) -> Fixture:
             f"Release-Plan-Digest: {'c' * 64}\n"
         ).encode("ascii"),
         parent=None,
-        identity="Scherzo Cloud Mirror",
+        identity="Useful Machinery Mirror",
         email="mirror@scherzo.dev",
     )
     git(source, "update-ref", "refs/tags/v0.24.0", base)
@@ -287,7 +287,7 @@ def build_fixture(module: ModuleType, root: Path) -> Fixture:
         candidate_tree,
         candidate_message(module, plan, source_revision),
         parent=base,
-        identity="Scherzo Cloud Mirror",
+        identity="Useful Machinery Mirror",
         email="mirror@scherzo.dev",
     )
     git(source, "update-ref", "refs/heads/main", candidate)
@@ -521,7 +521,7 @@ def make_dist(root: Path, version: str = "0.25.0") -> Path:
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
     ):
-        package = f"scherzo-cloud-{version}-{target}"
+        package = f"um-{version}-{target}"
         path = dist / f"{package}.tar.gz"
         with path.open("wb") as output:
             with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
@@ -535,7 +535,7 @@ def make_dist(root: Path, version: str = "0.25.0") -> Path:
                     for name, value, mode in (
                         ("LICENSE", b"fixture license\n", 0o644),
                         ("README.md", b"fixture readme\n", 0o644),
-                        ("scherzo-cloud", f"binary-{target}\n".encode("ascii"), 0o755),
+                        ("um", f"binary-{target}\n".encode("ascii"), 0o755),
                     ):
                         member = tarfile.TarInfo(f"{package}/{name}")
                         member.size = len(value)
@@ -628,7 +628,7 @@ def main() -> int:
             tree,
             candidate_message(module, stale_plan, "a" * 40),
             parent=fixture.candidate,
-            identity="Scherzo Cloud Mirror",
+            identity="Useful Machinery Mirror",
             email="mirror@scherzo.dev",
         )
         git(

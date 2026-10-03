@@ -2,7 +2,7 @@
 
 ## Current state
 
-This repository defines the public source boundary for the Rust `scherzo-cloud`
+This repository defines the public source boundary for the Rust `um`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, caller-managed service API-key input, OAuth Device
 Authorization, server-confirmed authentication status, explicit human-principal signup,
@@ -10,19 +10,19 @@ service-principal and credential lifecycle management, revoking logout, organiza
 profile and membership management, one-page active member-directory and owner-only membership-history reads, inputless Cloud run creation
 and current projection reads, local Workflow V1 definition validation, and an outbound,
 enrolled runner transport.
-`scherzo-cloud runner serve` opens a versioned WebSocket connection, durably
+`um runner serve` opens a versioned WebSocket connection, durably
 acknowledges received assignment effects, and uses the shared workflow resolver,
 admission boundary, and execution engine for one configured inputless command, Pi,
 Claude Code, Codex, or mixed workflow. Semantic acceptance reserves the runner's single
 local assignment slot; a matching later start effect authorizes execution.
-`scherzo-cloud runner doctor` performs one
+`um runner doctor` performs one
 default local Git check and can explicitly check the `pi`, `claude`, and `codex`
 installations selected independently from inherited `PATH`; passing those checks
 establishes only the selected closed harness installation, not complete runner readiness.
 
 ## One executable with separate roles
 
-`scherzo-cloud` will initially provide one installation and command tree. A thin command
+`um` will initially provide one installation and command tree. A thin command
 entrypoint will dispatch to components with distinct responsibilities:
 
 - human-facing commands will perform short-lived public API operations;
@@ -32,11 +32,11 @@ entrypoint will dispatch to components with distinct responsibilities:
   limit, accept assignments, and report observations;
 - the runner protocol component will encode, order, acknowledge, and validate runner
   messages; and
-- the new Scherzo Cloud execution engine will implement the one-run contract,
+- the new Useful Machinery execution engine will implement the one-run contract,
   workflow scheduler, execution roots, checkpoints, and agent execution in Rust.
 
 The long-running runner starts only through an explicit command such as
-`scherzo-cloud runner serve`. Bare `scherzo-cloud runner` will not implicitly start a
+`um runner serve`. Bare `um runner` will not implicitly start a
 service.
 
 ## Local workflow validation
@@ -56,7 +56,7 @@ not parse or validate workflow definitions independently.
 Validation stops at definition resolution. The adapter does not construct run
 admission or runtime state, execute command or agent steps, inspect harness
 availability, load either credential type, make a network request, or enter Runner
-Serve connectivity. Bare `scherzo-cloud workflow` prints composed help rather than
+Serve connectivity. Bare `um workflow` prints composed help rather than
 selecting a workflow or inferring a source boundary.
 
 The pure lexical and JSON decoding rules shared by Workflow V1 inputs and Cloud Run
@@ -195,7 +195,7 @@ token, expiration, and refresh token atomically before confirmation so a tempora
 API failure does not require another browser flow. Login alone never creates a principal.
 An onboarding agent may invoke the separate signup command only after reporting that
 signup is required and obtaining explicit human
-approval. `scherzo-cloud account signup` uses the existing human credential, creates
+approval. `um account signup` uses the existing human credential, creates
 one opaque idempotency key per invocation, and retries an ambiguous transport failure
 once with that same key. It reports an authenticated principal only from the signup
 response and never begins another device authorization transaction.
@@ -385,8 +385,8 @@ The binary depends on support, API, execution, runner, and human-auth in product
 and on test-support for tests. Its dev dependencies enable only the `test-fixtures`
 seams used by root tests; production dependencies do not expose fixture constructors.
 Commands, service credential policy, build identity, and exit policy remain rooted in
-`src/`. There is one `scherzo-cloud` executable, Cargo continues to provide
-`CARGO_BIN_EXE_scherzo-cloud`, and the archive shape is unchanged.
+`src/`. There is one `um` executable, Cargo continues to provide
+`CARGO_BIN_EXE_um`, and the archive shape is unchanged.
 
 The remaining seams have this closed ownership matrix:
 
@@ -432,7 +432,7 @@ frozen legacy archive; new append-only intent is reviewed outside this exported 
 
 Native Cargo builds report the permanent `0.0.0-dev` fallback. Reproducible Nix and
 release builds inject `SCHERZO_CLOUD_VERSION` and `SCHERZO_CLOUD_BUILD_IDENTITY` at
-compile time, and both `scherzo-cloud version` and `scherzo-cloud --version` read the same
+compile time, and both `um version` and `um --version` read the same
 version. Structured version output also reports the resolved executable path and
 separately injected build identity. Packaging must verify the installed executable
 reports these exact values. `scripts/check-release` validates static policy and fallback

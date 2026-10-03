@@ -224,7 +224,7 @@ fn write_failure(
             None,
             authentication
                 .rejected_error(
-                    "error: Scherzo Cloud access requires sign-in\n\nSign in first:\n  scherzo-cloud auth login",
+                    "error: Useful Machinery access requires sign-in\n\nSign in first:\n  um auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -232,7 +232,7 @@ fn write_failure(
         ProjectFailure::Forbidden => (
             "forbidden",
             None,
-            "error: Scherzo Cloud operation is not permitted for this account\n\nAsk an organization owner to perform this operation.".to_owned(),
+            "error: Useful Machinery operation is not permitted for this account\n\nAsk an organization owner to perform this operation.".to_owned(),
             OutcomeClass::Forbidden,
         ),
         ProjectFailure::InvalidInput => (
@@ -244,13 +244,13 @@ fn write_failure(
         ProjectFailure::NotFound => (
             "not_found",
             None,
-            "error: Scherzo Cloud resource not found or unavailable\n\nCheck the organization and resource identifier, then try again.".to_owned(),
+            "error: Useful Machinery resource not found or unavailable\n\nCheck the organization and resource identifier, then try again.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         ProjectFailure::RepositoryNotBound => (
             "repository_not_bound",
             None,
-            "error: project has no repository binding\n\nBind a repository first:\n  scherzo-cloud project repository set <ORGANIZATION> <PROJECT> --installation-id <INSTALLATION> --repository-id <REPOSITORY>".to_owned(),
+            "error: project has no repository binding\n\nBind a repository first:\n  um project repository set <ORGANIZATION> <PROJECT> --installation-id <INSTALLATION> --repository-id <REPOSITORY>".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         ProjectFailure::NameUnavailable => (
@@ -295,7 +295,7 @@ fn write_failure(
             "unreachable",
             Some(category.as_str()),
             format!(
-                "error: contact Scherzo Cloud API at {deployment}: {}\n\nCheck network access to the deployment and try again.",
+                "error: contact Useful Machinery API at {deployment}: {}\n\nCheck network access to the deployment and try again.",
                 category.as_str()
             ),
             super::super::unreachable_outcome_class(category),
@@ -303,7 +303,7 @@ fn write_failure(
         ProjectFailure::Protocol { .. } => (
             "invalid_response",
             None,
-            "error: Scherzo Cloud API response does not match the public contract\n\nTry again later.".to_owned(),
+            "error: Useful Machinery API response does not match the public contract\n\nTry again later.".to_owned(),
             OutcomeClass::Protocol,
         ),
     };

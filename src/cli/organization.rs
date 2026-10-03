@@ -20,7 +20,7 @@ use um_api::{
 };
 use um_human_auth::Deployment;
 
-pub(super) const ABOUT: &str = "Manage Scherzo Cloud organizations";
+pub(super) const ABOUT: &str = "Manage Useful Machinery organizations";
 const NAME: &str = "organization";
 
 #[derive(Debug, Args)]
@@ -149,7 +149,7 @@ fn execute_leaf<T>(
     super::execute_deployment_leaf(
         command,
         &[NAME],
-        "configure Scherzo Cloud organization access",
+        "configure Useful Machinery organization access",
         execute,
     )
 }

@@ -98,7 +98,7 @@ from pathlib import Path
 arguments = sys.argv[1:]
 {state_write}
 if arguments == ["--version"]:
-    output = {f"scherzo-cloud {VERSION}\n".encode()!r}
+    output = {f"um {VERSION}\n".encode()!r}
 elif arguments == ["workflow", "--help"]:
     output = {help_output!r}
 elif arguments == ["workflow", "reference"]:
@@ -126,7 +126,7 @@ def create_source(root: Path) -> tuple[Path, Path, Path]:
     (root / "README.md").write_text("fixture README\n", encoding="utf-8")
     (root / "docs/workflow-v1.md").write_text(REFERENCE, encoding="utf-8")
     (root / "schemas/workflow-v1.schema.json").write_text(SCHEMA, encoding="utf-8")
-    return scripts / PACKAGE.name, scripts / VERIFY_ISOLATED.name, root / "scherzo-cloud"
+    return scripts / PACKAGE.name, scripts / VERIFY_ISOLATED.name, root / "um"
 
 
 def archive(package_script: Path, binary: Path, output: Path) -> Path:
@@ -143,7 +143,7 @@ def archive(package_script: Path, binary: Path, output: Path) -> Path:
             VERSION,
         ]
     )
-    return output / f"scherzo-cloud-{VERSION}-{TARGET}.tar.gz"
+    return output / f"um-{VERSION}-{TARGET}.tar.gz"
 
 
 def expect_verification_failure(verifier: Path, archive_path: Path, description: str) -> None:

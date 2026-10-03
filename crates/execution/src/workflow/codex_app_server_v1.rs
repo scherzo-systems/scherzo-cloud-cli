@@ -32,7 +32,7 @@ const TURN_START_REQUEST_ID: RequestId = RequestId(4);
 const TURN_INTERRUPT_REQUEST_ID: RequestId = RequestId(5);
 const CORRECTION_TURN_START_REQUEST_ID: RequestId = RequestId(6);
 const MAXIMUM_CORRECTION_TURNS: u8 = 1;
-const CLIENT_NAME: &str = "scherzo-cloud";
+const CLIENT_NAME: &str = "um";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodexAppServerV1ProtocolLimits {

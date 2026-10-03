@@ -11,7 +11,7 @@ use super::{InstallationArg, OrganizationArg};
 
 pub(super) const ABOUT: &str = "Manage GitHub connections";
 const NAME: &str = "github";
-const ERROR_CONTEXT: &str = "configure Scherzo Cloud GitHub access";
+const ERROR_CONTEXT: &str = "configure Useful Machinery GitHub access";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

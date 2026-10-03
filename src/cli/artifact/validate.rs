@@ -16,7 +16,7 @@ use um_execution::{
 };
 
 pub(super) const ABOUT: &str = "Validate a portable workflow artifact directory";
-const COMMAND: &str = "scherzo-cloud artifact validate";
+const COMMAND: &str = "um artifact validate";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

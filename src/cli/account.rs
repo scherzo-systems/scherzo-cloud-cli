@@ -32,7 +32,7 @@ use um_api::{HttpClient, HttpTransportPolicy, signup_human, update_current_princ
 use um_human_auth::Deployment;
 use um_support::generate_idempotency_key;
 
-pub(super) const ABOUT: &str = "Manage your Scherzo Cloud account";
+pub(super) const ABOUT: &str = "Manage your Useful Machinery account";
 const NAME: &str = "account";
 
 #[derive(Debug, Args)]
@@ -109,7 +109,7 @@ fn execute_signup(
         command.options.http.transport_policy(),
         "create signup request identity",
         "prepare signup networking",
-        "create Scherzo Cloud account through",
+        "create Useful Machinery account through",
         signup_human,
     )?;
     signup::write_outcome(
@@ -130,7 +130,7 @@ fn execute_update(
         command.options.http.transport_policy(),
         &command.options.authentication,
         "prepare account update networking",
-        "update Scherzo Cloud account through",
+        "update Useful Machinery account through",
         |client, api_url, access_token| {
             update_current_principal(
                 client,
@@ -164,13 +164,13 @@ impl Command {
             Some(AccountCommand::Signup(command)) => super::execute_deployment_leaf(
                 command,
                 &[NAME],
-                "configure Scherzo Cloud account",
+                "configure Useful Machinery account",
                 execute_signup,
             ),
             Some(AccountCommand::Update(command)) => super::execute_deployment_leaf(
                 command,
                 &[NAME],
-                "configure Scherzo Cloud account",
+                "configure Useful Machinery account",
                 execute_update,
             ),
         }

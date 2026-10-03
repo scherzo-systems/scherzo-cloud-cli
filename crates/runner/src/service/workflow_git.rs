@@ -1494,7 +1494,7 @@ mod tests {
             .parent()
             .and_then(Path::parent)
             .unwrap()
-            .join(format!("scherzo-cloud{}", std::env::consts::EXE_SUFFIX))
+            .join(format!("um{}", std::env::consts::EXE_SUFFIX))
     }
 
     #[test]

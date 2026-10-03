@@ -318,7 +318,7 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
             "{path:?}"
         );
 
-        let input = std::iter::once("scherzo-cloud")
+        let input = std::iter::once("um")
             .chain(path.iter().copied())
             .chain(arguments.iter().copied());
         assert!(super::parse(input).is_ok(), "{path:?}");
@@ -331,7 +331,7 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
                 *arg
             }
         });
-        let input = std::iter::once("scherzo-cloud")
+        let input = std::iter::once("um")
             .chain(path.iter().copied())
             .chain(old_arguments);
         assert!(
@@ -388,20 +388,20 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
         &["project", "runner-pool", "remove", "example", "project"],
     ];
     for &args in gated {
-        let input = std::iter::once("scherzo-cloud").chain(args.iter().copied());
+        let input = std::iter::once("um").chain(args.iter().copied());
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::MissingRequiredArgument,
             "{args:?}"
         );
-        let input = std::iter::once("scherzo-cloud")
+        let input = std::iter::once("um")
             .chain(args.iter().copied())
             .chain(std::iter::once("--yes"));
         assert!(super::parse(input).is_ok(), "{args:?}");
     }
     for mode in ["disable", "drain"] {
         assert!(
-            super::parse(["scherzo-cloud", "runner", mode, "example", "runner"]).is_ok(),
+            super::parse(["um", "runner", mode, "example", "runner"]).is_ok(),
             "{mode}"
         );
     }
@@ -439,7 +439,7 @@ fn renamed_leaves_have_only_the_approved_verb_paths() {
         &["project", "repository", "detach"][..],
         &["runner", "activation", "create"][..],
     ] {
-        let input = std::iter::once("scherzo-cloud").chain(path.iter().copied());
+        let input = std::iter::once("um").chain(path.iter().copied());
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::InvalidSubcommand,
@@ -448,7 +448,7 @@ fn renamed_leaves_have_only_the_approved_verb_paths() {
     }
     assert!(
         super::parse([
-            "scherzo-cloud",
+            "um",
             "runner",
             "activation",
             "issue",

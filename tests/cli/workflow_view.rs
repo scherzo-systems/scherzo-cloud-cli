@@ -204,7 +204,7 @@ fn automatic_and_explicit_plain_and_json_are_complete_frozen_snapshots() {
         serde_json::from_slice(&fs::read(selected_result).unwrap()).unwrap();
     assert!(workflow_view_schema().is_valid(&view));
     assert_eq!(view["schemaVersion"], 1);
-    assert_eq!(view["command"], "scherzo-cloud workflow view");
+    assert_eq!(view["command"], "um workflow view");
     assert_eq!(view["outcome"], "view");
     assert_eq!(view["exitStatus"], 0);
     assert_eq!(view["currentAttemptNumber"], 1);

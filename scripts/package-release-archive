@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create one deterministic native Scherzo Cloud release archive."""
+"""Create one deterministic native Useful Machinery release archive."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def package_archive(binary: Path, output: Path, version: str, target: str) -> Pa
     sources = (
         ("LICENSE", regular_file(public_root / "LICENSE", "CLI license"), 0o644),
         ("README.md", regular_file(public_root / "README.md", "CLI README"), 0o644),
-        ("scherzo-cloud", regular_file(binary, "release binary", executable=True), 0o755),
+        ("um", regular_file(binary, "release binary", executable=True), 0o755),
     )
 
     if not VERSION_RE.fullmatch(version):
@@ -63,7 +63,7 @@ def package_archive(binary: Path, output: Path, version: str, target: str) -> Pa
         fail(f"output path is not a regular directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
 
-    package = f"scherzo-cloud-{version}-{target}"
+    package = f"um-{version}-{target}"
     destination = output / f"{package}.tar.gz"
     if destination.exists() or destination.is_symlink():
         fail(f"release archive already exists: {destination}")

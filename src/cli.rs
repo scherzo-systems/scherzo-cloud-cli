@@ -239,8 +239,8 @@ const AFTER_HELP: &str = "Documentation:\n  Public API contract: https://docs.us
 
 #[derive(Debug, Args)]
 #[command(
-    name = "scherzo-cloud",
-    about = "Scherzo Cloud CLI",
+    name = "um",
+    about = "Useful Machinery CLI",
     version = crate::build_info::VERSION,
     after_help = AFTER_HELP
 )]
@@ -251,14 +251,12 @@ pub(crate) struct Cli {
 
 impl CommandFactory for Cli {
     fn command() -> clap::Command {
-        with_pagination_after_help(<Self as Args>::augment_args(clap::Command::new(
-            "scherzo-cloud",
-        )))
+        with_pagination_after_help(<Self as Args>::augment_args(clap::Command::new("um")))
     }
 
     fn command_for_update() -> clap::Command {
         with_pagination_after_help(<Self as Args>::augment_args_for_update(clap::Command::new(
-            "scherzo-cloud",
+            "um",
         )))
     }
 }
@@ -399,7 +397,7 @@ impl<F: JsonOutputKind, A: Args> Deref for CommonArgs<F, A> {
 struct HttpOptions {
     #[arg(
         long,
-        help = "Allow this command's Scherzo Cloud requests over insecure HTTP connections"
+        help = "Allow this command's Useful Machinery requests over insecure HTTP connections"
     )]
     allow_insecure_http: bool,
 }
@@ -2112,7 +2110,7 @@ mod tests {
         let run = round.join("run");
         fs::create_dir_all(&execution).unwrap();
         let arguments = vec![
-            OsString::from("scherzo-cloud"),
+            OsString::from("um"),
             OsString::from("workflow"),
             OsString::from("run"),
             OsString::from("--source-root"),
@@ -2230,7 +2228,7 @@ mod tests {
 
     #[test]
     fn command_groups_are_alphabetical_with_help_last() {
-        assert_command_order(&Cli::command(), "scherzo-cloud");
+        assert_command_order(&Cli::command(), "um");
     }
 
     fn customer_command_paths() -> Vec<String> {
@@ -2265,7 +2263,7 @@ mod tests {
     fn service_authentication_is_explicit_and_human_only_leaves_reject_it() {
         assert!(
             parse([
-                "scherzo-cloud",
+                "um",
                 "service-principal",
                 "credential",
                 "list",
@@ -2276,7 +2274,7 @@ mod tests {
         );
         assert!(
             parse([
-                "scherzo-cloud",
+                "um",
                 "organization",
                 "show",
                 "example",
@@ -2287,7 +2285,7 @@ mod tests {
         );
         assert!(
             parse([
-                "scherzo-cloud",
+                "um",
                 "service-principal",
                 "create",
                 "--display-name",
@@ -2301,7 +2299,7 @@ mod tests {
         );
         assert!(
             parse([
-                "scherzo-cloud",
+                "um",
                 "organization",
                 "deletion",
                 "request",

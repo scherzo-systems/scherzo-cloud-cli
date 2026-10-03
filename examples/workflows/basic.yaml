@@ -10,7 +10,7 @@ steps:
       argv:
         - sh
         - -c
-        - "set -eu; printf '%s\\n' 'hello from Scherzo Cloud'"
+        - "set -eu; printf '%s\\n' 'hello from Useful Machinery'"
 
   explain:
     kind: cmd

@@ -28,7 +28,7 @@ unbounded token values rather than silently repairing or replacing them. Human
 credentials are never runner credentials.
 
 Treat the credential file as a secret. Do not copy it into bug reports, command output,
-logs, repositories, or runner configuration. Use `scherzo-cloud auth logout` to remove
+logs, repositories, or runner configuration. Use `um auth logout` to remove
 the active deployment's local credential.
 
 `auth login` requests `openid profile email offline_access`, requires both access and

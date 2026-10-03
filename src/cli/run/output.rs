@@ -232,7 +232,7 @@ pub(super) fn write_cloud(
         {
             writeln!(
                 io::stdout().lock(),
-                "\nInspect the failed attempt with scherzo-cloud publication show. After resolving the failure, review provider effects before creating another publication for this Run and export."
+                "\nInspect the failed attempt with um publication show. After resolving the failure, review provider effects before creating another publication for this Run and export."
             )?;
         } else if snapshot
             .run
@@ -242,7 +242,7 @@ pub(super) fn write_cloud(
         {
             writeln!(
                 io::stdout().lock(),
-                "\nInspect the failed automatic publication handoff. After resolving the failure, check for an existing attempt before using scherzo-cloud publication create for this Run and export."
+                "\nInspect the failed automatic publication handoff. After resolving the failure, check for an existing attempt before using um publication create for this Run and export."
             )?;
         }
         if let Some(replayed) = snapshot.replayed {
