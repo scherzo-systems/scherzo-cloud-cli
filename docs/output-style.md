@@ -72,7 +72,7 @@ Before and after:
 |---|---|
 | `Error: workflow retry rejected: latest_attempt_succeeded at attempt 1: A succeeded run cannot be retried; create a new run.` | the diagnostic + remedy split shown above |
 | `artifact_directory_unavailable: The artifact directory is unavailable. (artifact directory)` | `error: artifact directory unavailable: /path/no-such-artifacts` |
-| `Sign-in failed during existing_credential_check: unreachable (connection).` | `error: sign in: connect to https://api.scherzo.dev: connection refused` |
+| `Sign-in failed during existing_credential_check: unreachable (connection).` | `error: sign in: connect to https://api.usefulmachinery.com: connection refused` |
 
 ## Streams and exit codes
 
